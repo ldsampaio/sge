@@ -40,6 +40,9 @@ export default function LoginForm() {
   const [mode, setMode] = useState<SecurityModeValue>("implicit_tls");
   const [port, setPort] = useState(DEFAULT_PORTS.implicit_tls);
   const [status, setStatus] = useState<Status>({ kind: "idle" });
+  // IN-03: visible when the keyring cannot be read on launch.
+  const [keyringHint, setKeyringHint] = useState<string | null>(null);
+  const [forgetNote, setForgetNote] = useState<string | null>(null);
 
   // Reload remembered credentials once on launch (no auto-connect here —
   // auto-login stays in Phase 5; the user still presses Connect).
@@ -55,6 +58,11 @@ export default function LoginForm() {
       })
       .catch(() => {
         // Keyring unavailable: stay memory-only, fields keep their defaults.
+        if (!cancelled) {
+          setKeyringHint(
+            "Saved login unavailable — keyring locked? Continuing without remembered credentials.",
+          );
+        }
       });
     return () => {
       cancelled = true;
@@ -71,6 +79,15 @@ export default function LoginForm() {
       setStatus({
         kind: "error",
         message: "Enter the server, username, and password first.",
+      });
+      return;
+    }
+    // WR-04: guard here so NaN/out-of-range ports get the plain-language
+    // message instead of an opaque serde/u16 deserialization failure.
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      setStatus({
+        kind: "error",
+        message: "Port must be a number between 1 and 65535.",
       });
       return;
     }
@@ -91,15 +108,39 @@ export default function LoginForm() {
             password,
           });
           keyringNote = "Username and password saved in the OS keyring.";
+          // WR-10: the secret now lives in the keyring — drop it from JS
+          // memory instead of lingering in state indefinitely.
+          setPassword("");
         } catch (err) {
           // Keyring locked/headless: fall back to a memory-only session with
           // an explanatory note — never a silent file.
           keyringNote = `Remember-me unavailable (${String(err)}). Continuing with a memory-only session.`;
         }
+      } else {
+        // WR-02: opting out must revoke, not just ignore — a previously
+        // saved entry would otherwise be reloaded on next launch.
+        try {
+          await invoke("clear_credentials");
+        } catch {
+          // Best-effort cleanup; a stale entry is merely inconvenient, and
+          // the Forget button below offers a manual retry.
+        }
       }
       setStatus({ kind: "success", summary, keyringNote });
     } catch (err) {
       setStatus({ kind: "error", message: String(err) });
+    }
+  }
+
+  // WR-02: in-app revocation for saved credentials.
+  async function forgetSaved() {
+    try {
+      await invoke("clear_credentials");
+      setRememberMe(false);
+      setPassword("");
+      setForgetNote("Saved login forgotten — keyring entry cleared.");
+    } catch (err) {
+      setForgetNote(`Could not clear the saved login (${String(err)}).`);
     }
   }
 
@@ -166,7 +207,12 @@ export default function LoginForm() {
         <button type="submit" disabled={status.kind === "connecting"}>
           {status.kind === "connecting" ? "Connecting…" : "Connect"}
         </button>
+        <button type="button" onClick={() => void forgetSaved()}>
+          Forget saved login
+        </button>
       </form>
+      {keyringHint && <p>{keyringHint}</p>}
+      {forgetNote && <p>{forgetNote}</p>}
 
       {status.kind === "connecting" && <p>Connecting…</p>}
 
