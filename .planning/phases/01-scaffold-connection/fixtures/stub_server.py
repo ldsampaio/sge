@@ -5,15 +5,26 @@ Fixture generator for SGE Phase 1 (01-02-PLAN, local-simulated fallback):
 real client bytes over a real socket, stub answers. NEVER logs the LOGIN
 line (it carries the password). Single connection, then exits.
 
-Usage: python3 stub_server.py [port]   (default 11430)
+Usage: python3 stub_server.py [port] [--starttls]   (default 11430)
 """
 
 import socket
 import sys
 
-PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 11430
+positional = [a for a in sys.argv[1:] if not a.startswith("-")]
+PORT = int(positional[0]) if positional else 11430
+ADVERTISE_STARTTLS = "--starttls" in sys.argv[1:]
 
-CAPS = "IMAP4rev1 IDLE NAMESPACE LITERAL+ AUTH=PLAIN"
+# Advertised only with --starttls: the stub then accepts the STARTTLS verb
+# and replies OK, but cannot complete a real TLS upgrade (no test cert is
+# bundled) — it notes the upgrade point and closes. The Rust handshake logic
+# up to the upgrade is covered by replay unit tests (`negotiate_starttls`);
+# a live 143 server is still needed for the real TLS half. Residual risk:
+# post-upgrade greeting/behavior assumptions are unverified against a real
+# peer — see WR-05.
+STARTTLS_CAPS = "IMAP4rev1 IDLE NAMESPACE LITERAL+ STARTTLS AUTH=PLAIN"
+
+CAPS = STARTTLS_CAPS if ADVERTISE_STARTTLS else "IMAP4rev1 IDLE NAMESPACE LITERAL+ AUTH=PLAIN"
 
 
 def handle(conn: socket.socket) -> None:
@@ -41,6 +52,18 @@ def handle(conn: socket.socket) -> None:
             f.write(f"* CAPABILITY {CAPS}\r\n".encode())
             f.flush()
             ok(tag, "capabilities listed")
+        elif cmd == "STARTTLS":
+            if not ADVERTISE_STARTTLS:
+                f.write(f"{tag} BAD STARTTLS not advertised\r\n".encode())
+                f.flush()
+            else:
+                # No test cert bundled: acknowledge the verb (lets clients
+                # exercise pre-upgrade negotiation), then close so no one
+                # mistakes this for a completed upgrade.
+                f.write(f"{tag} OK begin TLS negotiation now\r\n".encode())
+                f.flush()
+                print("stub: STARTTLS accepted (no TLS upgrade without a cert) — closing", flush=True)
+                return
         elif cmd == "LOGIN":
             ok(tag, "logged in")
         elif cmd == "NAMESPACE":
