@@ -1,27 +1,26 @@
 ---
 phase: 01-scaffold-connection
-verified: 2026-10-03T06:00:00Z
+verified: 2026-10-03T12:00:00Z
 status: passed
 score: 6/6 must-haves verified
-covered_files: [.planning/phases/01-scaffold-connection/01-01-PLAN.md, .planning/phases/01-scaffold-connection/01-01-SUMMARY.md, .planning/phases/01-scaffold-connection/01-02-PLAN.md, .planning/phases/01-scaffold-connection/01-02-SUMMARY.md, .planning/phases/01-scaffold-connection/01-03-PLAN.md, .planning/phases/01-scaffold-connection/01-03-SUMMARY.md, .planning/phases/01-scaffold-connection/REVIEW.md, .planning/phases/01-scaffold-connection/fixtures/probe-transcript.txt, src-tauri/src/creds.rs, src-tauri/src/imap/errors.rs, src-tauri/src/imap/mod.rs, src-tauri/src/imap/probe.rs, src-tauri/src/imap/session.rs, src-tauri/src/lib.rs, src/components/LoginForm.tsx, src/components/SecuritySelector.tsx]
-covered_digest: "v1:sha256:030b7fb5115f8ffa6d6fe01c0bcf0819e31a4dafe26131f7e801fbceaf8f9cc3"
+covered_files: [.planning/phases/01-scaffold-connection/01-01-PLAN.md, .planning/phases/01-scaffold-connection/01-01-SUMMARY.md, .planning/phases/01-scaffold-connection/01-02-PLAN.md, .planning/phases/01-scaffold-connection/01-02-SUMMARY.md, .planning/phases/01-scaffold-connection/01-03-PLAN.md, .planning/phases/01-scaffold-connection/01-03-SUMMARY.md, .planning/phases/01-scaffold-connection/REVIEW.md, .planning/phases/01-scaffold-connection/fixtures/probe-transcript.txt, src-tauri/Cargo.toml, src-tauri/src/creds.rs, src-tauri/src/imap/errors.rs, src-tauri/src/imap/mod.rs, src-tauri/src/imap/probe.rs, src-tauri/src/imap/session.rs, src-tauri/src/lib.rs, src/App.tsx, src/components/LoginForm.tsx, src/components/SecuritySelector.tsx]
+covered_digest: "v1:sha256:fbc4422b67c7805d75350105378e3794d1ba0eab95943167689c9d13e7149499"
 behavior_unverified: 0
 overrides_applied: 0
-human_verification:
-  - test: "Run `npm run tauri dev`, eyeball the login screen (server pre-filled mail.utfpr.edu.br, 3-mode selector, port autofill + Advanced row, eye toggle, single Connect, remember-me + Forget button)"
-    expected: "Layout matches CONTEXT decisions; no second Test button; error + Retry flow reads plainly"
-    why_human: "Visual layout and interaction feel cannot be verified by grep/build (coverage D1 in 01-03-SUMMARY flags human_judgment: true)"
-  - test: "Connect with REAL UTFPR credentials and confirm INBOX SELECT summary (exists count, uid_validity) displays; optionally re-probe live via imap_probe to replace the [LOCAL-STUB] fixture section"
-    expected: "Real authenticated SELECT succeeds; fixture can be upgraded from MIXED to fully-live"
-    why_human: "No real-user credentials exist in this environment; live probes used dummy-only auth (correctly rejected). STARTTLS path is also untested-live (UTFPR is 993-only) — recorded as residual risk, unit-tested via stub + replay tests"
+re_verification:
+  previous_status: passed
+  previous_score: 6/6
+  gaps_closed: []
+  gaps_remaining: []
+  regressions: []
 ---
 
 # Phase 01: Scaffold + Connection Verification Report
 
 **Phase Goal:** User credentials open a real IMAP INBOX session against a configurable server.
-**Verified:** 2026-10-03T06:00:00Z
-**Status:** human_needed
-**Re-verification:** No — initial verification (includes 4 post-review fix commits a4fdc96, ff5ac68, e0b87f6, 77ff06c on top of reviewed 1608a10)
+**Verified:** 2026-10-03T12:00:00Z
+**Status:** passed
+**Re-verification:** Yes — refresh after two post-verification fix commits (74a6bab, 99b018d) on top of previously verified tree. Prior report (2026-10-03T06:00:00Z) was 6/6 verified; human validation recorded as passed by the user on 2026-10-03 (commit fb10e17 `docs(01): human validation passed`) and carried forward here — no downgrade to human_needed.
 
 ## Goal Achievement
 
@@ -29,95 +28,94 @@ human_verification:
 
 | # | Truth | Status | Evidence |
 |---|-------|--------|----------|
-| 1 | Login reaches INBOX SELECT against a real IMAP exchange | ✓ VERIFIED | `session.rs:447` `.select("INBOX")`; live stub probe this session: `SUMMARY selected_mailbox=INBOX exists=3 uid_validity=12345` exit 0; `connect_account` (lib.rs:44) delegates to `probe::run_probe` via spawn_blocking |
-| 2 | 3-mode switch + plain-language errors + manual retry, no auto-retry | ✓ VERIFIED | `SecurityMode::{ImplicitTls,StartTls,PlainLocal}` (mod.rs) ↔ frontend `SecurityModeValue` 1:1; error strings name the part (`cannot reach…`, `timed out after 30…`, `login rejected for…`, `TLS verification failed…`); Retry button bound to `connect()` (LoginForm.tsx:240); zero `setTimeout/setInterval` in LoginForm; 30 s timeout const tested |
-| 3 | Probe transcript fixture exists with honest source marking | ✓ VERIFIED | `fixtures/probe-transcript.txt` with `SOURCE: MIXED` header, LIVE Dovecot pre-auth profile + LOCAL-STUB authenticated exchange incl. `SELECT INBOX → exists=3 uid_validity=12345`; no secret bytes (negative-grep verified at capture) |
-| 4 | Remember-me saves username + password to OS keyring; unchecked stays memory-only | ✓ VERIFIED | `creds.rs` `KeyringStore` (service `sge`, single JSON blob) + `save/load/clear_credentials` commands via spawn_blocking, all three invoked from LoginForm (save on connect, clear on opt-out per WR-02 fix, Forget button, load-on-launch prefill); `creds` unit tests pass; unchecked path calls `clear_credentials` (no stale entry) |
-| 5 | No auto-connect code anywhere (Phase 5 scope guard) | ✓ VERIFIED | `grep -riE auto_login\|autoconnect\|auto-connect\|auto_connect` hits only two comments (LoginForm.tsx:47, creds.rs:5) explicitly stating auto-connect stays in Phase 5; launch `useEffect` only prefills fields, never invokes `connect_account` |
-| 6 | Read-only M1 discipline: no STORE, no BODY fetch, no flag writes | ✓ VERIFIED | `grep -rnE \bSTORE\b\|BODY\[ src-tauri/src/imap/*.rs src-tauri/src/lib.rs` empty; session.rs header documents SELECT/STATUS/LIST/CAPABILITY only; 01-02 grep gates intact |
+| 1 | Login reaches INBOX SELECT against a real IMAP exchange | ✓ VERIFIED | Unchanged since prior verification: `session.rs` `.select("INBOX")`; `connect_account` (lib.rs) delegates to `probe::run_probe`; live stub round-trip previously demonstrated (`exists=3 uid_validity=12345`, exit 0). No Rust changes in delta commits. |
+| 2 | 3-mode switch + plain-language errors + manual retry, no auto-retry | ✓ VERIFIED | Unchanged: `SecurityMode::{ImplicitTls,StartTls,PlainLocal}` ↔ frontend 1:1; typed error strings; Retry bound to `connect()`; zero timers in LoginForm. Delta only adds an earlier, plainer error path (outside-desktop guard) — consistent with this truth. |
+| 3 | Probe transcript fixture exists with honest source marking | ✓ VERIFIED | Unchanged: `fixtures/probe-transcript.txt` with `SOURCE: MIXED` header; untouched by delta. |
+| 4 | Remember-me saves username + password to OS keyring; unchecked stays memory-only | ✓ VERIFIED | Unchanged: `creds.rs` KeyringStore + save/load/clear commands; delta wraps invoke-failure surfaces with `toPlainError` (translates only `__TAURI__`-missing TypeErrors, otherwise verbatim) — keyring semantics untouched. |
+| 5 | No auto-connect code anywhere (Phase 5 scope guard) | ✓ VERIFIED | Re-checked this session: `auto_login\|autoconnect\|auto-connect\|auto_connect` hits only the two scope-guard comments (LoginForm.tsx, creds.rs); launch `useEffect` still only prefills, never invokes `connect_account`. Delta adds an early return before prefill — no connect call added. |
+| 6 | Read-only M1 discipline: no STORE, no BODY fetch, no flag writes | ✓ VERIFIED | Re-checked this session: `STORE\|BODY\[` grep over `src-tauri/src/imap/*.rs` + lib.rs empty. No Rust changes in delta. |
 
 **Score:** 6/6 truths verified (0 present-but-behavior-unverified)
+
+### Delta Verification (commits 74a6bab + 99b018d)
+
+| # | Delta claim | Status | Evidence |
+|---|-------------|--------|----------|
+| D1 | Outside-Tauri guard shows plain-language message | ✓ VERIFIED | `OUTSIDE_DESKTOP_MESSAGE` constant (LoginForm.tsx:29); surfaced in 4 paths: App banner (`role="alert"`), prefill `useEffect` early-return with keyring hint, `connect()` early-return as error status, `forgetSaved()` early-return as forget note; raw `__TAURI_INTERNALS__` TypeError translated by `toPlainError` (translates only missing-runtime text, passes everything else through verbatim — no error masking). |
+| D2 | No invoke crash path outside Tauri | ✓ VERIFIED | Every `invoke` call site in LoginForm (`load_credentials`, `connect_account`+save/clear, `clear_credentials`) is preceded by an `isTauriRuntime()` guard that returns before invoking; `isTauriRuntime` checks `__TAURI_INTERNALS__` or `__TAURI__` (covers v2 + legacy bridge). |
+| D3 | Build + lint green with the guard | ✓ VERIFIED | `npx tsc --noEmit` exit 0; `npx eslint src/App.tsx src/components/LoginForm.tsx` exit 0; `npm run build` ✓ built (225.66 kB js). |
+| D4 | Cargo `default_run` resolves to sge, imap_probe still explicit | ✓ VERIFIED | `src-tauri/Cargo.toml:7` `default-run = "sge"`; `src-tauri/src/bin/imap_probe.rs` remains cargo-auto-discovered binary (no `[[bin]]` needed) — bare `cargo run` is now unambiguous while `cargo run --bin imap_probe` still selects the probe explicitly. No Rust source touched. |
 
 ### Required Artifacts
 
 | Artifact | Expected | Status | Details |
 |----------|----------|--------|---------|
-| `src-tauri/src/imap/{mod,errors,session,probe}.rs` | 3-mode session + typed errors + shared probe core | ✓ VERIFIED | Substantive (~700-line session w/ tests), wired via `connect_account` + `imap_probe` CLI sharing `run_probe` |
-| `src-tauri/src/bin/imap_probe.rs` | CLI harness, env-only password | ✓ VERIFIED | `--password` refused with env redirect (WR-01 fix); stub round-trip demonstrated live this session |
-| `src-tauri/src/creds.rs` | Keyring save slice, no auto-connect | ✓ VERIFIED | Trait + KeyringStore + MemoryStore, zeroize noted, 3 unit tests + 1 ignored live-Secret-Service test |
-| `src/components/LoginForm.tsx` + `SecuritySelector.tsx` | Full login UX per CONTEXT | ✓ VERIFIED | Prefill, 3-mode selector + port autofill + Advanced + localhost warning, eye toggle, single Connect, Retry + TLS re-confirm, remember-me + Forget, keyring-unavailable hint |
-| `fixtures/probe-transcript.txt` + `stub_server.py` | Fixture + loopback stub (now w/ STARTTLS branch) | ✓ VERIFIED | Transcript verified above; stub supports `--starttls` advertisement branch (WR-05 fix commit a4fdc96) |
-| `.github/workflows/ci.yml` | Linux CI incl. tests + audit | ✓ VERIFIED | `cargo test` + `cargo audit` steps present (WR-09 fix); `targets: ["deb","appimage"]` Linux-only (WR-11 fix) |
-| `src-tauri/tauri.conf.json` | SGE identity + restrictive CSP | ✓ VERIFIED | Identity `br.edu.utfpr.sge`; CSP set (WR-08 fix); opener permission dropped (IN-01 fix) |
+| `src-tauri/src/imap/{mod,errors,session,probe}.rs` | 3-mode session + typed errors + shared probe core | ✓ VERIFIED | Untouched by delta; prior evidence stands. |
+| `src-tauri/src/bin/imap_probe.rs` | CLI harness, env-only password | ✓ VERIFIED | Untouched; still explicit via `--bin imap_probe`. |
+| `src-tauri/Cargo.toml` | Package manifest + default-run | ✓ VERIFIED | One-line addition `default-run = "sge"` (99b018d); manifest valid (frontend toolchain unaffected; no Rust source change). |
+| `src-tauri/src/creds.rs` | Keyring save slice, no auto-connect | ✓ VERIFIED | Untouched by delta. |
+| `src/components/LoginForm.tsx` + `SecuritySelector.tsx` | Full login UX per CONTEXT | ✓ VERIFIED | LoginForm +48/−3 (74a6bab): guard constant + `isTauriRuntime` + `toPlainError` + 3 early-returns; no existing behavior altered (all prior paths preserved, error surfaces only translated for missing-runtime text). |
+| `src/App.tsx` | App shell + outside-desktop banner | ✓ VERIFIED | +12 lines (74a6bab): `isTauriRuntime` + conditional `role="alert"` banner with `npm run tauri dev` guidance; LoginForm still always rendered. |
+| `fixtures/probe-transcript.txt` + `stub_server.py` | Fixture + loopback stub | ✓ VERIFIED | Untouched by delta. |
+| `.github/workflows/ci.yml` | Linux CI incl. tests + audit | ✓ VERIFIED | Untouched by delta. |
+| `src-tauri/tauri.conf.json` | SGE identity + restrictive CSP | ✓ VERIFIED | Untouched by delta. |
 
 ### Key Link Verification
 
 | From | To | Via | Status | Details |
 |------|----|-----|--------|---------|
-| LoginForm | `connect_account` | `invoke` with trimmed host/user + guarded port (WR-03/WR-04 fixes) | WIRED | lib.rs:54 `normalize_host` (trims + strips pasted `:port`); frontend port guard 1–65535 |
-| SecuritySelector | backend `SecurityMode` | mode strings `implicit_tls/starttls/plain` parsed by `SecurityMode::parse` | WIRED | 1:1 mapping, junk rejected by test |
-| Remember-me | keyring | `save/load/clear_credentials` invokes | WIRED | All three call sites present in LoginForm |
-| `connect_account` | IMAP server | `run_probe` → 3 transports → LOGIN..LIST/STATUS/SELECT..LOGOUT | WIRED | Proven by live stub probe this session |
-| Error strings | UI | surfaced verbatim, no secret material | WIRED | `ImapError` Display tested; `Debug` redacts password; zeroize on drop |
+| LoginForm | `connect_account` | `invoke` with trimmed host/user + guarded port | WIRED | Unchanged; guard returns before invoke outside Tauri — inside Tauri path identical. |
+| SecuritySelector | backend `SecurityMode` | mode strings parsed by `SecurityMode::parse` | WIRED | Unchanged. |
+| Remember-me | keyring | `save/load/clear_credentials` invokes | WIRED | Unchanged; `toPlainError` only reformats failure text. |
+| `connect_account` | IMAP server | `run_probe` → 3 transports → LOGIN..LIST/STATUS/SELECT..LOGOUT | WIRED | Unchanged (no Rust delta). |
+| Error strings | UI | surfaced verbatim, no secret material | WIRED | `toPlainError` passes non-runtime errors through via `String(err)` verbatim. |
 
 ### Data-Flow Trace (Level 4)
 
 | Artifact | Data Variable | Source | Produces Real Data | Status |
 |----------|---------------|--------|--------------------|--------|
-| LoginForm success view | `summary: ConnectSummary` | live `SELECT INBOX` via `connect_account` | ✓ FLOWING (stub demo: exists=3, uid_validity=12345) | ✓ FLOWING |
-| LoginForm prefill | `SavedCredentials` | `load_credentials` ← Secret Service | ✓ FLOWING (live roundtrip test passed at build) | ✓ FLOWING |
+| LoginForm success view | `summary: ConnectSummary` | live `SELECT INBOX` via `connect_account` | ✓ FLOWING (prior stub demo) | ✓ FLOWING |
+| LoginForm prefill | `SavedCredentials` | `load_credentials` ← Secret Service | ✓ FLOWING | ✓ FLOWING |
+| Outside-desktop banner | `outsideDesktop` boolean | `window.__TAURI_INTERNALS__`/`__TAURI__` presence | N/A (environment signal, not data) | ✓ WIRED (gated render, no data claim) |
 
 ### Behavioral Spot-Checks
 
 | Behavior | Command | Result | Status |
 |----------|---------|--------|--------|
-| `cargo test -p sge` | full suite | 29 passed, 0 failed, 1 ignored (live keyring) | ✓ PASS |
-| Stub full probe LOGIN..SELECT..SUMMARY | `imap_probe --host 127.0.0.1 --port 11431 --mode plain --allow-plain-local` vs stub_server.py | `SUMMARY selected_mailbox=INBOX exists=3 uid_validity=12345`, exit 0 | ✓ PASS |
-| `npm run build` | frontend build | ✓ built (224.99 kB js) | ✓ PASS |
-| Grep gates | no auto-connect code / no plaintext / no STORE-or-BODY / no LoginForm timers | all clean (only scope-guard comments match) | ✓ PASS |
+| `npx tsc --noEmit` | typecheck | exit 0 | ✓ PASS |
+| `npx eslint` on changed frontend files | lint | exit 0 | ✓ PASS |
+| `npm run build` | frontend build | ✓ built in 56ms | ✓ PASS |
+| Grep gates | no auto-connect code / no STORE-or-BODY | clean (only scope-guard comments match) | ✓ PASS |
+| `cargo test` full suite | not re-run | prior 29 passed / 0 failed stands; delta touches no Rust source (one manifest key) | ? SKIP (no Rust source change; manifest-only delta) |
 
 ### Probe Execution
 
 | Probe | Command | Result | Status |
 |-------|---------|--------|--------|
-| N/A — no `scripts/*/tests/probe-*.sh` in repo; phase "probe" is `imap_probe` CLI + transcript fixture, both exercised above | — | — | N/A (covered by spot-checks) |
+| N/A — no `scripts/*/tests/probe-*.sh`; phase "probe" is `imap_probe` CLI + transcript fixture | — | — | N/A (unchanged from prior report) |
 
 ### Requirements Coverage
 
 | Requirement | Source Plan | Description | Status | Evidence |
 |-------------|-------------|-------------|--------|----------|
-| CONN-01 | 01-01, 01-02, 01-03 | Login with user/pass/server, INBOX SELECT | ✓ SATISFIED | Frozen `connect_account` contract + real session + login UI |
-| CONN-02 | 01-01, 01-02, 01-03 | Security config + plain-language errors + retry | ✓ SATISFIED | 3 modes, typed errors, manual Retry, no auto-retry |
-| CONN-03 (save slice) | 01-03 | Remember credentials in keyring (auto-connect deferred to Phase 5) | ✓ SATISFIED (slice) | Save/load/clear + revocation UI; auto-connect structurally absent |
-
-### Review Follow-Up
-
-REVIEW.md (2026-10-03, 11 warnings + 7 info, 0 critical) has been addressed by 4 fix commits verified in-tree: WR-01 env-only CLI password, WR-02 revocation UI + opt-out clear, WR-03 `normalize_host`, WR-04 port guard, WR-05 STARTTLS stub branch + residual-risk docs, WR-06 op-named LIST/STATUS errors (test `list_and_status_no_name_the_operation` passes), WR-07 line caps (tests pass), WR-08 CSP, WR-09 CI tests+audit, WR-10 zeroize + JS password clear, WR-11 Linux-only targets, IN-01..IN-05/IN-07. No open review item blocks the phase goal.
+| CONN-01 | 01-01, 01-02, 01-03 | Login with user/pass/server, INBOX SELECT | ✓ SATISFIED | Unchanged; guard only adds a clearer failure path outside the desktop window. |
+| CONN-02 | 01-01, 01-02, 01-03 | Security config + plain-language errors + retry | ✓ SATISFIED | Strengthened: missing-runtime TypeError now plain-language in all 4 surfaces. |
+| CONN-03 (save slice) | 01-03 | Remember credentials in keyring (auto-connect deferred to Phase 5) | ✓ SATISFIED (slice) | Unchanged. |
 
 ### Anti-Patterns Found
 
 | File | Line | Pattern | Severity | Impact |
 |------|------|---------|----------|--------|
-| — | — | None found in phase files (no TODO/FIXME/placeholder/stub-return matches of concern) | — | — |
+| — | — | None in delta files (no TODO/FIXME/placeholder/stub-return; guard message is final copy, not a stub) | — | — |
 
 ### Human Verification Required
 
-### 1. Login screen visual eyeball
-
-**Test:** Run `npm run tauri dev`, inspect the login screen (prefill, selector, Advanced row, eye toggle, single Connect, remember-me + Forget button); fail once with dummy creds and use Retry.
-**Expected:** Layout matches CONTEXT decisions; error names the failing part; Retry preserves fields.
-**Why human:** Visual appearance and feel cannot be verified programmatically (coverage D1 flags human_judgment).
-
-### 2. Real-credential live INBOX SELECT
-
-**Test:** Connect with real UTFPR credentials; confirm the INBOX summary displays; optionally re-run `imap_probe` live to upgrade the fixture's `[LOCAL-STUB]` section.
-**Expected:** Authenticated SELECT succeeds against mail.utfpr.edu.br:993.
-**Why human:** No real credentials in this environment; live probes were dummy-only by design. STARTTLS mode additionally has zero live-server verification (UTFPR is 993-only) — unit/replay-tested only, recorded residual risk.
+None outstanding — human validation already performed and recorded as passed by the user on 2026-10-03 (commit fb10e17). The two items from the prior report (login-screen eyeball, real-credential live SELECT) were the subject of that validation.
 
 ### Gaps Summary
 
-No gaps. All six must-haves verified with in-tree evidence plus a live stub round-trip executed during this verification. Status is `human_needed` solely for the two human items above (visual UX + real-credential live proof), not for any code deficiency.
+No gaps. All 6 prior must-haves re-confirmed (2 by fresh grep this session, 4 by no-change carryover with delta-impact analysis), and all 4 delta claims verified with in-tree evidence plus green typecheck/lint/build. Status `passed` with human validation carried forward per instruction.
 
 ---
-_Verified: 2026-10-03T06:00:00Z_
+_Verified: 2026-10-03T12:00:00Z_
 _Verifier: the agent (gsd-verifier)_
