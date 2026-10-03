@@ -12,7 +12,7 @@ use futures::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use futures::{AsyncRead, AsyncWrite, TryStreamExt};
 
 use super::errors::{io_to_imap, login_err, session_err, tls_to_imap};
-use super::{AccountConfig, ImapError, MailboxSummary, SecurityMode, Transcript};
+use super::{BoxedSession, BoxedStream, SyncError, MailboxSummary, AccountConfig, ImapError, SecurityMode, Transcript};
 
 /// Bound shared by every stream handed to async-imap.
 pub trait StreamBound: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send {}
@@ -464,6 +464,7 @@ async fn login_and_select<S: StreamBound>(
     Ok(MailboxSummary {
         selected_mailbox: "INBOX".to_string(),
         uid_validity,
+        uid_next: mailbox.uid_next,
         exists: mailbox.exists,
     })
 }
@@ -720,5 +721,63 @@ mod tests {
             let after = client.read_response().await.unwrap();
             assert!(after.is_none(), "expected poisoned reads, got: {after:?}");
         });
+    }
+}
+
+// ── Sync-path connection (keeps the session open for SyncSession) ──────
+
+/// Box a stream into [`BoxedStream`].
+fn box_stream<S>(stream: S) -> BoxedStream
+where
+    S: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send + 'static,
+{
+    Box::new(stream)
+}
+
+/// Login on an already-connected boxed stream and return the authenticated
+/// [`BoxedSession`].  The server greeting is consumed internally by
+/// `AsyncRead::login`.
+async fn login_sync(stream: BoxedStream, cfg: &AccountConfig) -> Result<BoxedSession, SyncError> {
+    let client = Client::new(stream);
+    let session = client
+        .login(cfg.username.clone(), cfg.password.as_str().to_string())
+        .await
+        .map_err(|(e, _)| SyncError::Protocol(format!("LOGIN: {e}")))?;
+    Ok(session)
+}
+
+/// Establish a fully authenticated, sync-ready IMAP session whose
+/// transport is boxed (`BoxedSession`).
+///
+/// Unlike [`open_inbox`] (the one-shot probe that logs out immediately),
+/// this returns an open session the caller can drive through
+/// [`SyncSession`].  The caller is responsible for calling `logout`.
+pub async fn connect_sync(cfg: &AccountConfig) -> Result<BoxedSession, SyncError> {
+    check_cert_policy(cfg).map_err(|e| SyncError::State(format!("{e}")))?;
+
+    match cfg.security {
+        SecurityMode::ImplicitTls => {
+            let tcp = tcp_connect(cfg)
+                .await
+                .map_err(|e| SyncError::Protocol(format!("TCP: {e}")))?;
+            let tls = tls_upgrade(cfg, tcp)
+                .await
+                .map_err(|e| SyncError::Protocol(format!("TLS: {e}")))?;
+            login_sync(box_stream(tls), cfg).await
+        }
+        SecurityMode::StartTls => {
+            let mut t = Transcript::new();
+            let tls = starttls_upgrade(cfg, &mut t)
+                .await
+                .map_err(|e| SyncError::Protocol(format!("STARTTLS: {e}")))?;
+            login_sync(box_stream(tls), cfg).await
+        }
+        SecurityMode::PlainLocal => {
+            check_plain_allowed(cfg).map_err(|e| SyncError::State(format!("{e}")))?;
+            let tcp = tcp_connect(cfg)
+                .await
+                .map_err(|e| SyncError::Protocol(format!("TCP: {e}")))?;
+            login_sync(box_stream(tcp), cfg).await
+        }
     }
 }

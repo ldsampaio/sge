@@ -6,11 +6,22 @@
 
 pub mod creds;
 pub mod imap;
+pub mod store;
+pub mod sync;
+pub mod commands;
+
+use std::sync::{Arc, Mutex};
 
 use creds::{CredentialStore, KeyringStore, SavedCredentials};
-
 use serde::Serialize;
 use thiserror::Error;
+
+use store::Store;
+
+/// Shared app state: the SQLite store, accessible to all Tauri commands.
+pub struct AppState {
+    pub store: Arc<Mutex<Store>>,
+}
 
 /// Typed argument-validation errors for the connect path. Transport, auth,
 /// and TLS failures come from [`imap::ImapError`] and already name the
@@ -85,6 +96,22 @@ async fn connect_account(
     })
 }
 
+/// Save server config (host/port/security) to the OS keyring so
+/// `start_sync` can reconnect without re-prompting the user.
+#[tauri::command]
+async fn save_server_config(host: String, port: u16, security: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        creds::KeyringStore::new().save_server_config(&creds::ServerConfig {
+            host,
+            port,
+            security,
+        })
+    })
+    .await
+    .map_err(|e| format!("internal error: keyring task failed ({e})"))?
+    .map_err(|e| e.to_string())
+}
+
 /// Save username + password to the OS keyring (remember-me consent).
 /// Keyring I/O blocks: runs on a blocking thread, never on async runtime
 /// threads. Keyring-locked/headless failures surface as friendly errors so
@@ -126,12 +153,24 @@ async fn clear_credentials() -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let store = Arc::new(Mutex::new(
+        crate::store::Store::open_in_memory()
+            .expect("in-memory store should always succeed"),
+    ));
+    let state = AppState { store };
     tauri::Builder::default()
+        .manage(state)
         .invoke_handler(tauri::generate_handler![
             connect_account,
+            save_server_config,
             save_credentials,
             load_credentials,
-            clear_credentials
+            clear_credentials,
+            commands::sync::start_sync,
+            commands::sync::sync_status,
+            commands::sync::cancel_sync,
+            commands::sync::list_messages,
+            commands::sync::search_messages,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

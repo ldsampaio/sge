@@ -47,10 +47,29 @@ fn encode(creds: &SavedCredentials) -> String {
     serde_json::to_string(creds).expect("SavedCredentials always serializes")
 }
 
+fn encode_server_config(cfg: &ServerConfig) -> String {
+    serde_json::to_string(cfg).expect("ServerConfig always serializes")
+}
+
 fn decode(blob: &str) -> Result<SavedCredentials, CredsError> {
     serde_json::from_str(blob).map_err(|e| CredsError::Corrupt {
         detail: e.to_string(),
     })
+}
+
+fn decode_server_config(blob: &str) -> Result<ServerConfig, CredsError> {
+    serde_json::from_str(blob).map_err(|e| CredsError::Corrupt {
+        detail: e.to_string(),
+    })
+}
+
+/// Server config persisted alongside credentials (written by
+/// `connect_account` on first successful login, read by `start_sync`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ServerConfig {
+    pub host: String,
+    pub port: u16,
+    pub security: String,
 }
 
 /// OS-keyring store (Secret Service via `keyring sync-secret-service`).
@@ -58,6 +77,10 @@ pub struct KeyringStore {
     service: String,
     account: String,
 }
+
+/// Separate keyring entry for server config (host/port/security) so
+/// `start_sync` can reconnect without re-prompting the user.
+const KEYRING_SERVER_CFG: &str = "sge-server-cfg";
 
 impl KeyringStore {
     pub fn new() -> Self {
@@ -75,8 +98,32 @@ impl KeyringStore {
         }
     }
 
+    /// Persist server configuration (host, port, security mode).
+    pub fn save_server_config(&self, cfg: &ServerConfig) -> Result<(), CredsError> {
+        self.entry_for(KEYRING_SERVER_CFG)?
+            .set_password(&encode_server_config(cfg))
+            .map_err(unavailable)
+    }
+
+    /// Load server configuration. Returns `None` if no entry exists.
+    pub fn load_server_config(&self) -> Result<Option<ServerConfig>, CredsError> {
+        match self.entry_for(KEYRING_SERVER_CFG)?.get_password() {
+            Ok(blob) => decode_server_config(&blob).map(Some),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(unavailable(e)),
+        }
+    }
+
     fn entry(&self) -> Result<keyring::Entry, CredsError> {
         keyring::Entry::new(&self.service, &self.account).map_err(|e| {
+            CredsError::StoreUnavailable {
+                detail: e.to_string(),
+            }
+        })
+    }
+
+    fn entry_for(&self, account: &str) -> Result<keyring::Entry, CredsError> {
+        keyring::Entry::new(&self.service, account).map_err(|e| {
             CredsError::StoreUnavailable {
                 detail: e.to_string(),
             }

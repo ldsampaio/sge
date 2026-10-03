@@ -52,7 +52,7 @@ function toPlainError(err: unknown): string {
  * with a manual Retry button — this component never retries on its own
  * (no timers, no reconnect effects).
  */
-export default function LoginForm() {
+export default function LoginForm({ onConnect }: { onConnect?: () => void }) {
   const [server, setServer] = useState("mail.utfpr.edu.br");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -111,8 +111,6 @@ export default function LoginForm() {
       });
       return;
     }
-    // WR-04: guard here so NaN/out-of-range ports get the plain-language
-    // message instead of an opaque serde/u16 deserialization failure.
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
       setStatus({
         kind: "error",
@@ -129,6 +127,16 @@ export default function LoginForm() {
         username: username.trim(),
         password,
       });
+      // Persist server config so start_sync can reconnect (Phase 2 requires it).
+      try {
+        await invoke("save_server_config", {
+          host: server.trim(),
+          port,
+          security: mode,
+        });
+      } catch {
+        // Best-effort; the server config is also re-entered on each connect.
+      }
       let keyringNote: string | null = null;
       if (rememberMe) {
         try {
@@ -156,6 +164,7 @@ export default function LoginForm() {
         }
       }
       setStatus({ kind: "success", summary, keyringNote });
+      onConnect?.();
     } catch (err) {
       setStatus({ kind: "error", message: toPlainError(err) });
     }

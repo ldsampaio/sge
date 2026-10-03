@@ -13,9 +13,9 @@ From an empty repo to an installed Linux mail viewer: first a buildable Tauri sh
 
 Decimal phases appear between their surrounding integers in numeric order.
 
-- [x] **Phase 1: Scaffold + Connection** - Tauri shell that logs in and SELECTs INBOX on a real server (completed 2026-10-02)
-- [ ] **Phase 2: Sync Engine + Local Store** - Headers-first INBOX sync into SQLite with status
-- [ ] **Phase 3: Mailbox UI Shell + Search** - Gmail-like three-pane UI with offline FTS search
+|- [x] **Phase 1: Scaffold + Connection** - Tauri shell that logs in and SELECTs INBOX on a real server (completed 2026-10-02)
+|- [x] **Phase 2: Sync Engine + Local Store** - Headers-first INBOX sync into SQLite with status (completed 2026-10-03)
+|- [x] **Phase 3: Mailbox UI Shell + Search** - Gmail-like three-pane UI with offline FTS search (completed 2026-10-03)
 - [ ] **Phase 4: Reader + Attachments** - Sanitized message reading with attachment download
 - [ ] **Phase 5: Keyring + Packaging** - Secure auto-login and installable Linux bundle
 
@@ -62,7 +62,7 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. User can type sender/subject search and get instant offline results from local FTS
   4. User sees sensible empty, loading, and error states in every pane (first-run, empty INBOX, auth/TLS failure with retry)
 
-**Plans**: TBD
+**Plans**: 03-01 (list/search_messages Tauri commands), 03-02 (three-pane UI + MessageList), 03-03 (SearchBar + state handling)
 **UI hint**: yes
 
 ### Phase 4: Reader + Attachments
@@ -103,7 +103,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Scaffold + Connection | 3/3 | Complete    | 2026-10-02 |
-| 2. Sync Engine + Local Store | 0/TBD | Not started | - |
-| 3. Mailbox UI Shell + Search | 0/TBD | Not started | - |
+| 2. Sync Engine + Local Store | 3/3 | Complete    | 2026-10-03 |
+| 3. Mailbox UI Shell + Search | 3/3 | Complete    | 2026-10-03 |
 | 4. Reader + Attachments | 0/TBD | Not started | - |
 | 5. Keyring + Packaging | 0/TBD | Not started | - |

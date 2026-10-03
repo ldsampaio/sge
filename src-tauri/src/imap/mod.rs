@@ -10,11 +10,15 @@
 //! full-message fetch — bodies arrive in later phases and use peek-only
 //! fetches, so M1 never sets `\Seen` on the server.
 
+pub mod bodies;
 pub mod errors;
+pub mod headers;
 pub mod probe;
 pub mod session;
 
 pub use errors::ImapError;
+
+use futures::TryStreamExt;
 
 /// Connection (and whole-probe) timeout, seconds. Locked by CONTEXT D-timeout.
 pub const CONNECT_TIMEOUT_SECS: u64 = 30;
@@ -172,6 +176,164 @@ pub struct MailboxSummary {
     pub selected_mailbox: String,
     pub uid_validity: u32,
     pub exists: u32,
+    pub uid_next: Option<u32>,
+}
+
+/// A boxed async stream satisfying async-imap's transport bound —
+/// `AsyncRead + AsyncWrite + Unpin + Debug + Send`.  Used to erase
+/// TLS/TCP stream types behind `Client<BoxedStream>`.
+///
+/// Trait objects cannot contain multiple non-auto traits, so we bundle
+/// the async-imap bound behind a sealed marker trait and erase to
+/// `Box<dyn AsyncStream>`.
+pub trait AsyncStream: futures::AsyncRead + futures::AsyncWrite + Unpin + std::fmt::Debug + Send {}
+impl<T: futures::AsyncRead + futures::AsyncWrite + Unpin + std::fmt::Debug + Send> AsyncStream for T {}
+
+/// A fully typed IMAP session over a [`BoxedStream`] — the concrete type
+/// the sync engine owns and drives through [`SyncSession`].
+pub type BoxedStream = Box<dyn AsyncStream>;
+pub type BoxedSession = async_imap::Session<BoxedStream>;
+
+/// Pinned boxed future alias consumed by [`SyncSession`] trait methods.
+/// The trait stays object-safe because every method returns this
+/// concrete `Pin<Box<dyn Future …>>` rather than `impl Future`.
+pub type PinBox<'a, T> = std::pin::Pin<std::boxed::Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+/// Errors from the sync-path IMAP layer (Phase 2+).
+///
+/// `SyncError` is intentionally coarse at this layer — most variants carry
+/// a diagnostic string that the IPC layer maps back to a structured
+/// `SyncError` enum for the frontend.
+#[derive(Debug)]
+pub enum SyncError {
+    /// Protocol-level failure (FETCH/SELECT/LOGOUT returned an error).
+    Protocol(String),
+    /// I/O failure during a body fetch or attachment write.
+    Io(String),
+    /// Parse failure (envelope, bodystructure, or RFC822 parse).
+    Parse(String),
+    /// Invariants violation (e.g. missing UIDVALIDITY, unexpected state).
+    State(String),
+}
+
+impl std::fmt::Display for SyncError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SyncError::Protocol(s) => write!(f, "IMAP protocol error: {s}"),
+            SyncError::Io(s) => write!(f, "IMAP I/O error: {s}"),
+            SyncError::Parse(s) => write!(f, "IMAP parse error: {s}"),
+            SyncError::State(s) => write!(f, "IMAP state error: {s}"),
+        }
+    }
+}
+
+impl std::error::Error for SyncError {}
+
+impl From<crate::store::StoreError> for SyncError {
+    fn from(e: crate::store::StoreError) -> Self {
+        SyncError::Protocol(format!("store: {e}"))
+    }
+}
+
+impl From<async_imap::error::Error> for SyncError {
+    fn from(e: async_imap::error::Error) -> Self {
+        SyncError::Protocol(format!("{e}"))
+    }
+}
+
+/// Object-safe trait abstracting a read-only IMAP INBOX session.
+///
+/// Implemented by:
+/// - [`BoxedSession`] — real IMAP session (Phase 1 connection core)
+/// - `MockSession` (in `sync::worker::tests`) — deterministic fixture
+///
+/// All methods are read-only (ENVELOPE sweeps, `BODY.PEEK[]` bodies,
+/// SELECT, LOGOUT). `STORE`, `EXPUNGE`, and `APPEND` are **never**
+/// exposed, honoring the M1 read-only invariant (D-flags: T-02-01).
+pub trait SyncSession: Unpin + Send {
+    /// `SELECT INBOX` — validates the mailbox is selectable and returns
+    /// UIDVALIDITY / UIDNEXT / exists counts.
+    fn select_inbox(&mut self) -> PinBox<'_, Result<MailboxSummary, SyncError>>;
+
+    /// `UID FETCH <range> (UID FLAGS INTERNALDATE ENVELOPE BODYSTRUCTURE)`
+    /// over a ≤200-UID range.  Returns parsed headers (never raw `Fetch`).
+    fn fetch_envelopes<'a>(
+        &'a mut self,
+        range: &'a str,
+    ) -> PinBox<'a, Result<Vec<headers::MessageHeader>, SyncError>>;
+
+    /// `UID FETCH <uid> BODY.PEEK[]` — fetch the full RFC822 message
+    /// bytes for a single UID. Never sets `\\Seen`.
+    fn fetch_body(&mut self, uid: u32) -> PinBox<'_, Result<Vec<u8>, SyncError>>;
+
+    /// Graceful `LOGOUT`.  Idempotent on error.
+    fn logout(&mut self) -> PinBox<'_, Result<(), SyncError>>;
+}
+
+impl SyncSession for BoxedSession {
+    fn select_inbox(&mut self) -> PinBox<'_, Result<MailboxSummary, SyncError>> {
+        Box::pin(async move {
+            let mailbox = self
+                .select("INBOX")
+                .await
+                .map_err(|e| SyncError::Protocol(format!("SELECT: {e}")))?;
+            Ok(MailboxSummary {
+                selected_mailbox: "INBOX".to_string(),
+                uid_validity: mailbox
+                    .uid_validity
+                    .ok_or_else(|| SyncError::State("server did not return UIDVALIDITY".into()))?,
+                uid_next: mailbox.uid_next,
+                exists: mailbox.exists,
+            })
+        })
+    }
+
+    fn fetch_envelopes<'a>(
+        &'a mut self,
+        range: &'a str,
+    ) -> PinBox<'a, Result<Vec<headers::MessageHeader>, SyncError>> {
+        let range_owned = range.to_string();
+        Box::pin(async move {
+            let attrs = "UID FLAGS INTERNALDATE ENVELOPE BODYSTRUCTURE";
+            let mut stream = self
+                .uid_fetch(&range_owned, attrs)
+                .await
+                .map_err(|e| SyncError::Protocol(format!("UID FETCH: {e}")))?;
+            let mut out = Vec::new();
+            while let Some(fetch) = stream.try_next().await? {
+                let uid = fetch
+                    .uid
+                    .ok_or_else(|| SyncError::Protocol("missing UID in FETCH response".into()))?;
+                out.push(headers::parse_fetch_item(&fetch, uid));
+            }
+            Ok(out)
+        })
+    }
+
+    fn fetch_body(&mut self, uid: u32) -> PinBox<'_, Result<Vec<u8>, SyncError>> {
+        let uid_str = uid.to_string();
+        Box::pin(async move {
+            let mut stream = self
+                .uid_fetch(&uid_str, "BODY.PEEK[]")
+                .await
+                .map_err(|e| SyncError::Protocol(format!("UID FETCH body: {e}")))?;
+            while let Some(fetch) = stream.try_next().await? {
+                if let Some(body) = fetch.body() {
+                    return Ok(body.to_vec());
+                }
+            }
+            Ok(Vec::new())
+        })
+    }
+
+    fn logout(&mut self) -> PinBox<'_, Result<(), SyncError>> {
+        Box::pin(async move {
+            self.logout()
+                .await
+                .map_err(|e| SyncError::Protocol(format!("LOGOUT: {e}")))?;
+            Ok(())
+        })
+    }
 }
 
 /// Append-only command/response transcript for the probe fixture.

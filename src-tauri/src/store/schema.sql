@@ -20,7 +20,7 @@ CREATE TABLE mailboxes (
   name          TEXT NOT NULL UNIQUE,          -- 'INBOX' (M1); others later
   uid_validity  INTEGER NOT NULL DEFAULT 0,
   uid_next      INTEGER NOT NULL DEFAULT 0,
-  highest_modseq INTEGER,                      -- NULL if server lacks CONDSTORE
+  highest_modseq INTEGER,                      -- NULL if server lacks cond-store extension
   last_sync_at  TEXT                           -- ISO8601 UTC
 );
 -- sync_state folds into mailboxes (one row per folder); no separate table

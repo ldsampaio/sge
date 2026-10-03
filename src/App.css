@@ -28,6 +28,7 @@
   flex-direction: column;
   justify-content: center;
   text-align: center;
+  position: relative;
 }
 
 .logo {
@@ -58,6 +59,22 @@ a:hover {
 
 h1 {
   text-align: center;
+}
+
+.disconnect-btn {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  background: none;
+  border: none;
+  color: #646cff;
+  font-size: 13px;
+  cursor: pointer;
+  padding: 4px 8px;
+}
+
+.disconnect-btn:hover {
+  text-decoration: underline;
 }
 
 input,
