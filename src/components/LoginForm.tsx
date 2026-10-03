@@ -22,6 +22,27 @@ type Status =
   | { kind: "success"; summary: ConnectSummary; keyringNote: string | null }
   | { kind: "error"; message: string };
 
+// Plain-browser guard: when the frontend runs under plain Vite (browser URL)
+// instead of the Tauri WebView, `invoke()` throws a raw TypeError about
+// `window.__TAURI_INTERNALS__` being undefined. Detect the missing runtime
+// before any invoke call and surface plain language instead (D-failure).
+const OUTSIDE_DESKTOP_MESSAGE =
+  "SGE is running outside its desktop window — launch with `npm run tauri dev` and use the app window, not the browser URL.";
+
+function isTauriRuntime(): boolean {
+  const w = window as unknown as Record<string, unknown>;
+  return w["__TAURI_INTERNALS__"] !== undefined || w["__TAURI__"] !== undefined;
+}
+
+/** Translate a raw missing-runtime TypeError into the plain-language message. */
+function toPlainError(err: unknown): string {
+  const text = String(err);
+  if (text.includes("__TAURI_INTERNALS__") || text.includes("__TAURI__")) {
+    return OUTSIDE_DESKTOP_MESSAGE;
+  }
+  return text;
+}
+
 /**
  * SGE login form (locked decisions D-server-prefill, D-security-ui,
  * D-show-hide, D-single-connect, D-failure, D-remember, D-demo).
@@ -47,6 +68,10 @@ export default function LoginForm() {
   // Reload remembered credentials once on launch (no auto-connect here —
   // auto-login stays in Phase 5; the user still presses Connect).
   useEffect(() => {
+    if (!isTauriRuntime()) {
+      setKeyringHint(OUTSIDE_DESKTOP_MESSAGE);
+      return;
+    }
     let cancelled = false;
     invoke<SavedCredentials | null>("load_credentials")
       .then((saved) => {
@@ -75,6 +100,10 @@ export default function LoginForm() {
   }
 
   async function connect() {
+    if (!isTauriRuntime()) {
+      setStatus({ kind: "error", message: OUTSIDE_DESKTOP_MESSAGE });
+      return;
+    }
     if (!server.trim() || !username.trim() || !password) {
       setStatus({
         kind: "error",
@@ -114,7 +143,7 @@ export default function LoginForm() {
         } catch (err) {
           // Keyring locked/headless: fall back to a memory-only session with
           // an explanatory note — never a silent file.
-          keyringNote = `Remember-me unavailable (${String(err)}). Continuing with a memory-only session.`;
+          keyringNote = `Remember-me unavailable (${toPlainError(err)}). Continuing with a memory-only session.`;
         }
       } else {
         // WR-02: opting out must revoke, not just ignore — a previously
@@ -128,19 +157,23 @@ export default function LoginForm() {
       }
       setStatus({ kind: "success", summary, keyringNote });
     } catch (err) {
-      setStatus({ kind: "error", message: String(err) });
+      setStatus({ kind: "error", message: toPlainError(err) });
     }
   }
 
   // WR-02: in-app revocation for saved credentials.
   async function forgetSaved() {
+    if (!isTauriRuntime()) {
+      setForgetNote(OUTSIDE_DESKTOP_MESSAGE);
+      return;
+    }
     try {
       await invoke("clear_credentials");
       setRememberMe(false);
       setPassword("");
       setForgetNote("Saved login forgotten — keyring entry cleared.");
     } catch (err) {
-      setForgetNote(`Could not clear the saved login (${String(err)}).`);
+      setForgetNote(`Could not clear the saved login (${toPlainError(err)}).`);
     }
   }
 
