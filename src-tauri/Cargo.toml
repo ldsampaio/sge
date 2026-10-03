@@ -4,6 +4,7 @@
 [package]
 name = "sge"
 version = "0.1.0"
+default-run = "sge"
 description = "SGE — Linux IMAP desktop client (UTFPR mail reader)"
 authors = ["SGE contributors"]
 edition = "2021"
