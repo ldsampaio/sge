@@ -103,7 +103,7 @@ async fn raw_command<S: StreamBound>(
     let id = session
         .run_command(cmd)
         .await
-        .map_err(|e| session_err(e, &cfg.host, cfg.port))?;
+        .map_err(|e| session_err(e, &cfg.host, cfg.port, cmd))?;
     // Auth is issued inside async-imap and never echoed: only capability and
     // mailbox probes pass through here, so echoing the command is safe.
     t.client(cmd);
@@ -184,18 +184,49 @@ async fn read_line<S>(rw: &mut BufReader<S>, cfg: &AccountConfig) -> Result<Stri
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let mut line = String::new();
-    let n = rw
-        .read_line(&mut line)
-        .await
-        .map_err(|e| io_to_imap(e, &cfg.host, cfg.port))?;
-    if n == 0 {
-        return Err(ImapError::Protocol {
-            detail: "server closed the connection mid-handshake".to_string(),
-        });
+    // Bounded line scan over `fill_buf`/`consume` (not `read` into a scratch
+    // chunk): bytes are consumed from the BufReader only after being taken,
+    // so multi-line reads are never lost, and a server that never sends
+    // `\n` still cannot grow the buffer past the cap inside the 30 s window.
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        if buf.len() > MAX_PROBE_LINE_LEN {
+            return Err(ImapError::Protocol {
+                detail: format!(
+                    "server sent an overlong line (over {MAX_PROBE_LINE_LEN} bytes) — refusing to buffer untrusted output"
+                ),
+            });
+        }
+        let available = rw
+            .fill_buf()
+            .await
+            .map_err(|e| io_to_imap(e, &cfg.host, cfg.port))?;
+        if available.is_empty() {
+            return Err(ImapError::Protocol {
+                detail: "server closed the connection mid-handshake".to_string(),
+            });
+        }
+        match available.iter().position(|&b| b == b'\n') {
+            Some(pos) => {
+                buf.extend_from_slice(&available[..pos + 1]);
+                rw.consume_unpin(pos + 1);
+                break;
+            }
+            None => {
+                let n = available.len();
+                buf.extend_from_slice(available);
+                rw.consume_unpin(n);
+            }
+        }
     }
-    Ok(line.trim_end().to_string())
+    Ok(String::from_utf8_lossy(&buf).trim_end().to_string())
 }
+
+/// WR-07 bounds for the pre-auth/STARTTLS raw-line loop: the server is
+/// untrusted bytes, so the transcript window is capped even though the outer
+/// 30 s probe timeout bounds the wait.
+pub(crate) const MAX_PROBE_LINES: usize = 200;
+pub(crate) const MAX_PROBE_LINE_LEN: usize = 16 * 1024;
 
 async fn read_until_tag<S>(
     rw: &mut BufReader<S>,
@@ -208,7 +239,22 @@ where
 {
     let mut out = Vec::new();
     loop {
+        if out.len() >= MAX_PROBE_LINES {
+            return Err(ImapError::Protocol {
+                detail: format!(
+                    "server sent more than {MAX_PROBE_LINES} untagged lines before {tag} completed — refusing to buffer untrusted output"
+                ),
+            });
+        }
         let line = read_line(rw, cfg).await?;
+        if line.len() > MAX_PROBE_LINE_LEN {
+            return Err(ImapError::Protocol {
+                detail: format!(
+                    "server sent an overlong line ({} bytes, cap {MAX_PROBE_LINE_LEN}) during {tag} — refusing to buffer untrusted output",
+                    line.len()
+                ),
+            });
+        }
         t.server(&line);
         let tagged = line.starts_with(&format!("{tag} "));
         out.push(line);
@@ -242,22 +288,27 @@ where
     Ok(lines)
 }
 
-/// Unencrypted STARTTLS handshake up to and including the TLS upgrade.
-/// Returns the TLS stream; the caller wraps it in a client. The pre-upgrade
-/// CAPABILITY exchange stays in the transcript as the STARTTLS offer proof.
-async fn starttls_upgrade(
+/// Unencrypted STARTTLS negotiation up to (excluding) the TLS upgrade:
+/// greeting, CAPABILITY offer check, and the STARTTLS command exchange.
+/// Split from [`starttls_upgrade`] so the handshake logic is unit-testable
+/// without a live 143 server (WR-05): tests drive this with a replay stream
+/// and assert each branch, while the real TLS upgrade still needs a live
+/// STARTTLS peer — `mail.utfpr.edu.br:143` times out, so that half remains
+/// covered only by refusal-path tests. Residual risk documented, not hidden.
+async fn negotiate_starttls<S>(
+    rw: &mut BufReader<S>,
     cfg: &AccountConfig,
     t: &mut Transcript,
-) -> Result<async_native_tls::TlsStream<TcpStream>, ImapError> {
-    let tcp = tcp_connect(cfg).await?;
-    let mut rw = BufReader::new(tcp);
-
+) -> Result<(), ImapError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     // Mandatory unencrypted greeting.
-    let greeting = read_line(&mut rw, cfg).await?;
+    let greeting = read_line(rw, cfg).await?;
     t.server(&greeting);
 
     // Capability probe on the unencrypted channel: STARTTLS must be offered.
-    let caps = manual_capability(&mut rw, "a0", cfg, t).await?;
+    let caps = manual_capability(rw, "a0", cfg, t).await?;
     let caps_text = caps.join("\n").to_uppercase();
     if !caps_text.split_whitespace().any(|tok| tok == "STARTTLS") {
         return Err(ImapError::Protocol {
@@ -268,14 +319,27 @@ async fn starttls_upgrade(
 
     // Upgrade, then TLS handshake over the same connection.
     t.client("a1 STARTTLS");
-    write_line(&mut rw, "a1 STARTTLS", cfg).await?;
-    let resp = read_until_tag(&mut rw, "a1", cfg, t).await?;
+    write_line(rw, "a1 STARTTLS", cfg).await?;
+    let resp = read_until_tag(rw, "a1", cfg, t).await?;
     let last = resp.last().cloned().unwrap_or_default();
     if !last.starts_with("a1 OK") {
         return Err(ImapError::Protocol {
             detail: format!("server rejected STARTTLS ({last})"),
         });
     }
+    Ok(())
+}
+
+/// Unencrypted STARTTLS handshake up to and including the TLS upgrade.
+/// Returns the TLS stream; the caller wraps it in a client. The pre-upgrade
+/// CAPABILITY exchange stays in the transcript as the STARTTLS offer proof.
+async fn starttls_upgrade(
+    cfg: &AccountConfig,
+    t: &mut Transcript,
+) -> Result<async_native_tls::TlsStream<TcpStream>, ImapError> {
+    let tcp = tcp_connect(cfg).await?;
+    let mut rw = BufReader::new(tcp);
+    negotiate_starttls(&mut rw, cfg, t).await?;
     let tcp = rw.into_inner();
     tls_upgrade(cfg, tcp).await
 }
@@ -308,9 +372,11 @@ async fn login_and_select<S: StreamBound>(
     t: &mut Transcript,
 ) -> Result<MailboxSummary, ImapError> {
     // LOGIN is issued inside async-imap; the password never touches the
-    // transcript or any log line on this path.
+    // transcript or any log line on this path. The transient owned copy here
+    // is unavoidable at the API boundary; the canonical copy in `cfg` is
+    // zeroized on drop (WR-10).
     let mut session = match client
-        .login(cfg.username.clone(), cfg.password.clone())
+        .login(cfg.username.clone(), cfg.password.as_str().to_string())
         .await
     {
         Ok(s) => s,
@@ -339,11 +405,11 @@ async fn login_and_select<S: StreamBound>(
     let stream = session
         .list(Some(""), Some("*"))
         .await
-        .map_err(|e| session_err(e, &cfg.host, cfg.port))?;
+        .map_err(|e| session_err(e, &cfg.host, cfg.port, "LIST"))?;
     let names: Vec<async_imap::types::Name> = stream
         .try_collect()
         .await
-        .map_err(|e| session_err(e, &cfg.host, cfg.port))?;
+        .map_err(|e| session_err(e, &cfg.host, cfg.port, "LIST"))?;
     t.client("LIST \"\" *");
     for name in &names {
         t.server(format!(
@@ -370,7 +436,7 @@ async fn login_and_select<S: StreamBound>(
     let status = session
         .status("INBOX", "(MESSAGES UIDVALIDITY UIDNEXT)")
         .await
-        .map_err(|e| session_err(e, &cfg.host, cfg.port))?;
+        .map_err(|e| session_err(e, &cfg.host, cfg.port, "STATUS"))?;
     t.client("STATUS INBOX (MESSAGES UIDVALIDITY UIDNEXT)");
     t.server(format!(
         "STATUS: exists={} uid_validity={:?}",
@@ -380,7 +446,7 @@ async fn login_and_select<S: StreamBound>(
     let mailbox = session
         .select("INBOX")
         .await
-        .map_err(|e| session_err(e, &cfg.host, cfg.port))?;
+        .map_err(|e| session_err(e, &cfg.host, cfg.port, "SELECT"))?;
     t.client("SELECT INBOX");
     t.server(format!(
         "SELECT: exists={} uid_validity={:?}",
@@ -468,7 +534,7 @@ mod tests {
             port: 143,
             security: mode,
             username: "u".into(),
-            password: "p".into(),
+            password: zeroize::Zeroizing::new("p".to_string()),
             allow_untrusted: false,
             plain_local_confirmed: confirmed,
         }
@@ -497,6 +563,85 @@ mod tests {
             matches!(err, ImapError::CertExceptionRefused),
             "unexpected: {err}"
         );
+    }
+
+    fn drive_negotiate(bytes: &[u8]) -> Result<(), ImapError> {
+        let cfg = cfg(SecurityMode::StartTls, "stub", false);
+        let mut t = Transcript::new();
+        let mut rw = BufReader::new(Replay {
+            data: bytes.to_vec(),
+            pos: 0,
+        });
+        async_std::task::block_on(negotiate_starttls(&mut rw, &cfg, &mut t))
+    }
+
+    /// WR-05: the full pre-TLS half of the STARTTLS handshake runs against a
+    /// replay stream — greeting, CAPABILITY offer, STARTTLS accept — so the
+    /// branch logic is covered with no live 143 server. (The real TLS upgrade
+    /// after this point still needs a live peer; see `negotiate_starttls`.)
+    #[test]
+    fn starttls_negotiation_happy_path() {
+        let bytes = b"* OK stub ready.\r\n\
+            * CAPABILITY IMAP4rev1 STARTTLS IDLE\r\n\
+            a0 OK done.\r\n\
+            a1 OK begin TLS negotiation now.\r\n";
+        assert!(drive_negotiate(bytes).is_ok());
+    }
+
+    #[test]
+    fn starttls_missing_offer_is_refused_plainly() {
+        let bytes = b"* OK stub ready.\r\n\
+            * CAPABILITY IMAP4rev1 IDLE\r\n\
+            a0 OK done.\r\n";
+        let err = drive_negotiate(bytes).unwrap_err();
+        assert!(
+            err.to_string().contains("does not offer STARTTLS"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn starttls_rejection_surfaces() {
+        let bytes = b"* OK stub ready.\r\n\
+            * CAPABILITY IMAP4rev1 STARTTLS IDLE\r\n\
+            a0 OK done.\r\n\
+            a1 NO TLS not available now.\r\n";
+        let err = drive_negotiate(bytes).unwrap_err();
+        assert!(
+            err.to_string().contains("rejected STARTTLS"),
+            "unexpected: {err}"
+        );
+    }
+
+    /// WR-07: a chattering server cannot stuff the transcript without bound.
+    #[test]
+    fn read_until_tag_enforces_line_cap() {
+        let cfg = cfg(SecurityMode::StartTls, "rogue", false);
+        let mut t = Transcript::new();
+        let mut slop = Vec::new();
+        for _ in 0..(MAX_PROBE_LINES + 5) {
+            slop.extend_from_slice(b"* UNTAGGED slop\r\n");
+        }
+        slop.extend_from_slice(b"a9 OK done.\r\n");
+        let mut rw = BufReader::new(Replay { data: slop, pos: 0 });
+        let err =
+            async_std::task::block_on(read_until_tag(&mut rw, "a9", &cfg, &mut t)).unwrap_err();
+        assert!(err.to_string().contains("more than"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn read_until_tag_rejects_overlong_line() {
+        let cfg = cfg(SecurityMode::StartTls, "rogue", false);
+        let mut t = Transcript::new();
+        let mut bytes = vec![b'A'; MAX_PROBE_LINE_LEN + 512];
+        bytes.extend_from_slice(b"\r\na9 OK done.\r\n");
+        let mut rw = BufReader::new(Replay {
+            data: bytes,
+            pos: 0,
+        });
+        let err =
+            async_std::task::block_on(read_until_tag(&mut rw, "a9", &cfg, &mut t)).unwrap_err();
+        assert!(err.to_string().contains("overlong"), "unexpected: {err}");
     }
 
     /// Canned-byte stream for parser-limit regression tests.

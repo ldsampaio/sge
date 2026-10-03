@@ -66,6 +66,9 @@ pub(crate) fn sniff_io_message(msg: &str) -> IoClass {
     if tls_markers.iter().any(|mark| m.contains(mark)) {
         return IoClass::Tls;
     }
+    // NOTE (IN-05): "timed out" is deliberately NOT in this list — a timeout
+    // at any layer maps to the dedicated `Timeout` variant (see `io_to_imap`),
+    // not `Unreachable`, so timeout UX stays consistent.
     let net_markers = [
         "refused",
         "no route",
@@ -75,7 +78,6 @@ pub(crate) fn sniff_io_message(msg: &str) -> IoClass {
         "name or service not known",
         "name resolution",
         "dns",
-        "timed out",
         "connection reset",
         "broken pipe",
         "connection aborted",
@@ -89,6 +91,16 @@ pub(crate) fn sniff_io_message(msg: &str) -> IoClass {
 /// Map a transport I/O error to the user-facing variant.
 pub(crate) fn io_to_imap(err: io::Error, host: &str, port: u16) -> ImapError {
     let detail = err.to_string();
+    // IN-05: a "timed out" message from ANY layer (generic ErrorKind included)
+    // is a timeout — it must reach the dedicated Timeout UX, not the
+    // "cannot reach" wording.
+    if err.kind() == io::ErrorKind::TimedOut || detail.to_lowercase().contains("timed out") {
+        return ImapError::Timeout {
+            host: host.to_string(),
+            port,
+            secs: super::CONNECT_TIMEOUT_SECS,
+        };
+    }
     match err.kind() {
         io::ErrorKind::ConnectionRefused
         | io::ErrorKind::ConnectionReset
@@ -104,6 +116,8 @@ pub(crate) fn io_to_imap(err: io::Error, host: &str, port: u16) -> ImapError {
             detail,
         },
         io::ErrorKind::TimedOut => ImapError::Timeout {
+            // Unreachable: handled by the early return above; kept so a
+            // future refactor of the guard cannot silently remap timeouts.
             host: host.to_string(),
             port,
             secs: super::CONNECT_TIMEOUT_SECS,
@@ -164,17 +178,31 @@ pub(crate) fn login_err(
 }
 
 /// Map an `async-imap` error raised after login (LIST/STATUS/SELECT).
-pub(crate) fn session_err(err: async_imap::error::Error, host: &str, port: u16) -> ImapError {
+///
+/// WR-06: the failing operation travels with the error so LIST/STATUS
+/// rejections name the right part instead of masquerading as SELECT
+/// failures. SELECT keeps the dedicated `SelectFailed` variant (the mailbox
+/// summary contract depends on it); every other `NO` becomes a `Protocol`
+/// error naming the operation.
+pub(crate) fn session_err(
+    err: async_imap::error::Error,
+    host: &str,
+    port: u16,
+    op: &str,
+) -> ImapError {
     use async_imap::error::Error as Up;
     match err {
-        Up::No(detail) => ImapError::SelectFailed { detail },
+        Up::No(detail) if op == "SELECT" => ImapError::SelectFailed { detail },
+        Up::No(detail) => ImapError::Protocol {
+            detail: format!("{op} failed ({detail})"),
+        },
         Up::Bad(detail) => ImapError::Protocol { detail },
         Up::Io(io) => io_to_imap(io, host, port),
         Up::ConnectionLost => ImapError::Protocol {
-            detail: "connection lost".to_string(),
+            detail: format!("connection lost during {op}"),
         },
         _ => ImapError::Protocol {
-            detail: "mailbox command failed".to_string(),
+            detail: format!("{op} failed (mailbox command failed)"),
         },
     }
 }
@@ -270,12 +298,41 @@ mod tests {
     }
 
     #[test]
+    fn generic_timed_out_message_maps_to_timeout() {
+        let err = io_to_imap(
+            io(io::ErrorKind::Other, "connection timed out after retry"),
+            "h",
+            143,
+        );
+        let msg = err.to_string();
+        assert!(matches!(err, ImapError::Timeout { .. }), "{msg}");
+        assert!(msg.contains("timed out"), "{msg}");
+    }
+
+    #[test]
     fn post_login_no_is_select_failure() {
         let err = session_err(
             async_imap::error::Error::No("mailbox not found".into()),
             "h",
             993,
+            "SELECT",
         );
         assert!(matches!(err, ImapError::SelectFailed { .. }), "{err}");
+    }
+
+    #[test]
+    fn list_and_status_no_name_the_operation() {
+        for op in ["LIST", "STATUS", "CAPABILITY"] {
+            let err = session_err(
+                async_imap::error::Error::No("rejected".into()),
+                "h",
+                993,
+                op,
+            );
+            let msg = err.to_string();
+            assert!(matches!(err, ImapError::Protocol { .. }), "{msg}");
+            assert!(msg.contains(op), "{msg}");
+            assert!(!msg.contains("could not be selected"), "{msg}");
+        }
     }
 }

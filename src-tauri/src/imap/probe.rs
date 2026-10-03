@@ -54,6 +54,9 @@ pub async fn run_probe(cfg: &AccountConfig) -> Result<ProbeOutcome, ImapError> {
 
     Ok(ProbeOutcome {
         summary,
+        // IN-07: render scrubs passwords of length >= 3 only — shorter
+        // secrets would annihilate readable text; LOGIN is never echoed, so
+        // this scrub is belt and suspenders either way.
         transcript: t.render(cfg),
     })
 }

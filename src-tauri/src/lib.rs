@@ -48,9 +48,10 @@ async fn connect_account(
     username: String,
     password: String,
 ) -> Result<ConnectSummary, String> {
-    if host.trim().is_empty() {
-        return Err(ConnectError::InvalidHost.to_string());
-    }
+    // WR-03: normalize before anything touches the network — the trimmed,
+    // port-stripped value is what reaches dial/DNS/TLS SNI, never the raw
+    // frontend string.
+    let host = imap::normalize_host(&host).map_err(|e| e.to_string())?;
     if port == 0 {
         return Err(ConnectError::InvalidPort.to_string());
     }
@@ -63,7 +64,8 @@ async fn connect_account(
         port,
         security: mode,
         username,
-        password,
+        // WR-10: zeroized on drop once the spawned probe finishes.
+        password: zeroize::Zeroizing::new(password),
         // No cert-exception path through this command: untrusted certs hard
         // fail. A warned one-time override can arrive via a separate,
         // explicitly confirmed command in a later plan.
@@ -87,6 +89,10 @@ async fn connect_account(
 /// Keyring I/O blocks: runs on a blocking thread, never on async runtime
 /// threads. Keyring-locked/headless failures surface as friendly errors so
 /// the UI can fall back to a memory-only session with an explanatory note.
+///
+/// IN-04: the username is trim-checked but the password is only empty-checked
+/// — password whitespace is significant (IMAP passwords may contain spaces)
+/// and must never be stripped.
 #[tauri::command]
 async fn save_credentials(username: String, password: String) -> Result<(), String> {
     if username.trim().is_empty() || password.is_empty() {
@@ -121,7 +127,6 @@ async fn clear_credentials() -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             connect_account,
             save_credentials,

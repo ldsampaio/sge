@@ -4,7 +4,8 @@
 //! Tauri command: connect, CAPABILITY, NAMESPACE, LIST, STATUS, SELECT INBOX,
 //! then prints the mailbox summary plus the transcript.
 //!
-//! Credentials come from flags or environment and are NEVER written to disk:
+//! Credentials come from the environment only and are NEVER written to disk:
+//! argv is world-readable via `ps` on Linux, so no password flag exists —
 //! the transcript echoes only capability/mailbox probes (auth is issued
 //! inside async-imap and never echoed), and the runner redacts any residual
 //! username/password occurrence before printing.
@@ -24,7 +25,6 @@ OPTIONS:
     --port PORT            Server port (default: 993 implicit_tls, 143 starttls)
     --mode MODE            implicit_tls (default) | starttls | plain
     --username USER        Login username (required for full probe)
-    --password PASS        Login password (prefer SGE_IMAP_PASSWORD env)
     --allow-untrusted      Request a cert exception (logged, surfaced, REFUSED —
                            verification is never bypassed silently)
     --allow-plain-local    Confirm localhost-only unencrypted mode for --mode plain
@@ -32,7 +32,7 @@ OPTIONS:
     --help                 Print this help and exit 0
 
 ENV:
-    SGE_IMAP_PASSWORD      Password fallback when --password is absent
+    SGE_IMAP_PASSWORD      Password (env-only: argv is visible via ps)
 
 EXAMPLES:
     SGE_IMAP_PASSWORD=secret imap_probe --host mail.utfpr.edu.br --username alice
@@ -75,7 +75,14 @@ fn parse_args() -> Result<Args, String> {
             }
             "--mode" => a.mode = it.next().ok_or("--mode needs a value")?,
             "--username" | "-u" => a.username = Some(it.next().ok_or("--username needs a value")?),
-            "--password" | "-p" => a.password = Some(it.next().ok_or("--password needs a value")?),
+            // WR-01: env-only password — /proc/<pid>/cmdline is world-readable,
+            // so a --password flag would leak the mailbox password via `ps`.
+            "--password" | "-p" => {
+                eprintln!(
+                    "refusing: pass the password via SGE_IMAP_PASSWORD (argv is visible via ps)"
+                );
+                std::process::exit(2);
+            }
             "--allow-untrusted" => a.allow_untrusted = true,
             "--allow-plain-local" => a.allow_plain_local = true,
             "--pre-auth-only" => a.pre_auth_only = true,
@@ -93,10 +100,19 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let host = match args.host {
+    let raw_host = match args.host {
         Some(h) if !h.trim().is_empty() => h,
         _ => {
             eprintln!("usage error: --host is required\n\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    // WR-03: normalize before dial/TLS — trim whitespace and split off a
+    // trailing :port the user may have pasted into the host field.
+    let host = match sge_lib::imap::normalize_host(&raw_host) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("usage error: {e}");
             return ExitCode::from(2);
         }
     };
@@ -128,7 +144,7 @@ fn main() -> ExitCode {
             port,
             security: mode,
             username: args.username.unwrap_or_default(),
-            password: String::new(),
+            password: zeroize::Zeroizing::new(String::new()),
             allow_untrusted: args.allow_untrusted,
             plain_local_confirmed: args.allow_plain_local,
         };
@@ -146,9 +162,7 @@ fn main() -> ExitCode {
         });
     }
     let (Some(username), Some(password)) = (args.username, args.password) else {
-        eprintln!(
-            "usage error: full probe needs --username and --password (or SGE_IMAP_PASSWORD)\n\n{USAGE}"
-        );
+        eprintln!("usage error: full probe needs --username and SGE_IMAP_PASSWORD\n\n{USAGE}");
         return ExitCode::from(2);
     };
     let cfg = AccountConfig {
@@ -156,7 +170,7 @@ fn main() -> ExitCode {
         port,
         security: mode,
         username,
-        password,
+        password: zeroize::Zeroizing::new(password),
         allow_untrusted: args.allow_untrusted,
         plain_local_confirmed: args.allow_plain_local,
     };

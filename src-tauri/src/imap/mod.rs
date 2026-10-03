@@ -58,23 +58,91 @@ impl SecurityMode {
 }
 
 /// True for loopback hosts allowed to use unencrypted IMAP.
+///
+/// Allowlist is deliberately narrow (fail-closed): only `localhost`,
+/// `127.0.0.1`, and `::1` (bracketed or bare) pass. The rest of `127.0.0.0/8`,
+/// `::ffff:127.0.0.1`, and dotted forms like `localhost.` are refused — a
+/// stub on `127.0.0.2` must use one of the listed names. Input should already
+/// be trimmed (see [`normalize_host`]).
 pub fn is_loopback(host: &str) -> bool {
     let h = host.trim().trim_matches(['[', ']']);
     h.eq_ignore_ascii_case("localhost") || h == "127.0.0.1" || h == "::1"
+}
+
+/// Normalize a user-supplied hostname before it reaches TCP dial, DNS, or
+/// TLS SNI/hostname verification.
+///
+/// Trims surrounding whitespace and splits off a trailing `:port` the user
+/// may have pasted into the server field (e.g. `mail.utfpr.edu.br:993` —
+/// without this the dial layer would treat the whole string as a hostname).
+/// An explicitly pasted port is dropped in favor of the separate port
+/// argument rather than silently overriding it. Bare IPv6 literals (multiple
+/// colons, no brackets) are left intact for [`socket_addr`]-style bracketing
+/// downstream.
+pub fn normalize_host(raw: &str) -> Result<String, ImapError> {
+    let host = raw.trim();
+    if host.is_empty() {
+        return Err(ImapError::Protocol {
+            detail: "invalid host: server address must not be empty".to_string(),
+        });
+    }
+    if let Some(stripped) = host.strip_prefix('[') {
+        // Bracketed literal: "[::1]" or "[::1]:993".
+        match stripped.find(']') {
+            Some(end) => {
+                let inner = &stripped[..end];
+                let rest = &stripped[end + 1..];
+                if !rest.is_empty()
+                    && !(rest.starts_with(':') && rest[1..].chars().all(|c| c.is_ascii_digit()))
+                {
+                    return Err(ImapError::Protocol {
+                        detail: format!("invalid host: malformed bracketed address {raw:?}"),
+                    });
+                }
+                if inner.is_empty() {
+                    return Err(ImapError::Protocol {
+                        detail: "invalid host: server address must not be empty".to_string(),
+                    });
+                }
+                return Ok(inner.to_string());
+            }
+            None => {
+                return Err(ImapError::Protocol {
+                    detail: format!("invalid host: unbalanced bracket in {raw:?}"),
+                });
+            }
+        }
+    }
+    if host.contains(':') && !host.contains("::") && host.matches(':').count() == 1 {
+        let (name, port_part) = host.rsplit_once(':').expect("single colon");
+        if !port_part.is_empty()
+            && port_part.chars().all(|c| c.is_ascii_digit())
+            && !name.trim().is_empty()
+        {
+            // Trailing numeric port: use the hostname half; the numeric half
+            // is intentionally dropped — the separate port argument wins.
+            return Ok(name.trim().to_string());
+        }
+    }
+    Ok(host.to_string())
 }
 
 /// Everything needed to open one IMAP INBOX session.
 ///
 /// `password` is held in memory only for the session: never logged (the
 /// manual [`fmt::Debug`] impl redacts it), never persisted here — keyring
-/// persistence lands in Plan 01-03 behind remember-me consent.
+/// persistence lands in Plan 01-03 behind remember-me consent. WR-10: the
+/// bytes are [`zeroize::Zeroizing`] so allocator memory is scrubbed on drop
+/// (cheap insurance against core-dump/swap exposure). Residual risk: copies
+/// briefly exist inside TLS/IMAP plumbing and in the frontend JS string —
+/// both outside Rust's reach — so this narrows, not eliminates, exposure.
 #[derive(Clone)]
 pub struct AccountConfig {
     pub host: String,
     pub port: u16,
     pub security: SecurityMode,
     pub username: String,
-    pub password: String,
+    pub password: zeroize::Zeroizing<String>,
     /// One-time cert exception requested by explicit user override. The
     /// backend NEVER silently bypasses verification for this flag (see
     /// [`probe::run_probe`]): it is logged, surfaced, and refused.
@@ -194,13 +262,36 @@ mod tests {
     }
 
     #[test]
+    fn normalize_host_trims_and_strips_pasted_port() {
+        // WR-03: the value reaching dial/TLS SNI must be clean.
+        assert_eq!(
+            normalize_host("  mail.utfpr.edu.br  ").unwrap(),
+            "mail.utfpr.edu.br"
+        );
+        assert_eq!(
+            normalize_host("mail.utfpr.edu.br:993").unwrap(),
+            "mail.utfpr.edu.br"
+        );
+        assert_eq!(
+            normalize_host("  mail.utfpr.edu.br:993  ").unwrap(),
+            "mail.utfpr.edu.br"
+        );
+        assert_eq!(normalize_host("[::1]").unwrap(), "::1");
+        assert_eq!(normalize_host("[::1]:143").unwrap(), "::1");
+        // Bare IPv6 is left intact for downstream bracketing.
+        assert_eq!(normalize_host("::1").unwrap(), "::1");
+        assert!(normalize_host("   ").is_err());
+        assert!(normalize_host("[::1").is_err());
+    }
+
+    #[test]
     fn transcript_redacts_secrets() {
         let cfg = AccountConfig {
             host: "mail.example".into(),
             port: 993,
             security: SecurityMode::ImplicitTls,
             username: "user1".into(),
-            password: "s3cret-pw".into(),
+            password: zeroize::Zeroizing::new("s3cret-pw".to_string()),
             allow_untrusted: false,
             plain_local_confirmed: false,
         };
@@ -225,7 +316,7 @@ mod tests {
             port: 993,
             security: SecurityMode::ImplicitTls,
             username: "u".into(),
-            password: "pw123".into(),
+            password: zeroize::Zeroizing::new("pw123".to_string()),
             allow_untrusted: false,
             plain_local_confirmed: false,
         };
