@@ -7,8 +7,8 @@
 
 ### Connection
 
-- [ ] **CONN-01**: User can log in with username, password, and IMAP server URL (UTFPR preset: mail.utfpr.edu.br)
-- [ ] **CONN-02**: User can configure IMAP security (host/port, SSL/TLS on 993 or STARTTLS) and test the connection with plain-language errors
+- [x] **CONN-01**: User can log in with username, password, and IMAP server URL (UTFPR preset: mail.utfpr.edu.br)
+- [x] **CONN-02**: User can configure IMAP security (host/port, SSL/TLS on 993 or STARTTLS) and test the connection with plain-language errors
 - [ ] **CONN-03**: App remembers credentials securely in the OS keyring and auto-connects on next launch
 
 ### Sync & Store
@@ -66,8 +66,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| CONN-01 | Phase 1 | Pending |
-| CONN-02 | Phase 1 | Pending |
+| CONN-01 | Phase 1 | Complete |
+| CONN-02 | Phase 1 | Complete |
 | CONN-03 | Phase 5 | Pending |
 | SYNC-01 | Phase 2 | Pending |
 | SYNC-02 | Phase 2 | Pending |
@@ -81,6 +81,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | SHIP-01 | Phase 5 | Pending |
 
 **Coverage:**
+
 - v1 requirements: 13 total
 - Mapped to phases: 13
 - Unmapped: 0 ✓

@@ -12,12 +12,11 @@ Connect to an IMAP server on Linux and read your mail locally in a fast Gmail-li
 
 ### Validated
 
-(None yet — ship to validate)
+- ✓ User can log in with username, password, and IMAP server URL — Phase 1 (human-validated with real UTFPR account)
+- ✓ App connects over configurable IMAP security (host/port, SSL/TLS or STARTTLS) — Phase 1 (993/SSL live-verified; STARTTLS path unit-tested only, server is 993-only)
 
 ### Active
 
-- [ ] User can log in with username, password, and IMAP server URL
-- [ ] App connects over configurable IMAP security (host/port, SSL/TLS or STARTTLS)
 - [ ] App syncs mail headers first, downloads bodies on demand into local SQLite (server copies preserved)
 - [ ] User sees Gmail-like three-pane UI (sidebar, message list, reading pane)
 - [ ] User can browse INBOX messages locally (offline-capable after sync)
@@ -63,6 +62,11 @@ Connect to an IMAP server on Linux and read your mail locally in a fast Gmail-li
 | Remember all credentials in OS keyring | Personal daily-use client, auto-login expected | — Pending |
 | Gmail-like three-pane layout | Familiar UX target explicitly requested | — Pending |
 | Linux-only ship | Explicit constraint for M1 | — Pending |
+| Remember-me keyring save in Phase 1 | User required saving user+password; secure path is keyring, so CONN-03 save slice moved forward (auto-connect stays Phase 5) | ✓ Good |
+| imap-proto 0.16 can't parse NAMESPACE | Parser gap poisons async-imap session; profile server from CAPABILITY+LIST instead, regression tripwire pinned | ✓ Good |
+| STARTTLS ships without live test | mail.utfpr.edu.br is 993-only; stub + unit coverage, residual risk documented | ⚠️ Revisit if a 143 server appears |
+| App detects non-Tauri hosting | Raw `__TAURI_INTERNALS__` TypeError confused browser-URL users; guard + plain-language message added | ✓ Good |
+| Cargo default-run = sge | imap_probe harness binary broke bare `cargo run` for Tauri dev | ✓ Good |
 
 ## Evolution
 
@@ -82,4 +86,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-10-02 after initialization*
+*Last updated: 2026-10-03 after Phase 1*
