@@ -35,6 +35,7 @@ keyring = { version = "3", features = ["sync-secret-service"] }
 thiserror = "2"
 chrono = "0.4"
 futures = "0.3"
+native-tls = "0.2"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

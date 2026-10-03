@@ -1,22 +1,19 @@
-// SGE connection IPC contract (Phase 1, Plan 01-01).
+// SGE connection IPC contract (Phase 1).
 //
 // `connect_account` is the permanent architecture contract for opening an
-// IMAP INBOX session. Its signature MUST NOT change in later plans:
-// Plan 01-02 fills the body with the real `imap::session` implementation
-// behind the same signature.
+// IMAP INBOX session. Its signature MUST NOT change in later plans; the body
+// delegates to `imap::probe` (filled in Plan 01-02, extended by later phases).
+
+pub mod imap;
 
 use serde::Serialize;
 use thiserror::Error;
 
-/// Typed backend errors for the connect path.
-///
-/// Each variant maps to a plain-language string that names the failing part
-/// (host vs credentials vs TLS) for the login UX. Only the not-wired stub
-/// exists in this plan; real variants land with the IMAP session in 01-02.
+/// Typed argument-validation errors for the connect path. Transport, auth,
+/// and TLS failures come from [`imap::ImapError`] and already name the
+/// failing part for the login UX.
 #[derive(Debug, Error)]
 pub enum ConnectError {
-    #[error("imap-not-wired")]
-    NotWired,
     #[error("invalid host: server address must not be empty")]
     InvalidHost,
     #[error("invalid port: must be in range 1-65535")]
@@ -37,8 +34,11 @@ pub struct ConnectSummary {
 /// in Rust and never trusted from the frontend. Password is held only for
 /// this call: never logged, never persisted (keyring persistence lands in
 /// Plan 01-03 behind remember-me consent).
+///
+/// Runs on a dedicated blocking thread (`spawn_blocking` + async-std
+/// executor), never on a Tokio runtime thread.
 #[tauri::command]
-fn connect_account(
+async fn connect_account(
     host: String,
     port: u16,
     security: String,
@@ -51,9 +51,33 @@ fn connect_account(
     if port == 0 {
         return Err(ConnectError::InvalidPort.to_string());
     }
-    // Tracer stub: real IMAP session wires in here in Plan 01-02.
-    let _ = (security, username, password);
-    Err(ConnectError::NotWired.to_string())
+    let mode = imap::SecurityMode::parse(&security).map_err(|e| e.to_string())?;
+    // Localhost plaintext needs no extra click; remote plaintext is always
+    // refused inside the session module.
+    let loopback = imap::is_loopback(&host);
+    let cfg = imap::AccountConfig {
+        host,
+        port,
+        security: mode,
+        username,
+        password,
+        // No cert-exception path through this command: untrusted certs hard
+        // fail. A warned one-time override can arrive via a separate,
+        // explicitly confirmed command in a later plan.
+        allow_untrusted: false,
+        plain_local_confirmed: loopback,
+    };
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        async_std::task::block_on(imap::probe::run_probe(&cfg))
+    })
+    .await
+    .map_err(|e| format!("internal error: connection task failed ({e})"))?
+    .map_err(|e| e.to_string())?;
+    Ok(ConnectSummary {
+        selected_mailbox: outcome.summary.selected_mailbox,
+        uid_validity: outcome.summary.uid_validity,
+        exists: outcome.summary.exists,
+    })
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

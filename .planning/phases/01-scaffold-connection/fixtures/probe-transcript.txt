@@ -1,0 +1,74 @@
+# SGE Phase 1 (01-02) IMAP probe transcript fixture
+#
+# SOURCE: MIXED — honest marking per 01-02-PLAN (never fake a live header).
+#   [LIVE]     Pre-auth greeting + CAPABILITY from mail.utfpr.edu.br:993
+#              (implicit TLS), captured 2026-10-03 with:
+#                imap_probe --host mail.utfpr.edu.br --mode implicit_tls --pre-auth-only
+#   [LOCAL-STUB] Authenticated CAPABILITY/LIST/STATUS/SELECT exchange against a
+#              loopback stub (fixtures/stub_server.py, 127.0.0.1:11430):
+#                imap_probe --host 127.0.0.1 --port 11430 --mode plain --allow-plain-local \
+#                  --username stubuser --password '<redacted-dummy>'
+#              Real client bytes over a real socket; stub answers. No user
+#              credentials exist at build time, so a fully-live authenticated
+#              probe was impossible.
+#   RE-PROBE fully live against mail.utfpr.edu.br before Phase 2 (needs real
+#   credentials): re-run imap_probe with a real username/password and replace
+#   the [LOCAL-STUB] section below.
+#
+# SERVER PROFILE (LIVE, pre-auth — the facts Phase 2 builds on):
+#   - Software: Dovecot (Debian) — from the greeting.
+#   - Pre-login capabilities: IMAP4rev1 SASL-IR LOGIN-REFERRALS ID ENABLE IDLE
+#     LITERAL+ AUTH=PLAIN AUTH=LOGIN AUTH=XOAUTH2 AUTH=OAUTHBEARER.
+#   - NAMESPACE not advertised pre-login ("post-login capabilities have more"
+#     per the server). Separator / SPECIAL-USE unknown until authenticated
+#     LIST — confirm on the live re-probe.
+#   - Port 143 finding (2026-10-03): STARTTLS probe to mail.utfpr.edu.br:143
+#     timed out after 30 s (filtered/unserved). Server is 993-only; the
+#     STARTTLS mode path is implemented and unit-tested but NOT live-verified.
+#   - Auth-failure path verified LIVE with a dummy username (single attempt):
+#     server answered NO -> client reports
+#       "login rejected for <user> — check the username and password, then retry".
+#
+# REDACTION: no password bytes in this file. The probe never echoes auth
+# (LOGIN is issued inside async-imap), the stub never logs the LOGIN line,
+# and Transcript::render scrubs residual password occurrences. Verified by
+# negative-grep for the dummy password value (see 01-02-SUMMARY.md).
+#
+# NOTE on NAMESPACE: the authenticated exchange below does NOT contain a
+# NAMESPACE command. imap-proto 0.16 has no RFC 2342 NAMESPACE response
+# parser, and async-imap permanently closes a session's read side after any
+# response parse failure — issuing NAMESPACE would poison the session (found
+# live-debugging this fixture; regression test
+# `imap::session::tests::namespace_response_is_unparseable` pins it). The
+# namespace profile is derived from CAPABILITY + LIST instead. If the parser
+# learns NAMESPACE, re-enable the command and re-probe.
+#
+# ============================ [LIVE] pre-auth ============================
+
+# PRE-AUTH CONNECT mail.utfpr.edu.br:993 mode=implicit_tls
+S: * OK [CAPABILITY IMAP4rev1 SASL-IR LOGIN-REFERRALS ID ENABLE IDLE LITERAL+ AUTH=PLAIN AUTH=LOGIN AUTH=XOAUTH2 AUTH=OAUTHBEARER] Dovecot (Debian) ready.
+C: a0 CAPABILITY
+S: * CAPABILITY IMAP4rev1 SASL-IR LOGIN-REFERRALS ID ENABLE IDLE LITERAL+ AUTH=PLAIN AUTH=LOGIN AUTH=XOAUTH2 AUTH=OAUTHBEARER
+S: a0 OK Pre-login capabilities listed, post-login capabilities have more.
+
+# ========================== [LOCAL-STUB] full probe ==========================
+# Stub: Dovecot-shaped answers (3-message INBOX, UIDVALIDITY 12345).
+# Client tags differ per run (A0001..); sequence is LOGIN CAPABILITY LIST
+# STATUS SELECT LOGOUT. The LOGIN line is never echoed (password safety).
+
+# CONNECT 127.0.0.1:11430 mode=plain
+# WARNING: plaintext IMAP — localhost only, credentials cross the loopback unencrypted
+S: Data { status: Ok, code: Some(Capabilities([Imap4rev1, Atom("IDLE"), Atom("NAMESPACE"), Atom("LITERAL+"), Auth("PLAIN")])), information: Some("stub ready.") }
+# CAPABILITY (post-login)
+C: CAPABILITY
+S: Capabilities([Imap4rev1, Atom("IDLE"), Atom("NAMESPACE"), Atom("LITERAL+"), Auth("PLAIN")])
+S: Done { tag: RequestId("A0002"), status: Ok, code: None, information: Some("capabilities listed.") }
+# NAMESPACE (not issued: unparseable by imap-proto 0.16 — server advertises NAMESPACE: true)
+C: LIST "" *
+S: LIST: "INBOX" delim=Some("/")
+# namespace profile (LIST-derived): delimiters=["/"]; personal namespace assumed "" (NAMESPACE command unsupported by parser)
+C: STATUS INBOX (MESSAGES UIDVALIDITY UIDNEXT)
+S: STATUS: exists=3 uid_validity=Some(12345)
+C: SELECT INBOX
+S: SELECT: exists=3 uid_validity=Some(12345)
+SUMMARY selected_mailbox=INBOX exists=3 uid_validity=12345

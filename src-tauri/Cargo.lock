@@ -3559,6 +3559,7 @@ dependencies = [
  "futures",
  "keyring",
  "mail-parser",
+ "native-tls",
  "rusqlite",
  "rusqlite_migration",
  "serde",
