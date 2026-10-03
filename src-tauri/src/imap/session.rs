@@ -18,12 +18,12 @@ use super::{AccountConfig, ImapError, MailboxSummary, SecurityMode, Transcript};
 pub trait StreamBound: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send> StreamBound for T {}
 
-/// Loopback-only plaintext rule shared by the command and the CLI.
+/// Loopback-only unencrypted-mode rule shared by the command and the CLI.
 pub fn check_plain_allowed(cfg: &AccountConfig) -> Result<(), ImapError> {
     if !super::is_loopback(&cfg.host) {
         return Err(ImapError::Protocol {
             detail: format!(
-                "plain-local mode refused for non-localhost host {:?} — plaintext IMAP must stay on localhost",
+                "plain-local mode refused for non-localhost host {:?} — unencrypted IMAP must stay on localhost",
                 cfg.host
             ),
         });
@@ -155,7 +155,9 @@ async fn establish_plain(
     t: &mut Transcript,
 ) -> Result<Client<TcpStream>, ImapError> {
     check_plain_allowed(cfg)?;
-    t.note("WARNING: plaintext IMAP — localhost only, credentials cross the loopback unencrypted");
+    t.note(
+        "WARNING: unencrypted IMAP — localhost only, credentials cross the loopback unencrypted",
+    );
     let tcp = tcp_connect(cfg).await?;
     let mut client = Client::new(tcp);
     read_greeting(&mut client, cfg, t).await?;
@@ -217,7 +219,7 @@ where
 }
 
 /// One manual `tag CAPABILITY` exchange over a buffered stream. Used for the
-/// plaintext STARTTLS check and the pre-auth-only probe, where no async-imap
+/// unencrypted STARTTLS check and the pre-auth-only probe, where no async-imap
 /// Session exists yet.
 async fn manual_capability<S>(
     rw: &mut BufReader<S>,
@@ -240,7 +242,7 @@ where
     Ok(lines)
 }
 
-/// Plaintext STARTTLS handshake up to and including the TLS upgrade.
+/// Unencrypted STARTTLS handshake up to and including the TLS upgrade.
 /// Returns the TLS stream; the caller wraps it in a client. The pre-upgrade
 /// CAPABILITY exchange stays in the transcript as the STARTTLS offer proof.
 async fn starttls_upgrade(
@@ -250,11 +252,11 @@ async fn starttls_upgrade(
     let tcp = tcp_connect(cfg).await?;
     let mut rw = BufReader::new(tcp);
 
-    // Mandatory plaintext greeting.
+    // Mandatory unencrypted greeting.
     let greeting = read_line(&mut rw, cfg).await?;
     t.server(&greeting);
 
-    // Capability probe on the plaintext channel: STARTTLS must be offered.
+    // Capability probe on the unencrypted channel: STARTTLS must be offered.
     let caps = manual_capability(&mut rw, "a0", cfg, t).await?;
     let caps_text = caps.join("\n").to_uppercase();
     if !caps_text.split_whitespace().any(|tok| tok == "STARTTLS") {

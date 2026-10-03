@@ -4,7 +4,10 @@
 // IMAP INBOX session. Its signature MUST NOT change in later plans; the body
 // delegates to `imap::probe` (filled in Plan 01-02, extended by later phases).
 
+pub mod creds;
 pub mod imap;
+
+use creds::{CredentialStore, KeyringStore, SavedCredentials};
 
 use serde::Serialize;
 use thiserror::Error;
@@ -52,7 +55,7 @@ async fn connect_account(
         return Err(ConnectError::InvalidPort.to_string());
     }
     let mode = imap::SecurityMode::parse(&security).map_err(|e| e.to_string())?;
-    // Localhost plaintext needs no extra click; remote plaintext is always
+    // Localhost unencrypted mode needs no extra click; remote unencrypted mode is always
     // refused inside the session module.
     let loopback = imap::is_loopback(&host);
     let cfg = imap::AccountConfig {
@@ -80,11 +83,51 @@ async fn connect_account(
     })
 }
 
+/// Save username + password to the OS keyring (remember-me consent).
+/// Keyring I/O blocks: runs on a blocking thread, never on async runtime
+/// threads. Keyring-locked/headless failures surface as friendly errors so
+/// the UI can fall back to a memory-only session with an explanatory note.
+#[tauri::command]
+async fn save_credentials(username: String, password: String) -> Result<(), String> {
+    if username.trim().is_empty() || password.is_empty() {
+        return Err("username and password must not be empty".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        KeyringStore::new().save(&SavedCredentials { username, password })
+    })
+    .await
+    .map_err(|e| format!("internal error: keyring task failed ({e})"))?
+    .map_err(|e| e.to_string())
+}
+
+/// Load remembered credentials, if any. `Ok(None)` means nothing was saved.
+#[tauri::command]
+async fn load_credentials() -> Result<Option<SavedCredentials>, String> {
+    tauri::async_runtime::spawn_blocking(|| KeyringStore::new().load())
+        .await
+        .map_err(|e| format!("internal error: keyring task failed ({e})"))?
+        .map_err(|e| e.to_string())
+}
+
+/// Delete remembered credentials. Missing entries are a no-op success.
+#[tauri::command]
+async fn clear_credentials() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(|| KeyringStore::new().clear())
+        .await
+        .map_err(|e| format!("internal error: keyring task failed ({e})"))?
+        .map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![connect_account])
+        .invoke_handler(tauri::generate_handler![
+            connect_account,
+            save_credentials,
+            load_credentials,
+            clear_credentials
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

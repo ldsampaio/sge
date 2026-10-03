@@ -27,7 +27,7 @@ OPTIONS:
     --password PASS        Login password (prefer SGE_IMAP_PASSWORD env)
     --allow-untrusted      Request a cert exception (logged, surfaced, REFUSED —
                            verification is never bypassed silently)
-    --allow-plain-local    Confirm localhost-only plaintext for --mode plain
+    --allow-plain-local    Confirm localhost-only unencrypted mode for --mode plain
     --pre-auth-only        Connect + greeting + CAPABILITY only, no login
     --help                 Print this help and exit 0
 

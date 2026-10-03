@@ -27,7 +27,7 @@ pub enum SecurityMode {
     ImplicitTls,
     /// Plain connect upgraded with STARTTLS (port 143).
     StartTls,
-    /// Plaintext, localhost only, explicit confirm required.
+    /// Unencrypted, localhost only, explicit confirm required.
     PlainLocal,
 }
 
@@ -57,7 +57,7 @@ impl SecurityMode {
     }
 }
 
-/// True for loopback hosts allowed to use plaintext IMAP.
+/// True for loopback hosts allowed to use unencrypted IMAP.
 pub fn is_loopback(host: &str) -> bool {
     let h = host.trim().trim_matches(['[', ']']);
     h.eq_ignore_ascii_case("localhost") || h == "127.0.0.1" || h == "::1"
