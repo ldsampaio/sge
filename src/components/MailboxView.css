@@ -205,12 +205,20 @@
 /* ── Reading pane ── */
 
 .reading-pane {
-  width: 320px;
-  min-width: 320px;
+  width: 360px;
+  min-width: 360px;
   background: var(--card, #ffffff);
   border-left: 1px solid var(--border, #e0e0e0);
-  overflow-y: auto;
   display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.reading-pane.full-height {
+  height: 100%;
+}
+
+.reading-pane.flex-center {
   align-items: center;
   justify-content: center;
 }
@@ -222,22 +230,111 @@
   padding: 16px;
 }
 
-.reading-content {
-  padding: 16px;
-  width: 100%;
-}
-
-.reading-preview {
-  font-size: 12px;
-  color: var(--muted-foreground, #888);
-  font-style: italic;
-  margin-bottom: 8px;
-}
-
-.reading-preview-text {
+.reading-error {
+  color: #d32f2f;
   font-size: 13px;
-  line-height: 1.5;
+  text-align: center;
+  padding: 16px;
+}
+
+/* Header */
+.reading-header {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border, #e0e0e0);
+}
+
+.reading-subject {
+  margin: 0 0 8px 0;
+  font-size: 17px;
+  font-weight: 600;
   color: var(--foreground, #0f0f0f);
+}
+
+.reading-subject em {
+  font-weight: 400;
+  color: var(--muted-foreground, #888);
+}
+
+.reading-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+  color: var(--muted-foreground, #666);
+}
+
+.reading-meta span {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Attachments */
+.reading-attachments {
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border, #e0e0e0);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.attachment-btn {
+  background: none;
+  border: 1px solid var(--border, #e0e0e0);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 12px;
+  color: var(--foreground, #0f0f0f);
+  cursor: pointer;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: border-color 0.15s;
+}
+
+.attachment-btn:hover {
+  border-color: var(--accent, #4285e8);
+}
+
+.attachment-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Body */
+.reading-body {
+  flex: 1;
+  overflow: hidden;
+  padding: 0;
+}
+
+.reading-iframe {
+  width: 100%;
+  height: 100%;
+  border: none;
+}
+
+.reading-text {
+  margin: 0;
+  padding: 16px;
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--foreground, #0f0f0f);
+  background: none;
+  border: none;
+  overflow: auto;
+  font-family: inherit;
+}
+
+/* Loading / empty states */
+.reading-loading {
+  padding: 24px 16px;
+  text-align: center;
+  color: var(--muted-foreground, #666);
+  font-size: 13px;
 }
 
 /* Dark mode */

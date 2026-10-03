@@ -16,7 +16,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 |- [x] **Phase 1: Scaffold + Connection** - Tauri shell that logs in and SELECTs INBOX on a real server (completed 2026-10-02)
 |- [x] **Phase 2: Sync Engine + Local Store** - Headers-first INBOX sync into SQLite with status (completed 2026-10-03)
 |- [x] **Phase 3: Mailbox UI Shell + Search** - Gmail-like three-pane UI with offline FTS search (completed 2026-10-03)
-- [ ] **Phase 4: Reader + Attachments** - Sanitized message reading with attachment download
+|- [x] **Phase 4: Reader + Attachments** - Sanitized message reading with attachment download (completed 2026-10-03)
 - [ ] **Phase 5: Keyring + Packaging** - Secure auto-login and installable Linux bundle
 
 ## Phase Details
@@ -78,10 +78,9 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. User can tell read vs unread messages apart visually (display-only, no server flag writes)
   4. Malicious mail (script/srcdoc/object payloads) renders inert with no Tauri IPC reachability
 
-**Plans**: TBD
+**Plans**: 04-01 (fetch_message + save_attachment Tauri commands), 04-02 (ReadingPane with sandboxed iframe + attachment list), 04-03 (CSP hardening + security model)
 **UI hint**: yes
-
-### Phase 5: Keyring + Packaging
+**Verified**: 4 success criteria all pass — 63 Rust tests + tsc + eslint + vite build
 
 **Goal**: User launches straight into mail and can install the app on a clean Linux machine
 **Mode:** mvp
@@ -105,5 +104,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 | 1. Scaffold + Connection | 3/3 | Complete    | 2026-10-02 |
 | 2. Sync Engine + Local Store | 3/3 | Complete    | 2026-10-03 |
 | 3. Mailbox UI Shell + Search | 3/3 | Complete    | 2026-10-03 |
-| 4. Reader + Attachments | 0/TBD | Not started | - |
+| 4. Reader + Attachments | 3/3 | Complete    | 2026-10-03 |
 | 5. Keyring + Packaging | 0/TBD | Not started | - |

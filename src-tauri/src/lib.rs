@@ -159,6 +159,8 @@ pub fn run() {
     ));
     let state = AppState { store };
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             connect_account,
@@ -171,6 +173,8 @@ pub fn run() {
             commands::sync::cancel_sync,
             commands::sync::list_messages,
             commands::sync::search_messages,
+            commands::sync::fetch_message,
+            commands::sync::save_attachment,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

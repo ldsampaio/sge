@@ -315,6 +315,55 @@ fn row_to_message(row: &Row<'_>) -> Result<MessageRow, rusqlite::Error> {
     })
 }
 
+/// Look up a single message row by UID (for the reader).
+pub fn get_message_by_uid(
+    conn: &Connection,
+    mailbox: &str,
+    uid: u32,
+) -> StoreResult<Option<MessageRow>> {
+    match conn.query_row(
+        "SELECT m.uid, m.subject, m.from_addr, m.to_addrs, m.date_utc, \
+         m.flags, m.has_attachments, m.preview \
+         FROM messages m JOIN mailboxes mb ON m.mailbox_id = mb.id \
+         WHERE mb.name = ?1 AND m.uid = ?2",
+        rusqlite::params![mailbox, uid],
+        row_to_message,
+    ) {
+        Ok(row) => Ok(Some(row)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(StoreError::Sql(e)),
+    }
+}
+
+/// Metadata for a single attachment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AttachmentInfo {
+    pub name: String,
+    pub size: u64,
+    pub content_type: String,
+    pub part_number: String,
+}
+
+/// List attachment metadata for a message (Phase 4 reader cache).
+pub fn list_attachments(
+    conn: &Connection,
+    message_id: u64,
+) -> StoreResult<Vec<AttachmentInfo>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT part_number, filename, mime_type, size_bytes \
+         FROM attachment_parts WHERE message_id = ?1",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![message_id], |row| {
+        Ok(AttachmentInfo {
+            part_number: row.get::<_, String>(0)?,
+            name: row.get::<_, String>(1)?,
+            content_type: row.get::<_, String>(2)?,
+            size: row.get::<_, u64>(3)?,
+        })
+    })?;
+    rows.map(|r| r.map_err(StoreError::Sql)).collect()
+}
+
 /// List messages for a mailbox, newest-first (`date_utc DESC, uid DESC`).
 ///
 /// `offset` is used for pagination (infinite scroll): pass 0 for the first

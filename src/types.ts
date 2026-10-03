@@ -7,9 +7,28 @@ export interface MessageRow {
   from_addr: string;
   to_addrs: string;
   date_utc: string;
-  flags: string; // JSON array string, e.g. ["\\Seen"] or []
+  flags: string;
   has_attachments: boolean;
   preview: string;
+}
+
+export interface AttachmentInfo {
+  name: string;
+  size: number;
+  content_type: string;
+  part_number: string;
+}
+
+export interface MessageView {
+  uid: number;
+  subject: string;
+  from_addr: string;
+  to_addrs: string[];
+  date_utc: string;
+  html: string | null;
+  text: string | null;
+  has_attachments: boolean;
+  attachments: AttachmentInfo[];
 }
 
 export interface SyncStatusInfo {
