@@ -98,9 +98,9 @@ status: complete
 
 Plan committed atomically per orchestrator instruction (single commit for the plan):
 
-1. **Tracer + pins + hygiene + CI** - `78b339c` (feat)
+1. **Tracer + pins + hygiene + CI** - `f664075` (feat)
 
-**Plan metadata:** SUMMARY amended into `78b339c` (docs: plan 01-01 complete)
+**Plan metadata:** Code in `f664075` (feat); SUMMARY in follow-up docs commit
 
 ## Files Created/Modified
 
@@ -129,7 +129,7 @@ Plan committed atomically per orchestrator instruction (single commit for the pl
 - **Fix:** Reverted the extra key; placed the sketch as a comment block at the top of `.github/workflows/ci.yml` instead, with a note explaining why
 - **Files modified:** `.github/workflows/ci.yml`, `src-tauri/tauri.conf.json` (reverted)
 - **Verification:** `cargo check` passes after revert; sketch text grep-able in ci.yml
-- **Committed in:** 78b339c (part of plan commit)
+- **Committed in:** f664075 (part of plan commit)
 
 ---
 
@@ -153,7 +153,7 @@ None - no external service configuration required.
 ## Self-Check: PASSED
 
 - `src-tauri/src/lib.rs`, `src/App.tsx`, `.github/workflows/ci.yml`, `LICENSE` all FOUND on disk
-- Commit `78b339c` FOUND in git log
+- Commit `f664075` FOUND in git log
 - `cargo check` + `npm run build` + `npm run lint` all green at commit time
 
 ---
