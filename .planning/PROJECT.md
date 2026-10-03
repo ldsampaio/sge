@@ -37,6 +37,8 @@ Connect to an IMAP server on Linux and read your mail locally in a fast Gmail-li
 
 - Stack is fixed: Rust + Tauri v2 backend, React frontend, SQLite local store.
 - Primary server example: mail.utfpr.edu.br (personal UTFPR mail use on Linux).
+  - Incoming IMAP: mail.utfpr.edu.br, port 993/SSL.
+  - Outgoing SMTP (reserved for post-M1 send milestone): smtp.utfpr.edu.br, port 587/STARTTLS.
 - Sync strategy decided in questioning: headers-first for fast list, bodies on demand (not full bulk download up front).
 - Layout decided: full three-pane Gmail look (sidebar + list + reader), not a minimal list.
 - Auth UX decided: remember everything securely (OS keyring), auto-login next launch.
