@@ -12,7 +12,7 @@ pub mod commands;
 
 use std::sync::{Arc, Mutex};
 
-use creds::{CredentialStore, KeyringStore, SavedCredentials};
+use creds::{CredentialStore, KeyringStore, SavedCredentials, ServerConfig};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -151,6 +151,25 @@ async fn clear_credentials() -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Load saved server configuration (host/port/security) from the keyring.
+///
+/// Returns `Ok(None)` when no entry exists or the keyring is unavailable —
+/// never surfaces a plaintext fallback (WR-02).
+#[tauri::command]
+async fn load_server_config() -> Result<Option<ServerConfig>, String> {
+    let stored = tauri::async_runtime::spawn_blocking(|| {
+        KeyringStore::new().load_server_config()
+    })
+    .await
+    .map_err(|e| format!("internal error: keyring task failed ({e})"))?;
+
+    match stored {
+        Ok(opt) => Ok(opt),
+        Err(creds::CredsError::StoreUnavailable { .. }) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let store = Arc::new(Mutex::new(
@@ -175,6 +194,7 @@ pub fn run() {
             commands::sync::search_messages,
             commands::sync::fetch_message,
             commands::sync::save_attachment,
+            load_server_config,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

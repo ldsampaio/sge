@@ -77,6 +77,13 @@ h1 {
   text-decoration: underline;
 }
 
+.auto-connect-note {
+  padding: 12px 16px;
+  font-size: 13px;
+  color: var(--muted-foreground, #666);
+  text-align: center;
+}
+
 input,
 button {
   border-radius: 8px;

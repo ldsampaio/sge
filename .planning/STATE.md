@@ -1,19 +1,19 @@
 ---
 gsd_state_version: "1.1"
-current_phase: 4
-current_phase_name: Reader + Attachments
-status: complete
-stopped_at: Phase 4 complete, ready for Phase 5
-last_updated: "2026-10-03T19:00:00.000Z"
+current_phase: 5
+current_phase_name: Keyring + Packaging
+status: milestone-complete
+stopped_at: All 5 phases complete — Milestone 1 delivered
+last_updated: "2026-10-03T20:00:00.000Z"
 last_activity: 2026-10-03
-last_activity_desc: Phase 4 complete — reader UI, attachments, security hardening
+last_activity_desc: Phase 5 complete — auto-connect, packaging config, keyring-less fallback
 state_head: 7938de7a704005d4cd936b68a40bc64cdc1cdcba
 progress:
   total_phases: 5
-  completed_phases: 4
-  total_plans: 12
-  completed_plans: 12
-  percent: 80
+  completed_phases: 5
+  total_plans: 15
+  completed_plans: 15
+  percent: 100
 ---
 
 # Project State
@@ -27,12 +27,12 @@ See: .planning/PROJECT.md (updated 2026-10-02)
 
 ## Current Position
 
-Phase: 4 of 5 (Reader + Attachments) — ✅ COMPLETE
-Plan: All 3 plans (04-01, 04-02, 04-03) implemented and verified
-Status: Ready for Phase 5 (Keyring + Packaging)
-Last activity: 2026-10-03 — Phase 4 complete (backend reader commands + frontend reader UI + security hardening)
+Phase: 5 of 5 (Keyring + Packaging) — ✅ COMPLETE
+Plan: All 3 plans (05-01, 05-02, 05-03) implemented and verified
+Status: Milestone 1 — COMPLETE
+Last activity: 2026-10-03 — Phase 5 complete (auto-connect, packaging config, keyring fallback)
 
-Progress: [████████░░░░░░] 80%
+Progress: [█████████████] 100%
 
 ## Performance Metrics
 

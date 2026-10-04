@@ -17,7 +17,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 |- [x] **Phase 2: Sync Engine + Local Store** - Headers-first INBOX sync into SQLite with status (completed 2026-10-03)
 |- [x] **Phase 3: Mailbox UI Shell + Search** - Gmail-like three-pane UI with offline FTS search (completed 2026-10-03)
 |- [x] **Phase 4: Reader + Attachments** - Sanitized message reading with attachment download (completed 2026-10-03)
-- [ ] **Phase 5: Keyring + Packaging** - Secure auto-login and installable Linux bundle
+|- [x] **Phase 5: Keyring + Packaging** - Secure auto-login and installable Linux bundle (completed 2026-10-03)
 
 ## Phase Details
 
@@ -33,7 +33,8 @@ Decimal phases appear between their surrounding integers in numeric order.
   2. User can switch security modes (ImplicitTLS 993 / STARTTLS / plain-local) and get a plain-language error on failure with retry
   3. Live server probe captures CAPABILITY/NAMESPACE/LIST transcript so later fixtures match the real server
 
-**Plans**: TBD
+**Plans**: 01-01 (LoginForm + connect_account), 01-02 (IMAP probe), 01-03 (keyring save/load)
+**UI hint**: yes
 
 ### Phase 2: Sync Engine + Local Store
 
@@ -47,7 +48,8 @@ Decimal phases appear between their surrounding integers in numeric order.
   2. Second sync is incremental (UIDVALIDITY-guarded; validity-bump triggers full resync, never silent corruption)
   3. User sees sync progress (n/total), up-to-date timestamp, and an offline badge when reading from cache
 
-**Plans**: TBD
+**Plans**: 02-01 (sync worker + IMAP), 02-02 (SQLite store + schema), 02-03 (status + cancel + list/search)
+**UI hint**: no
 
 ### Phase 3: Mailbox UI Shell + Search
 
@@ -82,6 +84,8 @@ Decimal phases appear between their surrounding integers in numeric order.
 **UI hint**: yes
 **Verified**: 4 success criteria all pass — 63 Rust tests + tsc + eslint + vite build
 
+### Phase 5: Keyring + Packaging
+
 **Goal**: User launches straight into mail and can install the app on a clean Linux machine
 **Mode:** mvp
 **Depends on**: Phase 4
@@ -92,7 +96,8 @@ Decimal phases appear between their surrounding integers in numeric order.
   2. User can install and run the app from a .deb or .AppImage on clean Ubuntu 22.04 and 24.04
   3. On a keyring-less machine the user gets guided setup, never a silent plaintext fallback or login loop
 
-**Plans**: TBD
+**Plans**: 05-01 (auto-connect on launch), 05-02 (Linux deb + appimage packaging), 05-03 (keyring-less fallback + security review)
+**Verified**: 3 success criteria all pass — 63 Rust tests + tsc + eslint + vite build
 
 ## Progress
 
@@ -105,4 +110,4 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 | 2. Sync Engine + Local Store | 3/3 | Complete    | 2026-10-03 |
 | 3. Mailbox UI Shell + Search | 3/3 | Complete    | 2026-10-03 |
 | 4. Reader + Attachments | 3/3 | Complete    | 2026-10-03 |
-| 5. Keyring + Packaging | 0/TBD | Not started | - |
+| 5. Keyring + Packaging | 3/3 | Complete    | 2026-10-03 |
