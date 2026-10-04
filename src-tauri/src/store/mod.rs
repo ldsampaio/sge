@@ -16,9 +16,11 @@ pub mod queries;
 pub const BODY_CACHE_CAP_BYTES: usize = 262144;
 
 /// Schema version managed by rusqlite_migration.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 // v1 = full schema.sql (canonical DDL from ARCHITECTURE.md)
+// M2 = flag_outbox durable queue (Phase 6, Plan 06-01). The schema.sql v1
+// baseline text stays untouched; forward migrations append below.
 // NOTE: rusqlite_migration 2.x takes Vec<M>, which is not const-constructable,
 // so we build the Migrations inline in apply_migrations().
 
@@ -77,7 +79,10 @@ impl Store {
     fn apply_migrations(conn: &mut Connection) -> StoreResult<()> {
         // WAL for concurrent reader (UI) + writer (sync worker)
         conn.execute_batch("PRAGMA journal_mode = WAL;")?;
-        let migrations = Migrations::new(vec![M::up(include_str!("schema.sql"))]);
+        let migrations = Migrations::new(vec![
+            M::up(include_str!("schema.sql")),
+            M::up(M2_FLAG_OUTBOX_SQL),
+        ]);
         migrations.to_latest(conn)?;
         Ok(())
     }
@@ -98,6 +103,28 @@ impl Default for Store {
         Self::open_in_memory().expect("in-memory default store should always succeed")
     }
 }
+
+/// M2 forward migration: durable Seen-flag outbox (Phase 6, Plan 06-01).
+///
+/// Queues optimistic flag toggles made while offline so they replay on
+/// reconnect (RFC 4549 drop rules enforced by the replay engine: whole
+/// mailbox queue drops on UIDVALIDITY bump, single ops drop when the UID
+/// is absent). `UNIQUE(mailbox_id, uid)` collapses rapid toggle flapping
+/// to latest-wins — intermediate states are intentionally not replayed.
+const M2_FLAG_OUTBOX_SQL: &str = concat!(
+    "CREATE TABLE flag_outbox (",
+    "  id            INTEGER PRIMARY KEY,",
+    "  mailbox_id    INTEGER NOT NULL REFERENCES mailboxes(id) ON DELETE CASCADE,",
+    "  uid           INTEGER NOT NULL,",
+    "  seen          INTEGER NOT NULL,",
+    "  uid_validity  INTEGER NOT NULL,",
+    "  created_at    TEXT NOT NULL DEFAULT (datetime('now')),",
+    "  attempts      INTEGER NOT NULL DEFAULT 0,",
+    "  last_error    TEXT,",
+    "  UNIQUE (mailbox_id, uid)",
+    ");",
+    "CREATE INDEX idx_outbox_mailbox ON flag_outbox(mailbox_id);",
+);
 
 /// Returns the app-data attachment directory for a given mailbox UID.
 ///
@@ -184,5 +211,28 @@ mod tests {
     fn attachment_dir_layout() {
         let dir = attachment_dir(std::path::Path::new("/tmp/sge"), 4321, 7);
         assert_eq!(dir, std::path::PathBuf::from("/tmp/sge/attachments/4321/7"));
+    }
+
+    #[test]
+    fn schema_version_is_2_with_outbox_table() {
+        assert_eq!(SCHEMA_VERSION, 2);
+        let store = Store::open_in_memory().expect("migration should succeed");
+        let conn = store.conn();
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name = 'flag_outbox'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("query should succeed");
+        assert_eq!(count, 1, "flag_outbox table should exist at schema v2");
+        let idx: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name = 'idx_outbox_mailbox'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("query should succeed");
+        assert_eq!(idx, 1, "outbox mailbox index should exist");
     }
 }

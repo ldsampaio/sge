@@ -29,12 +29,33 @@ pub fn parse_flags(flags_json: &str) -> Vec<String> {
     serde_json::from_str::<Vec<String>>(flags_json).unwrap_or_default()
 }
 
+/// Canonical `\Seen` flag spelling (case-sensitive, backslash form).
+///
+/// Used for both the SQLite JSON `flags` column and the IMAP STORE
+/// argument — a single constant so the two can never drift apart.
+pub const SEEN_FLAG: &str = "\\Seen";
+
+/// Rewrite a stored flags JSON string with the target Seen state.
+///
+/// Adds `\Seen` when `seen` is true, removes every occurrence when false,
+/// preserving all other flags and their order. An empty or unparseable
+/// prior value starts from an empty set, so toggling a message with no
+/// prior flag state still applies the target state.
+pub fn set_seen_flag(flags_json: &str, seen: bool) -> String {
+    let mut flags = parse_flags(flags_json);
+    flags.retain(|f| f != SEEN_FLAG);
+    if seen {
+        flags.push(SEEN_FLAG.to_string());
+    }
+    serde_json::to_string(&flags).unwrap_or_else(|_| "[]".to_string())
+}
+
 /// `true` when the `\Seen` flag is absent — the message is unread.
 ///
-/// Read/unread is **display-only** in M1: flags are stored on the row but
-/// the client never writes `\Seen` back to the server (D-flags).
+/// Local reads are display-only; writes go through `SessionManager`
+/// (`imap/manager.rs`) via UID STORE, never through this helper.
 pub fn is_unread(flags_json: &str) -> bool {
-    !parse_flags(flags_json).iter().any(|f| f == "\\Seen")
+    !parse_flags(flags_json).iter().any(|f| f == SEEN_FLAG)
 }
 
 // ── mailbox / sync-state ─────────────────────────────────────────
@@ -493,6 +514,166 @@ pub fn insert_attachment_meta(
     Ok(())
 }
 
+// ── flag outbox (durable offline queue) ──────────────────────────
+
+/// One queued Seen toggle awaiting server acknowledgement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboxOp {
+    pub id: u64,
+    pub mailbox_id: u64,
+    pub uid: u32,
+    pub seen: bool,
+    pub uid_validity: u32,
+    pub attempts: i64,
+    pub last_error: Option<String>,
+}
+
+/// Enqueue (or collapse) a Seen toggle for `mailbox_id` + `uid`.
+///
+/// `UNIQUE(mailbox_id, uid)` makes the latest toggle win: a rapid
+/// read→unread→read flap converges to the final state and replays once
+/// instead of once per tap. Re-enqueue refreshes the op epoch
+/// (`uid_validity`) and resets the retry counters.
+pub fn enqueue_outbox(
+    conn: &Connection,
+    mailbox_id: u64,
+    uid: u32,
+    seen: bool,
+    uid_validity: u32,
+) -> StoreResult<()> {
+    conn.execute(
+        "INSERT INTO flag_outbox (mailbox_id, uid, seen, uid_validity)
+          VALUES (?1, ?2, ?3, ?4)
+          ON CONFLICT(mailbox_id, uid) DO UPDATE SET
+            seen         = excluded.seen,
+            uid_validity = excluded.uid_validity,
+            attempts     = 0,
+            last_error   = NULL",
+        rusqlite::params![mailbox_id, uid, seen, uid_validity],
+    )?;
+    Ok(())
+}
+
+/// UIDs with a queued (unacknowledged) op for `mailbox_id`.
+///
+/// The sync worker gates its step-5 upsert loop on this set so pending
+/// optimistic flags are never clobbered by a concurrent server sweep.
+pub fn pending_uids(conn: &Connection, mailbox_id: u64) -> StoreResult<Vec<u32>> {
+    let mut stmt =
+        conn.prepare("SELECT uid FROM flag_outbox WHERE mailbox_id = ?1 ORDER BY uid")?;
+    let rows = stmt
+        .query_map(rusqlite::params![mailbox_id], |row| {
+            row.get::<_, u32>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// All queued ops for `mailbox_id` in creation order (replay order).
+pub fn list_outbox(conn: &Connection, mailbox_id: u64) -> StoreResult<Vec<OutboxOp>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, mailbox_id, uid, seen, uid_validity, attempts, last_error
+          FROM flag_outbox WHERE mailbox_id = ?1 ORDER BY id",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![mailbox_id], |row| {
+            Ok(OutboxOp {
+                id: row.get::<_, u64>(0)?,
+                mailbox_id: row.get::<_, u64>(1)?,
+                uid: row.get::<_, u32>(2)?,
+                seen: row.get::<_, bool>(3)?,
+                uid_validity: row.get::<_, u32>(4)?,
+                attempts: row.get::<_, i64>(5)?,
+                last_error: row.get::<_, Option<String>>(6)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Delete the queued op for `mailbox_id` + `uid` (server acknowledged).
+/// Returns the number of rows deleted.
+pub fn delete_outbox_op(
+    conn: &Connection,
+    mailbox_id: u64,
+    uid: u32,
+) -> StoreResult<usize> {
+    conn.execute(
+        "DELETE FROM flag_outbox WHERE mailbox_id = ?1 AND uid = ?2",
+        rusqlite::params![mailbox_id, uid],
+    )
+    .map_err(StoreError::from)
+}
+
+/// Drop the whole mailbox queue (UIDVALIDITY-bump path, RFC 4549).
+/// Returns the number of rows deleted.
+pub fn drop_outbox_for_mailbox(conn: &Connection, mailbox_id: u64) -> StoreResult<usize> {
+    conn.execute(
+        "DELETE FROM flag_outbox WHERE mailbox_id = ?1",
+        rusqlite::params![mailbox_id],
+    )
+    .map_err(StoreError::from)
+}
+
+/// Record a failed replay attempt (bumps `attempts`, stores the error text).
+pub fn record_outbox_error(
+    conn: &Connection,
+    mailbox_id: u64,
+    uid: u32,
+    err: &str,
+) -> StoreResult<()> {
+    conn.execute(
+        "UPDATE flag_outbox
+          SET attempts = attempts + 1, last_error = ?1
+          WHERE mailbox_id = ?2 AND uid = ?3",
+        rusqlite::params![err, mailbox_id, uid],
+    )?;
+    Ok(())
+}
+
+/// Number of queued (unacknowledged) ops for `mailbox_id`.
+/// Surfaced in `sync_status` as the pending indicator.
+pub fn outbox_count(conn: &Connection, mailbox_id: u64) -> StoreResult<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM flag_outbox WHERE mailbox_id = ?1",
+        rusqlite::params![mailbox_id],
+        |row| row.get(0),
+    )
+    .map_err(StoreError::from)
+}
+
+// ── local Seen write (optimistic UI) ───────────────────────────────
+
+/// Apply the target Seen state to the local `messages.flags` JSON.
+///
+/// Optimistic-write half of `set_seen`: the row keeps every other flag
+/// and only the `\Seen` membership changes. Missing rows are a no-op
+/// (the message may have been expunged between tap and write).
+pub fn set_local_seen(
+    conn: &Connection,
+    mailbox_id: u64,
+    uid: u32,
+    seen: bool,
+) -> StoreResult<()> {
+    let current: Option<String> = match conn.query_row(
+        "SELECT flags FROM messages WHERE mailbox_id = ?1 AND uid = ?2",
+        rusqlite::params![mailbox_id, uid],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(flags) => Some(flags),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => return Err(StoreError::Sql(e)),
+    };
+    if let Some(flags) = current {
+        let next = set_seen_flag(&flags, seen);
+        conn.execute(
+            "UPDATE messages SET flags = ?1 WHERE mailbox_id = ?2 AND uid = ?3",
+            rusqlite::params![next, mailbox_id, uid],
+        )?;
+    }
+    Ok(())
+}
+
 // ── tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -795,5 +976,122 @@ mod tests {
             )
             .unwrap();
         assert_eq!(att_count, 1);
+    }
+
+    // ── Phase 6: flag outbox (latest-wins, pending set, delete, drop) ──
+
+    #[test]
+    fn outbox_enqueue_latest_wins() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let mb_id = ensure_mailbox(conn, "INBOX").unwrap();
+
+        enqueue_outbox(conn, mb_id, 7, true, 100).unwrap();
+        // Rapid flap: unread then read again — latest toggle wins, one row.
+        enqueue_outbox(conn, mb_id, 7, false, 100).unwrap();
+        enqueue_outbox(conn, mb_id, 7, true, 100).unwrap();
+
+        let ops = list_outbox(conn, mb_id).unwrap();
+        assert_eq!(ops.len(), 1, "flapping must collapse to a single op");
+        assert_eq!(ops[0].uid, 7);
+        assert!(ops[0].seen, "latest toggle (seen=true) must win");
+    }
+
+    #[test]
+    fn outbox_pending_set_roundtrip() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let mb_id = ensure_mailbox(conn, "INBOX").unwrap();
+
+        assert!(pending_uids(conn, mb_id).unwrap().is_empty());
+        enqueue_outbox(conn, mb_id, 3, true, 100).unwrap();
+        enqueue_outbox(conn, mb_id, 9, false, 100).unwrap();
+
+        let mut pending = pending_uids(conn, mb_id).unwrap();
+        pending.sort_unstable();
+        assert_eq!(pending, vec![3, 9]);
+
+        // Other mailboxes are isolated.
+        let other = ensure_mailbox(conn, "Sent").unwrap();
+        assert!(pending_uids(conn, other).unwrap().is_empty());
+    }
+
+    #[test]
+    fn outbox_single_op_delete() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let mb_id = ensure_mailbox(conn, "INBOX").unwrap();
+
+        enqueue_outbox(conn, mb_id, 3, true, 100).unwrap();
+        enqueue_outbox(conn, mb_id, 9, false, 100).unwrap();
+
+        // Ack UID 3 → only UID 9 remains.
+        let deleted = delete_outbox_op(conn, mb_id, 3).unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(pending_uids(conn, mb_id).unwrap(), vec![9]);
+
+        // Deleting a UID with no op is a no-op success.
+        let deleted = delete_outbox_op(conn, mb_id, 3).unwrap();
+        assert_eq!(deleted, 0);
+    }
+
+    #[test]
+    fn outbox_mailbox_drop() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let mb_id = ensure_mailbox(conn, "INBOX").unwrap();
+
+        enqueue_outbox(conn, mb_id, 1, true, 100).unwrap();
+        enqueue_outbox(conn, mb_id, 2, false, 100).unwrap();
+        assert_eq!(outbox_count(conn, mb_id).unwrap(), 2);
+
+        // UIDVALIDITY bump → whole mailbox queue drops (RFC 4549).
+        let dropped = drop_outbox_for_mailbox(conn, mb_id).unwrap();
+        assert_eq!(dropped, 2);
+        assert!(pending_uids(conn, mb_id).unwrap().is_empty());
+        assert_eq!(outbox_count(conn, mb_id).unwrap(), 0);
+    }
+
+    #[test]
+    fn empty_prior_flags_toggle_applies_target_state() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let mb_id = ensure_mailbox(conn, "INBOX").unwrap();
+
+        insert_msg(conn, mb_id, 1, "NoFlags", "a@x.com", "[]");
+        insert_msg(conn, mb_id, 2, "SeenAlready", "b@x.com", r#"["\\Seen"]"#);
+
+        // Mark read from empty flags → \Seen appears in canonical form.
+        set_local_seen(conn, mb_id, 1, true).unwrap();
+        let row = get_message_by_uid(conn, "INBOX", 1).unwrap().unwrap();
+        assert_eq!(parse_flags(&row.flags), vec!["\\Seen".to_string()]);
+        assert!(!is_unread(&row.flags));
+
+        // Mark unread from empty flags → stays empty, still unread.
+        set_local_seen(conn, mb_id, 1, false).unwrap();
+        let row = get_message_by_uid(conn, "INBOX", 1).unwrap().unwrap();
+        assert_eq!(parse_flags(&row.flags), Vec::<String>::new());
+        assert!(is_unread(&row.flags));
+
+        // Mark unread on a Seen row → \Seen removed, other flags kept.
+        insert_msg(
+            conn,
+            mb_id,
+            3,
+            "Flagged",
+            "c@x.com",
+            r#"["\\Flagged","\\Seen"]"#,
+        );
+        set_local_seen(conn, mb_id, 3, false).unwrap();
+        let row = get_message_by_uid(conn, "INBOX", 3).unwrap().unwrap();
+        assert_eq!(parse_flags(&row.flags), vec!["\\Flagged".to_string()]);
+        assert!(is_unread(&row.flags));
+
+        // Toggling a UID with no local row is a no-op, not an error.
+        set_local_seen(conn, mb_id, 999, true).unwrap();
+
+        // Pure helper round-trips.
+        assert_eq!(set_seen_flag("not-json{{{", true), r#"["\\Seen"]"#);
+        assert_eq!(set_seen_flag("[]", false), "[]");
     }
 }
