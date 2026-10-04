@@ -40,7 +40,7 @@ Full phase details archived under `.planning/milestones/archived-20261004-phases
 
 </details>
 
-- [ ] **Phase 6: Flag Sync + Outbox** - Mark read/unread with server-synced Seen flags and offline queue
+- [x] **Phase 6: Flag Sync + Outbox** - Mark read/unread with server-synced Seen flags and offline queue
 - [ ] **Phase 7: Folders + Per-Folder Sync** - Browse Sent/Drafts/custom folders with unread counts
 - [ ] **Phase 8: Poll + Manual Refresh** - Periodic and on-demand refresh over one single-flight path
 - [ ] **Phase 9: UID Backfill** - No silent gaps; missed UIDs converge on incremental sync
@@ -60,7 +60,7 @@ Full phase details archived under `.planning/milestones/archived-20261004-phases
   3. A flag toggle never flaps or lands on the wrong message when a sync runs concurrently (UID-only STORE, pending-wins reconcile)
   4. No fetch path in the app sets \Seen as a side effect (BODY.PEEK audit holds — read-only-era regression class closed)
 
-**Plans**: 1/3 plans executed
+**Plans**: 3/3 plans executed
 
 Plans:
 **Wave 1**
@@ -69,11 +69,11 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 06-02-PLAN.md — Frontend toggle UX + pending states
+- [x] 06-02-PLAN.md — Frontend toggle UX + pending states
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 06-03-PLAN.md — BODY.PEEK audit + hardening + phase gate
+- [x] 06-03-PLAN.md — BODY.PEEK audit + hardening + phase gate
 
 **Cross-cutting constraints:**
 
@@ -141,7 +141,7 @@ Phases execute in numeric order: 6 → 7 → 8 → 9
 | 3. Mailbox UI Shell + Search | v1.0 | 3/3 | Complete | 2026-10-03 |
 | 4. Reader + Attachments | v1.0 | 3/3 | Complete | 2026-10-03 |
 | 5. Keyring + Packaging | v1.0 | 3/3 | Complete | 2026-10-03 |
-| 6. Flag Sync + Outbox | v1.1 | 1/3 | In Progress|  |
+|| 6. Flag Sync + Outbox | v1.1 | 3/3 | Complete | 2026-10-04 |
 | 7. Folders + Per-Folder Sync | v1.1 | 0/TBD | Not started | - |
 | 8. Poll + Manual Refresh | v1.1 | 0/TBD | Not started | - |
 | 9. UID Backfill | v1.1 | 0/TBD | Not started | - |

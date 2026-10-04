@@ -2,19 +2,19 @@
 gsd_state_version: "1.0"
 milestone: v1.1
 milestone_name: Triage & Folders
-current_phase: 6
-current_phase_name: Flag Sync + Outbox
-status: executing
-stopped_at: Completed 06-01-PLAN.md
-last_updated: "2026-10-04T15:23:01.191Z"
+status: Awaiting next milestone
+stopped_at: Plan 06-03 complete — BODY.PEEK audit + RFC 4549 tests + phase gate green
+last_updated: "2026-10-04T21:06:56.667Z"
 last_activity: 2026-10-04
-last_activity_desc: Phase 6 execution started
-state_head: 6d578f54cafa0518db182340440fb4523b1294bb
+last_activity_desc: Milestone v1.1 completed and archived
+state_head: 778a98f8ac76a81a13451e963143aaae406b578f
 progress:
   total_phases: 4
   completed_phases: 5
-  total_plans: 3
-  completed_plans: 1
+  total_plans: 8
+  completed_plans: 8
+current_phase: 9
+current_phase_name: UID Backfill
 ---
 
 # Project State
@@ -24,16 +24,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-10-04)
 
 **Core value:** Connect to an IMAP server on Linux and read your mail locally in a fast Gmail-like UI.
-**Current focus:** Phase 6 — Flag Sync + Outbox
+**Current focus:** Phase 7 — Folders + Per-Folder Sync
 
 ## Current Position
 
-Phase: 6 (Flag Sync + Outbox) — EXECUTING
-Plan: 2 of 3
-Status: Ready to execute
-Last activity: 2026-10-04 — Phase 6 execution started
-
-Progress: [░░░░░░░░░░] 0% (v1.1)
+Phase: Milestone v1.1 complete
+Plan: —
+Status: Awaiting next milestone
+Last activity: 2026-10-04 — Milestone v1.1 completed and archived
 
 ## Performance Metrics
 
@@ -60,6 +58,8 @@ Progress: [░░░░░░░░░░] 0% (v1.1)
 | Plan | Duration | Tasks | Files |
 |------|----------|-------|-------|
 | Phase 6 P01 | ~1 session | 3 tasks | 9 files |
+| Phase 06 P02 | 10min | 3 tasks | 4 files |
+| Phase 06 P03 | ~15min | 3 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -73,6 +73,8 @@ Recent decisions affecting current work:
 - [v1.1 roadmap]: BODY.PEEK audit ships in Phase 6 (ends read-only era)
 - [M1 Phase 5]: Keyring auto-login + Linux bundle shipped — M1 archived
 - [Phase 6]: 06-01: outbox replay is a SyncWorker method on &mut dyn SyncSession; set_seen returns Ok+acked=false when queued; opportunistic replay only after successful STORE
+- [Phase 6]: 06-02: pending wash and error ellipsis use inline styles referencing existing tokens to stay within the plan's 4-file scope (no new CSS rules or tokens)
+- [Phase 6]: 06-02: offline-queued SyncStatus line fires on pending_count>0 AND last_sync_at empty (only frontend-visible session-down signal without new plumbing); replay-failure N from last polled outbox depth
 
 ### Pending Todos
 
@@ -95,6 +97,10 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-04T15:23:01.180Z
-Stopped at: Completed 06-01-PLAN.md
+Last session: 2026-10-04T15:43:14.480Z
+Stopped at: Completed 06-02-PLAN.md (flag toggle UX)
 Resume file: None
+
+## Operator Next Steps
+
+- Start the next milestone with /gsd-new-milestone
