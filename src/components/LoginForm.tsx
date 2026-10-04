@@ -1,9 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import SecuritySelector, {
-  DEFAULT_PORTS,
-  type SecurityModeValue,
-} from "./SecuritySelector";
+import SecuritySelector, { DEFAULT_PORTS, type SecurityModeValue } from "./SecuritySelector";
+import { IconBook, IconInbox, IconHelp, IconSparkle } from "./icons";
 
 interface ConnectSummary {
   selected_mailbox: string;
@@ -22,19 +20,14 @@ type Status =
   | { kind: "success"; summary: ConnectSummary; keyringNote: string | null }
   | { kind: "error"; message: string };
 
-// Plain-browser guard: when the frontend runs under plain Vite (browser URL)
-// instead of the Tauri WebView, `invoke()` throws a raw TypeError about
-// `window.__TAURI_INTERNALS__` being undefined. Detect the missing runtime
-// before any invoke call and surface plain language instead (D-failure).
 const OUTSIDE_DESKTOP_MESSAGE =
-  "SGE is running outside its desktop window — launch with `npm run tauri dev` and use the app window, not the browser URL.";
+  "O SGE Edu roda na janela do app — abra com `npm run tauri dev` e use a janela do aplicativo, não o endereço do navegador.";
 
 function isTauriRuntime(): boolean {
   const w = window as unknown as Record<string, unknown>;
   return w["__TAURI_INTERNALS__"] !== undefined || w["__TAURI__"] !== null;
 }
 
-/** Translate a raw missing-runtime TypeError into the plain-language message. */
 function toPlainError(err: unknown): string {
   const text = String(err);
   if (text.includes("__TAURI_INTERNALS__") || text.includes("__TAURI__")) {
@@ -43,17 +36,6 @@ function toPlainError(err: unknown): string {
   return text;
 }
 
-/**
- * SGE login form.
- *
- * Field order: Username → Password → Server → IMAP Security → Connect →
- * Forget saved login → Remember me.
- *
- * Single Connect button: validates, connects, SELECTs INBOX, and shows the
- * real connection state. Failures surface the backend typed error verbatim
- * with a manual Retry button — this component never retries on its own
- * (no timers, no reconnect effects).
- */
 export default function LoginForm({ onConnect }: { onConnect?: () => void }) {
   const [server, setServer] = useState("mail.utfpr.edu.br");
   const [username, setUsername] = useState("");
@@ -63,11 +45,9 @@ export default function LoginForm({ onConnect }: { onConnect?: () => void }) {
   const [mode, setMode] = useState<SecurityModeValue>("implicit_tls");
   const [port, setPort] = useState(DEFAULT_PORTS.implicit_tls);
   const [status, setStatus] = useState<Status>({ kind: "idle" });
-  // IN-03: visible when the keyring cannot be read on launch.
   const [keyringHint, setKeyringHint] = useState<string | null>(null);
   const [forgetNote, setForgetNote] = useState<string | null>(null);
 
-  // Auto-connect only runs in App.tsx; LoginForm just fills remembered values.
   useEffect(() => {
     if (!isTauriRuntime()) {
       setKeyringHint(OUTSIDE_DESKTOP_MESSAGE);
@@ -85,7 +65,7 @@ export default function LoginForm({ onConnect }: { onConnect?: () => void }) {
       .catch(() => {
         if (!cancelled) {
           setKeyringHint(
-            "Saved login unavailable — keyring locked? Continuing without remembered credentials.",
+            "Login salvo indisponível — cofre bloqueado? Continuando sem credenciais lembradas.",
           );
         }
       });
@@ -107,14 +87,14 @@ export default function LoginForm({ onConnect }: { onConnect?: () => void }) {
     if (!server.trim() || !username.trim() || !password) {
       setStatus({
         kind: "error",
-        message: "Enter the server, username, and password first.",
+        message: "Preencha servidor, usuário e senha para entrar na sala.",
       });
       return;
     }
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
       setStatus({
         kind: "error",
-        message: "Port must be a number between 1 and 65535.",
+        message: "A porta deve ser um número entre 1 e 65535.",
       });
       return;
     }
@@ -127,7 +107,6 @@ export default function LoginForm({ onConnect }: { onConnect?: () => void }) {
         username: username.trim(),
         password,
       });
-      // Persist server config so start_sync can reconnect.
       try {
         await invoke("save_server_config", {
           host: server.trim(),
@@ -135,7 +114,7 @@ export default function LoginForm({ onConnect }: { onConnect?: () => void }) {
           security: mode,
         });
       } catch {
-        // Best-effort; the server config is also re-entered on each connect.
+        // Best-effort
       }
       let keyringNote: string | null = null;
       if (rememberMe) {
@@ -144,23 +123,16 @@ export default function LoginForm({ onConnect }: { onConnect?: () => void }) {
             username: username.trim(),
             password,
           });
-          keyringNote = "Username and password saved in the OS keyring.";
-          // WR-10: the secret now lives in the keyring — drop it from JS
-          // memory instead of lingering in state indefinitely.
+          keyringNote = "Usuário e senha guardados no cofre do sistema.";
           setPassword("");
         } catch (err) {
-          // Keyring locked/headless: fall back to a memory-only session with
-          // an explanatory note — never a silent file.
-          keyringNote = `Remember-me unavailable (${toPlainError(err)}). Continuing with a memory-only session.`;
+          keyringNote = `Lembrete indisponível (${toPlainError(err)}). Seguindo com sessão só em memória.`;
         }
       } else {
-        // WR-02: opting out must revoke, not just ignore — a previously
-        // saved entry would otherwise be reloaded on next launch.
         try {
           await invoke("clear_credentials");
         } catch {
-          // Best-effort cleanup; a stale entry is merely inconvenient, and
-          // the Forget button below offers a manual retry.
+          // Best-effort cleanup
         }
       }
       setStatus({ kind: "success", summary, keyringNote });
@@ -170,7 +142,6 @@ export default function LoginForm({ onConnect }: { onConnect?: () => void }) {
     }
   }
 
-  // WR-02: in-app revocation for saved credentials.
   async function forgetSaved() {
     if (!isTauriRuntime()) {
       setForgetNote(OUTSIDE_DESKTOP_MESSAGE);
@@ -180,129 +151,177 @@ export default function LoginForm({ onConnect }: { onConnect?: () => void }) {
       await invoke("clear_credentials");
       setRememberMe(false);
       setPassword("");
-      setForgetNote("Saved login forgotten — keyring entry cleared.");
+      setForgetNote("Login salvo esquecido — entrada do cofre apagada.");
     } catch (err) {
-      setForgetNote(`Could not clear the saved login (${toPlainError(err)}).`);
+      setForgetNote(`Não foi possível apagar o login salvo (${toPlainError(err)}).`);
     }
   }
 
-  const isTlsError =
-    status.kind === "error" && status.message.includes("TLS verification failed");
+  const isTlsError = status.kind === "error" && status.message.includes("TLS verification failed");
 
   return (
     <div className="login-form-container">
-      <form
-        onSubmit={(e) => {
-          e.preventDefault();
-          void connect();
-        }}
-      >
-        {/* 1. Username */}
-        <label>
-          Usuario
-          <input
-            id="username-input"
-            value={username}
-            onChange={(e) => setUsername(e.currentTarget.value)}
-            autoComplete="username"
-          />
-        </label>
-
-        {/* 2. Password with built-in show/hide toggle */}
-        <label>
-          Senha
-          <div className="password-field">
-            <input
-              id="password-input"
-              type={showPassword ? "text" : "password"}
-              value={password}
-              onChange={(e) => setPassword(e.currentTarget.value)}
-              autoComplete="current-password"
-            />
-            <button
-              type="button"
-              className="password-toggle"
-              aria-label={showPassword ? "Ocultar senha" : "Mostrar senha"}
-              onClick={() => setShowPassword((v) => !v)}
-            >
-              {showPassword ? "Ocultar" : "Mostrar"}
-            </button>
-          </div>
-        </label>
-
-        {/* 3. Server */}
-        <label>
-          Servidor
-          <input
-            id="server-input"
-            value={server}
-            onChange={(e) => setServer(e.currentTarget.value)}
-            autoComplete="off"
-          />
-        </label>
-
-        {/* 4. IMAP Security options */}
-        <SecuritySelector
-          mode={mode}
-          port={port}
-          onModeChange={handleModeChange}
-          onPortChange={setPort}
-        />
-
-        {/* 5. Connect button */}
-        <button type="submit" disabled={status.kind === "connecting"}>
-          {status.kind === "connecting" ? "Conectando…" : "Conectar"}
-        </button>
-      </form>
-
-      {keyringHint && <p className="hint">{keyringHint}</p>}
-      {forgetNote && <p className="hint">{forgetNote}</p>}
-
-      {status.kind === "connecting" && <p className="status">Conectando…</p>}
-
-      {status.kind === "success" && (
-        <div className="status-success">
-          <p>
-            Conectado: {status.summary.selected_mailbox} ({status.summary.exists} messages, UIDVALIDITY{" "}
-            {status.summary.uid_validity})
+      <div className="edu-login-grid">
+        <section className="edu-hero" aria-label="Boas-vindas ao SGE Edu">
+          <span className="edu-hero-eyebrow">
+            <IconSparkle size={14} />
+            Sua Caixa de E-mails Inteligente
+          </span>
+          <h1>
+            Sua caixa institucional,
+            <br />
+            organizada para facilitar a vida.
+          </h1>
+          <p className="lead">
+            O SGE Edu transforma seu e-mail em um auxiliar inteligente capaz de responder e-mails,
+            assinar documentos automaticamente entre outras funcionalidades.
           </p>
-          {status.keyringNote && <p className="keyring-note">{status.keyringNote}</p>}
-        </div>
-      )}
+          <ul className="edu-hero-list">
+            <li>
+              <span className="edu-hero-icon" aria-hidden="true">
+                <IconInbox size={18} />
+              </span>
+              <span>
+                <strong>Trilha de entrada</strong>
+                <span>Caixa de entrada vira fila de leitura: o que é novo fica em destaque.</span>
+              </span>
+            </li>
+            <li>
+              <span className="edu-hero-icon" aria-hidden="true">
+                <IconBook size={18} />
+              </span>
+              <span>
+                <strong>Rascunho de Respostas</strong>
+                <span>O agente lê o e-mail e prepara uma resposta como rascunho.</span>
+              </span>
+            </li>
+            <li>
+              <span className="edu-hero-icon" aria-hidden="true">
+                <IconHelp size={18} />
+              </span>
+              <span>
+                <strong>Integração Automatizada</strong>
+                <span>Mensagens que solicitam a assinatura de documentos utilizam assinaturas via SEI ou gov.br
+                  após sua aprovação.</span>
+              </span>
+            </li>
+          </ul>
+        </section>
 
-      {status.kind === "error" && (
-        <div className="status-error">
-          <p role="alert">Connection failed: {status.message}</p>
-          {isTlsError && (
-            <p role="alert">
-              Warning: the server certificate could not be verified. SGE will
-              not bypass this check silently — retrying re-verifies the
-              certificate strictly.
+        <section className="edu-access-card" aria-label="Acesso do estudante">
+          <h2>Acesso</h2>
+          <p className="edu-access-sub">
+            Configure abaixo o acesso a sua caixa de e-mails.
+          </p>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              void connect();
+            }}
+          >
+            <label>
+              Usuário institucional
+              <input
+                id="username-input"
+                value={username}
+                onChange={(e) => setUsername(e.currentTarget.value)}
+                autoComplete="username"
+                placeholder="nome.sobrenome"
+              />
+            </label>
+
+            <label>
+              Senha
+              <span className="password-field">
+                <input
+                  id="password-input"
+                  type={showPassword ? "text" : "password"}
+                  value={password}
+                  onChange={(e) => setPassword(e.currentTarget.value)}
+                  autoComplete="current-password"
+                  placeholder="••••••••"
+                />
+                <button
+                  type="button"
+                  className="password-toggle"
+                  aria-label={showPassword ? "Ocultar senha" : "Mostrar senha"}
+                  onClick={() => setShowPassword((v) => !v)}
+                >
+                  {showPassword ? "Ocultar" : "Mostrar"}
+                </button>
+              </span>
+            </label>
+
+            <label>
+              Servidor da Caixa de E-mails
+              <input
+                id="server-input"
+                value={server}
+                onChange={(e) => setServer(e.currentTarget.value)}
+                autoComplete="off"
+              />
+            </label>
+
+            <SecuritySelector
+              mode={mode}
+              port={port}
+              onModeChange={handleModeChange}
+              onPortChange={setPort}
+            />
+
+            <button type="submit" disabled={status.kind === "connecting"}>
+              {status.kind === "connecting" ? "Abrindo a caixa…" : "Entrar"}
+            </button>
+          </form>
+
+          {keyringHint && <p className="hint">{keyringHint}</p>}
+          {forgetNote && <p className="hint">{forgetNote}</p>}
+
+          {status.kind === "connecting" && (
+            <p className="status" role="status">
+              Conectando à caixa...
             </p>
           )}
-          <button type="button" onClick={() => void connect()}>
-            {isTlsError ? "I understand — retry anyway" : "Retry"}
-          </button>
-        </div>
-      )}
 
-      {/* 6+7: Sub-actions block (below main form) */}
-      <div className="login-sub-actions">
-        <button
-          type="button"
-          className="btn-secondary"
-          onClick={() => void forgetSaved()}
-        >
-          Esquecer login salvo
-        </button>
-        <label className="checkbox-row">
-          <input
-            type="checkbox"
-            checked={rememberMe}
-            onChange={(e) => setRememberMe(e.currentTarget.checked)}
-          />
-          Lembrar me (salvar usuario e senha no keyring do OS)
-        </label>
+          {status.kind === "success" && (
+            <div className="status-success">
+              <p>
+                Caixa aberta: {status.summary.selected_mailbox} ({status.summary.exists} mensagens,
+                UIDVALIDITY {status.summary.uid_validity})
+              </p>
+              {status.keyringNote && <p>{status.keyringNote}</p>}
+            </div>
+          )}
+
+          {status.kind === "error" && (
+            <div className="status-error">
+              <p role="alert">Não foi possível entrar: {status.message}</p>
+              {isTlsError && (
+                <p role="alert">
+                  O certificado do servidor não pôde ser verificado. O SGE Edu não ignora essa
+                  verificação — tentar de novo verifica tudo outra vez.
+                </p>
+              )}
+              <button type="button" className="btn" onClick={() => void connect()}>
+                {isTlsError ? "Entendi — tentar de novo" : "Tentar de novo"}
+              </button>
+            </div>
+          )}
+
+          <div className="login-sub-actions">
+            <button type="button" className="btn-secondary" onClick={() => void forgetSaved()}>
+              Esquecer login salvo
+            </button>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={rememberMe}
+                onChange={(e) => setRememberMe(e.currentTarget.checked)}
+              />
+              Lembrar de mim (guardar usuário e senha no cofre do sistema)
+            </label>
+          </div>
+        </section>
       </div>
     </div>
   );

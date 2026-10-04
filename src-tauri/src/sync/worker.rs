@@ -56,7 +56,7 @@ impl SyncWorker {
             queries::ensure_mailbox(conn, "INBOX")
                 .map_err(|e| SyncError::Protocol(format!("ensure mailbox: {e}")))?
         };
-        let (prev_uidv, prev_next) = {
+        let (prev_uidv, _prev_next) = {
             let guard = self.store.lock().unwrap();
             let conn = guard.conn();
             let prev = queries::get_sync_state(conn, "INBOX")
@@ -66,6 +66,10 @@ impl SyncWorker {
 
         // ── Step 2: SELECT INBOX ──────────────────────────────────
         let summary: MailboxSummary = session.select_inbox().await?;
+        eprintln!(
+            "[SGE sync] SELECT INBOX: exists={} uid_validity={} uid_next={:?}",
+            summary.exists, summary.uid_validity, summary.uid_next
+        );
 
         // ── Step 3: UIDVALIDITY guard ─────────────────────────────
         let uid_validity_bump = prev_uidv != 0 && prev_uidv != summary.uid_validity;
@@ -75,28 +79,44 @@ impl SyncWorker {
                 .map_err(|e| SyncError::Protocol(format!("wipe on UIDVALIDITY bump: {e}")))?;
         }
 
-        // ── Step 4: compute fetch_from ────────────────────────────
-        let fetch_from = if uid_validity_bump {
-            1u32
-        } else {
-            prev_next.max(1)
-        };
-        let max_uid = summary
-            .uid_next
-            .and_then(|u| u.checked_sub(1))
-            .unwrap_or(summary.exists);
-
         let mut result = SyncSummary {
             uid_validity_bump,
             ..Default::default()
         };
 
+        // ── Step 4: search for all live UIDs on the server ────────
+        let server_uids = session.search_uids().await?;
+        eprintln!(
+            "[SGE sync] UID SEARCH ALL: {} uids (min={:?} max={:?})",
+            server_uids.len(),
+            server_uids.first(),
+            server_uids.last()
+        );
+
+        // Inconsistency guard: the server claims messages exist but SEARCH
+        // came back empty. Wiping the local cache here would destroy data
+        // on a protocol hiccup — fail loudly instead.
+        if server_uids.is_empty() && summary.exists > 0 {
+            return Err(SyncError::Protocol(format!(
+                "server reports EXISTS={} but UID SEARCH ALL returned no UIDs — \
+                 refusing to wipe local cache (check server logs / namespace)",
+                summary.exists
+            )));
+        }
+
         // Empty-mailbox shortcut — no UID range to sweep.
-        if summary.exists == 0 || fetch_from > max_uid {
+        if server_uids.is_empty() {
             {
                 let guard = self.store.lock().unwrap();
-                queries::set_sync_state(guard.conn(), "INBOX", summary.uid_validity, max_uid)
-                    .map_err(|e| SyncError::Protocol(format!("set sync state: {e}")))?;
+                queries::delete_missing_uids(guard.conn(), mailbox_id, &[])
+                    .map_err(|e| SyncError::Protocol(format!("wipe empty mailbox: {e}")))?;
+                queries::set_sync_state(
+                    guard.conn(),
+                    "INBOX",
+                    summary.uid_validity,
+                    summary.uid_next.unwrap_or(1),
+                )
+                .map_err(|e| SyncError::Protocol(format!("set sync state: {e}")))?;
             }
             session.logout().await?;
             cb(SyncEvent::SyncCompleted {
@@ -106,19 +126,43 @@ impl SyncWorker {
         }
 
         // ── Step 5: header sweep (BATCH_SIZE UIDs at a time) ──────
-        let mut server_uids: Vec<u32> = Vec::with_capacity(summary.exists as usize);
-        let mut current = fetch_from;
+        let total_messages = server_uids.len() as u32;
 
-        while current <= max_uid {
-            let end = (current + BATCH_SIZE - 1).min(max_uid);
-            let range_str = format!("{current}-{end}");
+        for chunk in server_uids.chunks(BATCH_SIZE as usize) {
+            let range_str = chunk
+                .iter()
+                .map(|u| u.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+
+            let display_range = if chunk.len() == 1 {
+                format!("{}", chunk[0])
+            } else {
+                format!("{}-{}", chunk[0], chunk[chunk.len() - 1])
+            };
 
             cb(SyncEvent::BatchStarted {
-                range: range_str.clone(),
-                server_total: summary.exists,
+                range: display_range.clone(),
+                server_total: total_messages,
             });
 
             let headers: Vec<MessageHeader> = session.fetch_envelopes(&range_str).await?;
+            eprintln!(
+                "[SGE sync] FETCH {}: {} headers",
+                display_range,
+                headers.len()
+            );
+            // async-imap's FETCH stream ends silently (no error) when the
+            // server rejects the command with NO/BAD — that once produced a
+            // "successful" 0-message sync. A non-empty request must yield
+            // headers; otherwise fail loudly instead of syncing nothing.
+            if headers.is_empty() {
+                return Err(SyncError::Protocol(format!(
+                    "UID FETCH {range_str} returned no headers for {} requested UID(s) — \
+                     server may have rejected the command (see FETCH log line above)",
+                    chunk.len()
+                )));
+            }
 
             let batch_uids: Vec<u32> = headers.iter().map(|h| h.uid).collect();
             let existing = {
@@ -128,8 +172,6 @@ impl SyncWorker {
                     .map_err(|e| SyncError::Protocol(format!("existing_uids: {e}")))?
             };
             let existing_set: HashSet<u32> = existing.into_iter().collect();
-
-            server_uids.extend(batch_uids);
 
             {
                 let guard = self.store.lock().unwrap();
@@ -175,8 +217,6 @@ impl SyncWorker {
                 updated: result.updated,
                 deleted: result.deleted,
             });
-
-            current = end + 1;
         }
 
         // ── Step 6: expunge diff (delete UIDs no longer on server) ──
@@ -188,7 +228,9 @@ impl SyncWorker {
         };
 
         // ── Step 7: write sync state + logout ──────────────────────
-        let new_next = max_uid;
+        let new_next = summary.uid_next.unwrap_or_else(|| {
+            server_uids.last().map(|&u| u + 1).unwrap_or(1)
+        });
         {
             let guard = self.store.lock().unwrap();
             let conn = guard.conn();
@@ -197,6 +239,21 @@ impl SyncWorker {
         }
 
         session.logout().await?;
+        {
+            let guard = self.store.lock().unwrap();
+            let conn = guard.conn();
+            let db_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM messages WHERE mailbox_id = ?1",
+                    rusqlite::params![mailbox_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(-1);
+            eprintln!(
+                "[SGE sync] done: new={} updated={} deleted={} db_rows={}",
+                result.new, result.updated, result.deleted, db_count
+            );
+        }
         cb(SyncEvent::SyncCompleted {
             summary: result.clone(),
         });
@@ -225,6 +282,11 @@ mod tests {
         fn select_inbox(&mut self) -> PinBox<'_, Result<MailboxSummary, SyncError>> {
             let summary = self.summary.clone();
             Box::pin(async move { Ok(summary) })
+        }
+
+        fn search_uids(&mut self) -> PinBox<'_, Result<Vec<u32>, SyncError>> {
+            let uids = self.envelopes.iter().map(|h| h.uid).collect();
+            Box::pin(async move { Ok(uids) })
         }
 
         fn fetch_envelopes<'a>(

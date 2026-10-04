@@ -7,8 +7,18 @@
 use async_imap::imap_proto::{Address, BodyStructure};
 use async_imap::types::{Fetch, Flag};
 use futures::TryStreamExt;
+use mail_parser::parsers::MessageStream;
 
 use super::SyncError;
+
+/// FETCH attribute set for the header sweep.
+///
+/// MUST stay parenthesized: RFC 3501 §6.4.5 allows a bare single
+/// `fetch-att`, but multiple attributes REQUIRE `(...)`. An unparenthesized
+/// multi-attr FETCH is malformed — strict servers (Zimbra) reject it with
+/// `BAD Invalid arguments`, and async-imap surfaces that rejection as an
+/// empty stream (no error), i.e. a silent "0 messages" sync.
+pub const FETCH_ATTRS: &str = "(UID FLAGS INTERNALDATE ENVELOPE BODYSTRUCTURE)";
 
 /// A single message header row extracted from an IMAP ENVELOPE FETCH.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +72,7 @@ fn format_address(addr: &Address) -> String {
         .name
         .as_ref()
         .map(|b| String::from_utf8_lossy(b).trim_matches('"').to_string())
+        .map(|n| decode_header_words(&n))
         .unwrap_or_default();
 
     if !name.is_empty() && !mailbox.is_empty() && !host.is_empty() {
@@ -90,6 +101,92 @@ pub fn format_addresses(addrs: Option<&[Address]>) -> String {
 /// string, trimming trailing CR that IMAP servers sometimes append.
 fn decode_bytes_opt(b: Option<&[u8]>) -> Option<String> {
     b.map(|bytes| String::from_utf8_lossy(bytes).trim_end_matches('\r').to_string())
+}
+
+/// Decode RFC 2047 encoded-words (`=?charset?Q|B?payload?=`) in a header
+/// value — display names and subjects arrive in this form for any
+/// non-ASCII text ("Gabinete da Direção-Geral…" shows up raw otherwise).
+///
+/// - Plain text passes through untouched; malformed words are left visible
+///   (fail-visible, never silently dropped).
+/// - Adjacent encoded-words separated only by whitespace are joined WITHOUT
+///   the gap (RFC 2047 §6.2).
+/// - Charset coverage comes from mail-parser's `full_encoding` decoder.
+pub fn decode_header_words(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len());
+    let mut pending_ws = String::new();
+    let mut prev_was_word = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        if raw[i..].starts_with("=?") {
+            match try_decode_word(&raw[i..]) {
+                Some((decoded, consumed)) => {
+                    // Whitespace between two encoded-words is ignored…
+                    if !prev_was_word {
+                        out.push_str(&pending_ws);
+                    }
+                    pending_ws.clear();
+                    out.push_str(&decoded);
+                    i += consumed;
+                    prev_was_word = true;
+                }
+                None => {
+                    out.push_str(&pending_ws);
+                    pending_ws.clear();
+                    out.push_str("=?");
+                    i += 2;
+                    prev_was_word = false;
+                }
+            }
+        } else if bytes[i].is_ascii_whitespace() {
+            pending_ws.push(bytes[i] as char);
+            i += 1;
+        } else {
+            out.push_str(&pending_ws);
+            pending_ws.clear();
+            let ch = raw[i..].chars().next().expect("non-empty slice");
+            out.push(ch);
+            i += ch.len_utf8();
+            prev_was_word = false;
+        }
+    }
+    // …but leading/trailing/isolated whitespace is preserved.
+    out.push_str(&pending_ws);
+    out
+}
+
+/// Try to decode ONE encoded-word at the start of `s` (which must begin
+/// with `=?`). Returns the decoded text plus bytes consumed (including the
+/// trailing `?=`), or `None` when it isn't a valid encoded-word.
+///
+/// Parsed structurally (`=?charset?enc?payload?=`) instead of searching for
+/// the first `?=` — a Q-payload may itself START with `=XX`, which a naive
+/// terminator search mistakes for the end of the word.
+fn try_decode_word(s: &str) -> Option<(String, usize)> {
+    let b = s.as_bytes();
+    // Charset runs to the next `?`.
+    let q1 = b.iter().skip(2).position(|&c| c == b'?')? + 2;
+    if q1 <= 2 {
+        return None; // empty charset
+    }
+    // Exactly one encoding char followed by `?`.
+    let enc = *b.get(q1 + 1)?;
+    if b.get(q1 + 2) != Some(&b'?') {
+        return None;
+    }
+    if !matches!(enc, b'q' | b'Q' | b'b' | b'B') {
+        return None;
+    }
+    // Payload runs to the first `?=` — neither Q-escaping (`?` → `=3F`)
+    // nor base64 (no `?` in alphabet) can contain a literal `?=`.
+    let payload_start = q1 + 3;
+    let rel = s[payload_start..].find("?=")?;
+    let end = payload_start + rel + 2; // consume through `?=`
+    // mail-parser's decoder takes the word starting at `?charset?...?=`.
+    let inner = &s[1..end];
+    let decoded = MessageStream::new(inner.as_bytes()).decode_rfc2047()?;
+    Some((decoded, end))
 }
 
 /// Build the ~200-char text preview from the first text part we can find.
@@ -130,17 +227,27 @@ pub fn body_has_attachments(bs: &BodyStructure) -> bool {
 /// BODYSTRUCTURE`) into a [`MessageHeader`].
 pub fn parse_fetch_item(fetch: &Fetch, uid: u32) -> MessageHeader {
     let env = fetch.envelope();
-    let (subject, message_id, from_addr, to_addrs, cc_addrs, date_utc) = if let Some(e) = env {
+    let date_utc = fetch
+        .internal_date()
+        .map(|dt| dt.to_rfc3339())
+        .or_else(|| {
+            env.as_ref()
+                .and_then(|e| decode_bytes_opt(e.date.as_deref()))
+        })
+        .unwrap_or_default();
+
+    let (subject, message_id, from_addr, to_addrs, cc_addrs) = if let Some(e) = env {
         (
-            decode_bytes_opt(e.subject.as_deref()).unwrap_or_default(),
+            decode_bytes_opt(e.subject.as_deref())
+                .map(|s| decode_header_words(&s))
+                .unwrap_or_default(),
             decode_bytes_opt(e.message_id.as_deref()),
             format_addresses(e.from.as_deref()),
             format_addresses(e.to.as_deref()),
             format_addresses(e.cc.as_deref()),
-            decode_bytes_opt(e.date.as_deref()).unwrap_or_default(),
         )
     } else {
-        (String::new(), None, String::new(), String::new(), String::new(), String::new())
+        (String::new(), None, String::new(), String::new(), String::new())
     };
 
     let flags = format_flags(fetch.flags().collect());
@@ -174,9 +281,8 @@ pub async fn fetch_envelope_batch(
     session: &mut super::BoxedSession,
     range: &str,
 ) -> Result<Vec<MessageHeader>, SyncError> {
-    let attrs = "UID FLAGS INTERNALDATE ENVELOPE BODYSTRUCTURE";
     let mut stream = session
-        .uid_fetch(range, attrs)
+        .uid_fetch(range, FETCH_ATTRS)
         .await
         .map_err(|e| SyncError::Protocol(format!("UID FETCH: {e}")))?;
     let mut out = Vec::new();
@@ -262,5 +368,64 @@ mod tests {
         let long = "x".repeat(300);
         let p = make_preview(&long, None);
         assert_eq!(p.len(), 200);
+    }
+
+    #[test]
+    fn decodes_split_q_words_with_gap_collapse() {
+        // Real Zimbra sender name: two adjacent Q-words — the space between
+        // them must be dropped (§6.2), `_` becomes a real space.
+        let raw = "=?UTF-8?Q?Gabinete_da_Dire=C3=A7=C3=A3o-Geral_de_Corn=C3=A9lio_Proc?= =?UTF-8?Q?=C3=B3pio?=";
+        assert_eq!(
+            decode_header_words(raw),
+            "Gabinete da Direção-Geral de Cornélio Procópio"
+        );
+    }
+
+    #[test]
+    fn decodes_subject_with_escaped_colon() {
+        let raw = "=?UTF-8?Q?Re=3A_Base_de_Conhecimento_-_Processo_de_Afastamento_d?= =?UTF-8?Q?o_Pa=C3=ADs?=";
+        assert_eq!(
+            decode_header_words(raw),
+            "Re: Base de Conhecimento - Processo de Afastamento do País"
+        );
+    }
+
+    #[test]
+    fn decodes_base64_word_and_leaves_plain_text() {
+        assert_eq!(
+            decode_header_words("=?UTF-8?B?Q2Fmw6k=?= hello"),
+            "Café hello"
+        );
+        assert_eq!(decode_header_words("plain subject"), "plain subject");
+        assert_eq!(decode_header_words(""), "");
+    }
+
+    #[test]
+    fn leaves_malformed_words_visible() {
+        // No closing `?=` / unknown encoding: fail-visible, never dropped.
+        assert_eq!(decode_header_words("=?UTF-8?Q?abc"), "=?UTF-8?Q?abc");
+        assert_eq!(decode_header_words("=?UTF-8?X?abc?="), "=?UTF-8?X?abc?=");
+    }
+
+    /// Regression: the FETCH attribute set MUST be parenthesized (RFC 3501
+    /// §6.4.5). An unparenthesized multi-attr FETCH is malformed — Zimbra
+    /// rejects it with BAD, which async-imap reports as an empty stream,
+    /// i.e. a silent "0 messages" sync on a non-empty mailbox.
+    #[test]
+    fn fetch_attrs_are_parenthesized() {
+        assert!(
+            FETCH_ATTRS.starts_with('(') && FETCH_ATTRS.ends_with(')'),
+            "FETCH_ATTRS must be parenthesized, got: {FETCH_ATTRS}"
+        );
+        for attr in ["UID", "FLAGS", "INTERNALDATE", "ENVELOPE", "BODYSTRUCTURE"] {
+            assert!(
+                FETCH_ATTRS.contains(attr),
+                "FETCH_ATTRS missing {attr}: {FETCH_ATTRS}"
+            );
+        }
+        assert!(
+            !FETCH_ATTRS.contains("BODY[]") && !FETCH_ATTRS.contains("BODY.PEEK[HEADER"),
+            "header sweep must not fetch bodies (read-only invariant): {FETCH_ATTRS}"
+        );
     }
 }

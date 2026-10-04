@@ -255,8 +255,11 @@ pub trait SyncSession: Unpin + Send {
     /// UIDVALIDITY / UIDNEXT / exists counts.
     fn select_inbox(&mut self) -> PinBox<'_, Result<MailboxSummary, SyncError>>;
 
+    /// `UID SEARCH ALL` — returns all UIDs currently in the selected mailbox.
+    fn search_uids(&mut self) -> PinBox<'_, Result<Vec<u32>, SyncError>>;
+
     /// `UID FETCH <range> (UID FLAGS INTERNALDATE ENVELOPE BODYSTRUCTURE)`
-    /// over a ≤200-UID range.  Returns parsed headers (never raw `Fetch`).
+    /// over a range or comma-separated list of UIDs. Returns parsed headers.
     fn fetch_envelopes<'a>(
         &'a mut self,
         range: &'a str,
@@ -288,15 +291,26 @@ impl SyncSession for BoxedSession {
         })
     }
 
+    fn search_uids(&mut self) -> PinBox<'_, Result<Vec<u32>, SyncError>> {
+        Box::pin(async move {
+            let uids_set = self
+                .uid_search("ALL")
+                .await
+                .map_err(|e| SyncError::Protocol(format!("UID SEARCH ALL: {e}")))?;
+            let mut uids: Vec<u32> = uids_set.into_iter().collect();
+            uids.sort_unstable();
+            Ok(uids)
+        })
+    }
+
     fn fetch_envelopes<'a>(
         &'a mut self,
         range: &'a str,
     ) -> PinBox<'a, Result<Vec<headers::MessageHeader>, SyncError>> {
         let range_owned = range.to_string();
         Box::pin(async move {
-            let attrs = "UID FLAGS INTERNALDATE ENVELOPE BODYSTRUCTURE";
             let mut stream = self
-                .uid_fetch(&range_owned, attrs)
+                .uid_fetch(&range_owned, headers::FETCH_ATTRS)
                 .await
                 .map_err(|e| SyncError::Protocol(format!("UID FETCH: {e}")))?;
             let mut out = Vec::new();

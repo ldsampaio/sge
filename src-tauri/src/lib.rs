@@ -18,9 +18,25 @@ use thiserror::Error;
 
 use store::Store;
 
-/// Shared app state: the SQLite store, accessible to all Tauri commands.
+/// Shared app state: the SQLite store, accessible to all Tauri commands,
+/// plus the in-memory active account (set by `connect_account`).
+///
+/// `active_account` lets `start_sync` / `fetch_message` / `save_attachment`
+/// reconnect without requiring keyring persistence (remember-me unchecked).
+/// It is memory-only: never written to disk.
 pub struct AppState {
     pub store: Arc<Mutex<Store>>,
+    pub active_account: Mutex<Option<ActiveAccount>>,
+}
+
+/// In-memory credentials + server config for the connected session.
+#[derive(Debug, Clone)]
+pub struct ActiveAccount {
+    pub host: String,
+    pub port: u16,
+    pub security: String,
+    pub username: String,
+    pub password: String,
 }
 
 /// Typed argument-validation errors for the connect path. Transport, auth,
@@ -53,6 +69,7 @@ pub struct ConnectSummary {
 /// executor), never on a Tokio runtime thread.
 #[tauri::command]
 async fn connect_account(
+    state: tauri::State<'_, AppState>,
     host: String,
     port: u16,
     security: String,
@@ -70,6 +87,11 @@ async fn connect_account(
     // Localhost unencrypted mode needs no extra click; remote unencrypted mode is always
     // refused inside the session module.
     let loopback = imap::is_loopback(&host);
+    // Clones for the in-memory session (cfg moves the originals).
+    let mem_host = host.clone();
+    let mem_username = username.clone();
+    let mem_password = password.clone();
+    let mem_security = security.clone();
     let cfg = imap::AccountConfig {
         host,
         port,
@@ -89,6 +111,18 @@ async fn connect_account(
     .await
     .map_err(|e| format!("internal error: connection task failed ({e})"))?
     .map_err(|e| e.to_string())?;
+    // Remember the session in memory so start_sync can reconnect even
+    // when remember-me (keyring) is unchecked.
+    {
+        let mut guard = state.active_account.lock().unwrap();
+        *guard = Some(ActiveAccount {
+            host: mem_host,
+            port,
+            security: mem_security,
+            username: mem_username,
+            password: mem_password,
+        });
+    }
     Ok(ConnectSummary {
         selected_mailbox: outcome.summary.selected_mailbox,
         uid_validity: outcome.summary.uid_validity,
@@ -170,13 +204,28 @@ async fn load_server_config() -> Result<Option<ServerConfig>, String> {
     }
 }
 
+fn default_db_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local").join("share"))
+        })?;
+    Some(base.join("sge").join("sge.db"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let store = Arc::new(Mutex::new(
-        crate::store::Store::open_in_memory()
-            .expect("in-memory store should always succeed"),
-    ));
-    let state = AppState { store };
+    let store_instance = default_db_path()
+        .and_then(|path| crate::store::Store::open(&path).ok())
+        .unwrap_or_else(|| {
+            crate::store::Store::open_in_memory()
+                .expect("in-memory store should always succeed")
+        });
+    let store = Arc::new(Mutex::new(store_instance));
+    let state = AppState {
+        store,
+        active_account: Mutex::new(None),
+    };
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())

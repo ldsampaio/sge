@@ -1,13 +1,14 @@
 //! Sync Tauri commands: start_sync, sync_status, cancel_sync.
 //!
-//! `start_sync` loads stored creds + server config from the OS keyring,
-//! opens a real IMAP session (BODY.PEEK only), runs the [`SyncWorker`],
-//! and streams typed [`SyncEvent`] progress over a `Channel`.
+//! `start_sync` prefers in-memory `AppState::active_account` (set on login),
+//! falling back to the OS keyring so auto-connect after restart also works.
+//! It opens a real IMAP session (BODY.PEEK only), runs the SyncWorker,
+//! and streams typed SyncEvent progress over a Channel.
 //! `sync_status` reads the worker-written sync_state row from SQLite.
 //! `cancel_sync` sets the cancellation flag so the worker aborts at
 //! the next batch boundary.
 //!
-//! No auto-login logic — login screen always shown first (Phase 5).
+//! No auto-login logic -- login screen always shown first (Phase 5).
 
 use std::sync::Arc;
 
@@ -24,70 +25,94 @@ use crate::imap::SyncSession;
 
 /// Start a sync pass against the stored IMAP server + credentials.
 ///
-/// Loads the server config and credentials from the OS keyring, opens an
-/// IMAP session via `connect_sync` (BODY.PEEK only), then runs the sync
-/// worker. Progress events are streamed over `on_event: Channel<SyncEvent>`.
+/// Prefers the in-memory `AppState::active_account` (set by `connect_account`)
+/// over the OS keyring, so sync works even when "Lembrar me" is unchecked.
+/// Falls back to keyring if in-memory session is absent (e.g. app restart).
 ///
-/// Fails with a plain-language string if creds or server config are missing,
-/// the IMAP connection fails, or the sweep encounters a protocol error.
+/// Progress events are streamed over `on_event: Channel<SyncEvent>`.
 #[tauri::command]
 pub async fn start_sync(
     state: State<'_, crate::AppState>,
     on_event: Channel<SyncEvent>,
 ) -> Result<(), String> {
-    // ── Load server config + creds from keyring (blocking) ──
-    let server_cfg: ServerConfig = {
-        let kr = KeyringStore::new();
-        tauri::async_runtime::spawn_blocking(move || kr.load_server_config())
-            .await
-            .map_err(|e| format!("internal error: keyring task failed ({e})"))?
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "No server config saved — log in first".to_string())?
-    };
-    let creds: SavedCredentials = {
-        let kr = KeyringStore::new();
-        tauri::async_runtime::spawn_blocking(move || kr.load())
-            .await
-            .map_err(|e| format!("internal error: keyring task failed ({e})"))?
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "No saved credentials — log in first".to_string())?
+    // Load credentials: prefer in-memory session, fall back to keyring.
+    let account_cfg: AccountConfig = {
+        let mem = state.active_account.lock().unwrap().clone();
+        if let Some(acc) = mem {
+            eprintln!("[SGE sync] Using in-memory credentials for {}", acc.username);
+            AccountConfig {
+                host: acc.host,
+                port: acc.port,
+                security: SecurityMode::parse(&acc.security).map_err(|e| e.to_string())?,
+                username: acc.username,
+                password: zeroize::Zeroizing::new(acc.password),
+                allow_untrusted: false,
+                plain_local_confirmed: false,
+            }
+        } else {
+            eprintln!("[SGE sync] No in-memory session -- loading from keyring...");
+            let server_cfg: ServerConfig = {
+                let kr = KeyringStore::new();
+                tauri::async_runtime::spawn_blocking(move || kr.load_server_config())
+                    .await
+                    .map_err(|e| format!("internal error: keyring task failed ({e})"))?
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "No server config saved -- log in first".to_string())?
+            };
+            let creds: SavedCredentials = {
+                let kr = KeyringStore::new();
+                tauri::async_runtime::spawn_blocking(move || kr.load())
+                    .await
+                    .map_err(|e| format!("internal error: keyring task failed ({e})"))?
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "No saved credentials -- log in first".to_string())?
+            };
+            eprintln!("[SGE sync] Using keyring credentials for {}", creds.username);
+            AccountConfig {
+                host: server_cfg.host,
+                port: server_cfg.port,
+                security: SecurityMode::parse(&server_cfg.security).map_err(|e| e.to_string())?,
+                username: creds.username,
+                password: zeroize::Zeroizing::new(creds.password),
+                allow_untrusted: false,
+                plain_local_confirmed: false,
+            }
+        }
     };
 
-    let account_cfg = AccountConfig {
-        host: server_cfg.host,
-        port: server_cfg.port,
-        security: SecurityMode::parse(&server_cfg.security)
-            .map_err(|e| e.to_string())?,
-        username: creds.username,
-        password: zeroize::Zeroizing::new(creds.password),
-        allow_untrusted: false,
-        plain_local_confirmed: false,
-    };
+    eprintln!("[SGE sync] Connecting to {}:{}...", account_cfg.host, account_cfg.port);
 
-    // ── Run sync on a dedicated blocking thread ──
+    // Run sync on a dedicated blocking thread.
     let store = state.store.clone();
     tauri::async_runtime::spawn_blocking(move || {
         async_std::task::block_on(async {
             let session = connect_sync(&account_cfg).await
                 .map_err(|e| format!("IMAP connection: {e}"))?;
+            eprintln!("[SGE sync] Connected -- starting worker...");
             let worker = SyncWorker::new(store);
             let cb: SyncCallback = Arc::new(move |event| {
                 let _ = on_event.send(event);
             });
-            worker.sync_with_session(Box::new(session), cb).await
-                .map_err(|e| e.to_string())
+            let result = worker.sync_with_session(Box::new(session), cb).await
+                .map_err(|e| e.to_string());
+            match &result {
+                Ok(s) => eprintln!("[SGE sync] Done: new={} updated={} deleted={}", s.new, s.updated, s.deleted),
+                Err(e) => eprintln!("[SGE sync] Error: {e}"),
+            }
+            result
         })
     })
     .await
-    .map_err(|e| format!("internal error: sync task failed ({e})"))?;
+    .map_err(|e| format!("internal error: sync task failed ({e})"))?
+    .map_err(|e| e)?;
 
     Ok(())
 }
 
 /// Return the latest sync status from SQLite: last_sync_at + counts.
 ///
-/// Read-only — no IMAP round-trip. Used by the frontend to show
-/// "Up-to-date <timestamp>" or "Offline — last synced <timestamp>".
+/// Read-only -- no IMAP round-trip. Used by the frontend to show
+/// "Up-to-date <timestamp>" or "Offline -- last synced <timestamp>".
 #[tauri::command]
 pub async fn sync_status(state: State<'_, crate::AppState>) -> Result<SyncStatus, String> {
     let store = state.store.clone();
@@ -112,7 +137,7 @@ pub async fn sync_status(state: State<'_, crate::AppState>) -> Result<SyncStatus
 /// List messages for a mailbox from the local SQLite store (offline, no IMAP).
 ///
 /// Mirrors the `sync_status` pattern: spawns a blocking thread, locks the
-/// Store mutex only for the synchronous DB read, returns a `Vec<MessageRow>`.
+/// Store mutex only for the synchronous DB read, returns a Vec<MessageRow>.
 /// Results are ordered newest-first (date_utc DESC, uid DESC) per the
 /// store query. Pagination is controlled by `limit` (caller fetches more
 /// batches for infinite scroll).
@@ -138,7 +163,7 @@ pub async fn list_messages(
 ///
 /// Calls `queries::fts_search` which joins `messages_fts` against `messages`
 /// with BM25 ranking. The search query string is passed as a parameter
-/// binding to FTS5 — no string interpolation (T-03-05 mitigations).
+/// binding to FTS5 -- no string interpolation (T-03-05 mitigations).
 #[tauri::command]
 pub async fn search_messages(
     state: State<'_, crate::AppState>,
@@ -162,7 +187,7 @@ pub async fn search_messages(
 /// and aborts cleanly (writes no partial sync_state).
 #[tauri::command]
 pub async fn cancel_sync() -> Result<(), String> {
-    // Cancellation flag lives in AppState — set it there.
+    // Cancellation flag lives in AppState -- set it there.
     // For now, no-op: the worker has no long-running batch to interrupt.
     // Phase 3 / poll timer will wire this properly.
     Ok(())
@@ -178,9 +203,9 @@ pub struct SyncStatus {
     pub message_count: i64,
 }
 
-// ── Phase 4: Reader + Attachments ───────────────────────────
+// Phase 4: Reader + Attachments
 
-/// Parsed, sanitized view of a single message — returned to the frontend.
+/// Parsed, sanitized view of a single message -- returned to the frontend.
 #[derive(Debug, Clone, Serialize)]
 pub struct MessageView {
     pub uid: u32,
@@ -197,37 +222,49 @@ pub struct MessageView {
 /// Fetch a single message body, sanitize HTML, extract headers + attachments.
 ///
 /// Loads server config + credentials from the OS keyring, connects to IMAP
-/// (read-only), and issues `BODY.PEEK[]` — never sets `\Seen`. HTML is sanitized
+/// (read-only), and issues `BODY.PEEK[]` -- never sets `\Seen`. HTML is sanitized
 /// with ammonia (Phase 3 constraint) and attachment metadata is extracted but
-/// content is not returned (saved via [`save_attachment`] on demand).
+/// content is not returned (saved via `save_attachment` on demand).
 #[tauri::command]
 pub async fn fetch_message(
     state: State<'_, crate::AppState>,
     uid: u32,
 ) -> Result<MessageView, String> {
     let store = state.store.clone();
+    let acc = state.active_account.lock().unwrap().clone();
     tauri::async_runtime::spawn_blocking(move || {
         async_std::task::block_on(async {
-            // Load server config + credentials from keyring.
-            let kr = KeyringStore::new();
-            let server_cfg = kr
-                .load_server_config()
-                .map_err(|e| e.to_string())?
-                .ok_or("No server config saved — log in first")?;
-            let creds = kr
-                .load()
-                .map_err(|e| e.to_string())?
-                .ok_or("No saved credentials — log in first")?;
-
-            let account_cfg = AccountConfig {
-                host: server_cfg.host,
-                port: server_cfg.port,
-                security: SecurityMode::parse(&server_cfg.security)
-                    .map_err(|e| e.to_string())?,
-                username: creds.username,
-                password: zeroize::Zeroizing::new(creds.password),
-                allow_untrusted: false,
-                plain_local_confirmed: false,
+            // Load server config + credentials: prefer in-memory, fall back to keyring.
+            let account_cfg: AccountConfig = if let Some(a) = acc {
+                AccountConfig {
+                    host: a.host,
+                    port: a.port,
+                    security: SecurityMode::parse(&a.security).map_err(|e| e.to_string())?,
+                    username: a.username,
+                    password: zeroize::Zeroizing::new(a.password),
+                    allow_untrusted: false,
+                    plain_local_confirmed: false,
+                }
+            } else {
+                let kr = KeyringStore::new();
+                let server_cfg = kr
+                    .load_server_config()
+                    .map_err(|e| e.to_string())?
+                    .ok_or("No server config saved -- log in first")?;
+                let creds = kr
+                    .load()
+                    .map_err(|e| e.to_string())?
+                    .ok_or("No saved credentials -- log in first")?;
+                AccountConfig {
+                    host: server_cfg.host,
+                    port: server_cfg.port,
+                    security: SecurityMode::parse(&server_cfg.security)
+                        .map_err(|e| e.to_string())?,
+                    username: creds.username,
+                    password: zeroize::Zeroizing::new(creds.password),
+                    allow_untrusted: false,
+                    plain_local_confirmed: false,
+                }
             };
 
             // Connect, SELECT INBOX, fetch body via BODY.PEEK[] (read-only).
@@ -327,31 +364,44 @@ pub async fn fetch_message(
 /// Save a single attachment to `file_path` on disk (user-chosen via dialog).
 #[tauri::command]
 pub async fn save_attachment(
+    state: State<'_, crate::AppState>,
     uid: u32,
     part_number: String,
     file_path: String,
 ) -> Result<String, String> {
+    let acc = state.active_account.lock().unwrap().clone();
     tauri::async_runtime::spawn_blocking(move || {
         async_std::task::block_on(async {
-            let kr = KeyringStore::new();
-            let server_cfg = kr
-                .load_server_config()
-                .map_err(|e| e.to_string())?
-                .ok_or("No server config saved — log in first")?;
-            let creds = kr
-                .load()
-                .map_err(|e| e.to_string())?
-                .ok_or("No saved credentials — log in first")?;
-
-            let account_cfg = AccountConfig {
-                host: server_cfg.host,
-                port: server_cfg.port,
-                security: SecurityMode::parse(&server_cfg.security)
-                    .map_err(|e| e.to_string())?,
-                username: creds.username,
-                password: zeroize::Zeroizing::new(creds.password),
-                allow_untrusted: false,
-                plain_local_confirmed: false,
+            let account_cfg: AccountConfig = if let Some(a) = acc {
+                AccountConfig {
+                    host: a.host,
+                    port: a.port,
+                    security: SecurityMode::parse(&a.security).map_err(|e| e.to_string())?,
+                    username: a.username,
+                    password: zeroize::Zeroizing::new(a.password),
+                    allow_untrusted: false,
+                    plain_local_confirmed: false,
+                }
+            } else {
+                let kr = KeyringStore::new();
+                let server_cfg = kr
+                    .load_server_config()
+                    .map_err(|e| e.to_string())?
+                    .ok_or("No server config saved -- log in first")?;
+                let creds = kr
+                    .load()
+                    .map_err(|e| e.to_string())?
+                    .ok_or("No saved credentials -- log in first")?;
+                AccountConfig {
+                    host: server_cfg.host,
+                    port: server_cfg.port,
+                    security: SecurityMode::parse(&server_cfg.security)
+                        .map_err(|e| e.to_string())?,
+                    username: creds.username,
+                    password: zeroize::Zeroizing::new(creds.password),
+                    allow_untrusted: false,
+                    plain_local_confirmed: false,
+                }
             };
 
             let mut session = connect_sync(&account_cfg)
@@ -419,7 +469,7 @@ mod tests {
             "[]", "2024-06-03T08:00:00Z", r#"["\\Seen"]"#, false, "preview three",
         ).unwrap();
 
-        // list_messages → 3 rows, newest first (date_utc DESC)
+        // list_messages -> 3 rows, newest first (date_utc DESC)
         let rows = queries::list_messages(conn, "INBOX", 100, 0).unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].uid, 3);   // newest date first
@@ -431,7 +481,7 @@ mod tests {
         assert!(queries::is_unread(&rows[1].flags));   // unread
         assert!(queries::is_unread(&rows[2].flags));   // unread
 
-        // FTS search by sender term → finds alice
+        // FTS search by sender term -> finds alice
         let results = queries::fts_search(conn, "INBOX", "alice").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].from_addr, "alice@example.com");

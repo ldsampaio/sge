@@ -1,7 +1,8 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { MessageRow } from "../types";
-import { isUnread, humanizeDate } from "../types";
+import { isUnread, formatRowDate } from "../types";
+import { IconInbox, IconPaperclip } from "./icons";
 
 export interface ListState {
   kind: "loading" | "error" | "empty" | "ready";
@@ -15,9 +16,19 @@ interface MessageListProps {
   selectedUid: number | null;
   onStateChange?: (state: ListState) => void;
   onMessageCount?: (count: number) => void;
+  refreshKey?: number;
 }
 
-const PAGE_SIZE = 200;
+interface SyncStatusInfo {
+  mailbox: string;
+  last_sync_at: string;
+  uid_validity: number;
+  uid_next: number;
+  message_count: number;
+}
+
+const PAGE_SIZE = 50;
+const MAX_PAGE_BUTTONS = 7;
 
 function isTauriRuntime(): boolean {
   const w = window as unknown as Record<string, unknown>;
@@ -25,15 +36,15 @@ function isTauriRuntime(): boolean {
 }
 
 const OUTSIDE_DESKTOP_MESSAGE =
-  "SGE is running outside its desktop window — launch with `npm run tauri dev` and use the app window, not the browser URL.";
+  "O SGE Edu roda na janela do app — abra com `npm run tauri dev` e use a janela do aplicativo, não o endereço do navegador.";
 
-/**
- * Virtualized-by-pagination message list with infinite scroll.
- *
- * Fetches 200 messages at a time from the local SQLite store via
- * `list_messages` (or `search_messages` when searchQuery is set).
- * Pagination through OFFSET keeps the DOM small even at 10k+ messages.
- */
+function avatarInitial(addr: string): string {
+  const clean = addr.trim();
+  if (!clean) return "?";
+  const name = clean.includes("<") ? clean : clean;
+  return (name.charAt(0) || "?").toUpperCase();
+}
+
 export default function MessageList({
   mailbox,
   searchQuery,
@@ -41,12 +52,16 @@ export default function MessageList({
   selectedUid,
   onStateChange,
   onMessageCount,
+  refreshKey,
 }: MessageListProps) {
   const [messages, setMessages] = useState<MessageRow[]>([]);
-  const [loaded, setLoaded] = useState(0);
-  const [hasMore, setHasMore] = useState(true);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const searchCache = useRef<{ query: string; rows: MessageRow[] } | null>(null);
+  const countRef = useRef(onMessageCount);
+  countRef.current = onMessageCount;
 
   const reportState = useCallback(
     (state: ListState) => {
@@ -55,8 +70,11 @@ export default function MessageList({
     [onStateChange],
   );
 
-  const fetchBatch = useCallback(
-    async (offset: number, replace: boolean) => {
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const safePage = Math.min(page, totalPages - 1);
+
+  const loadPage = useCallback(
+    async (p: number) => {
       if (!isTauriRuntime()) {
         reportState({ kind: "error", message: OUTSIDE_DESKTOP_MESSAGE });
         return;
@@ -64,68 +82,64 @@ export default function MessageList({
 
       setLoading(true);
       setError(null);
-      if (replace) reportState({ kind: "loading", message: "Loading messages…" });
+      reportState({ kind: "loading", message: "Carregando avisos…" });
 
       try {
-        let result: MessageRow[];
         if (searchQuery) {
-          result = await invoke("search_messages", {
-            mailbox,
-            query: searchQuery,
-          });
+          if (!searchCache.current || searchCache.current.query !== searchQuery) {
+            const rows: MessageRow[] = await invoke("search_messages", {
+              mailbox,
+              query: searchQuery,
+            });
+            searchCache.current = { query: searchQuery, rows };
+          }
+          const all = searchCache.current.rows;
+          setMessages(all.slice(p * PAGE_SIZE, p * PAGE_SIZE + PAGE_SIZE));
+          setTotal(all.length);
+          countRef.current?.(all.length);
         } else {
-          result = await invoke("list_messages", {
-            mailbox,
-            limit: PAGE_SIZE,
-            offset,
-          });
+          const [rows, status] = await Promise.all([
+            invoke<MessageRow[]>("list_messages", {
+              mailbox,
+              limit: PAGE_SIZE,
+              offset: p * PAGE_SIZE,
+            }),
+            invoke<SyncStatusInfo>("sync_status"),
+          ]);
+          setMessages(rows);
+          setTotal(status.message_count);
+          countRef.current?.(status.message_count);
         }
-
-        if (replace) {
-          setMessages(result);
-          onMessageCount?.(result.length);
-        } else {
-          setMessages((prev) => [...prev, ...result]);
-          onMessageCount?.(result.length);
-        }
-        setLoaded(replace ? result.length : loaded + result.length);
-        setHasMore(result.length === PAGE_SIZE);
         reportState({ kind: "ready", message: "" });
       } catch (err) {
         const msg = String(err);
         setError(msg);
         setMessages([]);
+        setTotal(0);
         reportState({ kind: "error", message: msg });
       } finally {
         setLoading(false);
       }
     },
-    [mailbox, searchQuery, loaded, reportState, onMessageCount],
+    [mailbox, searchQuery, reportState],
   );
 
-  // Initial load + search query change → replace full list.
   useEffect(() => {
-    setMessages([]);
-    setLoaded(0);
-    setHasMore(true);
-    void fetchBatch(0, true);
-  }, [mailbox, searchQuery]);
+    searchCache.current = null;
+    setPage(0);
+    void loadPage(0);
+  }, [mailbox, searchQuery, refreshKey]);
 
-  // Infinite scroll: load next batch when near bottom.
-  const handleScroll = useCallback(
-    (e: React.UIEvent<HTMLDivElement>) => {
-      if (searchQuery) return; // no pagination in search mode
-      const { scrollTop, scrollHeight, clientHeight } = e.currentTarget;
-      if (scrollTop + clientHeight > scrollHeight - 200) {
-        if (hasMore && !loading) {
-          void fetchBatch(loaded, false);
-        }
-      }
-    },
-    [hasMore, loading, loaded, fetchBatch, searchQuery],
-  );
+  useEffect(() => {
+    void loadPage(safePage);
+  }, [safePage]);
 
-  // --- Render states ---
+  function goTo(p: number) {
+    setPage(Math.max(0, Math.min(totalPages - 1, p)));
+  }
+
+  const rangeStart = total === 0 ? 0 : safePage * PAGE_SIZE + 1;
+  const rangeEnd = Math.min(total, (safePage + 1) * PAGE_SIZE);
 
   if (!isTauriRuntime()) {
     return (
@@ -136,86 +150,157 @@ export default function MessageList({
   }
 
   if (error && messages.length === 0) {
-    const isAuthError =
-      error.includes("auth") ||
-      error.includes("TLS") ||
-      error.includes("IMAP");
     return (
       <div className="message-list">
         <div className="list-error">
-          <p role="alert">Failed to load messages: {error}</p>
-          <button type="button" onClick={() => void fetchBatch(0, true)}>
-            Retry
+          <p role="alert">Não foi possível carregar os avisos: {error}</p>
+          <button type="button" className="btn" onClick={() => void loadPage(safePage)}>
+            Tentar de novo
           </button>
-          {isAuthError && (
-            <p>
-              Authentication or connection failed — please reconnect from the
-              login screen.
-            </p>
-          )}
         </div>
       </div>
     );
   }
 
-  if (messages.length === 0 && !loading && !searchQuery) {
+  if (!loading && messages.length === 0 && !searchQuery) {
     return (
       <div className="message-list">
         <div className="list-empty">
-          <p>📭 No messages in INBOX</p>
+          <span className="list-empty-ill" aria-hidden="true">
+            <IconInbox size={30} />
+          </span>
+          <p>Sua fila de leitura está vazia</p>
           <p>
-            Connect to your server and sync to see messages here. Use the Sync
-            Now button above.
+            Busque os avisos com o botão “Buscar avisos” acima. Depois da primeira busca, tudo fica
+            guardado para estudar offline.
           </p>
         </div>
       </div>
     );
   }
 
-  if (messages.length === 0 && searchQuery && !loading) {
+  if (!loading && messages.length === 0 && searchQuery) {
     return (
       <div className="message-list">
         <div className="list-empty">
-          <p>No results for “{searchQuery}”</p>
+          <span className="list-empty-ill" aria-hidden="true">
+            <IconInbox size={30} />
+          </span>
+          <p>Nada encontrado para “{searchQuery}”</p>
+          <p>Tente outro remetente ou palavra do assunto.</p>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="message-list" onScroll={handleScroll}>
-      {messages.map((msg) => {
-        const unread = isUnread(msg.flags);
-        const selected = selectedUid === msg.uid;
-        return (
+    <div className="message-list-wrap">
+      <div className="message-list" role="listbox" aria-label="Avisos da sala">
+        {messages.map((msg) => {
+          const unread = isUnread(msg.flags);
+          const selected = selectedUid === msg.uid;
+          return (
+            <button
+              type="button"
+              key={msg.uid}
+              role="option"
+              aria-selected={selected}
+              className={`message-row ${unread ? "unread" : "read"} ${selected ? "selected" : ""}`}
+              onClick={() => onMessageSelect(msg)}
+            >
+              <span
+                className={`unread-dot ${unread ? "unread" : "read"}`}
+                aria-label={unread ? "Não lido" : "Lido"}
+              />
+              <span className="message-sender-cell">
+                <span className="message-avatar" aria-hidden="true">
+                  {avatarInitial(msg.from_addr)}
+                </span>
+                <span className="message-sender" title={msg.from_addr}>
+                  {msg.from_addr}
+                </span>
+              </span>
+              <span className="message-subject-cell">
+                <span style={{ minWidth: 0, flex: 1 }}>
+                  <span className="message-subject">{msg.subject || "(sem assunto)"}</span>
+                  {msg.preview && (
+                    <span className="message-preview">{msg.preview.slice(0, 90)}</span>
+                  )}
+                </span>
+                {msg.has_attachments && (
+                  <span className="attachment-icon" title="Tem material em anexo">
+                    <IconPaperclip size={15} />
+                  </span>
+                )}
+              </span>
+              <span className="message-date">{formatRowDate(msg.date_utc)}</span>
+            </button>
+          );
+        })}
+        {loading && (
+          <div className="list-loading">
+            <p role="status">Carregando avisos…</p>
+          </div>
+        )}
+      </div>
+      {totalPages > 1 && (
+        <nav className="pager" aria-label="Paginação dos avisos">
           <button
             type="button"
-            key={msg.uid}
-            className={`message-row ${unread ? "unread" : "read"} ${selected ? "selected" : ""}`}
-            onClick={() => onMessageSelect(msg)}
+            className="pager-btn"
+            disabled={safePage === 0 || loading}
+            onClick={() => goTo(safePage - 1)}
+            aria-label="Página anterior"
           >
-            <span className={`unread-dot ${unread ? "unread" : "read"}`} aria-label={unread ? "Unread" : "Read"} />
-            <div className="message-sender">{msg.from_addr}</div>
-            <div className="message-subject">{msg.subject || "(no subject)"}</div>
-            <div className="message-date">{humanizeDate(msg.date_utc)}</div>
-            {msg.has_attachments && (
-              <span className="attachment-icon" title="Has attachments">
-                📎
-              </span>
-            )}
+            ← Anterior
           </button>
-        );
-      })}
-      {loading && hasMore && (
-        <div className="list-loading">
-          <p>Loading more…</p>
-        </div>
+          {pageNumbers(safePage, totalPages).map((n, i) =>
+            n === "…" ? (
+              <span key={`gap-${i}`} className="pager-gap" aria-hidden="true">
+                …
+              </span>
+            ) : (
+              <button
+                key={n}
+                type="button"
+                className={`pager-btn pager-num ${n === safePage ? "active" : ""}`}
+                disabled={loading}
+                onClick={() => goTo(n)}
+                aria-label={`Página ${n + 1}`}
+                aria-current={n === safePage ? "page" : undefined}
+              >
+                {n + 1}
+              </button>
+            ),
+          )}
+          <button
+            type="button"
+            className="pager-btn"
+            disabled={safePage >= totalPages - 1 || loading}
+            onClick={() => goTo(safePage + 1)}
+            aria-label="Próxima página"
+          >
+            Próxima →
+          </button>
+        </nav>
       )}
-      {!hasMore && !loading && messages.length > 0 && (
-        <div className="list-end">
-          <p>End of messages</p>
-        </div>
-      )}
+      <p className="pager-info" aria-live="polite">
+        Mostrando {rangeStart}–{rangeEnd} de {total}
+      </p>
     </div>
   );
+}
+
+function pageNumbers(current: number, totalPages: number): (number | "…")[] {
+  if (totalPages <= MAX_PAGE_BUTTONS) {
+    return Array.from({ length: totalPages }, (_, i) => i);
+  }
+  const pages = new Set<number>([0, totalPages - 1, current - 1, current, current + 1]);
+  const sorted = [...pages].filter((p) => p >= 0 && p < totalPages).sort((a, b) => a - b);
+  const out: (number | "…")[] = [];
+  for (let i = 0; i < sorted.length; i++) {
+    if (i > 0 && sorted[i] - sorted[i - 1] > 1) out.push("…");
+    out.push(sorted[i]);
+  }
+  return out;
 }

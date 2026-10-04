@@ -53,37 +53,23 @@ export function isUnread(flags: string): boolean {
 }
 
 /**
- * Humanize a date_utc ISO string into a short relative display.
- * e.g. "Today 10:30 AM", "Yesterday", "Oct 1".
+ * Date/time for a message-list row: time only ("14:30") for today's mail,
+ * full date ("04/10/2026") otherwise. Times use the local timezone.
  */
-export function humanizeDate(date_utc: string): string {
-  try {
-    const date = new Date(date_utc);
-    const now = new Date();
-    const diffMs = now.getTime() - date.getTime();
-    const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
-
-    const timeStr = date.toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-
-    if (diffDays === 0) return `Today ${timeStr}`;
-    if (diffDays === 1) return `Yesterday`;
-    if (diffDays < 7) {
-      const dayName = date.toLocaleDateString([], { weekday: "short" });
-      return dayName;
-    }
-    // Within current year → month + day
-    if (date.getFullYear() === now.getFullYear()) {
-      return date.toLocaleDateString([], { month: "short", day: "numeric" });
-    }
-    return date.toLocaleDateString([], {
-      year: "numeric",
-      month: "short",
-      day: "numeric",
-    });
-  } catch {
-    return date_utc;
+export function formatRowDate(date_utc: string): string {
+  const d = new Date(date_utc);
+  if (Number.isNaN(d.getTime())) return date_utc;
+  const now = new Date();
+  const sameDay =
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate();
+  if (sameDay) {
+    return d.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" });
   }
+  return d.toLocaleDateString("pt-BR", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+  });
 }

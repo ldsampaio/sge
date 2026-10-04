@@ -227,6 +227,10 @@ pub struct InsertMessage<'a> {
 /// Returns the number of rows deleted (for sync summary stats).
 /// This is plain row deletion mirroring server-side mailbox removals;
 /// no IMAP flag-write verbs appear in this module.
+///
+/// Implementation note: the live set goes through a TEMP TABLE instead of
+/// a `NOT IN (?, ?, …)` list, so mailboxes of any size work regardless of
+/// the SQLite bound-variables limit.
 pub fn delete_missing_uids(
     conn: &Connection,
     mailbox_id: u64,
@@ -241,18 +245,23 @@ pub fn delete_missing_uids(
             .map_err(StoreError::from);
     }
 
-    let placeholders = "?,".repeat(live_uids.len());
-    let in_clause = &placeholders[..placeholders.len() - 1];
-    let sql = format!(
-        "DELETE FROM messages WHERE mailbox_id = ?1 AND uid NOT IN ({in_clause})"
-    );
-
-    let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(live_uids.len() + 1);
-    params.push(&mailbox_id);
-    for uid in live_uids {
-        params.push(uid);
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS sge_live_uids(uid INTEGER PRIMARY KEY);
+         DELETE FROM sge_live_uids;",
+    )?;
+    {
+        let mut stmt = conn.prepare("INSERT OR IGNORE INTO sge_live_uids(uid) VALUES (?1)")?;
+        for chunk in live_uids.chunks(500) {
+            for uid in chunk {
+                stmt.execute(rusqlite::params![uid])?;
+            }
+        }
     }
-    conn.execute(&sql, params.as_slice()).map_err(StoreError::from)
+    conn.execute(
+        "DELETE FROM messages WHERE mailbox_id = ?1 AND uid NOT IN (SELECT uid FROM sge_live_uids)",
+        rusqlite::params![mailbox_id],
+    )
+    .map_err(StoreError::from)
 }
 
 /// Return the set of UIDs from `uids` that already exist for `mailbox_id`.

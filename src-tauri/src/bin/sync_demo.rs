@@ -15,10 +15,10 @@ use sge_lib::store::{Store, queries};
 use sge_lib::imap::{MailboxSummary, SyncError, SyncSession};
 use sge_lib::imap::headers::MessageHeader;
 use sge_lib::sync::worker::SyncWorker;
-use sge_lib::sync::SyncSummary;
 
 /// Deterministic mock IMAP session returning 5 fixed messages.
 struct MockSession {
+    #[allow(dead_code)]
     uid_next: AtomicU32,
 }
 
@@ -38,6 +38,10 @@ impl SyncSession for MockSession {
                 uid_next: Some(6),
             })
         })
+    }
+
+    fn search_uids(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u32>, SyncError>> + Send>> {
+        Box::pin(async move { Ok((1..=5u32).collect()) })
     }
 
     fn fetch_envelopes<'a>(
@@ -108,16 +112,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(summary2.new, 0, "incremental sync: expected 0 new messages");
         println!("✓ incremental sync: 0 new messages (idempotent)");
 
-        // ── Test UIDVALIDITY mismatch ──
+        // ── Test UIDVALIDITY mismatch: triggers wipe and full resync ──
         {
             let guard = store.lock().unwrap();
             let conn = guard.conn();
             queries::set_sync_state(conn, "INBOX", 99999, 1)?;
         }
         let session3 = MockSession::new();
-        let result = worker.sync_with_session(Box::new(session3), Arc::new(|_| {})).await;
-        assert!(result.is_err(), "UIDVALIDITY mismatch should fail");
-        println!("✓ UIDVALIDITY mismatch rejected correctly");
+        let result = worker.sync_with_session(Box::new(session3), Arc::new(|_| {})).await?;
+        assert!(result.uid_validity_bump, "UIDVALIDITY mismatch should trigger resync");
+        assert_eq!(result.new, 5, "UIDVALIDITY wipe should re-insert all messages");
+        println!("✓ UIDVALIDITY mismatch triggered clean resync (uid_validity_bump=true)");
 
         println!("\nAll Phase 2 success criteria met ✓");
         Ok::<(), Box<dyn std::error::Error>>(())

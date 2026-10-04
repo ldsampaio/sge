@@ -1,0 +1,127 @@
+/* ──────────────────────────────────────────────
+   SGE Edu — Design Tokens (three-layer)
+   Primitive → Semantic → Component
+   Base: ui-ux-pro-max Claymorphism (educational) +
+         LMS teal support. WCAG AA: texto ≥4.5:1,
+         foco ≥3:1, raio 16–24px, sombras suaves.
+   ────────────────────────────────────────────── */
+
+/* ── 1. Primitive (valores brutos) ── */
+:root {
+  --primitive-indigo-950: #1e1b4b;
+  --primitive-indigo-700: #4338ca;
+  --primitive-indigo-600: #4f46e5;
+  --primitive-indigo-400: #818cf8;
+  --primitive-indigo-200: #c7d2fe;
+  --primitive-indigo-100: #e0e7ff;
+  --primitive-indigo-50: #eef2ff;
+
+  --primitive-teal-800: #134e4a;
+  --primitive-teal-600: #0d9488;
+  --primitive-teal-400: #2dd4bf;
+  --primitive-teal-100: #ccfbf1;
+  --primitive-teal-50: #f0fdfa;
+
+  --primitive-amber-700: #b45309;
+  --primitive-amber-600: #d97706;
+  --primitive-amber-500: #ea580c;
+  --primitive-amber-100: #ffedd5;
+  --primitive-amber-50: #fff7ed;
+
+  --primitive-slate-900: #0f172a;
+  --primitive-slate-600: #475569;
+  --primitive-slate-400: #94a3b8;
+  --primitive-slate-200: #e2e8f0;
+  --primitive-slate-100: #f1f5f9;
+  --primitive-white: #ffffff;
+
+  --primitive-danger-600: #dc2626;
+  --primitive-success-600: #15803d;
+  --primitive-success-100: #dcfce7;
+
+  --primitive-radius-sm: 12px;
+  --primitive-radius-md: 16px;
+  --primitive-radius-lg: 20px;
+  --primitive-radius-xl: 24px;
+  --primitive-radius-pill: 999px;
+
+  --primitive-shadow-clay:
+    inset 0 1px 0 rgba(255, 255, 255, 0.7), 0 1px 2px rgba(30, 27, 75, 0.06),
+    0 8px 24px -12px rgba(79, 70, 229, 0.25);
+  --primitive-shadow-clay-lg:
+    inset 0 1px 0 rgba(255, 255, 255, 0.7), 0 2px 4px rgba(30, 27, 75, 0.06),
+    0 16px 40px -16px rgba(79, 70, 229, 0.35);
+
+  --primitive-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --primitive-duration: 200ms;
+}
+
+/* ── 2. Semantic (propósito) ── */
+:root {
+  --color-primary: var(--primitive-indigo-600);
+  --color-primary-strong: var(--primitive-indigo-700);
+  --color-primary-ink: var(--primitive-indigo-950);
+  --color-on-primary: var(--primitive-white);
+
+  --color-secondary: var(--primitive-teal-600);
+  --color-secondary-soft: var(--primitive-teal-100);
+  --color-on-secondary: var(--primitive-white);
+
+  --color-accent: var(--primitive-amber-500);
+  --color-accent-strong: var(--primitive-amber-600);
+  --color-accent-soft: var(--primitive-amber-100);
+  --color-on-accent: var(--primitive-white);
+
+  --color-background: #f4f5fd;
+  --color-background-alt: var(--primitive-indigo-50);
+  --color-foreground: var(--primitive-indigo-950);
+  --color-card: var(--primitive-white);
+  --color-card-foreground: var(--primitive-indigo-950);
+  --color-muted: var(--primitive-slate-100);
+  --color-muted-foreground: var(--primitive-slate-600);
+  --color-border: var(--primitive-indigo-200);
+  --color-border-strong: var(--primitive-indigo-400);
+  --color-ring: var(--primitive-indigo-600);
+
+  --color-success: var(--primitive-success-600);
+  --color-success-bg: var(--primitive-success-100);
+  --color-destructive: var(--primitive-danger-600);
+
+  --font-display: "Baloo 2", "Nunito", "Segoe UI", system-ui, sans-serif;
+  --font-body: "Nunito", "Segoe UI", system-ui, -apple-system, sans-serif;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+}
+
+/* ── 3. Component (específico) ── */
+:root {
+  --btn-primary-bg: var(--color-primary);
+  --btn-primary-fg: var(--color-on-primary);
+  --btn-primary-hover: var(--color-primary-strong);
+  --btn-accent-bg: var(--color-accent);
+  --btn-accent-fg: var(--color-on-accent);
+
+  --card-bg: var(--color-card);
+  --card-fg: var(--color-card-foreground);
+  --card-border: var(--color-border);
+  --card-radius: var(--primitive-radius-lg);
+  --card-shadow: var(--primitive-shadow-clay);
+
+  --input-bg: var(--primitive-white);
+  --input-border: var(--color-border);
+  --input-radius: var(--primitive-radius-md);
+
+  --nav-active-bg: var(--color-primary);
+  --nav-active-fg: var(--primitive-white);
+  --nav-hover-bg: var(--primitive-indigo-100);
+
+  --badge-unread-bg: var(--color-accent);
+  --badge-count-bg: var(--primitive-indigo-100);
+}

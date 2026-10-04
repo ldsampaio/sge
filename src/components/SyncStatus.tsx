@@ -1,7 +1,8 @@
 import { useEffect, useState, useRef } from "react";
 import { invoke, Channel } from "@tauri-apps/api/core";
+import { IconSync } from "./icons";
 
-interface SyncStatus {
+interface SyncStatusInfo {
   mailbox: string;
   last_sync_at: string;
   uid_validity: number;
@@ -12,10 +13,9 @@ interface SyncStatus {
 type Status =
   | { kind: "idle" }
   | { kind: "syncing"; progress: string }
-  | { kind: "synced"; status: SyncStatus }
+  | { kind: "synced"; status: SyncStatusInfo }
   | { kind: "error"; message: string };
 
-// Shape of events streamed from the backend SyncEvent enum.
 interface BatchStartedEvent {
   BatchStarted: { range: string; server_total: number };
 }
@@ -26,12 +26,25 @@ interface BatchCompletedEvent {
   BatchCompleted: { new: number; updated: number; deleted: number };
 }
 interface SyncCompletedEvent {
-  SyncCompleted: { summary: { new: number; updated: number; unchanged: number; deleted: number; uid_validity_bump: boolean } };
+  SyncCompleted: {
+    summary: {
+      new: number;
+      updated: number;
+      unchanged: number;
+      deleted: number;
+      uid_validity_bump: boolean;
+    };
+  };
 }
 interface SyncErrorEvent {
   SyncError: { detail: string };
 }
-type SyncEvent = BatchStartedEvent | MessageSyncedEvent | BatchCompletedEvent | SyncCompletedEvent | SyncErrorEvent;
+type SyncEvent =
+  | BatchStartedEvent
+  | MessageSyncedEvent
+  | BatchCompletedEvent
+  | SyncCompletedEvent
+  | SyncErrorEvent;
 
 function hasBatchStarted(e: SyncEvent): e is BatchStartedEvent {
   return "BatchStarted" in e;
@@ -49,50 +62,51 @@ function hasSyncError(e: SyncEvent): e is SyncErrorEvent {
   return "SyncError" in e;
 }
 
-export default function SyncStatus() {
+interface SyncStatusProps {
+  onSyncComplete?: () => void;
+}
+
+export default function SyncStatus({ onSyncComplete }: SyncStatusProps) {
   const [status, setStatus] = useState<Status>({ kind: "idle" });
   const channelRef = useRef<Channel<SyncEvent> | null>(null);
+  const syncingRef = useRef(false);
 
-  // Poll sync_status on mount and after each sync completes
   async function pollStatus() {
     try {
-      const s: SyncStatus = await invoke("sync_status");
+      const s: SyncStatusInfo = await invoke("sync_status");
       setStatus({ kind: "synced", status: s });
     } catch {
       setStatus({ kind: "idle" });
     }
   }
 
-  useEffect(() => {
-    void pollStatus();
-  }, []);
-
   async function startSync() {
-    setStatus({ kind: "syncing", progress: "Starting sync…" });
+    if (syncingRef.current) return;
+    syncingRef.current = true;
+    setStatus({ kind: "syncing", progress: "Preparando a sala…" });
 
-    // Create a Channel for real-time progress events from the backend.
     const channel = new Channel<SyncEvent>();
     channelRef.current = channel;
 
     channel.onmessage = (event: SyncEvent) => {
       if (hasBatchStarted(event)) {
-        setStatus({ kind: "syncing", progress: `Fetching ${event.BatchStarted.range}…` });
+        setStatus({ kind: "syncing", progress: `Buscando ${event.BatchStarted.range}…` });
       } else if (hasMessageSynced(event)) {
-        setStatus({ kind: "syncing", progress: `Message ${event.MessageSynced.uid}…` });
+        setStatus({ kind: "syncing", progress: `Aviso ${event.MessageSynced.uid}…` });
       } else if (hasBatchCompleted(event)) {
         const { new: n, updated, deleted } = event.BatchCompleted;
-        const parts = [`+${n} new`];
-        if (updated) parts.push(`${updated} updated`);
-        if (deleted) parts.push(`${deleted} deleted`);
-        setStatus({ kind: "syncing", progress: parts.join(", ") });
+        const parts = [`+${n} novos`];
+        if (updated) parts.push(`${updated} atualizados`);
+        if (deleted) parts.push(`${deleted} removidos`);
+        setStatus({ kind: "syncing", progress: parts.join(" · ") });
       } else if (hasSyncCompleted(event)) {
         const { new: n, updated, unchanged, deleted } = event.SyncCompleted.summary;
-        const parts = [`${n} new`];
-        if (updated) parts.push(`${updated} updated`);
-        if (unchanged) parts.push(`${unchanged} unchanged`);
-        if (deleted) parts.push(`${deleted} deleted`);
-        setStatus({ kind: "syncing", progress: `Done: ${parts.join(", ")}` });
-        void pollStatus();
+        const parts = [`${n} novos`];
+        if (updated) parts.push(`${updated} atualizados`);
+        if (unchanged) parts.push(`${unchanged} já lidos`);
+        if (deleted) parts.push(`${deleted} removidos`);
+        setStatus({ kind: "syncing", progress: `Pronto: ${parts.join(" · ")}` });
+        void pollStatus().then(() => onSyncComplete?.());
       } else if (hasSyncError(event)) {
         setStatus({ kind: "error", message: event.SyncError.detail });
       }
@@ -100,11 +114,12 @@ export default function SyncStatus() {
 
     try {
       await invoke("start_sync", { onEvent: channel });
-      // Final status poll after sync completes
       await pollStatus();
+      onSyncComplete?.();
     } catch (err) {
       setStatus({ kind: "error", message: String(err) });
     } finally {
+      syncingRef.current = false;
       channelRef.current = null;
     }
   }
@@ -118,49 +133,58 @@ export default function SyncStatus() {
     setStatus({ kind: "idle" });
   }
 
+  useEffect(() => {
+    void pollStatus();
+  }, []);
+
   return (
-    <div>
-      <h2>Sync Status</h2>
-      {status.kind === "idle" && <p>Not connected — log in first.</p>}
+    <div className="sync-status" aria-label="Sincronização da sala">
+      <div className="sync-status-main">
+        <h2>Sincronização da caixa</h2>
+        {status.kind === "idle" && <p>Ainda não sincronizado — entre e busque.</p>}
 
-      {status.kind === "synced" && (
-        <div>
-          <p>
-            {status.status.last_sync_at
-              ? `Up to date — last synced ${status.status.last_sync_at}`
-              : "Offline — never synced"}
-          </p>
-          <p>
-            INBOX: {status.status.message_count} messages, UID next {status.status.uid_next}
-          </p>
-        </div>
+        {status.kind === "synced" && (
+          <>
+            <p>
+              {status.status.last_sync_at
+                ? `Em dia · última busca ${status.status.last_sync_at}`
+                : "Offline · nunca sincronizado"}
+            </p>
+            <p className="sub">
+              {status.status.message_count}{" "}
+              {status.status.message_count === 1 ? "aviso guardado" : "avisos guardados"} para
+              estudar offline
+            </p>
+          </>
+        )}
+
+        {status.kind === "syncing" && (
+          <>
+            <p role="status">{status.progress}</p>
+            <div className="sync-progress" aria-hidden="true">
+              <span />
+            </div>
+          </>
+        )}
+
+        {status.kind === "error" && <p role="alert">Falha na busca: {status.message}</p>}
+      </div>
+
+      {status.kind === "syncing" ? (
+        <button type="button" onClick={() => void cancelSync()}>
+          Pausar
+        </button>
+      ) : (
+        <button type="button" onClick={() => void startSync()}>
+          <IconSync size={15} />
+          Buscar mensagens
+        </button>
       )}
-
-      {status.kind === "syncing" && (
-        <div>
-          <p>{status.progress}</p>
-          <button type="button" onClick={() => void cancelSync()}>
-            Cancel
-          </button>
-        </div>
-      )}
-
       {status.kind === "error" && (
-        <div>
-          <p role="alert">Sync error: {status.message}</p>
-          <button type="button" onClick={() => void startSync()}>
-            Retry
-          </button>
-        </div>
+        <button type="button" onClick={() => void startSync()}>
+          Tentar de novo
+        </button>
       )}
-
-      <button
-        type="button"
-        onClick={() => void startSync()}
-        disabled={status.kind === "syncing"}
-      >
-        {status.kind === "syncing" ? "Syncing…" : "Sync Now"}
-      </button>
     </div>
   );
 }

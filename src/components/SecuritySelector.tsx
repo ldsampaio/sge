@@ -62,8 +62,8 @@ export default function SecuritySelector({
       </label>
       {mode === "plain" && (
         <p role="alert">
-          Warning: unencrypted mode sends your password without protection and
-          works for localhost servers only. Remote hosts are always refused.
+          Warning: unencrypted mode sends your password without protection and works for localhost
+          servers only. Remote hosts are always refused.
         </p>
       )}
       <details>

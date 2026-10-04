@@ -180,6 +180,10 @@ mod tests {
             Box::pin(async move { Ok(summary) })
         }
 
+        fn search_uids(&mut self) -> PinBox<'_, Result<Vec<u32>, SyncError>> {
+            Box::pin(async move { Ok(vec![1]) })
+        }
+
         fn fetch_envelopes<'a>(
             &'a mut self,
             _range: &'a str,
