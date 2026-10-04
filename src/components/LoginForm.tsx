@@ -31,7 +31,7 @@ const OUTSIDE_DESKTOP_MESSAGE =
 
 function isTauriRuntime(): boolean {
   const w = window as unknown as Record<string, unknown>;
-  return w["__TAURI_INTERNALS__"] !== undefined || w["__TAURI__"] !== undefined;
+  return w["__TAURI_INTERNALS__"] !== undefined || w["__TAURI__"] !== null;
 }
 
 /** Translate a raw missing-runtime TypeError into the plain-language message. */
@@ -44,8 +44,10 @@ function toPlainError(err: unknown): string {
 }
 
 /**
- * SGE login form (locked decisions D-server-prefill, D-security-ui,
- * D-show-hide, D-single-connect, D-failure, D-remember, D-demo).
+ * SGE login form.
+ *
+ * Field order: Username → Password → Server → IMAP Security → Connect →
+ * Forget saved login → Remember me.
  *
  * Single Connect button: validates, connects, SELECTs INBOX, and shows the
  * real connection state. Failures surface the backend typed error verbatim
@@ -65,8 +67,7 @@ export default function LoginForm({ onConnect }: { onConnect?: () => void }) {
   const [keyringHint, setKeyringHint] = useState<string | null>(null);
   const [forgetNote, setForgetNote] = useState<string | null>(null);
 
-  // Reload remembered credentials once on launch (no auto-connect here —
-  // auto-login stays in Phase 5; the user still presses Connect).
+  // Auto-connect only runs in App.tsx; LoginForm just fills remembered values.
   useEffect(() => {
     if (!isTauriRuntime()) {
       setKeyringHint(OUTSIDE_DESKTOP_MESSAGE);
@@ -82,7 +83,6 @@ export default function LoginForm({ onConnect }: { onConnect?: () => void }) {
         }
       })
       .catch(() => {
-        // Keyring unavailable: stay memory-only, fields keep their defaults.
         if (!cancelled) {
           setKeyringHint(
             "Saved login unavailable — keyring locked? Continuing without remembered credentials.",
@@ -127,7 +127,7 @@ export default function LoginForm({ onConnect }: { onConnect?: () => void }) {
         username: username.trim(),
         password,
       });
-      // Persist server config so start_sync can reconnect (Phase 2 requires it).
+      // Persist server config so start_sync can reconnect.
       try {
         await invoke("save_server_config", {
           host: server.trim(),
@@ -190,30 +190,16 @@ export default function LoginForm({ onConnect }: { onConnect?: () => void }) {
     status.kind === "error" && status.message.includes("TLS verification failed");
 
   return (
-    <div>
+    <div className="login-form-container">
       <form
         onSubmit={(e) => {
           e.preventDefault();
           void connect();
         }}
       >
+        {/* 1. Username */}
         <label>
-          Server
-          <input
-            id="server-input"
-            value={server}
-            onChange={(e) => setServer(e.currentTarget.value)}
-            autoComplete="off"
-          />
-        </label>
-        <SecuritySelector
-          mode={mode}
-          port={port}
-          onModeChange={handleModeChange}
-          onPortChange={setPort}
-        />
-        <label>
-          Username
+          Usuario
           <input
             id="username-input"
             value={username}
@@ -221,56 +207,86 @@ export default function LoginForm({ onConnect }: { onConnect?: () => void }) {
             autoComplete="username"
           />
         </label>
+
+        {/* 2. Password with built-in show/hide toggle */}
         <label>
-          Password
+          Senha
+          <div className="password-field">
+            <input
+              id="password-input"
+              type={showPassword ? "text" : "password"}
+              value={password}
+              onChange={(e) => setPassword(e.currentTarget.value)}
+              autoComplete="current-password"
+            />
+            <button
+              type="button"
+              className="password-toggle"
+              aria-label={showPassword ? "Ocultar senha" : "Mostrar senha"}
+              onClick={() => setShowPassword((v) => !v)}
+            >
+              {showPassword ? "Ocultar" : "Mostrar"}
+            </button>
+          </div>
+        </label>
+
+        {/* 3. Server */}
+        <label>
+          Servidor
           <input
-            id="password-input"
-            type={showPassword ? "text" : "password"}
-            value={password}
-            onChange={(e) => setPassword(e.currentTarget.value)}
-            autoComplete="current-password"
+            id="server-input"
+            value={server}
+            onChange={(e) => setServer(e.currentTarget.value)}
+            autoComplete="off"
           />
         </label>
-        <button
-          type="button"
-          aria-label={showPassword ? "Hide password" : "Show password"}
-          onClick={() => setShowPassword((v) => !v)}
-        >
-          {showPassword ? "Hide" : "Show"}
+
+        {/* 4. IMAP Security options */}
+        <SecuritySelector
+          mode={mode}
+          port={port}
+          onModeChange={handleModeChange}
+          onPortChange={setPort}
+        />
+
+        {/* 5. Connect button */}
+        <button type="submit" disabled={status.kind === "connecting"}>
+          {status.kind === "connecting" ? "Conectando…" : "Conectar"}
         </button>
-        <label>
+
+        {/* 6. Forget saved login */}
+        <button type="button" onClick={() => void forgetSaved()}>
+          Esquecer login salvo
+        </button>
+
+        {/* 7. Other options */}
+        <label className="checkbox-row">
           <input
             type="checkbox"
             checked={rememberMe}
             onChange={(e) => setRememberMe(e.currentTarget.checked)}
           />
-          Remember me (save username and password in the OS keyring)
+          Lembrar me (salvar usuario e senha no keyring do SO)
         </label>
-        <button type="submit" disabled={status.kind === "connecting"}>
-          {status.kind === "connecting" ? "Connecting…" : "Connect"}
-        </button>
-        <button type="button" onClick={() => void forgetSaved()}>
-          Forget saved login
-        </button>
       </form>
-      {keyringHint && <p>{keyringHint}</p>}
-      {forgetNote && <p>{forgetNote}</p>}
 
-      {status.kind === "connecting" && <p>Connecting…</p>}
+      {keyringHint && <p className="hint">{keyringHint}</p>}
+      {forgetNote && <p className="hint">{forgetNote}</p>}
+
+      {status.kind === "connecting" && <p className="status">Conectando…</p>}
 
       {status.kind === "success" && (
-        <div>
+        <div className="status-success">
           <p>
-            Connected: {status.summary.selected_mailbox} (
-            {status.summary.exists} messages, UIDVALIDITY{" "}
+            Conectado: {status.summary.selected_mailbox} ({status.summary.exists} messages, UIDVALIDITY{" "}
             {status.summary.uid_validity})
           </p>
-          {status.keyringNote && <p>{status.keyringNote}</p>}
+          {status.keyringNote && <p className="keyring-note">{status.keyringNote}</p>}
         </div>
       )}
 
       {status.kind === "error" && (
-        <div>
+        <div className="status-error">
           <p role="alert">Connection failed: {status.message}</p>
           {isTlsError && (
             <p role="alert">

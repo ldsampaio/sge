@@ -29,7 +29,7 @@ export default function SecuritySelector({
 }: SecuritySelectorProps) {
   return (
     <fieldset>
-      <legend>Security</legend>
+      <legend>Segurança (IMAP)</legend>
       <label>
         <input
           type="radio"

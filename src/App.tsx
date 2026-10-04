@@ -1,15 +1,9 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import LoginForm from "./components/LoginForm";
-import SecuritySelector from "./components/SecuritySelector";
 import SyncStatus from "./components/SyncStatus";
 import MailboxView from "./components/MailboxView";
 import "./App.css";
-
-function isTauriRuntime(): boolean {
-  const w = window as unknown as Record<string, unknown>;
-  return w["__TAURI_INTERNALS__"] !== undefined || w["__TAURI__"] !== undefined;
-}
 
 interface SavedCredentials {
   username: string;
@@ -28,22 +22,15 @@ interface ConnectSummary {
   exists: number;
 }
 
-type SecurityMode = "implicit_tls" | "starttls" | "plain";
+function isTauriRuntime(): boolean {
+  const w = window as unknown as Record<string, unknown>;
+  return w["__TAURI_INTERNALS__"] !== undefined || w["__TAURI__"] !== undefined;
+}
 
 function App() {
   const outsideDesktop = !isTauriRuntime();
-  const [mode, setMode] = useState<SecurityMode>("implicit_tls");
-  const [port, setPort] = useState(993);
   const [connected, setConnected] = useState(false);
   const [autoConnecting, setAutoConnecting] = useState(false);
-
-  useEffect(() => {
-    // Persist the user's security+port choice across sessions.
-    const saved = localStorage.getItem("sge-security-mode");
-    if (saved === "starttls" || saved === "plain") setMode(saved);
-    const savedPort = localStorage.getItem("sge-security-port");
-    if (savedPort) setPort(Number(savedPort));
-  }, []);
 
   // Phase 5: Auto-connect on launch when saved credentials exist.
   // Loads from keyring → connect_account → start_sync.
@@ -93,14 +80,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, []);
-
-  function handleModeChange(next: SecurityMode) {
-    setMode(next);
-    setPort(next === "implicit_tls" ? 993 : 143);
-    localStorage.setItem("sge-security-mode", next);
-    localStorage.setItem("sge-security-port", String(next === "implicit_tls" ? 993 : 143));
-  }
+  }, [connected, autoConnecting]);
 
   function handleConnect() {
     setConnected(true);
@@ -112,7 +92,7 @@ function App() {
 
   return (
     <main className="container">
-      <h1>SGE</h1>
+      <h1>Sistema de Gestão de E-mail</h1>
       {outsideDesktop && (
         <p role="alert">
           SGE is running outside its desktop window — launch with `npm run
@@ -120,13 +100,12 @@ function App() {
         </p>
       )}
       {!connected && autoConnecting && (
-        <p className="auto-connect-note">Connecting to your mail…</p>
+        <p className="auto-connect-note">Conectando sua caixa de entrada…</p>
       )}
       {!connected && !autoConnecting ? (
         <>
-          <SecuritySelector mode={mode} port={port} onModeChange={handleModeChange} onPortChange={setPort} />
-          <LoginForm onConnect={handleConnect} />
           <SyncStatus />
+          <LoginForm onConnect={handleConnect} />
         </>
       ) : (
         <>
@@ -136,7 +115,7 @@ function App() {
             onClick={handleDisconnect}
             title="Disconnect and return to login"
           >
-            ← Change account
+            ← Mudar conta
           </button>
           <MailboxView />
         </>
