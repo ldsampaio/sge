@@ -1,40 +1,48 @@
-/* MailboxView — three-pane layout (Phase 3) */
+/* ──────────────────────────────────────────────
+   SGE MailboxView — Codemaster design system
+   Offline Black canvas, Spark Yellow accents,
+   Readex Pro font (SemiBold headlines, Light body)
+   ────────────────────────────────────────────── */
 
-.mailbox-layout {
-  display: flex;
-  flex-direction: column;
+/* ── Three-pane layout ── */
+.mailbox-view {
+  display: grid;
+  grid-template-columns: 240px 1fr 360px;
   height: calc(100vh - 80px);
-  overflow: hidden;
+  gap: 16px;
+  background: var(--offline);
 }
 
 .mailbox-header {
   padding: 12px 16px;
-  border-bottom: 1px solid var(--border, #e0e0e0);
+  border-bottom: 1.5px solid var(--spark);
   display: flex;
   align-items: center;
   justify-content: space-between;
-  background: var(--card, #ffffff);
+  background: var(--deep-offline);
 }
 
-.mailbox-header h2 {
+.mailbox-header h1 {
   margin: 0;
-  font-size: 18px;
+  font-size: 20px;
   font-weight: 600;
+  color: var(--spark);
 }
 
 .mailbox-panes {
   display: flex;
   flex: 1;
   overflow: hidden;
+  gap: 16px;
 }
 
 /* ── Sidebar ── */
-
 .sidebar {
   width: 240px;
   min-width: 240px;
-  background: var(--card, #ffffff);
-  border-right: 1px solid var(--border, #e0e0e0);
+  background: var(--raised-offline);
+  border: 1.5px solid var(--spark);
+  border-radius: 16px;
   overflow-y: auto;
 }
 
@@ -54,49 +62,108 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 14px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--online);
+  transition: background-color 0.2s, color 0.2s;
+  border-radius: 999px;
+  margin: 0 12px;
 }
 
 .sidebar-item:hover {
-  background-color: var(--accent-hover, #f0f0f0);
+  background: var(--spark);
+  color: var(--offline);
 }
 
 .sidebar-item.active {
-  background-color: var(--accent, #e8f0fe);
-  color: var(--accent, #4285e8);
-  font-weight: 600;
+  background: var(--spark);
+  color: var(--offline);
 }
 
 .sidebar-icon {
   font-size: 16px;
 }
 
+.sidebar-label {
+  flex: 1;
+}
+
 .sidebar-badge {
   margin-left: auto;
-  background: var(--muted, #e0e0e0);
-  border-radius: 10px;
-  padding: 1px 8px;
+  background: var(--graphite);
+  color: var(--online);
+  border-radius: 999px;
+  padding: 1px 10px;
   font-size: 12px;
   font-weight: 600;
+  min-width: 24px;
+  text-align: center;
+}
+
+.sidebar-item.active .sidebar-badge {
+  background: var(--offline);
+  color: var(--spark);
 }
 
 /* ── Message panel ── */
-
 .message-panel {
   flex: 1;
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  background: var(--card, #ffffff);
+  background: var(--raised-offline);
+  border: 1.5px solid var(--spark);
+  border-radius: 16px;
 }
 
 .message-list-header {
   padding: 8px 12px;
-  border-bottom: 1px solid var(--border, #e0e0e0);
-  background: var(--card, #ffffff);
-  position: sticky;
-  top: 0;
-  z-index: 1;
+  border-bottom: 1.5px solid var(--spark);
+  background: var(--deep-offline);
+}
+
+.search-bar-container {
+  position: relative;
+  display: flex;
+  align-items: center;
+  background: var(--raised-offline);
+  border: 1px solid var(--graphite);
+  border-radius: 999px;
+  padding: 8px 16px;
+  transition: border-color 0.2s;
+}
+
+.search-bar-container:focus-within {
+  border-color: var(--spark);
+}
+
+.search-input {
+  flex: 1;
+  border: none;
+  background: transparent;
+  color: var(--online);
+  font-family: inherit;
+  font-weight: 300;
+  font-size: 15px;
+  outline: none;
+}
+
+.search-input::placeholder {
+  color: var(--fog);
+}
+
+.search-clear {
+  background: transparent;
+  border: none;
+  color: var(--fog);
+  font-size: 20px;
+  cursor: pointer;
+  padding: 0 6px;
+  line-height: 1;
+}
+
+.search-clear:hover {
+  color: var(--spark);
 }
 
 .search-placeholder {
@@ -104,44 +171,53 @@
   justify-content: space-between;
   align-items: center;
   font-size: 13px;
-  color: var(--muted-foreground, #666);
+  color: var(--fog);
 }
 
 .message-count {
-  font-weight: 500;
+  font-weight: 600;
+  color: var(--spark);
 }
 
+/* ── Message list ── */
 .message-list {
   flex: 1;
   overflow-y: auto;
   overflow-x: hidden;
+  padding: 4px;
 }
 
 .message-row {
   width: 100%;
   text-align: left;
-  padding: 8px 12px;
+  padding: 10px 14px;
   border: none;
-  background: none;
+  background: transparent;
   cursor: pointer;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  border-bottom: 1px solid var(--border, #f0f0f0);
-  transition: background-color 0.1s;
+  display: grid;
+  grid-template-columns: 8px 1fr auto 80px;
+  align-items: start;
+  gap: 8px 12px;
+  border-radius: 12px;
+  transition: background-color 0.2s;
+  font-family: "Readex Pro", Arial, sans-serif;
 }
 
 .message-row:hover {
-  background-color: var(--hover, #f5f5f5);
+  background: var(--graphite);
 }
 
 .message-row.selected {
-  background-color: var(--accent, #e8f0fe);
+  background: rgba(251, 186, 0, 0.1);
 }
 
-.message-row.unread .message-sender,
-.message-row.unread .message-subject {
+.message-row.unread {
   font-weight: 600;
+}
+
+.message-row.read {
+  font-weight: 300;
+  opacity: 0.8;
 }
 
 .unread-dot {
@@ -152,40 +228,43 @@
 }
 
 .unread-dot.unread {
-  background-color: var(--accent, #4285e8);
+  background: var(--spark);
 }
 
 .unread-dot.read {
-  background-color: transparent;
+  background: var(--graphite);
 }
 
 .message-sender {
   font-size: 13px;
+  font-weight: 600;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  min-width: 120px;
+  min-width: 0;
+  color: var(--online);
 }
 
 .message-subject {
   font-size: 13px;
-  color: var(--muted-foreground, #444);
+  color: var(--online);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   flex: 1;
+  min-width: 0;
 }
 
 .message-date {
   font-size: 12px;
-  color: var(--muted-foreground, #888);
+  color: var(--fog);
   white-space: nowrap;
-  margin-left: 8px;
 }
 
 .attachment-icon {
   margin-left: 4px;
   font-size: 12px;
+  color: var(--fog);
 }
 
 .list-empty,
@@ -194,21 +273,20 @@
 .list-end {
   padding: 24px 16px;
   text-align: center;
-  color: var(--muted-foreground, #666);
+  color: var(--fog);
   font-size: 13px;
+  font-weight: 300;
 }
 
 .list-error p {
-  color: #d32f2f;
+  color: var(--fog);
 }
 
 /* ── Reading pane ── */
-
 .reading-pane {
-  width: 360px;
-  min-width: 360px;
-  background: var(--card, #ffffff);
-  border-left: 1px solid var(--border, #e0e0e0);
+  background: var(--raised-offline);
+  border: 1.5px solid var(--spark);
+  border-radius: 16px;
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -223,36 +301,47 @@
   justify-content: center;
 }
 
+.reading-loading {
+  padding: 48px 24px;
+  text-align: center;
+  color: var(--fog);
+  font-size: 14px;
+  font-weight: 300;
+}
+
 .reading-placeholder {
-  color: var(--muted-foreground, #888);
+  color: var(--fog);
   font-size: 14px;
   text-align: center;
   padding: 16px;
+  font-weight: 300;
 }
 
 .reading-error {
-  color: #d32f2f;
+  color: var(--fog);
   font-size: 13px;
   text-align: center;
   padding: 16px;
+  font-weight: 300;
 }
 
-/* Header */
 .reading-header {
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--border, #e0e0e0);
+  padding: 16px 20px;
+  border-bottom: 1.5px solid var(--spark);
+  background: var(--deep-offline);
+  border-radius: 16px 16px 0 0;
 }
 
 .reading-subject {
   margin: 0 0 8px 0;
-  font-size: 17px;
+  font-size: 18px;
   font-weight: 600;
-  color: var(--foreground, #0f0f0f);
+  color: var(--online);
 }
 
 .reading-subject em {
-  font-weight: 400;
-  color: var(--muted-foreground, #888);
+  font-weight: 300;
+  color: var(--fog);
 }
 
 .reading-meta {
@@ -260,41 +349,43 @@
   flex-direction: column;
   gap: 2px;
   font-size: 12px;
-  color: var(--muted-foreground, #666);
+  color: var(--fog);
+  font-weight: 300;
 }
 
 .reading-meta span {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  min-width: 0;
 }
 
-/* Attachments */
 .reading-attachments {
-  padding: 8px 16px;
-  border-bottom: 1px solid var(--border, #e0e0e0);
+  padding: 12px 20px;
+  border-bottom: 1.5px solid var(--spark);
   display: flex;
-  flex-direction: column;
-  gap: 4px;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .attachment-btn {
-  background: none;
-  border: 1px solid var(--border, #e0e0e0);
-  border-radius: 4px;
-  padding: 4px 8px;
-  font-size: 12px;
-  color: var(--foreground, #0f0f0f);
+  background: transparent;
+  color: var(--spark);
+  border: 1.5px solid var(--spark);
+  border-radius: 999px;
+  padding: 8px 16px;
+  font-size: 14px;
+  font-weight: 600;
   cursor: pointer;
-  text-align: left;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  transition: border-color 0.15s;
+  transition: background-color 0.2s, color 0.2s;
 }
 
 .attachment-btn:hover {
-  border-color: var(--accent, #4285e8);
+  background: var(--spark);
+  color: var(--offline);
 }
 
 .attachment-btn:disabled {
@@ -302,7 +393,6 @@
   cursor: default;
 }
 
-/* Body */
 .reading-body {
   flex: 1;
   overflow: hidden;
@@ -311,55 +401,60 @@
 
 .reading-iframe {
   width: 100%;
-  height: 100%;
+  height: calc(100vh - 80px - 40px - 48px - 56px - 60px - 48px);
   border: none;
+  background: var(--offline);
+  border-radius: 0 0 16px 16px;
 }
 
 .reading-text {
   margin: 0;
   padding: 16px;
-  font-size: 13px;
+  font-size: 15px;
   line-height: 1.6;
+  font-weight: 300;
   white-space: pre-wrap;
   word-break: break-word;
-  color: var(--foreground, #0f0f0f);
+  color: var(--online);
   background: none;
   border: none;
   overflow: auto;
-  font-family: inherit;
+  font-family: "Readex Pro", Arial, sans-serif;
+  outline: none;
 }
 
-/* Loading / empty states */
-.reading-loading {
-  padding: 24px 16px;
-  text-align: center;
-  color: var(--muted-foreground, #666);
+/* ── Sync status (embedded in mailbox-header) ── */
+.sync-status h2 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--spark);
+}
+
+.sync-status p {
   font-size: 13px;
+  font-weight: 300;
+  color: var(--fog);
 }
 
-/* Dark mode */
-@media (prefers-color-scheme: dark) {
-  .mailbox-header,
-  .sidebar,
-  .message-panel,
-  .reading-pane,
-  .message-list-header {
-    background: var(--card, #1a1a1a);
-  }
+.sync-status button {
+  background: transparent;
+  color: var(--spark);
+  border: 1.5px solid var(--spark);
+  border-radius: 999px;
+  padding: 8px 16px;
+  font-weight: 600;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background-color 0.2s, color 0.2s;
+}
 
-  .sidebar-item:hover {
-    background-color: var(--hover, #2a2a2a);
-  }
+.sync-status button:hover {
+  background: var(--spark);
+  color: var(--offline);
+}
 
-  .sidebar-item.active {
-    background-color: var(--accent, #1a3a5a);
-  }
-
-  .message-row:hover {
-    background-color: var(--hover, #2a2a2a);
-  }
-
-  .message-row.selected {
-    background-color: var(--accent, #1a3a5a);
-  }
+.sync-status button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
