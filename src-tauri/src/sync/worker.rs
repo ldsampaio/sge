@@ -276,6 +276,9 @@ mod tests {
         pub envelopes: Vec<MessageHeader>,
         pub fetch_calls: AtomicUsize,
         pub logout_called: AtomicBool,
+        /// Recorded `(uid, seen)` pairs from `set_seen` — asserts the flag
+        /// path addresses messages by UID (T-6-01), never by sequence number.
+        pub set_seen_calls: Vec<(u32, bool)>,
     }
 
     impl SyncSession for MockSession {
@@ -300,6 +303,11 @@ mod tests {
 
         fn fetch_body(&mut self, _uid: u32) -> PinBox<'_, Result<Vec<u8>, SyncError>> {
             Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn set_seen(&mut self, uid: u32, seen: bool) -> PinBox<'_, Result<(), SyncError>> {
+            self.set_seen_calls.push((uid, seen));
+            Box::pin(async move { Ok(()) })
         }
 
         fn logout(&mut self) -> PinBox<'_, Result<(), SyncError>> {
@@ -334,6 +342,7 @@ mod tests {
             envelopes,
             fetch_calls: AtomicUsize::new(0),
             logout_called: AtomicBool::new(false),
+            set_seen_calls: Vec::new(),
         }
     }
 
@@ -503,5 +512,31 @@ mod tests {
         assert_eq!(result.new, 0);
         assert_eq!(result.deleted, 0);
         assert!(!result.uid_validity_bump);
+    }
+
+    /// The mock flag path records UID-addressed writes (T-6-01): the UID
+    /// reaching `set_seen` is the message UID from the local DB row, and
+    /// no sequence-number store call exists on any flag path.
+    #[test]
+    fn mock_set_seen_records_uid_store_calls() {
+        let summary = MailboxSummary {
+            selected_mailbox: "INBOX".to_string(),
+            uid_validity: 100,
+            uid_next: Some(4),
+            exists: 3,
+        };
+        let mut session = mock(summary, vec![mkhdr(1), mkhdr(2), mkhdr(3)]);
+
+        async_std::task::block_on(async {
+            session.set_seen(42, true).await.unwrap();
+            session.set_seen(42, false).await.unwrap();
+            session.set_seen(7, true).await.unwrap();
+        });
+
+        assert_eq!(
+            session.set_seen_calls,
+            vec![(42, true), (42, false), (7, true)],
+            "flag writes must carry the message UID, never a sequence number"
+        );
     }
 }

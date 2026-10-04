@@ -73,6 +73,10 @@ impl SyncSession for MockSession {
         Box::pin(async move { Ok(body.into_bytes()) })
     }
 
+    fn set_seen(&mut self, _uid: u32, _seen: bool) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SyncError>> + Send>> {
+        Box::pin(async move { Ok(()) })
+    }
+
     fn logout(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SyncError>> + Send>> {
         Box::pin(async move { Ok(()) })
     }

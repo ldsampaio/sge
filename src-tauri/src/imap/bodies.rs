@@ -197,6 +197,10 @@ mod tests {
             Box::pin(async move { Ok(body) })
         }
 
+        fn set_seen(&mut self, _uid: u32, _seen: bool) -> PinBox<'_, Result<(), SyncError>> {
+            Box::pin(async move { Ok(()) })
+        }
+
         fn logout(&mut self) -> PinBox<'_, Result<(), SyncError>> {
             Box::pin(async move { Ok(()) })
         }

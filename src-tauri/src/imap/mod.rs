@@ -5,14 +5,17 @@
 //! dedicated blocking thread via `async_std::task::block_on` — never on the
 //! Tauri tokio runtime threads.
 //!
-//! M1 read-only invariant: this module issues only SELECT plus read-only
-//! probes (CAPABILITY, NAMESPACE, LIST, STATUS). No flag writes, no
-//! full-message fetch — bodies arrive in later phases and use peek-only
-//! fetches, so M1 never sets `\Seen` on the server.
+//! M1 read-only invariant (lifted in Phase 6): this module issued only
+//! SELECT plus read-only probes (CAPABILITY, NAMESPACE, LIST, STATUS).
+//! The first and only write verb is [`SyncSession::set_seen`] — UID STORE
+//! `\Seen` behind [`manager::SessionManager`]. No full-message fetch sets
+//! flags: bodies always use peek-only fetches, so background sync never
+//! sets `\Seen` on the server.
 
 pub mod bodies;
 pub mod errors;
 pub mod headers;
+pub mod manager;
 pub mod probe;
 pub mod session;
 
@@ -241,15 +244,16 @@ impl From<async_imap::error::Error> for SyncError {
     }
 }
 
-/// Object-safe trait abstracting a read-only IMAP INBOX session.
+/// Object-safe trait abstracting an IMAP INBOX session.
 ///
 /// Implemented by:
 /// - [`BoxedSession`] — real IMAP session (Phase 1 connection core)
 /// - `MockSession` (in `sync::worker::tests`) — deterministic fixture
 ///
-/// All methods are read-only (ENVELOPE sweeps, `BODY.PEEK[]` bodies,
-/// SELECT, LOGOUT). `STORE`, `EXPUNGE`, and `APPEND` are **never**
-/// exposed, honoring the M1 read-only invariant (D-flags: T-02-01).
+/// Reads are ENVELOPE sweeps, `BODY.PEEK[]` bodies, SELECT, LOGOUT.
+/// The single write verb is [`SyncSession::set_seen`] (UID STORE `\Seen`,
+/// Phase 6 — ends the M1 read-only era). `EXPUNGE` and `APPEND` are
+/// **never** exposed.
 pub trait SyncSession: Unpin + Send {
     /// `SELECT INBOX` — validates the mailbox is selectable and returns
     /// UIDVALIDITY / UIDNEXT / exists counts.
@@ -269,8 +273,26 @@ pub trait SyncSession: Unpin + Send {
     /// bytes for a single UID. Never sets `\\Seen`.
     fn fetch_body(&mut self, uid: u32) -> PinBox<'_, Result<Vec<u8>, SyncError>>;
 
+    /// `UID STORE <uid> ±FLAGS.SILENT (\Seen)` — set or clear the Seen
+    /// flag on exactly one message by UID. UID-only addressing: sequence
+    /// numbers must never reach this path (T-6-01).
+    fn set_seen(&mut self, uid: u32, seen: bool) -> PinBox<'_, Result<(), SyncError>>;
+
     /// Graceful `LOGOUT`.  Idempotent on error.
     fn logout(&mut self) -> PinBox<'_, Result<(), SyncError>>;
+}
+
+/// The UID STORE argument for a Seen toggle, in canonical form.
+///
+/// Exactly two variants exist — no user-input interpolation is possible
+/// (the UID travels as a `u32` formatted by the caller, never parsed from
+/// input). `.SILENT` suppresses the server's untagged FETCH replies.
+pub fn seen_store_arg(seen: bool) -> &'static str {
+    if seen {
+        "+FLAGS.SILENT (\\Seen)"
+    } else {
+        "-FLAGS.SILENT (\\Seen)"
+    }
 }
 
 impl SyncSession for BoxedSession {
@@ -337,6 +359,23 @@ impl SyncSession for BoxedSession {
                 }
             }
             Ok(Vec::new())
+        })
+    }
+
+    fn set_seen(&mut self, uid: u32, seen: bool) -> PinBox<'_, Result<(), SyncError>> {
+        Box::pin(async move {
+            let stream = self
+                .uid_store(uid.to_string(), seen_store_arg(seen))
+                .await
+                .map_err(|e| SyncError::Protocol(format!("UID STORE Seen uid {uid}: {e}")))?;
+            // The STORE silently never completes unless the returned
+            // response stream is drained to completion — a dropped stream
+            // aborts the write, so the acknowledgement is the drain.
+            let _responses: Vec<_> = stream
+                .try_collect()
+                .await
+                .map_err(|e| SyncError::Protocol(format!("UID STORE Seen uid {uid}: {e}")))?;
+            Ok(())
         })
     }
 
@@ -498,5 +537,25 @@ mod tests {
         };
         let dbg = format!("{cfg:?}");
         assert!(!dbg.contains("pw123"), "password in Debug: {dbg}");
+    }
+
+    #[test]
+    fn set_seen_store_arg_spelling() {
+        // T-6-01: UID-only STORE with the silent Seen literals — the exact
+        // wire spelling the mock-based worker tests assert against.
+        assert_eq!(seen_store_arg(true), "+FLAGS.SILENT (\\Seen)");
+        assert_eq!(seen_store_arg(false), "-FLAGS.SILENT (\\Seen)");
+    }
+
+    #[test]
+    fn set_seen_store_arg_never_sequence_addressed() {
+        // The argument carries no identifier at all — the UID travels as
+        // the separate uid_set parameter, so a sequence number can never
+        // be smuggled into the flag expression.
+        for seen in [true, false] {
+            let arg = seen_store_arg(seen);
+            assert!(!arg.contains("UID"), "flag arg must not name identifiers: {arg}");
+            assert!(arg.ends_with("(\\Seen)"), "canonical backslash-Seen form: {arg}");
+        }
     }
 }
