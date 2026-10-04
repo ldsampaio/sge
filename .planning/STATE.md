@@ -5,8 +5,8 @@ current_phase_name: Keyring + Packaging
 status: milestone-complete
 stopped_at: All 5 phases complete — Milestone 1 delivered
 last_updated: "2026-10-03T20:00:00.000Z"
-last_activity: 2026-10-03
-last_activity_desc: Phase 5 complete — auto-connect, packaging config, keyring-less fallback
+last_activity: 2026-10-04
+last_activity_desc: SGE Edu redesign shipped to main (410ba47) — educational UI, full-width layout, equal-height reader
 state_head: 7938de7a704005d4cd936b68a40bc64cdc1cdcba
 progress:
   total_phases: 5
