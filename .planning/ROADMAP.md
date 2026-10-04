@@ -2,112 +2,112 @@
 
 ## Overview
 
-From an empty repo to an installed Linux mail viewer: first a buildable Tauri shell that can SELECT INBOX on mail.utfpr.edu.br, then the headers-first sync engine persisting to SQLite, then the visible three-pane UI with offline search, then the sanitized reader with attachments, and finally keyring auto-login plus a shippable Linux bundle. Each phase is a thin MVP vertical slice — backend phases demo via CLI/fixture harness, UI phases demo in the app.
+M1 shipped a read-only INBOX viewer (Phases 1–5, archived). v1.1 Triage & Folders promotes it into a triage-capable multi-folder client: first the read/unread flag sync that ends the read-only era (with reconcile + durable outbox landing alongside the first STORE), then per-folder state and folder-tree browsing, then poll + manual refresh over one single-flight code path, and finally UID gap backfill as a convergence property of incremental sync. Each phase is a user-visible triage capability — backend hardening (SessionManager, single-flight, tombstoning) ships inside the phase that needs it, never as a standalone infra phase.
+
+**Build-order decision (researcher disagreement resolved):** Position A — flags-first wins. Rationale: (1) it matches the research-suggested phase structure (flags → folders → poll → backfill), which all four researchers agreed on as components; (2) the first STORE is the moment M1's "server overwrites local" assumption breaks, so the flag-integrity contract (UID-only addressing, pending-wins merge, durable outbox) must be designed alongside it, not retrofitted after multi-folder complexity multiplies the blast radius; (3) every phase still delivers observable user value in dependency order — per-folder state lands in Phase 7 before poll (Phase 8) and backfill (Phase 9) need it, and the INBOX regression suite stays green throughout as the `mailbox="INBOX"` case. Position B's foundation concern is honored by putting SessionManager ownership + extended SyncSession trait inside Phase 6 (flag writes need mailbox-scoped leases from day one).
+
+**Hard constraints honored across phases:**
+- All IMAP traffic flows through one SessionManager-owned session (single-flight guard ships in Phase 8, before any poll timer fires).
+- BODY.PEEK audit on all fetch paths ships in Phase 6, at the moment the read-only era ends.
+- Every sync-state field keyed per folder (Phase 7); first STORE ships with reconcile + durable outbox (Phase 6).
+- Poll timer and manual refresh share one `request_sync()` entry (Phase 8). IDLE/CONDSTORE/delete/move stay out of scope.
+
+## Milestones
+
+- ✅ **v1.0 Read-only Viewer** - Phases 1-5 (shipped 2026-10-03, archived under `.planning/milestones/archived-20261004-phases/`)
+- 🚧 **v1.1 Triage & Folders** - Phases 6-9 (in progress)
 
 ## Phases
 
 **Phase Numbering:**
-
 - Integer phases (1, 2, 3): Planned milestone work
 - Decimal phases (2.1, 2.2): Urgent insertions (marked with INSERTED)
 
 Decimal phases appear between their surrounding integers in numeric order.
 
-|- [x] **Phase 1: Scaffold + Connection** - Tauri shell that logs in and SELECTs INBOX on a real server (completed 2026-10-02)
-|- [x] **Phase 2: Sync Engine + Local Store** - Headers-first INBOX sync into SQLite with status (completed 2026-10-03)
-|- [x] **Phase 3: Mailbox UI Shell + Search** - Gmail-like three-pane UI with offline FTS search (completed 2026-10-03)
-|- [x] **Phase 4: Reader + Attachments** - Sanitized message reading with attachment download (completed 2026-10-03)
-|- [x] **Phase 5: Keyring + Packaging** - Secure auto-login and installable Linux bundle (completed 2026-10-03)
+<details>
+<summary>✅ v1.0 Read-only Viewer (Phases 1-5) - SHIPPED 2026-10-03</summary>
+
+- [x] **Phase 1: Scaffold + Connection** - Tauri shell that logs in and SELECTs INBOX on a real server
+- [x] **Phase 2: Sync Engine + Local Store** - Headers-first INBOX sync into SQLite with status
+- [x] **Phase 3: Mailbox UI Shell + Search** - Gmail-like three-pane UI with offline FTS search
+- [x] **Phase 4: Reader + Attachments** - Sanitized message reading with attachment download
+- [x] **Phase 5: Keyring + Packaging** - Secure auto-login and installable Linux bundle
+
+Full phase details archived under `.planning/milestones/archived-20261004-phases/`.
+
+</details>
+
+- [ ] **Phase 6: Flag Sync + Outbox** - Mark read/unread with server-synced Seen flags and offline queue
+- [ ] **Phase 7: Folders + Per-Folder Sync** - Browse Sent/Drafts/custom folders with unread counts
+- [ ] **Phase 8: Poll + Manual Refresh** - Periodic and on-demand refresh over one single-flight path
+- [ ] **Phase 9: UID Backfill** - No silent gaps; missed UIDs converge on incremental sync
 
 ## Phase Details
 
-### Phase 1: Scaffold + Connection
-
-**Goal**: User credentials open a real IMAP INBOX session against a configurable server
+### Phase 6: Flag Sync + Outbox
+**Goal**: User can triage read/unread state and trust it survives offline and server round-trips
 **Mode:** mvp
-**Depends on**: Nothing (first phase)
-**Requirements**: CONN-01, CONN-02
+**Depends on**: Phase 5 (M1 complete)
+**Requirements**: FLAG-01, FLAG-02
 **Success Criteria** (what must be TRUE):
-
-  1. User can enter username, password, and server (UTFPR preset mail.utfpr.edu.br) and reach INBOX SELECT successfully
-  2. User can switch security modes (ImplicitTLS 993 / STARTTLS / plain-local) and get a plain-language error on failure with retry
-  3. Live server probe captures CAPABILITY/NAMESPACE/LIST transcript so later fixtures match the real server
-
-**Plans**: 01-01 (LoginForm + connect_account), 01-02 (IMAP probe), 01-03 (keyring save/load)
+  1. User can mark a message read/unread and see the toggle apply instantly, with the Seen flag confirmed on the server after sync
+  2. User can toggle flags while offline and see them replay to the server on reconnect with a pending indicator until acknowledged
+  3. A flag toggle never flaps or lands on the wrong message when a sync runs concurrently (UID-only STORE, pending-wins reconcile)
+  4. No fetch path in the app sets \Seen as a side effect (BODY.PEEK audit holds — read-only-era regression class closed)
+**Plans**: TBD
 **UI hint**: yes
 
-### Phase 2: Sync Engine + Local Store
-
-**Goal**: INBOX headers sync incrementally into local SQLite and stay fresh across launches
+### Phase 7: Folders + Per-Folder Sync
+**Goal**: User can browse every mailbox, not just INBOX, with per-folder unread triage signals
 **Mode:** mvp
-**Depends on**: Phase 1
-**Requirements**: SYNC-01, SYNC-02
+**Depends on**: Phase 6
+**Requirements**: FOLD-01, FOLD-02, FOLD-03
 **Success Criteria** (what must be TRUE):
-
-  1. After first sync, INBOX headers are readable from local SQLite with server copies preserved (BODY.PEEK only, never sets \Seen)
-  2. Second sync is incremental (UIDVALIDITY-guarded; validity-bump triggers full resync, never silent corruption)
-  3. User sees sync progress (n/total), up-to-date timestamp, and an offline badge when reading from cache
-
-**Plans**: 02-01 (sync worker + IMAP), 02-02 (SQLite store + schema), 02-03 (status + cancel + list/search)
-**UI hint**: no
-
-### Phase 3: Mailbox UI Shell + Search
-
-**Goal**: User browses INBOX in a fast Gmail-like three-pane UI and finds mail by search, offline
-**Mode:** mvp
-**Depends on**: Phase 2
-**Requirements**: UI-01, UI-02, UI-03, SRCH-01
-**Success Criteria** (what must be TRUE):
-
-  1. User sees a three-pane layout (sidebar with INBOX node, message list, reading-pane slot) after login
-  2. User can scroll a 10k+ message list (sender, subject, date, unread dot, newest-first) without jank
-  3. User can type sender/subject search and get instant offline results from local FTS
-  4. User sees sensible empty, loading, and error states in every pane (first-run, empty INBOX, auth/TLS failure with retry)
-
-**Plans**: 03-01 (list/search_messages Tauri commands), 03-02 (three-pane UI + MessageList), 03-03 (SearchBar + state handling)
+  1. User sees the real server folder tree (Sent, Drafts, custom folders) in the sidebar, matching LIST discovery
+  2. User can open any folder and browse its messages from local cache (headers-first, same fast list as INBOX)
+  3. User sees an unread count badge per folder sourced from STATUS (UNSEEN)
+  4. A UIDVALIDITY change in one folder triggers resync of only that folder — other folders' caches are untouched
+**Plans**: TBD
 **UI hint**: yes
 
-### Phase 4: Reader + Attachments
-
-**Goal**: User reads full messages safely and saves attachments to disk
+### Phase 8: Poll + Manual Refresh
+**Goal**: User's mail stays fresh without thinking about sync and never corrupts from overlapping syncs
 **Mode:** mvp
-**Depends on**: Phase 3
-**Requirements**: READ-01, READ-02, READ-03
+**Depends on**: Phase 7
+**Requirements**: SYNC-03
 **Success Criteria** (what must be TRUE):
-
-  1. User can open a message and read RFC-decoded headers with sanitized HTML (remote images blocked) or plaintext fallback
-  2. User can see attachment names/sizes and save a file to disk via picker
-  3. User can tell read vs unread messages apart visually (display-only, no server flag writes)
-  4. Malicious mail (script/srcdoc/object payloads) renders inert with no Tauri IPC reachability
-
-**Plans**: 04-01 (fetch_message + save_attachment Tauri commands), 04-02 (ReadingPane with sandboxed iframe + attachment list), 04-03 (CSP hardening + security model)
+  1. User sees new INBOX mail arrive on the poll interval (configurable, default 5–10 min) without manual action
+  2. User can trigger a manual refresh that runs through the same code path as the poll timer
+  3. A poll firing mid-sync (or mid flag-STORE) never overlaps — one sync runs at a time on the single session
+  4. User sees a honest "reconnecting…" state (not a fatal disconnect) when the session expires, and sync resumes after keyring re-read + re-SELECT
+**Plans**: TBD
 **UI hint**: yes
-**Verified**: 4 success criteria all pass — 63 Rust tests + tsc + eslint + vite build
 
-### Phase 5: Keyring + Packaging
-
-**Goal**: User launches straight into mail and can install the app on a clean Linux machine
+### Phase 9: UID Backfill
+**Goal**: User never silently misses mail that arrived between syncs
 **Mode:** mvp
-**Depends on**: Phase 4
-**Requirements**: CONN-03, SHIP-01
+**Depends on**: Phase 8
+**Requirements**: SYNC-04
 **Success Criteria** (what must be TRUE):
-
-  1. User credentials persist in the OS keyring (never plaintext) and the app auto-connects on next launch
-  2. User can install and run the app from a .deb or .AppImage on clean Ubuntu 22.04 and 24.04
-  3. On a keyring-less machine the user gets guided setup, never a silent plaintext fallback or login loop
-
-**Plans**: 05-01 (auto-connect on launch), 05-02 (Linux deb + appimage packaging), 05-03 (keyring-less fallback + security review)
-**Verified**: 3 success criteria all pass — 63 Rust tests + tsc + eslint + vite build
+  1. User sees messages that arrived between two syncs appear after the next incremental sync (gap detected via UID range-diff, not just UIDNEXT walk)
+  2. Expunged-on-server UIDs stop being re-requested (tombstoned after empty results — no infinite backfill loop)
+  3. Double-poll-zero-FETCH convergence holds: two consecutive polls with no server change issue no message FETCHes
+**Plans**: TBD
 
 ## Progress
 
 **Execution Order:**
-Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
+Phases execute in numeric order: 6 → 7 → 8 → 9
 
-| Phase | Plans Complete | Status | Completed |
-|-------|----------------|--------|-----------|
-| 1. Scaffold + Connection | 3/3 | Complete    | 2026-10-02 |
-| 2. Sync Engine + Local Store | 3/3 | Complete    | 2026-10-03 |
-| 3. Mailbox UI Shell + Search | 3/3 | Complete    | 2026-10-03 |
-| 4. Reader + Attachments | 3/3 | Complete    | 2026-10-03 |
-| 5. Keyring + Packaging | 3/3 | Complete    | 2026-10-03 |
+| Phase | Milestone | Plans Complete | Status | Completed |
+|-------|-----------|----------------|--------|-----------|
+| 1. Scaffold + Connection | v1.0 | 3/3 | Complete | 2026-10-02 |
+| 2. Sync Engine + Local Store | v1.0 | 3/3 | Complete | 2026-10-03 |
+| 3. Mailbox UI Shell + Search | v1.0 | 3/3 | Complete | 2026-10-03 |
+| 4. Reader + Attachments | v1.0 | 3/3 | Complete | 2026-10-03 |
+| 5. Keyring + Packaging | v1.0 | 3/3 | Complete | 2026-10-03 |
+| 6. Flag Sync + Outbox | v1.1 | 0/TBD | Not started | - |
+| 7. Folders + Per-Folder Sync | v1.1 | 0/TBD | Not started | - |
+| 8. Poll + Manual Refresh | v1.1 | 0/TBD | Not started | - |
+| 9. UID Backfill | v1.1 | 0/TBD | Not started | - |

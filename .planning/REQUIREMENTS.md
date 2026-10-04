@@ -95,13 +95,13 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| FLAG-01 | TBD | Pending |
-| FLAG-02 | TBD | Pending |
-| FOLD-01 | TBD | Pending |
-| FOLD-02 | TBD | Pending |
-| FOLD-03 | TBD | Pending |
-| SYNC-03 | TBD | Pending |
-| SYNC-04 | TBD | Pending |
+| FLAG-01 | Phase 6 | Pending |
+| FLAG-02 | Phase 6 | Pending |
+| FOLD-01 | Phase 7 | Pending |
+| FOLD-02 | Phase 7 | Pending |
+| FOLD-03 | Phase 7 | Pending |
+| SYNC-03 | Phase 8 | Pending |
+| SYNC-04 | Phase 9 | Pending |
 | CONN-01 | Phase 1 (M1) | Complete |
 | CONN-02 | Phase 1 (M1) | Complete |
 | CONN-03 | Phase 5 (M1) | Complete |
@@ -119,8 +119,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 **Coverage:**
 
 - v1.1 requirements: 7 total
-- Mapped to phases: 0 (roadmapper assigns)
-- Unmapped: 7 (roadmap pending)
+- Mapped to phases: 7 (Phases 6-9)
+- Unmapped: 0 ✓
 
 ---
 *Requirements defined: 2026-10-02 (M1)*

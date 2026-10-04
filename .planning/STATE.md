@@ -3,10 +3,10 @@ gsd_state_version: "1.1"
 milestone: v1.1
 milestone_name: Triage & Folders
 status: planning
-last_updated: "2026-10-04T14:32:38.973Z"
+last_updated: "2026-10-04T00:00:00.000Z"
 last_activity: 2026-10-04
 progress:
-  total_phases: 0
+  total_phases: 4
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
@@ -17,38 +17,37 @@ progress:
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-10-02)
+See: .planning/PROJECT.md (updated 2026-10-04)
 
 **Core value:** Connect to an IMAP server on Linux and read your mail locally in a fast Gmail-like UI.
-**Current focus:** Phase 4 complete — Reader + Attachments (sanitized HTML, attachment save, security hardening).
+**Current focus:** v1.1 Triage & Folders — Phase 6 ready to plan (Flag Sync + Outbox).
 
 ## Current Position
 
-Phase: Not started (defining requirements)
-Plan: —
-Status: Defining requirements
-Last activity: 2026-10-04 — Milestone v1.1 started
+Phase: 6 of 9 (v1.1 Phase 1 of 4 — Flag Sync + Outbox)
+Plan: — (no plans yet)
+Status: Ready to plan
+Last activity: 2026-10-04 — v1.1 roadmap created (Phases 6-9)
+
+Progress: [░░░░░░░░░░] 0% (v1.1)
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 12 (Phase 1: 3, Phase 2: 3, Phase 3: 3, Phase 4: 3)
+- Total plans completed: 15 (M1 Phases 1-5: 3+3+3+3+3)
 - Average duration: ~1 session per plan
-- Total execution time: ~6 sessions
+- Total execution time: ~7 sessions
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| 1 | 3 | 3 | ~1 session |
-| 2 | 3 | 3 | ~1 session |
-| 3 | 3 | 3 | ~1 session |
-| 4 | 3 | 3 | ~1 session |
+| 1-5 (M1) | 15 | 15 | ~1 session |
 
 **Recent Trend:**
 
-- Last 3 plans: 04-01, 04-02, 04-03 — all completed
+- Last 3 plans: 05-01, 05-02, 05-03 — all completed
 - Trend: on track
 
 *Updated after each plan completion*
@@ -60,45 +59,32 @@ Last activity: 2026-10-04 — Milestone v1.1 started
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
-- [Phase 2]: SyncEngine owns single session — no per-command connections (anti-pattern 2)
-- [Phase 2]: `connect_account` signature is permanent architecture contract — must not change
-- [Phase 2]: BODY.PEEK only for sync (no BODY.STRUCTURE)
-- [Phase 2]: ServerConfig stored separately in keyring (`sge-server-cfg`) alongside credentials
-- [Phase 2]: AppState holds `Arc<Mutex<Store>>` for Tauri Send+Sync safety
-- [Phase 2]: `sync_status` query added to queries.rs for UI polling
-- [Phase 2]: Channel<SyncEvent> only for progress — no plain emit (D-progress)
-- [Phase 2]: No auto-login logic — launch lands on login per D-launch (Phase 5 owns auto-connect)
-- [Phase 3]: OFFSET pagination for message lists (simpler than UID cursor for MVP scale)
-- [Phase 3]: ReadingPane is placeholder → Phase 4: full HTML rendering with ammonia + sandboxed iframe
-- [Phase 3]: `save_server_config` call added to LoginForm (latent P2 bug — start_sync requires it)
-- [Phase 4]: fetch_message re-uses bodies.rs infrastructure (sanitize_html, BODY.PEEK[])
-- [Phase 4]: Attachment save uses file-dialog picker (tauri-plugin-dialog) — not downloads dir
-- [Phase 4]: Path basename reduction in save_attachment (D-attachments defense-in-depth)
-- [Phase 4]: CSP hardening adds object-src 'none', base-uri 'none', frame-ancestors 'none'
+- [v1.1 roadmap]: Flags-first build order (Position A) — reconcile + outbox ship with first STORE
+- [v1.1 roadmap]: SessionManager single-session ownership lands in Phase 6; single-flight guard in Phase 8 before poll timer
+- [v1.1 roadmap]: BODY.PEEK audit ships in Phase 6 (ends read-only era)
+- [M1 Phase 5]: Keyring auto-login + Linux bundle shipped — M1 archived
 
 ### Pending Todos
 
-- Phase 5: Auto-connect on launch (keyring auto-login)
-- Phase 5: Linux packaging (deb + appimage)
-- Phase 5: Launch freshness check (last message date vs server UIDNEXT)
+None yet.
 
 ### Blockers/Concerns
 
-- Live server profile (mail.utfpr.edu.br CAPABILITY/TLS) unverified — must probe before trusting fixtures
-- async-imap minor version + executor interop resolved via `cargo add` at scaffold; sync `imap 2.x` is the documented fallback
+- UTFPR server capabilities unverified (CONDSTORE advertisement, `.SILENT` STORE acceptance, SPECIAL-USE/LIST-EXTENDED, idle timeout) — live CAPABILITY/LIST probe at start of Phase 6/7 planning, graceful fallbacks as defaults
+- Poll cadence default (60–120 s vs 5–10 min) unresolved — validate in Phase 8 planning
 
 ## Deferred Items
 
+Items acknowledged and deferred at milestone close, most recent first:
+
 | Category | Item | Status | Deferred At | Milestone |
 |----------|------|--------|-------------|-----------|
-| Feature | Auto-login on launch | To Do | Phase 2 | M1 |
-| Feature | Flag writes (Seen/unread) | Deferred | Phase 2 | M1 |
-| Feature | Backfill for missing UIDs | Deferred | Phase 2 | M1 |
-| Feature | HTML message rendering | Complete | Phase 4 | M1 |
-| Feature | Attachment save via picker | Complete | Phase 4 | M1 |
+| Feature | IDLE push (poll stays fallback) | Deferred | M1 close | v1.1 |
+| Feature | CONDSTORE/QRESYNC fast path | Deferred | M1 close | v1.1 |
+| Feature | Delete/move with expunge | Deferred | M1 close | v1.1 |
 
 ## Session Continuity
 
-Last session: 2026-10-03
-Stopped at: Phase 4 complete, ready for Phase 5
+Last session: 2026-10-04
+Stopped at: v1.1 roadmap created (Phases 6-9), ready to discuss/plan Phase 6
 Resume file: None
