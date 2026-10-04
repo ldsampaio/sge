@@ -1,8 +1,8 @@
-# Stack Research
+# Stack Research: v1.1 Triage & Folders
 
-**Domain:** Rust + Tauri v2 + React + SQLite Linux desktop IMAP email client (Gmail-like, headers-first sync, OS keyring, INBOX-only read-only M1)
-**Researched:** 2026-10-03
-**Confidence:** HIGH for core pins (verified against crates.io/docs.rs/Tauri official release pages Sep 2026); MEDIUM for IMAP runtime-bridging pattern and frontend library minors.
+**Domain:** IMAP flag sync, multi-folder sync, poll refresh, UID backfill (incremental on existing SGE codebase)
+**Researched:** 2026-10-04
+**Confidence:** HIGH
 
 ## Recommended Stack
 
@@ -10,162 +10,96 @@
 
 | Technology | Version | Purpose | Why Recommended |
 |------------|---------|---------|-----------------|
-| `tauri` (Rust backend + bundler) | `2.12.0` (pin `tauri = "2"`, `@tauri-apps/api = "^2.12"`, `tauri-cli = "2.12"`) | App runtime, `#[tauri::command]` IPC, Linux bundling (.deb/.AppImage) | Current stable line per Tauri official release page (2.12.0, Sep 26 2026). v2 is the only line receiving fixes; v1 is legacy. Capability-based permission model is required for least-privilege IPC (only expose the mail commands the UI needs). |
-| React + TypeScript + Vite | React `19`, TS `~5.6`, Vite `6/7` (via `create-tauri-app` template) | Mailbox UI (sidebar, message list, reading pane) | Tauri's blessed frontend path; Vite dev-server + HMR is what `tauri dev` expects. React 19 + TS gives the component/typing discipline a three-pane mail UI needs. Scaffolding via `create-tauri-app 4.7.4` avoids hand-wiring `tauri.conf.json`. |
-| `rusqlite` (direct, in Rust backend) | `0.37` with `bundled` feature | Local mail store: accounts, headers, bodies, sync state | The sync engine lives in Rust, so SQL must live in Rust too — going through a JS SQLite plugin would push every query over IPC for no benefit. `bundled` compiles a known SQLite (3.5x) statically, so behavior (notably FTS5) is identical on every target distro. `^0.37` is the same major the Tauri rusqlite plugin ecosystem targets, so no duplicate SQLite linkage surprises. Single-writer `Arc<Mutex<Connection>>` is enough for M1; add `r2d2-sqlite` pooling only if contention appears. Enable WAL mode (`PRAGMA journal_mode=WAL`) from day one for concurrent reader (UI list) + writer (sync) access. |
-| `rusqlite_migration` | `2.x` | Schema migrations | Same crate the `tauri-plugin-rusqlite2` stack uses (`rusqlite_migration ^2` per its docs.rs dependency list). Versioned `Migrations::new(...)` applied at startup; M1 ships v1 schema, later milestones (folders, send-queue) become v2/v3. |
-| `async-imap` | `0.11.x` (`cargo add async-imap` resolves latest 0.11) | IMAP session: SELECT INBOX, UID FETCH headers, on-demand body FETCH | The maintained async IMAP client; shares the battle-tested `imap-proto` parser lineage with the sync `imap` crate but is actively released (0.11 line current). Async fits Tauri's tokio runtime and lets header-fetch fan out without one-thread-per-connection. Generic over any `futures-io` stream, so both implicit-TLS and STARTTLS transports plug in. |
-| `async-native-tls` (+ `async-std` with `attributes`/`tokio02`-free config) | `async-native-tls 0.5`, `async-std 1.13` | TLS transport under async-imap; async executor for the sync worker | Two deliberate choices: (1) **native-tls over rustls** on Linux because it uses the system CA store — a university server like `mail.utfpr.edu.br` behind institutional CAs/proxies validates without shipping custom roots; (2) **isolate the sync worker on its own executor**: run `async_std::task::block_on` inside a dedicated `std::thread` sync worker rather than mixing async-std futures into Tauri's tokio runtime. Commands talk to the worker via `tokio::sync::mpsc` / `Mutex<SyncState>` and progress flows back via Tauri `emit` events. Zero runtime interference, trivially testable, and the IDLE loop (post-M1) gets its own long-lived home. Bridge alternative if tokio-direct is preferred: `async-compat` shim around `tokio::net::TcpStream` — acceptable but adds a dependency to avoid; the dedicated-thread pattern is simpler to reason about. |
-| `mail-parser` (+ `encoding_rs` via `full_encoding`) | `0.11.9` (pin `mail-parser = "0.11"`, features `["full_encoding"]`) | Parse fetched RFC5322/MIME into subject/from/addresses/bodies/attachments | Unambiguous best-in-class: 100% safe Rust, zero-copy, fuzzed + MIRI-tested, battle-tested on millions of real messages, RFC 8621 §4.1.4 body model (text parts / html parts / attachments — exactly what the reader pane needs), 41 charsets including UTF-7, RFC2231 attachment filenames. `MessageParser::parse_headers` exists for a headers-only fast path. 3.8M+ downloads, 143 dependents, updated Sep 2026. `full_encoding` pulls `encoding_rs` for CJK multi-byte charsets real university mail contains. |
-| `keyring` (v3 API, Secret Service store) | `keyring = "3"` with feature `sync-secret-service` | Store IMAP password in GNOME Keyring / KWallet Secret Service; auto-login | Documented Linux path (`keyring = { version = "3", features = ["sync-secret-service"] }` per docs.rs 3.5.0): synchronous API backed by `dbus-secret-service`, no async runtime required — which is exactly why it fits the dedicated sync thread. Entry key `service="sge"`, `user=<imap-username>`. **Hard rule the roadmap must carry:** every keyring call runs inside `tauri::async_runtime::spawn_blocking` (or the sync thread) — the crate blocks the calling thread and deadlocks if invoked on a runtime thread. Never cache the password in memory longer than session bootstrap; re-read from keyring per sync start. Server host/port/username (non-secret) go in SQLite `accounts`, password never touches SQLite. |
+| async-imap (existing, no change) | 0.11.3 (locked) | UID STORE flag writes, per-folder SELECT/STATUS, UID SEARCH diff | Verified on docs.rs 0.11.3 (Sept 2026, current): `Session::uid_store(uid_set, query)` and `Session::store(seq_set, query)` both exist with `+FLAGS.SILENT` / `-FLAGS.SILENT` semantics. `select`, `status`, `list`, `noop` already cover every v1.1 IMAP verb. Zero new IMAP surface to learn; the M1 read-only invariant lifts by *extending* the existing `SyncSession` trait, not by adding a crate. |
+| tauri::async_runtime (existing re-export, no new dep) | via tauri 2.12.1 (locked) | Poll-loop spawning if a backend loop is ever needed | `commands/sync.rs` already drives all IMAP work as `spawn_blocking` + `async_std::task::block_on` on a dedicated thread, never on Tokio threads. A backend poll loop (if chosen over frontend polling) fits the identical pattern — `spawn_blocking` with an `async_std::task::sleep` loop. No direct `tokio` dependency needed; tokio 1.53.1 is already transitive via Tauri. |
+| rusqlite_migration (existing, no change) | 2.x (locked) | Schema migration v2: per-folder sync state | Folder support is a schema problem, not a library problem. `M::up` migration v2 generalizes the `mailboxes`/`sync_state` rows from hardcoded `INBOX` to one row per folder (name, uid_validity, uid_next, last_sync_at). The v1 pattern (WAL + single-writer `Arc<Mutex<Store>>`) carries over unchanged. |
+| React setInterval + existing Channel events (no new npm dep) | react 19.1, @tauri-apps/api v2 (locked) | Poll + manual refresh trigger | `start_sync` already streams `SyncEvent` progress over a Tauri `Channel`. Polling is just a timer calling the command that already exists. No scheduler library, no new IPC shape. |
 
 ### Supporting Libraries
 
 | Library | Version | Purpose | When to Use |
 |---------|---------|---------|-------------|
-| `tokio` | `1.x` (full features as Tauri enables) | Tauri command async runtime, mpsc channels, `spawn_blocking` for keyring/SQLite | Already pulled in by Tauri; use `tauri::async_runtime::{spawn, spawn_blocking}` rather than depending on tokio directly where possible. |
-| `serde` / `serde_json` | `1.x` | Command arg/result serialization across the IPC boundary | Every Tauri command payload; `mail-parser` also has a `serde` feature if raw parsed messages ever cross IPC (prefer pre-shaped DTOs instead — see Architecture note). |
-| `thiserror` | `2.x` | Typed backend errors mapped to `Result<T, String>` command errors | All IMAP/SQLite/keyring failures become user-actionable strings (`auth failed` vs `network unreachable` vs `keyring locked`) — the login UX depends on this mapping. |
-| `chrono` | `0.4` | Date header normalization, `INTERNALDATE` sorting, "today/yesterday" grouping | Needed the moment the list shows dates; `mail-parser` returns its own DateTime — convert once at ingest. |
-| `html2text` / `ammonia` (frontend-adjacent, evaluate in UI phase) | latest | Plain-text fallback + HTML sanitization of message bodies | Bodies render in the WebView — unsanitized HTML email is an XSS/trackers vector. Sanitize before render; keep remote-content blocking (no auto image load) as an M1 default. |
-| `@tanstack/react-query` | `5.x` | Frontend server-cache: message list queries, sync-status polling, body-on-demand caching | The UI reads SQLite via commands; react-query turns those command calls into cached queries with background refetch on `sync-progress` events. Prevents hand-rolled `useEffect` fetch spaghetti in the three-pane layout. |
-| `@tanstack/virtual` (or `virtua`) | latest | Virtualized message list | UTFPR mailboxes can hold tens of thousands of headers; render only visible rows. Required once the list exceeds a few hundred rows — plan for it in the list component from the start. |
-| `tauri-plugin-store` or plain JSON | `2.x` | Non-secret app prefs (selected account, pane sizes, theme) | Do NOT put credentials here; host/port/username may live in SQLite `accounts` instead — pick one home (recommend SQLite) and keep Store for pure UI prefs only. |
-
-### Development Tools
-
-| Tool | Purpose | Notes |
-|------|---------|-------|
-| `create-tauri-app 4.7.4` | Scaffold React+TS+Vite+Tauri v2 skeleton | `npm create tauri-app@latest`; select React+TypeScript. Verify `tauri.conf.json` bundle identifiers before first `tauri build`. |
-| Ubuntu 22.04 / Debian 12 build baseline (+ CI) | Produce portable .deb/AppImage | Tauri docs mandate: build on the **oldest** supported base providing `libwebkit2gtk-4.1-dev`, otherwise glibc floor breaks older targets. Dev deps: `libwebkit2gtk-4.1-dev build-essential libssl-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev`. CI (GitHub Actions `ubuntu-22.04`) builds artifacts; never build release bundles on a rolling/newer host. |
-| `cargo-deny` + `cargo-audit` | License/advisory gate on the Rust dep tree | IMAP/TLS/SQLite pull C-linked code (`native-tls`, `bundled` sqlite) — audit before each milestone bundle. |
+| (none — no new crates) | — | — | All four v1.1 features compose from locked dependencies. This is the headline finding: **v1.1 adds zero Rust dependencies and zero npm dependencies.** |
+| imap-proto 0.16.7 (transitive, unchanged) | 0.16.7 (locked) | Flag parsing on FETCH responses | FLAGS already flow through `fetch_envelopes` into the local `flags` column; flag-write round-trips reuse the same parser. The NAMESPACE gap is untouched (LIST-derived profiles still apply per folder). |
 
 ## Installation
 
 ```bash
-# Scaffold (React + TypeScript + Vite)
-npm create tauri-app@latest sge -- --template react-ts
-
-# Frontend
-cd sge && npm install
-npm install @tanstack/react-query @tanstack/virtual
-npm install -D @tauri-apps/cli  # or cargo install tauri-cli --version "^2.12"
-
-# Rust backend (src-tauri)
-cargo add tauri@2 serde serde_json thiserror chrono
-cargo add rusqlite@0.37 --features bundled
-cargo add rusqlite_migration
-cargo add async-imap async-std async-native-tls futures
-cargo add mail-parser@0.11 --features full_encoding
-cargo add keyring@3 --features sync-secret-service
+# No new dependencies for v1.1. Locked versions already cover everything:
+#   async-imap 0.11.3, imap-proto 0.16.7, rusqlite 0.37, rusqlite_migration 2.x,
+#   tauri 2.12.1, async-std 1.13, futures 0.3
+# After extending SyncSession, just:
+cargo check -p sge
 ```
 
-`tauri.conf.json` bundle sketch (Linux):
+## Integration Points (where each feature lands)
 
-```json
-{
-  "bundle": {
-    "linux": {
-      "deb": { "depends": ["libwebkit2gtk-4.1-0", "libgtk-3-0"] },
-      "appimage": { "bundleMediaFramework": true }
-    },
-    "targets": ["deb", "appimage"]
-  }
-}
-```
+| Feature | IMAP call (existing crate) | Trait change | Store change | UI trigger |
+|---------|---------------------------|--------------|--------------|------------|
+| Read/unread sync | `uid_store("<uid>", "+FLAGS.SILENT (\\Seen)")` to mark read; `-FLAGS.SILENT (\\Seen)` to mark unread (docs.rs 0.11.3, verified) | Add `set_seen(uid, seen)` to `SyncSession` in `imap/mod.rs`; implement for `BoxedSession` + `MockSession` | Optimistic local `flags` column update, reconcile on next sync | New `toggle_seen` Tauri command; use `.SILENT` so the server skips untagged FETCH floods |
+| Folder browsing | Existing `list(Some(""), Some("*"))` for discovery; `select("<folder>")` + `status("<folder>", "(MESSAGES UIDVALIDITY UIDNEXT)")` per folder | Generalize `select_inbox()` → `select_folder(name)`; `search_uids`/`fetch_envelopes` already folder-agnostic (they operate on the selected mailbox) | Migration v2: one `mailboxes` + sync-state row per folder; reuse the 7-step worker loop per selected folder | Sidebar folder list from local `mailboxes` table; SELECT only the opened folder |
+| Poll + manual refresh | Reuse full `sync_with_session` pass; optional lightweight `NOOP` keepalive between passes | None (reuse worker as-is) | None (existing `sync_status` row already feeds "Up-to-date \<timestamp\>") | Frontend `setInterval` calling `start_sync` (default 60 s, only when focused); manual refresh button calls the same command; backend skips a pass if a sync is already in flight (reuse the existing cancel-sync flag pattern) |
+| UID backfill | `uid_search` with range (`UID <lo>:*`) + existing `uid_fetch` in 200-UID batches (`BATCH_SIZE` unchanged) | None — gap fill is a caller-side range computation | Gap query: compare local UID set vs `UID SEARCH ALL` result; fetch only missing ranges instead of full re-sweep | Automatic inside each sync pass (Step 4.5 of the worker); no separate UI |
+
+### Cross-cutting rules
+
+- **SELECT (read-write), never EXAMINE, for any folder the user can triage.** EXAMINE opens read-only and silently drops flag writes — the exact class of silent-failure bug M1's worker guards already reject. Keep the worker's fail-loud style: a STORE that returns no confirmation is an error, not a success.
+- **Delimiter handling per folder:** reuse the LIST-derived delimiter profile from the probe when passing folder names to `select`/`status` (names with spaces or non-ASCII need quoting — construct via the `Name::name()` value verbatim).
+- **UIDVALIDITY guard stays per folder:** the M1 bump-and-wipe logic generalizes to each folder row independently; one folder's renumbering must not wipe the others.
 
 ## Alternatives Considered
 
 | Recommended | Alternative | When to Use Alternative |
 |-------------|-------------|-------------------------|
-| `async-imap 0.11` | sync `imap 2.x` crate | If async executor bridging proves painful during the sync spike: `imap` shares `imap-proto`, is dead-simple on a `std::thread`, and M1's sequential single-INBOX sync needs no concurrency. Downgrade path, not first choice. |
-| `async-imap 0.11` | `io-imap 0.6` (new, Rust-2024, no-std layered) | Watch only. 3.5k downloads/mo and 2026-fresh — promising RFC coverage (incl. IDLE) but unproven in production apps. Revisit post-M1 if async-imap stalls. |
-| `rusqlite 0.37` direct | `tauri-plugin-rusqlite2 2.2.x` (JS API) / official `tauri-plugin-sql` (sqlx) | Only if a future milestone wants SQL issued from JS. For M1 the sync engine owns the DB in Rust; the plugin would add IPC hops and a second connection story. `sqlx`+async is overkill for a single-writer local mailbox. |
-| `rusqlite_migration 2.x` | `refinery`, `schemamama` | `refinery` if the team prefers file-based `.sql` migration scripts checked into `migrations/`; functionally equivalent for M1's tiny schema. |
-| `keyring 3` + Secret Service | `oo7` / `secret-service` direct, `libsecret` bindings | If `keyring`'s sync API deadlocks or its default-store resolution misbehaves on KDE (KWallet UTF-8 limits): drop to `oo7 0.4` (pure-Rust Secret Service portal API, Flatpak-friendly) or raw `secret-service` with explicit collection handling. Also note: kernel `keyutils` store is **wrong** here — non-persistent across reboots, breaks auto-login. |
-| `native-tls` | `rustls` (+ `webpki-roots`) | If static-linking determinism beats system-store integration (e.g. AppImage on exotic distros, or corp proxy with custom CA you prefer to bundle). Costs: you own root-store updates. |
-| React 19 | Svelte / Solid / Leptos | Only on team-preference grounds; React has the widest Tauri examples + component ecosystem (virtual lists, sanitizers). No technical driver to switch. |
+| `uid_store` on async-imap 0.11.3 | Sync `imap` 2.x crate on `std::thread` | Only if 0.11 async bridging hurts — the documented fallback in `Cargo.toml`. Flag writes do **not** trigger it; `uid_store` is a normal async method on the already-owned session. |
+| Frontend `setInterval` poll | IMAP IDLE push (`Session::idle`, exists in 0.11.3) | Defer IDLE past v1.1. IDLE holds one connection open per selected folder, fights the one-shot `connect_sync`/`logout` lifecycle, and university servers routinely time out idle connections. Poll matches the milestone spec and the existing command shape. Revisit when real-time push is a stated requirement. |
+| `tauri::async_runtime` re-export | Direct `tokio` dependency with `time` feature | Never for v1.1 — tokio 1.53.1 is already transitive via Tauri and `async-std` drives the IMAP futures. A direct dep buys version-resolution risk for zero capability. |
+| Plain `UID SEARCH ALL` diff | CONDSTORE / QRESYNC (`select_condstore` exists in 0.11.3) | Only after probing `CAPABILITY` for CONDSTORE on the target server. mail.utfpr.edu.br support is unverified; the plain SEARCH diff is robust everywhere and the mailbox sizes don't justify the complexity yet. |
+| Timer + existing command | A scheduler crate (e.g. `tokio-cron`, `job_scheduler`) | Never for one interval. A crate is justified at 3+ schedules with persistence; v1.1 has exactly one ("refresh every N seconds while open"). |
 
 ## What NOT to Use
 
 | Avoid | Why | Use Instead |
 |-------|-----|-------------|
-| `imap` + `lettre` confusion (using lettre for IMAP) | `lettre` is SMTP-send only; it cannot read mail. M1 is read-only so lettre has no role at all. | `async-imap` for fetch; add `lettre` only when the send milestone lands. |
-| Plaintext credential files / SQLite-stored passwords | Violates the project's hard security constraint; plaintext secrets also leak into backups and dotfiles. | `keyring` Secret Service; only host/port/username in SQLite. |
-| `keyutils` (kernel keyring) as the credential store | In-memory only — wiped on reboot, so auto-login silently breaks after every restart; documented as "secure cache, not storage". | Secret Service via `keyring sync-secret-service`. |
-| Full-mailbox `FETCH BODY[]` up front | Multi-GB UTFPR mailboxes → minutes-long first sync, huge SQLite, ANR-feeling UI; contradicts the decided headers-first strategy. | `FETCH (UID FLAGS ENVELOPE BODYSTRUCTURE)` + UID-windowed pages; `BODY[]`/`BODY[TEXT]` only on message open; attachments via `BODY[<section>]` partial fetch on download click. |
-| JS-side SQLite plugin as the M1 store owner | Every list render and sync write crosses IPC; two connection owners invite lock contention and WAL-mode confusion. | `rusqlite` owned by the Rust backend; commands return shaped DTOs. |
-| Building release bundles on newest Ubuntu/Fedora | Raises minimum glibc, breaking installs on older-but-supported targets (documented Tauri limitation for both .deb and AppImage). | Frozen `ubuntu-22.04` CI builder with `libwebkit2gtk-4.1` stack. |
-| Auto-loading remote images in the reader pane | Tracking pixels + mixed-content + WebView attack surface on day one. | `ammonia`-sanitized HTML with remote content blocked; "load images" per-message opt-in (post-M1). |
+| Sync `imap` 2.x crate now | Swaps the entire async session model for zero v1.1 gain; `uid_store` already exists on the locked 0.11.3 | Stay on async-imap 0.11.3; keep the 2.x fallback documented-only |
+| `Session::examine` for triage folders | Read-only open: STOREs fail or silently no-op, producing "toggled but server disagrees" state | `select_folder(name)` (read-write SELECT) for any user-triageable folder |
+| Non-`.SILENT` STORE queries | Server returns an untagged FETCH per stored message — a 200-flag batch becomes a 200-FETCH flood the stream must drain | `+FLAGS.SILENT` / `-FLAGS.SILENT`; reconcile from the local optimistic write + next sync pass |
+| IMAP IDLE in v1.1 | Conflicts with one-shot session lifecycle; server idle timeouts create phantom-disconnect bugs; milestone explicitly scopes poll | Frontend interval + manual refresh; IDLE is a post-v1.1 enhancement |
+| Direct `tokio` dependency | Transitive tokio already present; mixing runtimes with `async_std::task::block_on` on the IMAP thread invites subtle executor bugs | `tauri::async_runtime::spawn_blocking` (already the codebase pattern) |
+| `EXPUNGE` / `CLOSE` anywhere in v1.1 | v1.1 has no delete feature; expunge permanently destroys server mail and widens every flag-write code path into a data-loss path | Flag writes only; expunge arrives with a delete feature and its own confirmation UX |
+| New npm scheduler/state library | Poll state (interval handle, last-sync timestamp, in-flight flag) is three `useRef`/`useState` values around an existing command | Plain `setInterval` in the existing sync hook |
 
 ## Stack Patterns by Variant
 
-**If the UTFPR server requires STARTTLS on port 143 (vs implicit TLS on 993):**
-- Use the same `async-imap` + `async-native-tls` pair; only the handshake differs (plain `TcpStream` → `STARTTLS` upgrade → TLS-wrapped stream vs direct TLS connect). This is exactly why IMAP host/port/security must be user-configurable fields in the login form and `accounts` table (`security: ImplicitTls | StartTls | Plain`), not build-time constants.
+**If the UTFPR server rejects `.SILENT` STORE variants:**
+- Fall back to non-SILENT `+FLAGS (\\Seen)` and drain the returned FETCH stream (same `try_next` loop as `fetch_envelopes`)
+- Because some older servers accept only RFC 3501 base syntax; behavior is identical, just chattier
 
-**If the mailbox is huge (10k+ messages) on first sync:**
-- Page header sync by UID windows (`UID FETCH 1:500 (ENVELOPE BODYSTRUCTURE)`, then next window), commit each window in one SQLite transaction, `emit("sync-progress")` per window so the list paints incrementally. FTS5 index updates stay inside the same transaction to avoid reindex churn.
+**If a folder name contains the hierarchy delimiter or non-ASCII (e.g. `INBOX.Enviadas`, `Rascunhos & Arquivos`):**
+- Pass the LIST-returned name verbatim as the single `select`/`status` argument; never split or re-encode
+- Because the server canonicalizes hierarchy — client-side splitting corrupts names on servers with `.` vs `/` delimiters
 
-**If GNOME Keyring is locked/headless at first launch:**
-- `keyring` returns an error, not a hang (with the sync-secret-service store) — map it to a "unlock your keyring / enter password" login state, fall back to in-memory-only session (no remember-me) rather than failing login outright.
+**If poll fires while a sync is in flight:**
+- Skip the tick (log + update "last checked" timestamp), never queue a second session
+- Because two concurrent sessions SELECTing different folders invalidate each other's EXISTS/UIDNEXT views and double-logins can trip server connection limits
 
 ## Version Compatibility
 
 | Package A | Compatible With | Notes |
 |-----------|-----------------|-------|
-| `tauri 2.12` | `@tauri-apps/api ^2.12`, `tauri-cli 2.12`, `tauri-bundler 2.10` | Keep Rust crate, JS API, and CLI on the same 2.x minor; mismatched CLI is the classic broken-bundle cause. Requires `libwebkit2gtk-4.1` (not 4.0) on build and target systems. |
-| `async-imap 0.11` | `async-std 1.x` + `async-native-tls 0.5` + `imap-proto 0.16/0.17` (transitive) | `cargo add` resolves the compatible `imap-proto`; do not pin it directly unless `cargo tree` shows a duplicate. |
-| `rusqlite 0.37` | `rusqlite_migration 2.x`, bundled SQLite 3.5x, FTS5 enabled | `bundled` implies FTS5 availability — verify once with `SELECT sqlite_version()` + `PRAGMA compile_options` in a smoke test; do not rely on distro sqlite. |
-| `mail-parser 0.11.9` | `encoding_rs 0.8` (via `full_encoding`), Rust edition 2024 toolchain | Crate itself is edition-2024; project needs a current stable toolchain (≥1.85). No conflicts with the rest of the tree (dependency-free core). |
-| `keyring 3` | `dbus-secret-service` backend, GNOME Keyring ≥40 / KWallet with secret-service API | Needs a D-Bus session + unlocked login keyring at runtime; `.deb` should recommend (not require) `gnome-keyring`/`kwallet`. KDE note: binary secrets must be UTF-8/base64 — passwords are, so no action for M1. |
-
-## Reference SQLite Schema (M1 contract for the roadmap)
-
-The roadmap's data phase should implement exactly this before any sync code:
-
-```sql
-CREATE TABLE accounts (
-  id INTEGER PRIMARY KEY,
-  username TEXT NOT NULL, host TEXT NOT NULL, port INTEGER NOT NULL,
-  security TEXT NOT NULL CHECK (security IN ('implicit_tls','starttls','plain')),
-  UNIQUE (username, host, port)
-) STRICT;
--- password lives ONLY in OS keyring under service 'sge', user = username@host
-
-CREATE TABLE sync_state (
-  account_id INTEGER PRIMARY KEY REFERENCES accounts(id),
-  uidvalidity INTEGER NOT NULL, last_uid INTEGER NOT NULL DEFAULT 0
-) STRICT;
-
-CREATE TABLE messages (
-  uid INTEGER NOT NULL, account_id INTEGER NOT NULL REFERENCES accounts(id),
-  message_id TEXT, subject TEXT, from_addr TEXT, to_addrs TEXT,
-  date_utc INTEGER, flags TEXT NOT NULL DEFAULT '[]',
-  snippet TEXT, body_text TEXT, body_html TEXT, -- NULL until fetched on demand
-  PRIMARY KEY (account_id, uid)
-) STRICT;
-
-CREATE VIRTUAL TABLE messages_fts USING fts5(subject, from_addr, snippet, body_text);
-
-CREATE TABLE attachments (
-  id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
-  uid INTEGER NOT NULL, filename TEXT, mime TEXT, size INTEGER,
-  section TEXT NOT NULL, -- IMAP BODY section for on-demand fetch
-  FOREIGN KEY (account_id, uid) REFERENCES messages(account_id, uid)
-) STRICT;
-```
-
-Sync invariant: if server `UIDVALIDITY` differs from `sync_state`, wipe and resync (RFC 3501). Incremental sync = `UID FETCH last_uid+1:*`. Search = `messages_fts` (offline), not server `SEARCH` (keeps M1 offline-capable).
+| async-imap@0.11.3 | imap-proto@0.16.7 | Locked pair in Cargo.lock; `uid_store`/`store` signatures verified against 0.11.3 docs (Sept 2026, latest in the 0.11 line) |
+| tauri@2.12.1 | tokio@1.53.1 (transitive) | `async_runtime::spawn_blocking` is the supported bridge; do not add direct tokio |
+| rusqlite@0.37 + rusqlite_migration@2.x | Schema v1 → v2 migration | v2 must be additive (new tables/columns only); v1 messages/bodies/FTS triggers untouched so M1 databases upgrade in place |
+| @tauri-apps/api@v2 | Channel<T> event streaming | Existing `SyncEvent` Channel carries poll results with no IPC change |
 
 ## Sources
 
-- Tauri official release page (`v2.tauri.app/release`) — `tauri`/`tauri-cli`/`@tauri-apps/api` 2.12.0, Sep 26 2026 — HIGH
-- Tauri Debian + AppImage bundling docs (`v2.tauri.app/distribute/*`) — webkit2gtk-4.1 deps, oldest-baseline build rule — HIGH
-- crates.io + docs.rs `mail-parser` 0.11.9 (Sep 2026), Stalwart README/CHANGELOG — HIGH
-- docs.rs `tauri-plugin-rusqlite2` 2.2.8 source + deps (`rusqlite ^0.37`, `rusqlite_migration ^2`) — HIGH
-- docs.rs `keyring` 3.5.0 + `dbus-secret-service-keyring-store` 1.0.1 + keyring-rs wiki (sync-secret-service feature, blocking-call rule, KWallet UTF-8 note) — HIGH
-- crates.io `async-imap` + `imap-proto` lineage, `io-imap` 0.6 newcomer signal — MEDIUM (version minor not re-verified at write time; `cargo add` at scaffold is source of truth)
+- docs.rs async-imap 0.11.3 `Session` API — `store`, `uid_store`, `select`, `status`, `list`, `noop`, `idle` signatures verified (HIGH confidence, fetched 2026-10-04)
+- `src-tauri/Cargo.lock` — async-imap 0.11.3, tauri 2.12.1, tokio 1.53.1, imap-proto 0.16.7 (HIGH, local lockfile)
+- `src-tauri/src/commands/sync.rs` — `spawn_blocking` + `block_on` threading pattern, Channel progress events (HIGH, local source)
+- `src-tauri/src/imap/mod.rs` + `session.rs` — `SyncSession` trait surface, LIST-derived namespace profile, 30 s timeout, read-only invariant scope (HIGH, local source)
+- `src-tauri/src/sync/worker.rs` — 7-step sweep, BATCH_SIZE=200, UIDVALIDITY guard, fail-loud invariants (HIGH, local source)
 
 ---
-*Stack research for: SGE Linux IMAP desktop client (Rust + Tauri v2 + React + SQLite)*
-*Researched: 2026-10-03*
+*Stack research for: SGE v1.1 Triage & Folders (incremental — validated M1 stack unchanged)*
+*Researched: 2026-10-04*

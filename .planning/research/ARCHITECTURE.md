@@ -1,338 +1,332 @@
-# Architecture Research
+# Architecture Research: v1.1 Triage & Folders
 
-**Domain:** Desktop IMAP email client — Rust (Tauri v2 backend) + React frontend + SQLite local cache, Linux-only M1
-**Researched:** 2026-10-03
-**Confidence:** HIGH (Tauri v2 bridge semantics from official docs; IMAP sync rules from RFC 3501 + imap/async-imap crate docs; mail parsing from mail-parser/stalwart docs; frontend offline-first from TanStack ecosystem docs)
+**Domain:** IMAP desktop client — flag sync, multi-folder sync, background poll, UID backfill
+**Researched:** 2026-10-04
+**Confidence:** HIGH (grounded in the live SGE codebase: `sync/worker.rs`, `imap/session.rs`, `imap/mod.rs`, `store/schema.sql`, `commands/sync.rs`, `lib.rs`)
 
 ## Standard Architecture
 
-### System Overview
+### System Overview — v1.1 Target
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    React Frontend (WebView)                  │
-│  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────────────┐  │
-│  │ Sidebar │  │ MsgList │  │ Reader  │  │ SyncStatusBar │  │
-│  │ (static │  │(virtual-│  │(sanitized│  │(progress via  │  │
-│  │ M1 INBOX│  │ ized)   │  │  HTML)  │  │ Channel)      │  │
-│  └────┬────┘  └────┬────┘  └────┬────┘  └────────┬────────┘  │
-│       │ invoke()   │ invoke()   │ invoke()       │ onmessage │
-├───────┴────────────┴────────────┴────────────────┴───────────┤
-│              Tauri IPC Bridge (invoke ↔ commands)             │
-│   commands (request/response) │ Channel (sync progress stream)│
-├──────────────────────────────────────────────────────────────┤
-│                  Rust Backend (src-tauri)                     │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │  SyncWorker (tokio task, owns IMAP session; emits   │    │
-│  │  SyncProgress via tauri::ipc::Channel, NOT events)  │    │
-│  └──────────────────┬──────────────────────────────────┘    │
-│  ┌──────────┐  ┌────┴─────┐  ┌──────────┐  ┌────────────┐    │
-│  │ ImapConn │  │ MailStore│  │ BodyFetch│  │ Credential │    │
-│  │ (connect │  │ (rusqlite│  │ (on-     │  │ Vault      │    │
-│  │ +SELECT) │  │ +WAL)    │  │ demand)  │  │ (keyring)  │    │
-│  └──────────┘  └──────────┘  └──────────┘  └────────────┘    │
-├──────────────────────────────────────────────────────────────┤
-│                    Local Persistence                          │
-│  ┌──────────┐  ┌──────────┐  ┌────────────────────────────┐  │
-│  │ SQLite   │  │ OS       │  │ FS attachment blob dir     │  │
-│  │ (WAL msg │  │ keyring  │  │ (~/.local/share/sge/att/)  │  │
-│  │ cache)   │  │ (secret) │  │                            │  │
-│  └──────────┘  └──────────┘  └────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                      Frontend (React)                            │
+│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────────┐  │
+│  │ FolderSidebar│  │ MessageList  │  │ Reader (Seen toggle,   │  │
+│  │ (LIST cache) │  │ (per-folder, │  │ poll badge, refresh btn)│  │
+│  │              │  │ OFFSET pages)│  │                        │  │
+│  └──────┬───────┘  └──────┬───────┘  └───────────┬────────────┘  │
+│         │  Tauri IPC (commands + app-wide sync-event bus)       │
+├─────────┴──────────────────┴──────────────────────┴─────────────┤
+│                   Backend (Rust / Tauri v2)                      │
+│  ┌──────────────────┐  ┌──────────────┐  ┌───────────────────┐   │
+│  │ SessionManager   │  │ SyncWorker   │  │ Poller            │   │
+│  │ (owns THE single │──│ (mailbox-    │──│ (interval loop →  │   │
+│  │  BoxedSession,   │  │  parameter-  │  │  request_sync,    │   │
+│  │  serializes ops) │  │  ized passes)│  │  no-overlap guard)│   │
+│  └────────┬─────────┘  └──────┬───────┘  └───────────────────┘   │
+│           │  SyncSession trait (extended: select_mailbox,       │
+│           │  store_flags, search_range)                         │
+├───────────┴──────────────────┴─────────────────────────────────┤
+│                   Store (SQLite, WAL)                            │
+│  ┌──────────────┐  ┌──────────────┐  ┌───────────────────────┐   │
+│  │ mailboxes    │  │ messages     │  │ message_bodies /      │   │
+│  │ (+folder cols│  │ (unchanged   │  │ attachment_parts      │   │
+│  │  via M2)     │  │  shape)      │  │ (unchanged)           │   │
+│  └──────────────┘  └──────────────┘  └───────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
 ```
+
+The single biggest architectural move of v1.1: **promote the IMAP session from
+per-command throwaway to a long-lived, manager-owned resource.** Today
+`start_sync`, `fetch_message`, and `save_attachment` each call `connect_sync`
+independently (three LOGIN/LOGOUT round-trips per user flow). The v1.1 contract
+— one session owned by the sync engine, through which all flag writes flow —
+requires a new `SessionManager` component. Everything else (folders, poll,
+backfill) hangs off it.
 
 ### Component Responsibilities
 
 | Component | Responsibility | Typical Implementation |
 |-----------|----------------|------------------------|
-| SyncWorker | Owns the single IMAP session; runs header sweep + incremental poll; streams progress; writes to SQLite | `tokio::spawn` task in Tauri `State<Mutex<SyncHandle>>`; `Channel<SyncEvent>` param on `start_sync` command; cancellable via `CancellationToken` |
-| ImapConn | TLS/STARTTLS connect, LOGIN, SELECT INBOX, FETCH, LOGOUT; reconnect with backoff | `async-imap` + `async-native-tls` (or `tokio-rustls`); connection timeout 10s, read timeout 30s; one session per worker, never pooled across threads |
-| MailStore | All SQLite access; schema migrations; UIDVALIDITY-guarded upserts; FTS index | `rusqlite` bundled SQLite, WAL mode, single writer behind `Mutex<Connection>` in Tauri managed state |
-| BodyFetch | On-demand `UID FETCH BODY[]` / `BODYSTRUCTURE` for selected message; attachment part fetch + save to disk | Tauri command `fetch_body(uid)` → cache in `message_bodies`; `save_attachment` streams bytes via `Channel` for large parts |
-| CredentialVault | Store/retrieve IMAP password in OS keyring; never in SQLite or logs | `keyring` crate (Secret Service on Linux); service=`sge`, account=username |
-| React query layer | All reads go to Rust via `invoke`, cached in TanStack Query; sync progress invalidates queries | `@tanstack/react-query` + `invoke`; `Channel` callback calls `queryClient.invalidateQueries(['messages'])` |
-| Reader sanitizer | Render HTML safely: sanitize in Rust, render in iframe/sandbox in React | Rust `ammonia` allowlist sanitize before storing/display; React renders via `srcDoc` in sandboxed `iframe` (`sandbox=""`) |
-| MIME parser | Parse headers, multipart bodies, attachment metadata from raw RFC822 | `mail-parser` crate (stalwartlabs, 100% safe Rust, no deps) for headers + body parts |
+| `SessionManager` (NEW, `imap/manager.rs`) | Owns the single `BoxedSession`; serializes every IMAP op (sync, flag write, body fetch); reconnects transparently; tracks currently-selected mailbox | `Mutex<Option<BoxedSession>>` + `Mutex<String>` selected-mailbox + `with_session(mailbox, op)` helper; held in `AppState` |
+| `SyncSession` trait (EXTENDED) | Add `select_mailbox(name)`, `store_flags(uid, add/remove \Seen)`, `search_range(set)` to the existing read-only trait | New methods on `BoxedSession` impl + `MockSession` test fixture |
+| `SyncWorker` (MODIFIED, `sync/worker.rs`) | Take a `mailbox: &str` parameter; support incremental (`UID last_next:*`) + gap-fill passes alongside the existing full sweep | `sync_folder(session, mailbox, cb)`; keep 7-step algorithm, generalize Steps 2/4/7 per folder |
+| `Poller` (NEW, `sync/poller.rs`) | Interval loop that calls the same `request_sync` entry as manual refresh; never overlaps a running pass; emits over the app-wide event bus | `async_std` task + `AtomicBool` running-guard + `AtomicBool` cancel; interval from frontend pref (default 5 min) |
+| `mailboxes` table (MIGRATED, M2) | Becomes the folder-list cache: one row per discovered folder with per-folder `uid_validity/uid_next/last_sync_at` (already per-row — no redesign needed) | New columns: `delimiter TEXT`, `selectable INTEGER DEFAULT 1`, `subscribed INTEGER DEFAULT 1`; `last_sync_at` already exists |
+| Tauri commands (MODIFIED + NEW) | `set_seen(uid, mailbox, seen)` (NEW); `list_folders` (NEW, reads cache); `start_sync`/`fetch_message`/`save_attachment` rerouted through `SessionManager`; `cancel_sync` wired to a real flag | Commands become thin: resolve mailbox → `manager.with_session(...)` → query/event |
+| `SyncEvent` bus (MODIFIED) | Per-invocation `Channel<SyncEvent>` cannot serve a background poller; move to app-wide `app.emit("sync-event", …)` + new variants | New variants: `FlagSynced{mailbox,uid,seen}`, `FolderSynced{mailbox,summary}`, `PollTick{…}`; keep existing sweep variants unchanged |
 
 ## Recommended Project Structure
 
 ```
-sge/
-├── src/                          # React frontend
-│   ├── components/
-│   │   ├── Sidebar.tsx           # M1: static INBOX entry + account status
-│   │   ├── MessageList.tsx       # virtualized list, selection model
-│   │   ├── ReaderPane.tsx        # sanitized HTML via sandboxed iframe
-│   │   └── SyncStatus.tsx        # progress bar bound to Channel events
-│   ├── hooks/
-│   │   ├── useMessages.ts        # TanStack Query: list_messages(uid range/search)
-│   │   ├── useMessageBody.ts     # TanStack Query: fetch_body(uid), on-demand
-│   │   └── useSync.ts            # invoke start_sync + Channel wiring
-│   ├── lib/
-│   │   └── tauri.ts              # typed invoke wrappers + SyncEvent types
-│   └── App.tsx                   # three-pane shell layout
-├── src-tauri/
-│   ├── src/
-│   │   ├── main.rs               # Tauri builder, plugin registration
-│   │   ├── lib.rs                # command registration, managed State
-│   │   ├── commands/             # thin invoke adapters (no IMAP logic here)
-│   │   │   ├── auth.rs           # login, logout, stored-credential check
-│   │   │   ├── sync.rs           # start_sync(Channel), sync_status, cancel
-│   │   │   ├── messages.rs       # list_messages, search, fetch_body
-│   │   │   └── attachments.rs    # list_parts, save_attachment
-│   │   ├── imap/
-│   │   │   ├── session.rs        # connect + SELECT, TLS/STARTTLS modes
-│   │   │   ├── headers.rs        # header sweep FETCH logic
-│   │   │   └── bodies.rs         # on-demand BODY[] / BODYSTRUCTURE fetch
-│   │   ├── store/
-│   │   │   ├── mod.rs            # Connection setup, WAL, migrations
-│   │   │   ├── schema.sql        # canonical DDL (see sketch below)
-│   │   │   └── queries.rs        # all SQL in one reviewable module
-│   │   ├── sanitize.rs           # ammonia pipeline for HTML bodies
-│   │   └── creds.rs              # keyring get/set/delete
-│   ├── Cargo.toml
-│   └── tauri.conf.json           # Linux bundle targets (deb/appimage)
-└── .planning/research/           # this research
+src-tauri/src/
+├── imap/
+│   ├── mod.rs            # SyncSession trait EXTENDED (select_mailbox, store_flags, search_range)
+│   ├── session.rs        # connect_sync stays (manager uses it for reconnect); probe untouched
+│   └── manager.rs        # NEW — SessionManager: single-session owner + with_session helper
+├── sync/
+│   ├── mod.rs            # SyncEvent EXTENDED (FlagSynced, FolderSynced, PollTick)
+│   ├── worker.rs         # MODIFIED — sync_folder(session, mailbox, mode, cb)
+│   ├── backfill.rs       # NEW — gap detection (local vs server UID sets) + range builder
+│   └── poller.rs         # NEW — interval loop, no-overlap guard, cancel flag
+├── store/
+│   ├── schema.sql        # M2 migration appended (folder columns; messages untouched)
+│   └── queries.rs        # NEW fns: upsert_folder, list_folders, folder_uids, update_flags
+├── commands/
+│   └── sync.rs           # MODIFIED — route via manager; NEW set_seen, list_folders, refresh_now
+└── lib.rs                # AppState += SessionManager handle; connect_account signature UNCHANGED
 ```
 
 ### Structure Rationale
 
-- **commands/ stays thin:** every command is argument validation + delegate to `imap/` or `store/`. This is the testing seam — unit-test `imap/` and `store/` without Tauri, integration-test commands with a fake store trait.
-- **store/queries.rs centralizes SQL:** all queries in one file means the UIDVALIDITY guard and FTS triggers get reviewed once, not scattered.
-- **imap/ split by fetch type:** headers sweep vs body fetch have different performance shapes (batched small FETCH vs single large FETCH); separating them keeps timeout/retry policy per operation.
-- **Frontend mirrors backend boundaries:** `hooks/useMessages` ↔ `commands/messages.rs`, `hooks/useSync` ↔ `commands/sync.rs`. One hook per command module prevents prop-drilling sync state through the pane tree.
+- **`imap/manager.rs`:** session ownership is a transport concern, not a sync-algorithm
+  concern — it lives next to `connect_sync`, which becomes the manager's private
+  reconnect primitive rather than a per-command public call.
+- **`sync/backfill.rs`:** gap detection is pure set logic over `Vec<u32>` (local UIDs
+  vs `UID SEARCH` result); isolating it makes it unit-testable without any IMAP
+  fixture, unlike the worker.
+- **`sync/poller.rs`:** the poll loop owns timing/cancellation only — it must not
+  contain sync logic, or manual-refresh and poll will drift into two code paths.
+  Both call one `request_sync(mailbox)` entry.
+- **No new tables.** `mailboxes` already stores per-folder sync state
+  (`uid_validity`, `uid_next`, `last_sync_at`); v1.1 only adds folder-discovery
+  columns. `messages` is already keyed `(mailbox_id, uid)` — multi-folder safe
+  as-is. A separate `sync_state` or `folders` table would duplicate what exists.
 
 ## Architectural Patterns
 
-### Pattern 1: Command for request/response, Channel for sync progress
+### Pattern 1: Single-Session Owner with Mailbox-Scoped Leases
 
-**What:** Tauri commands (`invoke`) return a single value — use them for login, list, search, fetch_body. For the header sweep, pass a `tauri::ipc::Channel<SyncEvent>` argument; the Rust worker calls `channel.send(...)` per batch and the frontend's `onmessage` updates progress + invalidates queries.
-**When to use:** Any operation longer than ~200ms or emitting N progress updates (sync sweep, large attachment download).
-**Trade-offs:** Channels are ordered and typed (better than `emit` events, which are untyped JSON strings and unsuitable for high-throughput per official docs). Cost: caller must construct a `Channel` per invocation; don't reuse one channel across syncs.
+**What:** One component (`SessionManager`) holds the only `BoxedSession`.
+Every operation runs inside `with_session(mailbox, |session| …)`, which
+(1) locks, (2) reconnects if the session died, (3) `SELECT`s the mailbox only
+if it differs from the last-selected one, (4) runs the op, (5) keeps the
+session open. A `generation: u64` counter invalidates stale state after
+reconnect.
+
+**When to use:** Every v1.1 IMAP touch — sync passes, `STORE` flag writes,
+body fetches. No exceptions; that is the contract.
+
+**Trade-offs:** Serializes all IMAP traffic (a flag write waits for a running
+sweep — correct for IMAP, which is a single-selected-mailbox protocol anyway);
+adds one mutex hop to every command. The alternative (per-command connections)
+breaks server-side `RECENT`/cond-store coherence and multiplies LOGIN load
+against university servers that rate-limit.
 
 **Example:**
 ```rust
-// src-tauri/src/commands/sync.rs
-#[derive(Clone, Serialize)]
-#[serde(tag = "event", content = "data", rename_all = "camelCase")]
-enum SyncEvent { Started { total: u32 }, Progress { fetched: u32, total: u32 }, Finished { added: u32 }, Failed { reason: String } }
-
-#[tauri::command]
-async fn start_sync(state: State<'_, AppState>, on_event: Channel<SyncEvent>) -> Result<(), String> {
-    let worker = SyncWorker::new(state.inner().clone(), on_event);
-    worker.run_incremental().await.map_err(|e| e.to_string())
-}
-```
-```typescript
-// src/hooks/useSync.ts
-import { invoke, Channel } from '@tauri-apps/api/core';
-const onEvent = new Channel<SyncEvent>();
-onEvent.onmessage = (m) => {
-  if (m.event === 'progress') setProgress(m.data);
-  if (m.event === 'finished') queryClient.invalidateQueries({ queryKey: ['messages'] });
-};
-await invoke('start_sync', { onEvent });
+// All v1.1 commands funnel through this — never connect_sync directly.
+manager.with_session("Sent", |session| async move {
+    session.store_flags(uid, FlagOp::AddSeen).await
+}).await?;
+// Sync reuses the same lease; SELECT is skipped when already on "Sent".
+manager.with_session("INBOX", |session| async move {
+    worker.sync_folder(session, "INBOX", SyncMode::Incremental, cb).await
+}).await?;
 ```
 
-### Pattern 2: UIDVALIDITY-guarded incremental sync with sync_state table
+### Pattern 2: Optimistic Flag Toggle with Server Reconciliation
 
-**What:** Persist `(mailbox, uid_validity, uid_next, highest_modseq)` per mailbox. Every sync compares stored UIDVALIDITY against SELECT response; mismatch → full resync (delete + re-sweep). Match → fetch only UIDs ≥ stored `uid_next`. Bodies never fetched in the sweep.
-**When to use:** Always — this is the core sync algorithm for M1 and the multi-folder future.
-**Trade-offs:** UID-based (not sequence numbers) survives expunges. Cost: must handle UIDVALIDITY resets explicitly or users see duplicated/stale mail; must store ENVELOPE+FLAGS (not full RFC822) in sweep to keep it fast.
+**What:** `set_seen` writes the local `messages.flags` JSON immediately,
+returns to the UI, then issues `UID STORE <uid> ±FLAGS \Seen` through the
+manager. On success, re-fetch that UID's `FLAGS` and reconcile; on failure,
+roll the local row back and emit `FlagSynced{…ok:false}` so the UI flips back.
 
-**Example (algorithm steps — quality-gate normative):**
-```
-1. CONNECT with 10s timeout → LOGIN → SELECT INBOX
-   → server returns (uid_validity, uid_next, highest_modseq?, exists)
-2. READ sync_state WHERE mailbox='INBOX'
-3. IF no row OR stored.uid_validity != server.uid_validity:
-     DELETE FROM messages WHERE mailbox_id=INBOX
-     DELETE FROM message_bodies for those uids
-     SET fetch_from = 1, full_resync = true
-   ELSE:
-     SET fetch_from = stored.uid_next   // incremental window
-     IF fetch_from >= server.uid_next: nothing new → still run expunge check (step 5), then DONE
-4. HEADER SWEEP in batches of 200 UIDs:
-     FETCH <batch> (UID FLAGS INTERNALDATE ENVELOPE BODYSTRUCTURE)
-     // BODY.PEEK[HEADER] equivalent: never set \Seen — read-only M1 must not mutate flags
-     FOR each msg: parse with mail-parser → UPSERT messages row → FTS index update
-     SEND Channel Progress { fetched, total } per batch
-     COMMIT per batch (keeps UI responsive, bounds WAL)
-5. EXPUNGE CHECK (cheap, every sync): FETCH 1:* (UID) or UID SEARCH ALL → diff UID set
-   vs local → DELETE missing rows (server-side deletes)
-6. WRITE sync_state SET uid_validity=server.uid_validity, uid_next=server.uid_next,
-   highest_modseq=server.highest_modseq, last_sync=now()
-7. SEND Channel Finished { added } → frontend invalidates ['messages']
-```
+**When to use:** Read/unread toggle — the highest-frequency write in a triage
+milestone; blocking the UI on an IMAP round-trip feels broken.
 
-On-demand body fetch (separate path, not part of sweep):
-```
-ON select message uid:
-  IF message_bodies.body_complete for uid → render from SQLite (offline OK)
-  ELSE FETCH uid (BODY[] + BODYSTRUCTURE) → parse parts via mail-parser
-       → sanitize text/html via ammonia → INSERT message_bodies
-       → INSERT attachment_parts rows → render
-```
-
-### Pattern 3: SQLite as the single source of truth; React never talks IMAP
-
-**What:** React renders exclusively from SQLite-via-commands. IMAP is write-into-store only. TanStack Query caches command results with `staleTime` ~30s; sync completion invalidates. Offline = queries still resolve from cache/store; `start_sync` failure surfaces as banner, not empty list.
-**When to use:** Entire M1; extends to multi-folder later by adding mailbox_id filter to the same queries.
-**Trade-offs:** Pro: offline-capable after first sync (explicit requirement), fast list paint, trivially testable UI with seeded DB. Con: search must be implemented in SQLite FTS (not server SEARCH) — acceptable for M1 INBOX scope.
+**Trade-offs:** Brief window where local and server disagree (acceptable for
+`\Seen`; never use optimistic writes for expunge-worthy state). Requires the
+flags column to stay the single source of truth for `is_unread` — it already is.
 
 **Example:**
-```typescript
-// src/hooks/useMessages.ts
-export function useMessages(search: string) {
-  return useQuery({
-    queryKey: ['messages', search],
-    queryFn: () => invoke<MessageRow[]>('list_messages', { mailbox: 'INBOX', search, limit: 200 }),
-    staleTime: 30_000, placeholderData: keepPreviousData,
-  });
-}
+```rust
+// 1. local write (fast, UI updates)
+queries::update_flags(conn, mailbox_id, uid, add_seen(seen))?;
+// 2. server write through the single session
+manager.with_session(mailbox, |s| s.store_flags(uid, seen.into())).await
+    // 3a. ok → re-fetch FLAGS, reconcile row
+    // 3b. err → restore previous flags JSON, emit failure event
 ```
 
-### Pattern 4: Rust-side HTML sanitization pipeline
+### Pattern 3: Tiered Sync — Full Sweep Once, Incremental + Gap-Fill After
 
-**What:** Raw `text/html` MIME part → `mail-parser` decode (charset/base64/quoted-printable) → `ammonia` allowlist sanitize (no `<script>`, no `on*`, no `javascript:` URLs; allow `a[href]`, `img[src=cid/http]`, basic tables) → store sanitized HTML in `message_bodies.body_html` → React renders in `<iframe sandbox="" srcDoc>`.
-**When to use:** Every HTML body before storage, never sanitize only at render time (stored copy must already be safe so FTS preview and exports can't leak unsanitized content).
-**Trade-offs:** Double protection (Rust sanitize + iframe sandbox) costs one extra render hop but closes the #1 desktop-mail XSS vector: remote content + credential-bearing WebView.
+**What:** Three sync modes selected by `SyncWorker` from stored state, not by
+the caller:
+- `Full` (first sync ever, or UIDVALIDITY bump): existing 7-step sweep — `UID
+  SEARCH ALL` + 200-UID `FETCH` batches + expunge diff. Unchanged code, now
+  parameterized by mailbox.
+- `Incremental` (steady state): `UID SEARCH <stored_uid_next>:*`, fetch only
+  the delta, update `uid_next`. No `SEARCH ALL`, no expunge diff (cheap poll).
+- `GapFill` (backfill): compare local UID set vs `UID SEARCH ALL` result;
+  any server UID missing locally below `max(local)` is a gap (missed between
+  syncs — e.g. app was asleep); fetch exactly those ranges in 200-UID batches.
+  Runs piggybacked after every `Incremental` pass, and standalone on demand.
 
-## Concrete SQLite Table Sketch (normative for roadmap Phase: local store)
+**When to use:** `Incremental` is the poll-loop workhorse; `GapFill` is what
+makes "no silent gaps" true without paying a full sweep per poll.
 
-```sql
--- WAL for concurrent reader (UI) + writer (sync worker)
-PRAGMA journal_mode = WAL;
+**Trade-offs:** `Incremental` alone can miss expunges of old mail (server
+deleted UID 5 while we only asked about `900:*`); therefore run a bounded
+`Full` (or at least `SEARCH ALL` + expunge diff without re-fetching known
+UIDs) every N polls (suggested: every 12th poll / hourly). UIDNEXT-only sync
+without gap detection is the classic silent-gap bug — the `GapFill` step exists
+specifically to forbid that shortcut.
 
-CREATE TABLE mailboxes (
-  id            INTEGER PRIMARY KEY,
-  name          TEXT NOT NULL UNIQUE,          -- 'INBOX' (M1); others later
-  uid_validity  INTEGER NOT NULL DEFAULT 0,
-  uid_next      INTEGER NOT NULL DEFAULT 0,
-  highest_modseq INTEGER,                      -- NULL if server lacks CONDSTORE
-  last_sync_at  TEXT                           -- ISO8601 UTC
-);
--- sync_state folds into mailboxes (one row per folder); no separate table needed at M1 scale.
-
-CREATE TABLE messages (
-  id            INTEGER PRIMARY KEY,
-  mailbox_id    INTEGER NOT NULL REFERENCES mailboxes(id) ON DELETE CASCADE,
-  uid           INTEGER NOT NULL,              -- IMAP UID, unique per mailbox
-  message_id    TEXT,                          -- RFC822 Message-ID (nullable, not trusted as key)
-  subject       TEXT NOT NULL DEFAULT '',
-  from_addr     TEXT NOT NULL DEFAULT '',
-  to_addrs      TEXT NOT NULL DEFAULT '',      -- JSON array (M1-simple; normalize later)
-  cc_addrs      TEXT NOT NULL DEFAULT '[]',
-  date_utc      TEXT NOT NULL,                 -- INTERNALDATE preferred over Date: header
-  flags         TEXT NOT NULL DEFAULT '[]',    -- JSON: Seen, Flagged, Answered...
-  has_attachments INTEGER NOT NULL DEFAULT 0,  -- from BODYSTRUCTURE, drives paperclip icon
-  preview       TEXT NOT NULL DEFAULT '',      -- first ~200 chars of text/plain, for list + FTS
-  UNIQUE (mailbox_id, uid)
-);
-CREATE INDEX idx_messages_mailbox_uid ON messages(mailbox_id, uid);
-CREATE INDEX idx_messages_date ON messages(mailbox_id, date_utc DESC);
-
-CREATE TABLE message_bodies (
-  message_id    INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
-  body_text     TEXT,                          -- text/plain decoded
-  body_html     TEXT,                          -- SANITIZED html only (never raw)
-  body_complete INTEGER NOT NULL DEFAULT 0,    -- 1 when fetched; 0 = header-only row
-  fetched_at    TEXT
-);
-
-CREATE TABLE attachment_parts (
-  id            INTEGER PRIMARY KEY,
-  message_id    INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-  part_number   TEXT NOT NULL,                 -- MIME part path e.g. '2', '1.2'
-  filename      TEXT NOT NULL DEFAULT '',
-  mime_type     TEXT NOT NULL DEFAULT 'application/octet-stream',
-  size_bytes    INTEGER NOT NULL DEFAULT 0,
-  local_path    TEXT,                          -- set after save_attachment; NULL = not downloaded
-  UNIQUE (message_id, part_number)
-);
-
--- Full-text search over cached headers+preview (M1 local search requirement)
-CREATE VIRTUAL TABLE messages_fts USING fts5(subject, from_addr, preview,
-  content='messages', content_rowid='id');
-CREATE TRIGGER msg_ai AFTER INSERT ON messages BEGIN
-  INSERT INTO messages_fts(rowid, subject, from_addr, preview)
-  VALUES (new.id, new.subject, new.from_addr, new.preview);
-END;
-CREATE TRIGGER msg_ad AFTER DELETE ON messages BEGIN
-  INSERT INTO messages_fts(messages_fts, rowid, subject, from_addr, preview)
-  VALUES ('delete', old.id, old.subject, old.from_addr, old.preview);
-END;
+**Example:**
+```rust
+pub enum SyncMode { Full, Incremental, GapFill }
+let mode = match stored_state {
+    None => SyncMode::Full,                              // never synced
+    Some((uidv, _)) if uidv != server.uid_validity => SyncMode::Full, // bump → wipe
+    Some((_, next)) if server.uid_next.unwrap_or(next) == next => SyncMode::GapFill, // nothing new, check gaps
+    _ => SyncMode::Incremental,                          // normal delta
+};
 ```
 
-Sizing note: headers ~1–2KB/row → 50k-message UTFPR INBOX ≈ 100MB SQLite, fine for local. Bodies/attachments excluded from DB growth except fetched-on-demand rows; attachment bytes live on disk, only metadata in `attachment_parts`.
+### Pattern 4: One Sync Entry, Two Triggers (Poll = Scheduled Manual Refresh)
+
+**What:** A single `request_sync(mailbox, reason)` function owns the
+no-overlap guard (`AtomicBool compare_exchange`), drives worker → manager →
+events. The poller calls it on a timer; the refresh button / `refresh_now`
+command calls it on demand with `reason: Manual`. A manual refresh during a
+running poll pass is a no-op that re-emits current progress (never a second
+connection, never a queue).
+
+**When to use:** Always — poll and manual refresh must be the same code path
+from day one.
+
+**Trade-offs:** Manual refresh may appear to "do nothing" if a poll pass just
+started; mitigate by emitting `PollTick{started_at}` so the UI shows "syncing…"
+instead of silence. Debounce manual clicks (2 s) at the command layer.
 
 ## Data Flow
 
-### Request Flow
+### Request Flow — Flag Toggle (new write path)
 
 ```
-[Select message in list]
+[Reader: click "mark unread"]
     ↓
-[ReaderPane] → invoke('fetch_body', {uid}) → [commands/messages.rs] → [store: SELECT body_complete?]
-    ↓ HIT                                              ↓ MISS
-[render from SQLite]                    [imap/bodies.rs: UID FETCH] → parse → sanitize → INSERT
-                                                        ↓
-                                          [return row] → TanStack caches → render
+[set_seen command] → [local flags JSON update] → [UI flips instantly]
+    ↓
+[SessionManager.with_session(mailbox)] → [SELECT if needed] → [UID STORE uid -FLAGS \Seen]
+    ↓                                                        ↓
+[re-fetch FLAGS → reconcile row] ← [OK]            [ERR → rollback row + FlagSynced{ok:false}]
+    ↓
+[app.emit("sync-event", FlagSynced)] → [React updates list badge]
+```
+
+### Request Flow — Poll Refresh (new background path)
+
+```
+[Poller timer fires] ──or── [refresh_now command]
+    ↓
+[request_sync(INBOX, reason)] → [guard: running? → emit PollTick, return]
+    ↓ (lease acquired)
+[SessionManager.with_session(INBOX)] → [SELECT INBOX (cached, usually skipped)]
+    ↓
+[SyncWorker: Incremental pass] → [GapFill pass] → [set_sync_state + last_sync_at]
+    ↓
+[app.emit FolderSynced + MessageSynced…] → [React list re-queries SQLite, OFFSET pages unchanged]
 ```
 
 ### State Management
 
 ```
-[SQLite] ──invoke list/search──▶ [TanStack Query cache] ──subscribe──▶ [Sidebar/List/Reader]
-    ▲                                    │
-    │ Channel Finished → invalidate ─────┘
-[SyncWorker writes batches; UI never writes IMAP state in M1]
+SQLite (source of truth for lists) ←writes── SyncWorker / set_seen (via Store Mutex, short scopes)
+    ↓ (read, offline-first)
+Tauri commands (list_messages / search_messages / sync_status — UNCHANGED signatures, +mailbox param flows through)
+    ↓ (app.emit sync-event bus — NEW app-wide, replaces per-call Channel for poller-originated events)
+React (OFFSET pagination + folder selector + unread badges; per-call Channel kept for start_sync progress)
 ```
 
 ### Key Data Flows
 
-1. **Login → first sweep:** `login` stores creds in keyring → `start_sync(Channel)` full sweep (no sync_state row) → batched progress → list paints incrementally via per-batch invalidation (throttle: invalidate at most 1×/500ms).
-2. **Incremental poll (app focus / 5-min timer):** `start_sync` with stored `uid_next` → typically 0–few rows → cheap; expunge diff keeps deletes correct.
-3. **Body on demand:** selection → `fetch_body` → cache-or-fetch → sanitized render; attachment click → `save_attachment` (dialog path from frontend) → stream bytes via Channel for >1MB parts.
+1. **Folder discovery:** `LIST "" *` (already proven in the probe drive) →
+   `upsert_folder` rows in `mailboxes` (selectable/delimiter cached) →
+   `list_folders` command serves the sidebar offline. Refresh discovery on every
+   `connect_account` and on manual refresh; cheap and keeps renames visible.
+2. **Per-folder sync:** sidebar select → `request_sync(folder)` → worker's
+   generalized 7-step pass with that folder's stored `(uid_validity, uid_next)`.
+   INBOX behavior is byte-identical to today; other folders reuse the same code.
+3. **UID backfill:** after each incremental pass, `backfill::missing_ranges
+   (local_uids, server_uids)` → fetch exactly the gaps → upsert. Standalone
+   `backfill_folder` runs inside `request_sync`, not as a separate command
+   (avoids two callers racing over the same UID ranges).
 
 ## Scaling Considerations
 
 | Scale | Architecture Adjustments |
 |-------|--------------------------|
-| M1: single INBOX, ~10–50k msgs | This design as-is. Batch 200, per-batch commit, FTS5. No changes needed. |
-| Multi-folder (post-M1) | Add rows to `mailboxes`; sync loops folders; `mailbox_id` filter already in schema. SyncWorker gains per-folder Channel events. |
-| 100k+ msgs / huge attachments | Paginate `list_messages` with cursor (`date_utc, uid` keyset, not OFFSET); cap FTS `preview` length; attachment streaming already via Channel; consider `VACUUM INTO` backup. |
+| Personal UTFPR mailbox (v1.1 target) | Monolith as-is: single session, 200-UID batches, OFFSET pagination. No change. |
+| 50k+ messages per folder | `SEARCH ALL` + full `existing_uids` per batch gets slow: switch expunge-diff to chunked `HashSet` diff (already chunked fetches; keep) and consider `UID SEARCH UNSEEN` fast-badge path for unread counts instead of full-row scans. |
+| Many folders (10+) × short poll | Round-robin: poll INBOX every interval, other folders every kth tick (stale-ok). Never open parallel sessions to parallelize folders — serialize through the manager; IMAP servers throttle concurrent LOGINS per user. |
 
 ### Scaling Priorities
 
-1. **First bottleneck:** header sweep latency on slow university IMAP (mail.utfpr.edu.br). Fix: batch size 100–200, per-batch commit + progressive render, 30s read timeout with 1 retry, then surface partial results (never block list on full sweep).
-2. **Second bottleneck:** FTS index write amplification during full resync. Fix: wrap full resync in single transaction with `defer_foreign_keys`, rebuild FTS once at end instead of per-row triggers for the initial load path.
+1. **First bottleneck:** full-sweep cost per poll. Fixed by tiered sync
+   (`Incremental` + periodic `Full`) — this is why Pattern 3 is load-bearing,
+   not optional.
+2. **Second bottleneck:** `list_messages` OFFSET over huge folders (OFFSET
+   rescans). Defer: keyset pagination (`WHERE uid < ? ORDER BY uid DESC`) is
+   the known fix when OFFSET visibly lags; do not pay for it in v1.1.
 
 ## Anti-Patterns
 
-### Anti-Pattern 1: Sequence-number-based sync
+### Anti-Pattern 1: Per-Command Connections for Writes
 
-**What people do:** `FETCH 1:*` by sequence number and assume stability.
-**Why it's wrong:** Sequence numbers shift on every expunge; UIDVALIDITY+UID is the only stable identity (RFC 3501 §2.3.1.1). Sequence-based caches silently show wrong messages after deletes.
-**Do this instead:** Key everything on `(mailbox_id, uid)`; use sequence numbers only transiently inside one SELECT session.
+**What people do:** `set_seen` calls `connect_sync` itself for a quick
+STORE + LOGOUT, like `fetch_message` does today.
+**Why it's wrong:** Breaks the single-session contract; races with a running
+sweep (STORE on connection A while connection B holds SELECT can silently
+apply to a stale mailbox view); doubles LOGIN load; defeats the poller's
+SELECT cache.
+**Do this instead:** Every IMAP touch goes through
+`SessionManager.with_session`. Migrate `fetch_message`/`save_attachment` to
+the manager in the same phase as `set_seen` — three call sites, one rule.
 
-### Anti-Pattern 2: IMAP logic inside Tauri commands / frontend-driven FETCH loops
+### Anti-Pattern 2: Holding the Store Mutex Across `.await`
 
-**What people do:** Frontend calls `fetch_batch` in a loop, or each command opens its own IMAP connection.
-**Why it's wrong:** N connections → server throttling/lockouts; UI thread orchestrates retries; impossible to cancel cleanly; credentials cross the bridge repeatedly.
-**Do this instead:** One SyncWorker owns one session; commands are thin; cancellation via token; frontend only observes via Channel.
+**What people do:** Lock `Arc<Mutex<Store>>`, then `STORE`/`FETCH` over the
+network while holding it.
+**Why it's wrong:** The worker's documented invariant ("mutex only during
+synchronous DB ops, never across `.await`") exists because the UI reader
+thread needs the same mutex — a slow IMAP op under lock freezes the whole UI.
+**Do this instead:** Snapshot what the network needs (uid, mailbox, prev
+flags) under a short lock, drop the guard, do I/O, re-lock to write results.
+The existing worker steps already model this; copy the shape.
 
-### Anti-Pattern 3: Rendering unsanitized HTML / `dangerouslySetInnerHTML` on raw parts
+### Anti-Pattern 3: SELECT-per-Message and STORE-without-SELECT-check
 
-**What people do:** Display `BODY[TEXT]` directly for fidelity.
-**Why it's wrong:** Tracking pixels, `javascript:` URIs, and CSS exfiltration run in the same WebView that holds the keyring-backed session — stored XSS with credential access.
-**Do this instead:** `ammonia` in Rust before storage + sandboxed `iframe srcDoc` at render. Block remote images by default (M1-safe choice; add per-sender allowlist post-M1).
+**What people do:** `SELECT` the mailbox fresh inside every flag write "to be
+safe", or `STORE` assuming the session is still on the right mailbox.
+**Why it's wrong:** The first adds a round-trip to the highest-frequency op;
+the second applies flags to the wrong folder after a folder switch (IMAP STORE
+is selection-scoped — a stale SELECT silently corrupts another folder's flags).
+**Do this instead:** Manager tracks `selected_mailbox`; `with_session` compares
+and SELECTs only on change. Flag writes never SELECT directly.
 
-### Anti-Pattern 4: Storing credentials in SQLite / Tauri Store plugin
+### Anti-Pattern 4: UIDNEXT-Only Incremental Sync (Silent Gaps)
 
-**What people do:** Persist password next to mail for convenience.
-**Why it's wrong:** DB file is backed up/copied; plaintext secret violates the project's explicit security constraint.
-**Do this instead:** `keyring` crate only; SQLite holds `account_username`, never the secret.
+**What people do:** Sync `UID last_next:*` and call it done.
+**Why it's wrong:** Misses UIDs that arrived and stayed below the old
+`uid_next` window between passes (server-side delay, app asleep mid-batch) —
+the exact gap class v1.1 promises to eliminate.
+**Do this instead:** Always follow `Incremental` with the `GapFill` set-diff;
+it's one extra `SEARCH ALL` (cheap, no bodies) plus fetches only for actually
+missing UIDs.
+
+### Anti-Pattern 5: Two Sync Paths (Poll vs Manual) and Overlapping Polls
+
+**What people do:** Poller has its own fetch loop; a second timer fires while
+the first pass still runs.
+**Why it's wrong:** Two writers over the same `(mailbox_id, uid)` rows with two
+sessions = lost flag updates and `uid_next` clobbering; overlapping full sweeps
+double server load.
+**Do this instead:** Pattern 4 — one `request_sync` with an `AtomicBool`
+guard; `cancel_sync` finally gets a real flag wired to batch boundaries
+(today it is a documented no-op).
 
 ## Integration Points
 
@@ -340,39 +334,51 @@ Sizing note: headers ~1–2KB/row → 50k-message UTFPR INBOX ≈ 100MB SQLite, 
 
 | Service | Integration Pattern | Notes |
 |---------|---------------------|-------|
-| IMAP server (mail.utfpr.edu.br) | `async-imap` over TLS (`async-native-tls`); STARTTLS vs SSL/TLS user-configurable per PROJECT.md | University servers often have slow/old TLS: allow port 993 SSL + 143 STARTTLS; 10s connect / 30s read timeouts; single session; never `STORE` flags in M1 (read-only) |
-| OS keyring (Secret Service) | `keyring` crate; service `sge` | Linux Secret Service may be locked headless — surface clear error, don't fall back to plaintext |
-| Linux bundle | Tauri v2 bundler: `.deb` + `.AppImage` | Sign nothing for M1; test install on clean VM (missing webkit deps is the classic Linux failure) |
+| IMAP server (mail.utfpr.edu.br:993 + others) | Single `BoxedSession` via `async-imap 0.11`: `select`, `uid_search`, `uid_fetch`, `uid_store` | async-imap 0.11 `uid_store(set, "+FLAGS", "\\Seen")` is the write primitive; verify flag arg spelling against server (some servers want `+FLAGS` vs `+FLAGS.SILENT` — prefer `.SILENT` to avoid unsolicited FETCH noise during sweeps); never issue NAMESPACE (imap-proto 0.16 parser poison — existing tripwire test stays); BODY.PEEK-only reads preserved |
+| OS keyring | Unchanged — manager reads creds once at first connect, caches `AccountConfig` in memory for reconnects | Reconnect path must reuse the in-memory config, not re-prompt; zeroize handling unchanged |
 
 ### Internal Boundaries
 
 | Boundary | Communication | Notes |
 |----------|---------------|-------|
-| React ↔ Rust | `invoke` (typed commands) + `Channel<SyncEvent>` (progress) | Commands return `Result<T, String>`; frontend maps Err to toast. No `emit` for progress (untyped, unordered). |
-| SyncWorker ↔ MailStore | `Mutex<rusqlite::Connection>` via Tauri `State` | Single writer; readers take short locks; WAL lets list queries run during sweep. Testing seam: `Store` trait with in-memory SQLite impl. |
-| MIME parse ↔ sanitize | `mail-parser` output → `ammonia::clean` → store | Sanitize-before-store invariant enforced in `store/queries.rs` insert path (can't bypass by calling parse directly). |
+| Commands ↔ SessionManager | `manager.with_session(mailbox, op).await` | Replaces all direct `connect_sync` calls; `connect_account` signature UNCHANGED (still probe + set `active_account`; manager lazily connects on first op) |
+| Poller ↔ Worker | `request_sync(mailbox, reason)` single entry | Poller never touches `SyncSession` directly; manual `refresh_now` is the same call with `reason: Manual` |
+| Worker ↔ Store | Existing `queries::*` + new `upsert_folder`, `folder_uids`, `update_flags` | Keep single-SQL-module invariant: all new SQL lives in `queries.rs`; `update_flags` must also bump FTS? No — flags aren't in FTS; plain UPDATE suffices |
+| Backend → Frontend events | `app.emit("sync-event", SyncEvent)` app-wide bus | Per-call `Channel<SyncEvent>` retained for `start_sync` (contract), but poller-originated events use the bus; frontend subscribes via `listen("sync-event")` — one listener serves both |
+| SQLite schema M1 → M2 | `rusqlite_migration` append M2: `ALTER TABLE mailboxes ADD COLUMN …` ×3 | Non-destructive; existing rows (INBOX) default `selectable=1`; `SCHEMA_VERSION` 1→2; messages/bodies/attachments/F T S untouched |
 
-## Phase-Shaped Component Boundaries (for downstream roadmap)
+## Suggested Build Order (dependency-aware)
 
-| Roadmap phase | Owns | Depends on | Done when |
-|---------------|------|------------|-----------|
-| 1. Backend sync core | `imap/session.rs`, `headers.rs`, sync algorithm, timeouts/reconnect | Nothing (mock FETCH against local fixture RFC822 files) | Incremental algorithm steps 1–7 pass against a fake IMAP transcript; UIDVALIDITY-reset test passes |
-| 2. Local store | `schema.sql`, `queries.rs`, FTS triggers, MailStore state | Phase 1 types (MessageRow) | Header sweep persists 10k fixture rows; `list/search` <50ms; resync test green |
-| 3. UI shell | Three-pane layout, virtualized list, TanStack hooks, sync progress bar | Phase 2 commands | List paints from seeded DB offline; progress bar reflects Channel events |
-| 4. Reader + attachments | `bodies.rs`, sanitize pipeline, iframe reader, save_attachment | Phases 2–3 | HTML renders sanitized (XSS fixture test); attachment downloads byte-identical |
-| 5. Auth + packaging | keyring vault, auto-login, Linux bundles | Phases 1–4 | Cold start auto-logs-in; `.deb` installs on clean VM |
-
-Order rationale: sync-core → store → shell → reader → packaging is dependency order; each phase is demoable (CLI sweep → sqlite3 inspect → offline UI → full read → installed app).
+1. **`SessionManager` + trait extension** (`imap/manager.rs`, `select_mailbox` /
+   `store_flags` / `search_range` on `SyncSession` + `MockSession`). Foundation —
+   unblocks everything; migrate `fetch_message`/`save_attachment` onto it now
+   while the call sites are still three.
+2. **M2 migration + folder cache** (schema columns, `upsert_folder`,
+   `list_folders`, discovery refresh inside `connect_account` flow without
+   changing its signature). Unlocks the sidebar with zero sync changes.
+3. **Worker parameterization + tiered sync** (`sync_folder(mailbox, mode)`,
+   `backfill.rs` gap logic, periodic-Full policy). INBOX regression suite
+   (existing 4 worker tests) must stay green — they become the `mailbox="INBOX"`
+   cases.
+4. **`set_seen` optimistic toggle** (command + reconcile/rollback + `FlagSynced`
+   event). Depends on 1; testable against a real folder immediately.
+5. **Poller + unified entry** (`request_sync`, no-overlap guard, real
+   `cancel_sync`, app-wide event bus, manual `refresh_now`). Depends on 1–3;
+   last because it orchestrates the others.
 
 ## Sources
 
-- Tauri v2 official docs — Calling the Frontend from Rust (Events vs Channels guidance; Channel ordered/typed recommendation): https://v2.tauri.app/develop/calling-frontend/
-- Tauri v2 official docs — Calling Rust from the Frontend (async commands preferred): https://v2.tauri.app/develop/calling-rust/
-- `imap` / `async-imap` crate docs — Session, UID/UIDNEXT/UIDVALIDITY semantics (docs.rs/imap, lib.rs/crates/async-imap)
-- RFC 3501 §2.3.1.1 + nickb.dev Introduction to IMAP — UIDVALIDITY/UID immutability contract; BODY.PEEK non-mutating fetch
-- stalwartlabs `mail-parser` (crates.io / context7) — header/MIME parsing choice
-- TanStack DB / Query offline-first docs (tanstack.com, powersync.com, expo local-first) — SQLite-as-truth + query-invalidation pattern
+- Live codebase: `src-tauri/src/sync/worker.rs` (7-step sweep, BATCH_SIZE=200,
+  UIDVALIDITY guard, inconsistency guard), `src-tauri/src/imap/mod.rs`
+  (`SyncSession` read-only trait, `select_inbox/search_uids/fetch_envelopes/
+  fetch_body`), `src-tauri/src/imap/session.rs` (`connect_sync`, NAMESPACE
+  parser-poison tripwire), `src-tauri/src/store/schema.sql` + `store/mod.rs`
+  (per-row sync state already in `mailboxes`), `commands/sync.rs` (per-command
+  connections — the pattern v1.1 retires), `lib.rs` (`AppState`, `connect_account`
+  permanent signature).
+- IMAP semantics: RFC 3501 `STORE`/`UID STORE` selection-scoping, `UIDNEXT` /
+  `UIDVALIDITY` guarantees; async-imap 0.11 `uid_store` API shape.
 
 ---
-*Architecture research for: SGE Linux IMAP desktop client (Tauri v2 + React + SQLite)*
-*Researched: 2026-10-03*
+*Architecture research for: SGE v1.1 Triage & Folders*
+*Researched: 2026-10-04*

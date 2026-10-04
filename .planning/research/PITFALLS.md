@@ -1,200 +1,150 @@
-# Pitfalls Research
+# Pitfalls Research: v1.1 Triage & Folders (adding writes, folders, polling, backfill to a read-only IMAP client)
 
-**Domain:** Rust IMAP desktop client (Tauri v2 + SQLite, Linux, university servers)
-**Researched:** 2026-10-02
-**Confidence:** HIGH (RFC-backed + Tauri/official docs); MEDIUM on mail.utfpr.edu.br specifics (unverified server config)
+**Domain:** IMAP email client — incremental v1.1 capabilities on an existing read-only single-session client
+**Researched:** 2026-10-04
+**Confidence:** HIGH (RFC 3501/4549/4551/7162/4315/2177 semantics + Dovecot/Evolution implementation history)
 
 ## Critical Pitfalls
 
-### Pitfall 1: Ignoring UIDVALIDITY — silent cache corruption
+### Pitfall 1: Treating \Seen toggle as "just a STORE" without a same-source-of-truth flag-reconcile pass
 
 **What goes wrong:**
-Local SQLite cache maps UIDs to messages. Server (mailbox rebuild, migration, Dovecot maintenance) bumps UIDVALIDITY, invalidating every cached UID. App keeps showing stale/wrong messages or silently refills with nothing (known bichon bug: incremental fetch off a pre-reset high-water mark returns 0 rows and the mailbox looks empty).
+User taps read/unread, app fires `UID STORE +FLAGS \Seen`, updates local DB optimistically — but the next header sync overwrites the local flag with stale server data (or vice versa), so the toggle visibly flaps: read → unread → read. Worse, if the FETCH during sync uses non-UID sequence numbers, an intervening EXPUNGE shifts sequence numbers and the flag lands on the wrong message.
 
 **Why it happens:**
-Developers store `uid -> message` but forget to store `uidvalidity` per mailbox, or compare it only at login instead of on every SELECT. RFC 3501 STRONGLY encourages servers to bump it on reorder/recreate, and university servers do this during maintenance.
+M1 was read-only, so the sync path was designed as "server is truth, overwrite local." The first write feature breaks that assumption, but developers bolt STORE onto the side without changing sync to reconcile (compare-and-merge) instead of overwrite. Sync also commonly fetches flags by sequence number rather than UID, which is only safe inside a single SELECT with no expunge in between.
 
 **How to avoid:**
-- Store `(mailbox, uidvalidity, uidnext)` in SQLite alongside messages. Buildable task: `sync_meta` table + check on every SELECT; on mismatch, wipe that mailbox's cached rows and do a **full** `UID FETCH 1:*`, never incremental.
-- Never persist high-water UID across a UIDVALIDITY change.
+- Always address flag writes by UID (`UID STORE <uid> ±FLAGS (\Seen)`), never by sequence number.
+- Sync must FETCH `UID + FLAGS` together and merge: apply server flags except for UIDs with a locally-pending (unacked) toggle; once STORE returns OK, clear pending and accept server state.
+- Never use plain `FETCH BODY[]`/`FETCH FLAGS` (implicit `\Seen` side effect on some servers for BODY[] — use BODY.PEEK discipline from M1; for flags-only FETCH there is no Seen side effect, but keep the habit of explicit `.SILENT` or UID STORE to suppress noisy untagged FETCH storms).
+- If server advertises CONDSTORE (RFC 7162), prefer `UID STORE … UNCHANGEDSINCE <modseq>` for toggles so a concurrent change from another client/phone returns `MODIFIED` instead of silently clobbering; on MODIFIED, re-fetch flags and re-apply user intent or surface conflict.
 
 **Warning signs:**
-Mailbox suddenly empty after server maintenance; messages with wrong bodies; duplicate rows after re-sync.
+- Flag state visibly flaps after toggle + sync.
+- "Wrong message marked read" bug reports (sequence-number addressing + expunge shift).
+- STORE issued with sequence numbers anywhere in the codebase.
 
 **Phase to address:**
-Sync-engine / local-cache phase (first backend phase). Gate: integration test that simulates a UIDVALIDITY bump and asserts full resync.
+Flag-sync phase (first v1.1 phase) — reconcile logic must land in the same phase as the first STORE, not "later."
 
 ---
 
-### Pitfall 2: Fetching sequence numbers instead of UIDs, and full RFC822 up front
+### Pitfall 2: Single global UIDVALIDITY / UIDNEXT / high-water-mark applied to all folders
 
 **What goes wrong:**
-Using message sequence numbers (`FETCH 1:N`) breaks the moment another client expunges a message — sequence numbers shift, cache points at the wrong mail. Fetching full `RFC822` bodies for the whole INBOX on first sync hangs the UI for minutes on a 10k+ university mailbox and can take 25–90s+ per large message with attachments.
+App stores one `uidvalidity` / `last_uid` in SQLite, then adds Sent/Drafts/custom folders reusing the same row. Opening a second folder either (a) compares the wrong UIDVALIDITY and needlessly wipes/re-downloads, or (b) misses a real UIDVALIDITY change and shows stale/wrong messages matched to recycled UIDs. Folder rename on another client looks like "folder vanished + unknown folder appeared" and orphans local rows.
 
 **Why it happens:**
-`rust-imap` examples show `fetch("1", "RFC822")` — easy to copy. Sequence numbers feel natural; UID discipline feels like boilerplate.
+M1 only knew INBOX, so per-mailbox state got modeled as global app state. RFC 3501/9051 UIDVALIDITY is per-mailbox, and UIDNEXT/high-water-mark are meaningless across mailboxes. Developers also forget that LIST must be re-queried: folder set is dynamic.
 
 **How to avoid:**
-- Use `UID FETCH` exclusively; key cache on UID, order UI by INTERNALDATE/UID.
-- Headers-first sync: `UID FETCH x:y (UID FLAGS INTERNALDATE ENVELOPE BODYSTRUCTURE)` paginated in chunks (e.g. 500 UIDs/window); bodies on demand via `UID FETCH uid (BODY.PEEK[])` or partial `BODY.PEEK[TEXT]<start.size>` for large parts. Buildable tasks: paginated header sync + on-demand body fetch + progress UI.
+- Schema rule: every piece of sync state is keyed by folder — `(mailbox_name, uidvalidity, uidnext, highest_uid_seen)` at minimum; messages table gets a `folder` column (or folder id FK) in the same migration that adds folder browsing.
+- On every SELECT: compare returned UIDVALIDITY to stored per-folder value; on mismatch, purge only that folder's cached messages + drop its queued flag actions (RFC 4549 §3-d-1), then full re-fetch that folder.
+- Re-run LIST on each sync/poll cycle (cheap) and handle: renamed folder = delete-old-rows + fresh sync under new name; deleted folder = purge local rows (or tombstone) rather than showing a ghost folder forever.
+- Remember the existing stack constraint: imap-proto 0.16 cannot parse NAMESPACE — keep profiling folders from CAPABILITY + LIST-EXTENDED responses only; never branch on NAMESPACE data.
 
 **Warning signs:**
-Wrong message opens when tapped; first sync never finishes; memory spikes on large INBOX.
+- Switching folders shows INBOX messages, or unread counts leak across folders.
+- One `sync_state` row without a folder column in code review.
+- Folder list is fetched once at login and never refreshed.
 
 **Phase to address:**
-Sync-engine phase. Gate: 15k-message fixture syncs headers in <10s on loopback; body fetch is lazy.
+Folder-browsing phase — the per-folder sync-state migration is a prerequisite task in that phase, before any multi-folder FETCH.
 
 ---
 
-### Pitfall 3: Assuming Gmail-isms — SPECIAL-USE, NAMESPACE, separator
+### Pitfall 3: Overlapping syncs on one connection — poll timer fires while a sync (or STORE) is still in flight
 
 **What goes wrong:**
-Hardcoding folder names (`INBOX/Sent`), `/` separator, or assuming `SPECIAL-USE` flags exist. University Dovecot/Zimbra servers often: (a) have no SPECIAL-USE mailboxes configured by default, (b) use `.` separator or `INBOX.` prefixes, (c) hide alias namespaces. M1 is INBOX-only so blast radius is small, but LIST parsing that assumes `/` breaks even INBOX display on some servers, and M2 folder support will explode without abstraction.
+Poll interval elapses mid-sync; app issues a second SELECT/FETCH on the same single `async-imap` session (or sends a command while IDLE is active without DONE). Responses interleave, untagged FETCH/EXPUNGE lines get attributed to the wrong operation, UI shows duplicates or drops messages. With `async-imap 0.11`'s single-session SyncEngine there is exactly one command pipeline — concurrent use is a data race even if it compiles (requires `&mut` juggling or panics/deadlocks on a shared session).
 
 **Why it happens:**
-Dev tests only against Gmail; Gmail normalizes everything.
+Polling looks trivially easy (`tokio::time::interval` + `sync()`), so it gets added without a sync mutex/queue. Developers also mix IDLE-style expectations with poll code, or forget RFC 2177's rule that nothing may be sent while the server waits for DONE.
 
 **How to avoid:**
-- Issue `CAPABILITY`, `NAMESPACE`, `LIST "" "*"` at connect; use returned hierarchy separator verbatim; treat SPECIAL-USE as optional (fall back to name matching). Buildable task: `mailbox_discovery` module + fixture tests with `.`-separator and no-SPECIAL-USE CAPABILITY responses.
+- Single-flight guard: one async Mutex (or command queue / actor) around the entire SyncEngine session; poll tick that finds sync-in-progress either skips (and records "dirty → sync again after") or coalesces — never runs concurrently.
+- Decide poll vs IDLE explicitly: v1.1 scope is poll + manual refresh (NOOP/SELECT-based). If IDLE is ever added, it needs its own dedicated connection; the poll timer must DONE/close IDLE before issuing any command.
+- Manual refresh button must go through the same single-flight gate as the timer (shared `request_sync()` entry point).
+- Re-issue logic: RFC 2177 advises re-issuing IDLE ≥ every 29 min; for poll, pick a conservative default (e.g. 60–120 s, user-configurable) and add jitter so reconnect storms don't hammer the server.
 
 **Warning signs:**
-Folders missing/duplicated on real server but fine on Gmail; backslash-escaped names.
+- Two tasks holding the IMAP session handle; `select`/`fetch` called from timer callback directly.
+- Intermittent duplicate or missing messages that only reproduce under slow networks (long sync overlapping next tick).
+- IDLE `DONE` never sent before next command (protocol error / server BYE).
 
 **Phase to address:**
-Connection/discovery phase (before sync). Gate: connects to a Dovecot fixture with `.` separator and passes.
+Poll-refresh phase — single-flight + shared entry point are acceptance criteria of that phase.
 
 ---
 
-### Pitfall 4: IDLE without fallback — dead "new mail" on university networks
+### Pitfall 4: Treating every UID gap as "missing, fetch it" — confusing expunged UIDs with never-seen UIDs, and racing UIDNEXT
 
 **What goes wrong:**
-Relying solely on IMAP IDLE for freshness. University firewalls/NAT kill idle sockets silently; some servers don't advertise IDLE at all (client MUST NOT use it then, RFC 2177). Result: no new mail until restart, or a hung background thread holding a dead socket. `rust-imap`'s blocking IDLE also blocks the session — a second connection is needed for concurrent fetch.
+Backfill logic computes `missing = (max_seen+1..UIDNEXT) − present` naively and FETCHes each gap UID. For UIDs that were expunged (deleted elsewhere) the server returns nothing, so the gap is "still missing" next cycle → app re-requests forever (sync never converges, log spam, battery drain). Conversely, sampling UIDNEXT, then FETCHing, then assuming contiguity misses arrivals between the two commands (UIDNEXT race) — new mail silently skipped until next full poll.
 
 **Why it happens:**
-IDLE demos look trivial (`idle()` + `DONE`); polling feels old-fashioned.
+UIDs are dense-in-practice so gaps feel like errors; developers forget expunge creates permanent holes (RFC 3501: UIDs are never reused within a UIDVALIDITY epoch, holes are normal). UIDNEXT is a prediction, not a snapshot — it can advance between any two commands.
 
 **How to avoid:**
-- Design sync as **poll-first, IDLE-later**: M1 ships with `NOOP`/re-SELECT polling (e.g. 60–120s, manual refresh button); add IDLE post-M1 with 29-min re-issue timer, heartbeat, and poll fallback when CAPABILITY lacks IDLE. Buildable tasks: (1) periodic poll + manual refresh in M1; (2) IDLE worker on a dedicated connection with watchdog in hardening phase.
+- Backfill protocol per folder: `SELECT` → record `UIDNEXT_u1` → `UID FETCH known_range` (or `UID SEARCH ALL`) to learn the true present-set → missing = expected_range − present − known_expunged; fetch only those; then re-check UIDNEXT (`u2`); if `u2 > u1`, fetch `u1..u2` arrivals explicitly. Never loop forever on a UID the server repeatedly returns nothing for — after N (e.g. 2) empty results, record it as expunged/tombstoned in SQLite and stop asking.
+- Distinguish three states per UID in local store: `present`, `expunged` (server confirmed gone or repeatedly empty), `unknown` (never observed). Backfill only targets `unknown`.
+- Do NOT use `1:*` sequence FETCH to "fill gaps" — sequence numbers shift under expunge; always UID-addressed FETCH.
+- Cap backfill range size per cycle (e.g. fetch in chunks of 50–100) so a huge gap after offline weeks doesn't block the UI or OOM the session parser.
 
 **Warning signs:**
-New mail arrives on phone but never on desktop; app hangs on sleep/wake; IDLE thread never returns.
+- Sync loop never reports "up to date"; same UIDs re-fetched every poll.
+- New mail intermittently missed right after backfill runs (UIDNEXT sampled too early).
+- `FETCH 1:*` or sequence-range FETCH in backfill code.
 
 **Phase to address:**
-M1: polling sync phase. Post-M1: live-update hardening phase.
+UID-backfill phase — convergence test (poll twice, second poll issues zero FETCHes) belongs in that phase's success criteria.
 
 ---
 
-### Pitfall 5: TLS verification corner-cutting on flaky university certs
+### Pitfall 5: Offline flag toggle lost or double-applied — no durable outbox for writes made while disconnected
 
 **What goes wrong:**
-`mail.utfpr.edu.br` may present expired/intermediate-missing/hostname-mismatched chains (common on university mail). Two failure modes: (a) dev adds `danger_accept_invalid_certs(true)` / custom accept-all verifier to "make it work" and ships it — full MITM exposure of password + mail; (b) strict verifier with no escape hatch — user locked out with an opaque error.
+User toggles read/unread with no connection (or session expired mid-STORE). App either drops the intent (toggle silently reverts on next sync — user thinks app is broken) or retries blindly on reconnect and double-applies / applies to a stale UID after a UIDVALIDITY change (flag lands on a different message or errors confusingly).
 
 **Why it happens:**
-`native-tls` vs `rustls` root-store differences (system store vs Mozilla WebPKI) produce "works on my machine" TLS; pressure to just disable verification.
+M1 never needed a write queue — everything was a read. First-write feature inherits "fire and forget STORE; on error, show toast." RFC 4549 §5 explicitly calls out playback error recovery as the trickiest part: operations on no-longer-existing messages, and pending actions invalidated by UIDVALIDITY change.
 
 **How to avoid:**
-- Use platform verifier (`native-tls` on Linux honoring system CA store, or `rustls-platform-verifier`); **never** ship accept-all. Add user-configurable security mode per PROJECT.md (SSL/TLS 993 vs STARTTLS 143) + explicit "trust this certificate" flow: on verification failure, show cert fingerprint (SHA-256) and pin it in SQLite/keyring on user consent (TOFU). Buildable tasks: TLS mode selector + cert-error dialog with fingerprint pinning. Prefer `rustls-platform-verifier::Verifier::new_with_extra_roots` for pinned roots.
+- Durable pending-ops table in SQLite: `(folder, uid, op=±Seen, created_at, attempts)` written before the optimistic UI update; a replay worker drains it on reconnect in order.
+- Playback rules (RFC 4549 §5.1): on per-op failure because message no longer exists → silently drop that op (not abort whole queue); on UIDVALIDITY mismatch for the folder → drop all queued ops for that folder (they reference dead UIDs) and notify once; cap retries with backoff, then surface "N changes couldn't sync" with a retry button.
+- Optimistic UI must mark toggled rows as "pending" (subtle indicator) until STORE ACK clears the queue entry — so revert-on-failure reads as honest state, not a glitch.
 
 **Warning signs:**
-`certificate verify failed` only on some distros; `danger_accept_invalid` anywhere outside a `#[cfg(test)]` fixture.
+- No table/queue for pending writes; STORE errors only toasted.
+- Toggle-while-offline silently does nothing (no outbox row).
+- After UIDVALIDITY regeneration, queued STOREs applied to recycled UIDs.
 
 **Phase to address:**
-Connection/auth phase. Gate: `grep -r danger_accept_invalid` must be empty in release profile; cert-error UX verified against a bad-cert fixture.
+Flag-sync phase (outbox + replay designed alongside first STORE); poll phase adds "drain outbox on reconnect" trigger.
 
 ---
 
-### Pitfall 6: Charset/encoding hell — mojibake subjects and panics
+### Pitfall 6: Session expiry treated as fatal / login replayed from plaintext instead of keyring + clean re-SELECT
 
 **What goes wrong:**
-Brazilian university mail is full of `iso-8859-1`, `windows-1252`, `iso-8859-15` subjects/bodies and malformed RFC 2047 encoded-words. Naive `String::from_utf8(body).expect(...)` (as in `rust-imap` docs example) panics; `mailparse`'s Latin-1 fallback returns garbage silently; dates from "creative" servers fail `dateparse`.
+Server closes idle connection (common: 30-min inactivity timeout; explicitly noted in RFC 2177 for IDLE, and aggressive on some providers). App shows "disconnected" permanently, or crashes on use-after-close, or — worst — caches the password in memory/plaintext to "reconnect quickly," violating the keyring-only constraint. After reconnect, app resumes FETCHing with pre-disconnect sequence numbers or cached UIDNEXT, missing everything that arrived during the gap.
 
 **Why it happens:**
-Copying the docs example's `.expect("message was not valid utf-8")`; assuming UTF-8 everywhere.
+M1's happy path keeps one long-lived session from login; expiry paths were never exercised. Reconnect feels like an edge case until polling keeps a client connected for hours.
 
 **How to avoid:**
-- Use `mail-parser` (stalwart, 41 charsets, Postel-law lenient, zero-copy) over `mailparse` for header/body decoding; route all byte→str through it, never raw `from_utf8().unwrap()`. Wrap parse in `Result` with fallback row ("undecodable part — show raw"). Buildable tasks: decode pipeline on `mail-parser` + fixture corpus of win-1252/iso-8859-1/qp/broken-encoded-word mails + never-panic fuzz test.
+- Health-check each poll tick: cheap `NOOP` (RFC 3501 §6.1.2 — explicitly designed as periodic poll/keepalive) before sync; on failure, full reconnect: re-auth using keyring credentials (never cached plaintext), re-SELECT folder, re-read UIDVALIDITY + UIDNEXT, then incremental sync — not resume-mid-stream.
+- Session wrapper: `ensure_connected()` that every sync/poll/STORE path calls; exponential backoff on repeated failures; surface "reconnecting…" state in UI rather than error toast per tick.
+- Clear in-memory auth material on disconnect; re-read from keyring per reconnect (keeps the M1 keyring decision intact).
 
 **Warning signs:**
-`Ã©`/`?` in subjects; panics on specific messages; empty bodies on multipart/alternative.
+- Password held in a global/static for reconnect; any plaintext credential file.
+- Sync-after-reconnect uses stale sequence numbers or skips UIDVALIDITY check.
+- First manual "leave app open 1 hour" test never performed.
 
 **Phase to address:**
-Parse/render pipeline phase. Gate: fixture corpus (≥20 real-world Brazilian mails) renders without panic or mojibake.
-
----
-
-### Pitfall 7: Rendering raw HTML email — XSS → Tauri IPC = arbitrary code execution
-
-**What goes wrong:**
-Email HTML rendered unsanitized (or `FORBID_TAGS: ['script']` only) via `dangerouslySetInnerHTML` in the React reader. Known Tauri RCE chain (CVE-2026-82642, Readest): `<iframe srcdoc>` / `<object>` / `<embed>` payload survives naive DOMPurify config, executes inside `sandbox="allow-same-origin allow-scripts"` iframe, and reaches `parent.parent.__TAURI_INTERNALS__.invoke(...)` → every permitted IPC command. Email is attacker-controlled input by definition.
-
-**Why it happens:**
-Forgetting email is untrusted; trusting "we stripped `<script>` so we're safe"; reusing the app's own origin for the reader iframe.
-
-**How to avoid:**
-- Sanitize **in Rust backend or at render boundary** with allowlist sanitizer (e.g. `ammonia` crate) that also strips `iframe/object/embed/form/base/link/meta`, all `on*` handlers, and `srcdoc`; block remote content by default (no external images — tracking pixels + mixed-content); render in sandboxed iframe **without** `allow-same-origin` (use `sandbox=""` or `allow-popups` only) so even escaped JS can't touch IPC; set Tauri CSP in `tauri.conf.json`; route link clicks through `openUrl`/shell-open allowlist. Buildable tasks: sanitizer module + CSP config + iframe sandbox + remote-content toggle + XSS fixture tests (srcdoc/iframe/object/event-handler payloads).
-
-**Warning signs:**
-`dangerouslySetInnerHTML` with unsanitized input; `allow-same-origin` on mail iframe; remote images loading by default.
-
-**Phase to address:**
-Reader-UI phase (before any real mail is displayed). Gate: OWASP-style XSS payload suite renders inert; `__TAURI_INTERNALS__` unreachable from mail iframe.
-
----
-
-### Pitfall 8: Keyring absent on minimal Linux — login loop / plaintext fallback
-
-**What goes wrong:**
-`keyring`/`libsecret` Secret Service needs a running daemon (GNOME Keyring/KWallet + D-Bus). On minimal WMs (i3/sway), headless installs, or fresh logins with locked collection, every secret-store call fails → auto-login breaks, or worse, dev "temporarily" writes the password to a plaintext config file and forgets.
-
-**Why it happens:**
-Dev machine has GNOME Keyring unlocked via PAM; target machines don't. `keyring-rs` docs explicitly warn headless/secret-service is the painful case.
-
-**How to avoid:**
-- Probe keyring availability at startup; on `NoDefaultCollection`/`PlatformFailure`, show explicit setup guidance (install+autostart `gnome-keyring`, PAM unlock) and offer **explicit opt-in** encrypted-file fallback (e.g. age/XChaCha20 sealed file with user-set master password) — never silent plaintext. Buildable tasks: keyring probe + error UX + optional encrypted-file fallback behind a clear consent screen. Consider `oo7` (portal-aware, file backend for sandboxed builds) if Flatpak is ever targeted.
-
-**Warning signs:**
-Login works on dev laptop, fails on fresh VM; `secret service: no default collection` errors; any `.toml`/`.json` containing a password.
-
-**Phase to address:**
-Auth/persistence phase. Gate: tested on a minimal Linux VM without keyring daemon; no plaintext credential anywhere (`grep -ri password ~/.config/sge` empty).
-
----
-
-### Pitfall 9: Tauri Linux bundling — "works in dev, won't install"
-
-**What goes wrong:**
-Tauri v2 needs `libwebkit2gtk-4.1` + GTK/AppIndicator at build **and** runtime. Building on newest Ubuntu raises minimum glibc → `.deb` fails on older targets with `GLIBC_X.XX not found`; Ubuntu 20.04 can't even install `libwebkit2gtk-4.1-dev` (not in repos); missing system deps → white screen or linker errors for users.
-
-**Why it happens:**
-`cargo tauri dev` works because dev deps are installed; bundling/runtime matrix is never tested.
-
-**How to avoid:**
-- Pin build baseline to oldest supported target (Ubuntu 22.04 / Debian 12 container or CI runner — both ship webkit2gtk-4.1); declare `depends: libwebkit2gtk-4.1-0, libgtk-3-0` in bundler config; ship `.deb` + document AppImage as fallback (bundled, ~70MB+, glibc caveat remains). Buildable tasks: Docker/CI build image pinned to 22.04 + install-matrix test (fresh 22.04 + 24.04 VMs) + `tauri info` prerequisite docs.
-
-**Warning signs:**
-White screen on launch (missing capabilities/frontend dist); `webkit2gtk-4.0 vs 4.1` linker errors from following v1 tutorials; GLIBC errors on user machines.
-
-**Phase to address:**
-Packaging/ship phase (last). Gate: clean-install test on two fresh distro versions before calling M1 done.
-
----
-
-### Pitfall 10: Attachment + SQLite blowup — unbounded disk growth
-
-**What goes wrong:**
-Storing attachment blobs in SQLite, or re-downloading bodies on every view, balloons the DB (a few 30MB PDFs = 100MB+ DB) and slows FTS/list queries; no eviction → disk fills on a student laptop.
-
-**Why it happens:**
-"Cache everything in one table" is the fastest schema to write; `BODY[]` always fetches attachments with the text.
-
-**How to avoid:**
-- Metadata in SQLite, attachment bytes as files under app-data dir keyed by `(uidvalidity, uid, part-id)` with size + SHA-256; bodies via `BODYSTRUCTURE`-aware part fetch (text parts inline, attachments only on explicit download); LRU/size-cap eviction (e.g. 500MB default, user-adjustable) that deletes files but keeps metadata rows. Buildable tasks: attachment store module + quota/eviction + download-on-demand UI.
-
-**Warning signs:**
-DB file >500MB after a week; list scrolling janks; re-download on every open (check network log).
-
-**Phase to address:**
-Cache/storage phase + attachment UI phase. Gate: 100-mail × 5MB-attachment fixture keeps DB <50MB with lazy attachments.
+Poll-refresh phase (reconnect + NOOP health check are core poll-phase tasks).
 
 ---
 
@@ -202,106 +152,97 @@ Cache/storage phase + attachment UI phase. Gate: 100-mail × 5MB-attachment fixt
 
 | Shortcut | Immediate Benefit | Long-term Cost | When Acceptable |
 |----------|-------------------|----------------|-----------------|
-| Sequence numbers instead of UIDs | Less code | Wrong-message bugs after any expunge | Never |
-| Skip UIDVALIDITY column | Simpler schema | Full cache corruption on server maintenance | Never |
-| `danger_accept_invalid_certs` to "fix" TLS | Unblocks dev | Credential-stealing MITM in prod | Never (test fixtures only) |
-| Raw HTML into `dangerouslySetInnerHTML` | Reader works day 1 | XSS→IPC RCE | Never |
-| Plaintext credential file "for now" | Login persists without keyring setup | Credential theft; hard to migrate later | Never — use explicit encrypted fallback |
-| Poll-only, no IDLE | Ships faster | Stale inbox, user complaints | M1 only (IDLE is a hardening phase) |
-| Attachments as SQLite BLOBs | One-table schema | DB bloat, slow queries | Never for M1+ (files + metadata) |
-| `unwrap()`/`expect()` on MIME decode | Less error plumbing | Panic on real-world mail | Never on parse path |
-| Build `.deb` on latest Ubuntu | Fastest CI | GLIBC breakage on older targets | Never — pin 22.04 baseline |
+| Poll only INBOX, backfill/folders reuse INBOX code path with a folder-name parameter but shared sync-state row | Folders "work" fast | Cross-folder state corruption (Pitfall 2) | Never — per-folder state from the start |
+| Optimistic flag toggle with no pending-ops table ("add queue later") | Flag sync ships in days | Silent loss of offline toggles; no conflict story (Pitfalls 1, 5) | Never for writes — queue is part of the write feature |
+| Fire-and-forget STORE without checking MODIFIED / re-fetch | Simpler toggle code | Lost updates when phone + desktop both flag (Pitfall 1) | Only if CONDSTORE absent AND single-client assumption documented; revisit when multi-client reports appear |
+| `FETCH 1:*` full re-download as "backfill" | No gap logic to write | Bandwidth/CPU blowup on large UTFPR mailboxes; UI jank | Only as a manual "repair" button, never the automatic path |
+| Fixed 10 s poll interval for "real-time feel" | Feels instant in demo | Server throttling/BYE, battery drain, hammering on metered links | Never as default; 60–120 s default + manual refresh; sub-30 s only user-opt-in |
+| Single global "last sync" timestamp instead of per-folder UIDNEXT/modseq | Less schema churn | Cannot resume per folder; one slow folder stalls all | Never — schema cost is one migration |
 
 ## Integration Gotchas
 
 | Integration | Common Mistake | Correct Approach |
-|-------------|----------------|------------------|
-| University IMAP (Dovecot/Zimbra) | Assume Gmail CAPABILITY set (IDLE, SPECIAL-USE, QRESYNC) | Probe `CAPABILITY`/`NAMESPACE`; degrade gracefully; fixture-test non-Gmail responses |
-| TLS (native-tls vs rustls) | Assume same root store everywhere | Use platform verifier; test on target distros; support TOFU pinning UX |
-| Secret Service keyring | Assume daemon + unlocked collection | Probe, guide setup, explicit encrypted-file fallback |
-| WebKit2GTK runtime | Assume user has webkit installed | Declare `.deb` deps; test fresh installs; offer AppImage |
-| SQLite + Tauri IPC | Large blobs over IPC / main thread | Stream/paginate; binary via files, metadata via IPC; `rusqlite` + WAL on backend thread |
+|-------------|---------------|------------------|
+| Dovecot / generic IMAP server (flag writes) | Assuming STORE +FLAGS always succeeds; ignoring `MODIFIED` / `NO` responses | Check tagged response; handle MODIFIED by re-fetching flags; treat `NO [UIDNOTSTICKY]`/read-only SELECT as "flags not persisted" (re-open read-write or warn) |
+| Server without CONDSTORE/QRESYNC (e.g. minimal/older servers) | Requiring HIGHESTMODSEQ/CHANGEDSINCE unconditionally → sync breaks on capable-poor servers | Capability-gate: use CONDSTORE fast path when advertised, fall back to UID+FLAGS full-range FETCH diff otherwise |
+| async-imap 0.11 session | Sharing `&mut Session` across timer + UI tasks; sending while IDLE active | Single owner + async Mutex/actor; commands only when no IDLE outstanding (DONE first); dedicated connection if IDLE ever adopted |
+| imap-proto 0.16 parser | Parsing NAMESPACE / exotic LIST-EXTENDED responses; unhandled untagged responses crash sync loop | Keep CAPABILITY+LIST profiling (existing M1 decision); tolerate-and-ignore unknown untagged data; keep regression tripwire test |
+| OS keyring (reconnect auth) | Caching password in memory indefinitely for fast reconnect | Re-read from keyring on each reconnect; zero in-memory copies after disconnect |
+| SQLite store | One `sync_state` row; messages without folder FK; no pending-ops table | Migrate: `folders(name PK, uidvalidity, uidnext, highest_seen)` + `messages(folder, uid, …, UNIQUE(folder,uid))` + `pending_ops(id, folder, uid, op, attempts)` |
 
 ## Performance Traps
 
 | Trap | Symptoms | Prevention | When It Breaks |
 |------|----------|------------|----------------|
-| Full-body sync of INBOX | First sync takes forever, UI frozen | Headers-first + paged UID windows + bodies on demand | ~2k+ messages or any 10MB+ mail |
-| Unchunked `UID FETCH 1:*` on 15k mailbox | Timeout / OOM | Page by UID ranges (e.g. 500), commit per page, progress bar | Large UTFPR alumni/staff inboxes |
-| Loading remote images by default | Slow render, tracking leaks | Block remote content; click-to-load per sender | Any newsletter-heavy inbox |
-| FTS without index / LIKE on body | Search takes seconds | SQLite FTS5 on subject/from + snippet; bodies indexed lazily | ~5k+ cached messages |
-| IDLE on UI thread (blocking rust-imap) | UI freezes during idle | Dedicated sync thread/connection; poll fallback with timer | Immediately under real use |
+| Full-folder UID+FLAGS FETCH every poll | Poll latency grows linearly; UI stalls on big INBOX | Incremental: `UID FETCH last_seen:UIDNEXT` + flag-diff only for known range; full FETCH only on UIDVALIDITY change | Breaks at ~5–10k messages per folder on poll cadence |
+| Unbounded backfill range in one FETCH | Multi-second hangs, large allocations in imap-proto parse | Chunk backfill (50–100 UIDs/command), yield to UI between chunks | Breaks after offline weeks / first sync of huge Sent folder |
+| Poll + backfill + flag-replay all firing on reconnect | Thundering-herd: 3 full syncs back-to-back | Single `request_sync(reason)` coalescing entry; reconnect = one ordered pass: connect → per-folder incremental → drain outbox → backfill | Breaks on every laptop-wake/reconnect |
+| Re-LIST + re-SELECT every folder every tick | N folders × round trips per poll; slow on high-latency links | LIST refresh at slower cadence (e.g. every N polls or on manual refresh); per-tick only sync visible/selected folder + INBOX | Breaks with 20+ folders on slow links |
 
 ## Security Mistakes
 
 | Mistake | Risk | Prevention |
 |---------|------|------------|
-| Accept-all TLS verifier shipped | Password + mail MITM on campus Wi-Fi | Platform verifier + TOFU pin UX; audit for `danger_accept_invalid` |
-| Unsanitized mail HTML in same-origin iframe | XSS → Tauri IPC → arbitrary code execution | Allowlist sanitize (strip iframe/object/embed/srcdoc/on*), `sandbox` without same-origin, CSP |
-| Plaintext credential storage | Local credential theft | OS keyring primary; explicit encrypted fallback only with consent |
-| Auto-loading remote images/trackers | Read-receipt tracking, IP leak, mixed-content | Block by default; per-sender allowlist |
-| Attachment auto-open / preview without sandbox | Malicious file execution | Download-to-disk + open via system handler only on user action; never auto-execute |
+| Storing password outside keyring for reconnect convenience | Credential theft from disk/memory dump | Keyring-only (M1 constraint restated); re-read per reconnect; no plaintext fallback |
+| Using sequence-number FETCH/STORE after reconnect | Flags/bodies attributed to wrong messages (integrity, not just cosmetic — could mark wrong mail read in a shared mailbox) | UID-only addressing for all post-connect operations |
+| Applying queued STOREs after UIDVALIDITY change | Mutating wrong messages on recycled UIDs | Drop folder's queue on UIDVALIDITY mismatch (RFC 4549) + user-visible notice |
 
 ## UX Pitfalls
 
 | Pitfall | User Impact | Better Approach |
 |---------|-------------|-----------------|
-| No offline/error state for dead IDLE/socket | Inbox silently stale; user distrusts app | Connection status indicator + "last synced Xm ago" + manual refresh |
-| Opaque TLS/keyring errors | User can't log in, gives up | Actionable messages ("install gnome-keyring", "cert expired — review fingerprint") |
-| Blocking first sync with no progress | App looks hung on large inbox | Headers-first + progress bar + usable list ASAP |
-| Mojibake subjects (encoding bugs) | App looks broken for Portuguese mail (ç, ã, é) | Correct charset pipeline; test with PT-BR corpus |
-| Losing scroll/selection on background resync | Disorienting list jumps | Stable UID-keyed list reconciliation; preserve selection |
+| Toggle with no pending indicator; silent revert on failure | "App ignores me / is broken" | Optimistic toggle + subtle pending dot; honest revert + inline retry on failure |
+| Full-folder spinner on every poll | App feels frozen every minute | Background incremental sync; only badge/list-update, no modal spinner; spinner only on manual refresh |
+| Ghost folders after server-side rename/delete | Confusion, taps into empty dead folder | Refresh LIST regularly; remove/rename local folder rows with a one-time notice |
+| Backfill progress invisible on huge gaps | "Is it stuck?" after offline weeks | Determinate progress ("Syncing 1,200 of 3,400") with cancel; backfill yields to interaction |
+| Poll failure toasts every 60 s on bad network | Notification spam | Quiet reconnecting state; toast only after sustained failure (e.g. 3+ failed polls) |
 
 ## "Looks Done But Isn't" Checklist
 
-- [ ] **Sync:** Looks done (messages listed) but missing UIDVALIDITY check — verify by simulating a validity bump
-- [ ] **Sync:** Looks done but fetches by sequence number — verify expunge from another client doesn't shift the list
-- [ ] **TLS:** Looks done (connects) but ships accept-all verifier — verify `grep danger_accept_invalid` is clean in release
-- [ ] **Reader:** Looks done (HTML renders) but unsanitized — verify srcdoc/iframe/object payload suite is inert
-- [ ] **Auth:** Looks done (remembers login) but plaintext — verify no secret bytes outside keyring/encrypted store
-- [ ] **Keyring:** Looks done on dev machine — verify on minimal VM without keyring daemon
-- [ ] **Attachments:** Looks done (names shown) but eagerly downloaded — verify DB stays small with large-attachment fixture
-- [ ] **Search:** Looks done (filters current page) but not FTS — verify offline search across full cache
-- [ ] **Bundle:** Looks done (`dev` runs) but never installed fresh — verify `.deb` on clean 22.04 + 24.04 VMs
-- [ ] **Charset:** Looks done with ASCII test mail — verify PT-BR corpus (latin-1/win-1252 subjects) renders correctly
+- [ ] **Flag sync:** Often missing reconcile-on-sync — verify toggle → poll → flag stays; toggle on phone → poll → desktop reflects it
+- [ ] **Flag sync:** Often missing expunged-during-STORE handling — verify toggle on a message deleted elsewhere fails silently without breaking the queue
+- [ ] **Folders:** Often missing per-folder UIDVALIDITY check — verify change UIDVALIDITY for one folder (or simulate) purges only that folder
+- [ ] **Folders:** Often missing LIST refresh — verify server-side create/rename/delete appears/disappears locally after poll
+- [ ] **Poll:** Often missing single-flight — verify poll firing mid-sync coalesces instead of overlapping (instrument or slow-network test)
+- [ ] **Poll:** Often missing reconnect path — verify kill connection / wait out timeout → next poll reconnects via keyring with no user action
+- [ ] **Backfill:** Often missing convergence — verify two consecutive polls after backfill issue zero FETCHes
+- [ ] **Backfill:** Often missing expunged-vs-missing distinction — verify deleted-elsewhere UID is tombstoned, not re-requested forever
+- [ ] **Offline writes:** Often missing durable outbox — verify toggle offline → kill app → relaunch online → toggle replays
 
 ## Recovery Strategies
 
 | Pitfall | Recovery Cost | Recovery Steps |
 |---------|---------------|----------------|
-| UIDVALIDITY invalidation shipped without handling | MEDIUM | Ship fix that wipes+resyncs on mismatch; users re-sync once, no data loss (server is source of truth) |
-| Accept-all TLS shipped | HIGH | Emergency release removing it; rotate password guidance; add pinning UX |
-| XSS via mail reader | HIGH | Emergency sanitizer fix + CSP tightening; audit IPC permissions (least-privilege capabilities) |
-| Plaintext credentials shipped | HIGH | Migrate into keyring on next launch, shred file, disclose to user |
-| SQLite blob bloat | LOW–MEDIUM | Migration: extract blobs to files, add quota/eviction; one-time vacuum |
-| Wrong-arch/glibc bundle | LOW | Rebuild on pinned 22.04 image; re-release |
+| Flag flap / wrong-message flags | MEDIUM | Stop sequence-addressed STOREs; add UID addressing + reconcile pass; one-time full flag re-FETCH per folder to heal |
+| Global sync state corruption across folders | MEDIUM | Migrate schema to per-folder state; wipe + full resync all folders once (bounded, user-warned) |
+| UIDVALIDITY miss (stale cache shown) | LOW | Add per-SELECT UIDVALIDITY compare; purge affected folder; re-fetch |
+| Runaway backfill (infinite re-FETCH) | LOW | Add tombstone marking + empty-result counter; clear runaway loop; backfill converges next poll |
+| Lost offline toggles | HIGH (data already lost) | Ship outbox; cannot recover past intents — apologize via release note; going forward all intents durable |
+| Plaintext credential cache added for reconnect | MEDIUM | Remove cache; re-read keyring; rotate password if written to disk; add test asserting no credential file exists |
 
 ## Pitfall-to-Phase Mapping
 
 | Pitfall | Prevention Phase | Verification |
 |---------|------------------|--------------|
-| UIDVALIDITY handling | Sync-engine / cache phase (early backend) | Validity-bump simulation test → full resync |
-| UID-only + paged headers-first fetch | Sync-engine phase | 15k-fixture header sync fast; lazy bodies |
-| NAMESPACE/separator/SPECIAL-USE probing | Connection/discovery phase | Dovecot `.`-separator + no-SPECIAL-USE fixtures pass |
-| Poll-first, IDLE later | M1 sync phase → post-M1 live-update hardening | M1 manual+periodic refresh works; IDLE watchdog post-M1 |
-| TLS strict + TOFU pinning | Connection/auth phase | Bad-cert fixture shows fingerprint UX; no accept-all in release |
-| Charset pipeline (mail-parser) | Parse/render phase | PT-BR corpus renders, no panics (fuzz clean) |
-| HTML sanitization + iframe sandbox + CSP | Reader-UI phase | XSS payload suite inert; IPC unreachable |
-| Keyring probe + fallback UX | Auth/persistence phase | Minimal-VM test; no plaintext secrets |
-| Attachment file-store + quota | Cache/storage + attachment UI phase | Large-attachment fixture keeps DB small |
-| Pinned-baseline bundling + install matrix | Packaging/ship phase (last) | Clean-install on 22.04 + 24.04 |
+| 1 — Flag reconcile / UID STORE / CONDSTORE conflict | Flag-sync phase (ships with first STORE) | Toggle stays across poll; cross-client (phone) change reflected; no sequence-number STORE in review |
+| 5 — Offline outbox + playback rules | Flag-sync phase (same phase as first write) | Offline toggle → restart → replay; UIDVALIDITY-change drops queue with notice |
+| 2 — Per-folder sync state + LIST refresh + rename/delete | Folder-browsing phase (prerequisite migration) | Per-folder rows in schema; folder rename/delete handled; imap-proto NAMESPACE still untouched |
+| 3 — Single-flight sync + shared entry for timer/manual | Poll-refresh phase | Overlapping-tick test coalesces; manual + timer share gate |
+| 6 — NOOP health check + keyring reconnect + re-SELECT | Poll-refresh phase | Kill-connection test self-heals; no credential outside keyring |
+| 4 — Backfill gap semantics + UIDNEXT race + convergence | UID-backfill phase | Double-poll zero-FETCH; expunged tombstoned; chunked FETCH |
+
+Suggested phase order from these pitfalls: **flags (with outbox) → folders (with per-folder state) → poll (with single-flight + reconnect) → backfill (with convergence)**. Backfill last because it depends on per-folder high-water marks (folders phase) and must not fight the poll loop (poll phase).
 
 ## Sources
 
-- RFC 3501 (IMAP4rev1) §2.3.1.1 UIDVALIDITY semantics; RFC 2177 (IDLE, 29-min rule); RFC 5162 (QRESYNC validity-mismatch behavior)
-- `rust-imap` docs.rs (UID type docs, `fetch("1","RFC822")` example as anti-pattern source); bichon issue #297 (UIDVALIDITY resync bug post-mortem)
-- Dovecot docs (namespaces, SPECIAL-USE not configured by default, IMAP extensions)
-- `mail-parser` (stalwart) vs `mailparse` docs.rs (charset coverage, Latin-1 fallback behavior)
-- Tauri v2 docs (CSP, Debian/AppImage bundling, webkit2gtk-4.1 + glibc baseline); tauri-apps issues #9039 (compat), #12758 (20.04 missing 4.1)
-- ForwardEmail SECURITY.md (Tauri CSP/iframe isolation gotchas); CVE-2026-82642 / Readest (DOMPurify `srcdoc` bypass → Tauri IPC RCE chain)
-- `keyring-rs` / `oo7` docs.rs + GitHub issues #95, #133 (headless/no-daemon Secret Service failures)
-- `rustls-platform-verifier`, `rustls-native-certs` docs (platform root store handling)
+- RFC 3501 / RFC 9051 §2.3.1 — UIDs, UIDVALIDITY, UIDNEXT semantics (HIGH)
+- RFC 4549 (Synchronization Operations for Disconnected IMAP4 Clients) §§3–5 — sync algorithm, UIDVALIDITY-mismatch purge, playback error recovery (HIGH)
+- RFC 4551 / RFC 7162 (CONDSTORE/QRESYNC) — UNCHANGEDSINCE, MODIFIED response, mod-sequences (HIGH)
+- RFC 4315 (UIDPLUS) — UID EXPUNGE semantics for disconnected clients (HIGH)
+- RFC 2177 (IDLE) — DONE-before-command rule, 29-minute re-issue, server inactivity timeout (HIGH)
+- Dovecot docs + Nylas UIDVALIDITY troubleshooting — signed-32-bit UID bugs, resync-stop on UIDVALIDITY flapping (MEDIUM)
+- Evolution/camel-imapx history — NOOP-race crashes, IDLE-cancel SELECT races, DONE-timeout reconnect (MEDIUM)
 
 ---
-*Pitfalls research for: SGE — Linux IMAP desktop client (Rust + Tauri v2 + SQLite)*
-*Researched: 2026-10-02*
+*Pitfalls research for: SGE v1.1 Triage & Folders*
+*Researched: 2026-10-04*

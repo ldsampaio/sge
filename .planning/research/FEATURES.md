@@ -1,32 +1,22 @@
 # Feature Research
 
-**Domain:** Linux desktop IMAP email client (read-only M1, Gmail-like three-pane)
-**Researched:** 2026-10-03
-**Confidence:** HIGH
+**Domain:** Desktop IMAP email client — v1.1 triage & folders (flag sync, multi-folder browsing, refresh, UID backfill)
+**Researched:** 2026-10-04
+**Confidence:** HIGH (IMAP RFC 3501/9051 behavior + established desktop-client conventions: Thunderbird, eM Client, Apple Mail)
 
 ## Feature Landscape
 
 ### Table Stakes (Users Expect These)
 
-Features users assume exist. Missing these = product feels incomplete.
+Features users assume exist in any desktop mail client. Missing these = product feels broken.
 
 | Feature | Why Expected | Complexity | Notes |
 |---------|--------------|------------|-------|
-| IMAP login form (username, password, server URL) — **table-stakes** | Every desktop client opens with account setup; no login = no product. | LOW | Three fields + validation; prefill port from security mode; test-connection button before save. Thunderbird/Geary both lead with this. |
-| Configurable IMAP security (host/port, SSL/TLS vs STARTTLS) — **table-stakes** | University/corporate servers (e.g. mail.utfpr.edu.br) vary ports and modes; hardcoded 993/TLS fails on real servers. | MEDIUM | Offer presets (993/SSL-TLS, 143/STARTTLS, 143/plain-local-only with warning); verify TLS cert; surface handshake errors in plain language. |
-| INBOX folder sidebar — **table-stakes** | Three-pane Gmail/Thunderbird/Geary layout is the requested mental model; a list without sidebar feels broken. | LOW | M1 shows single INBOX node (+ optional Unread/Special views); component must accept multi-folder data later without rewrite. |
-| Virtualized message list (sender, subject, date, unread dot, sort desc) — **table-stakes** | Users judge "fast" in the first 2 seconds; rendering 10k rows without virtualization janks or OOMs. | MEDIUM | Use TanStack Virtual / react-virtuoso; row height fixed or measured; selection + keyboard nav (j/k, arrows, Enter). |
-| Reading pane with From/To/Date/Subject header — **table-stakes** | Thunderbird/Geary/Gmail all show a header block above body; missing headers destroy trust in what's displayed. | LOW | Render RFC-decoded headers; show address not just display-name; date in local tz. |
-| Plain-text body rendering — **table-stakes** | Fallback for every multipart/legacy message; HTML-only readers show blank on text-only mail. | LOW | Wrap, preserve quoted `>` blocks; linkify URLs. |
-| HTML body rendering with sanitization — **table-stakes** | Most real mail is HTML; rendering raw HTML enables XSS/tracking (cf. OWA CVE-2026-42897 half-click precedent). | MEDIUM | DOMPurify-equivalent allowlist (strip script/event handlers/javascript: URIs/forms) + sandboxed iframe + block remote images by default. This is table-stakes *security*, not polish. |
-| Headers-first sync into SQLite, bodies on demand — **table-stakes** | Core Value promise: fast first paint on large UTFPR mailboxes; bulk full-download stalls startup (proton-mail-mcp pattern validates this). | MEDIUM | ENVELOPE/FETCH headers → list immediately; lazy BODY[] fetch + cache; UIDVALIDITY/UID tracking for incremental sync. |
-| Local search/filter (sender/subject via SQLite FTS5) — **table-stakes** | Thunderbird Quick Filter bar sets the expectation: type-to-filter must work offline and instantly. | MEDIUM | FTS5 over from/subject (+ cached body); debounce input; rank by BM25; show "searching local cache" hint when bodies not yet fetched. |
-| Attachment names list + download/save — **table-stakes** | PROJECT.md Active requirement; users must at least see filenames/sizes and save files. | LOW | Parse MIME structure; show icon + size; Save-As dialog; stream to disk, never load whole file into memory. |
-| Sync status indicator + offline badge — **table-stakes** | Offline-capable-after-sync is promised; without a visible badge users can't tell stale from live. | LOW | Status bar/pill: Syncing (progress n/total), Up-to-date (timestamp), Offline (cached data), Error (retry). |
-| Empty / loading / error states for every pane — **table-stakes** | First-run (no account), empty INBOX, slow UTFPR server, wrong password all occur; blank panes read as "crashed". | LOW | Skeleton list rows; empty-INBOX illustration; per-pane error card with retry; auth errors name the field (host vs credentials vs TLS). |
-| Read/unread state display — **table-stakes** | Unread bolding/dots are universal email grammar; users triage by scan. | LOW | M1 may be display-only (no server flag write) — but visual distinction is still required. Document whether toggle writes back (M1: read-only, so persist locally or defer toggle). |
-| Secure credential remember + auto-login (OS keyring) — **table-stakes** | PROJECT.md mandates keyring + auto-login for daily personal use; plaintext or retype-every-launch fails the brief. | MEDIUM | Secret Service API via keyring crate; store password + server; auto-connect on launch; lock-screen semantics respected. |
-| Linux desktop bundle (Tauri v2) + system integration — **table-stakes** | "Ships as Linux build" is an Active requirement; a dev-only `cargo run` is not shippable. | MEDIUM | .deb/.AppImage via tauri-bundler; window state persistence; sane HiDPI fonts. |
+| Mark read / mark unread with server sync | Every client (Thunderbird, Apple Mail, Outlook) toggles read state and it sticks across devices; users treat read-state as mailbox truth | LOW | IMAP `STORE <seq/uid> ±FLAGS (\Seen)`. Use `UID STORE` so local UID maps 1:1. Optimistic local update + async STORE; on failure, roll back the row and surface error. Opening/reading a message in the reader auto-marks Seen (debatable delay: Thunderbird marks on open or after N sec — pick "on open", keep it simple). Explicit "mark unread" must `UID STORE -FLAGS (\Seen)`. Must never set \Seen during background sync — keep BODY.PEEK discipline from M1 for all fetch paths. |
+| Manual refresh (Get Mail / F5 button) | Users distrust auto-sync; every client has an explicit refresh affordance when mail "feels stale" | LOW | Re-run incremental sync for the selected folder (UID-based, same path as poll). Must be cancellable-safe (no duplicate rows on rapid clicks — guard with in-flight flag per folder) and show spinner/disabled state while running. Cheap: reuse the poll sync path with a `manual=true` trigger. |
+| Folder list shows real server tree (Sent, Drafts, Trash, custom) | Users expect their server-side folders; synthetic views (Gmail-style All Mail) confuse IMAP users | MEDIUM | `LIST "" "*"` (or `LSUB` fallback) at login + refresh; store `folders(mailbox_path, uidvalidity, uidnext, last_seen_uid)`. Per-folder sync state row — M1's single-INBOX sync state becomes per-folder. Special-use detection via `LIST-EXTENDED`/`SPECIAL-USE` (`\Sent \Drafts \Trash \Junk`) when advertised, else name-heuristic fallback (case-insensitive Sent/Sent Items, Drafts, Trash, Junk/Spam). Folder open = SELECT + incremental sync that folder. |
+| Per-folder message list with unread counts | Sidebar badge counts are the primary triage signal in every three-pane client | LOW–MEDIUM | Unread count per folder: `STATUS <mailbox> (UNSEEN)` is cheapest (no SELECT needed) — refresh counts for all subscribed folders on poll tick; exact list sync only for the selected folder. Store `unseen_count` on the folder row. |
+| Poll-based auto-refresh on a configurable interval | Thunderbird polls IMAP by default ("Check for new messages every N minutes", default 10); users expect fresh mail without clicking | LOW | Timer in Tauri backend (or frontend interval invoking a Tauri command): default 5–10 min, user-configurable 1–60 min + "manual only" option. Each tick: incremental UID sync of INBOX (and unseen-count STATUS for other folders). Must pause while offline and resume on reconnect; must not run concurrent syncs (serialize per folder). IDLE/push is NOT required for v1.1 — polling is the established baseline (Thunderbird itself polls IMAP; IDLE is a differentiator). |
 
 ### Differentiators (Competitive Advantage)
 
@@ -34,13 +24,10 @@ Features that set the product apart. Not required, but valuable.
 
 | Feature | Value Proposition | Complexity | Notes |
 |---------|-------------------|------------|-------|
-| Sub-second cold start to readable list (headers-first + virtualized + cached) — **differentiator** | Thunderbird on huge IMAP boxes feels heavy; instant-open is the "wow" that validates Core Value. | MEDIUM | Measure: time-to-first-list < 2s on 10k-message INBOX; lazy bodies keep it there. Worth instrumenting in M1. |
-| Search-as-you-type with highlighting over 10k+ local messages — **differentiator** | FTS5 + BM25 ranking + highlight snippets feels like Gmail, not like a thin IMAP wrapper. | MEDIUM | `highlight()` snippets in results; prefix queries; exact-phrase support. Cheap because FTS5 is already there. |
-| Remote-image blocking with per-sender allow — **differentiator** | Privacy win over naive renderers; blocks open-tracking pixels by default while staying one click from full fidelity. | LOW | Banner "Images blocked — Show once / Always from sender"; persisted allowlist in SQLite. |
-| Attachment quick-look (size + MIME icon + open-with) — **differentiator** | Listing names is expected; one-click preview/open is what makes attachments feel done. | LOW | xdg-open integration; warn before executing risky types. |
-| Keyboard-first triage (j/k/n/p, / to search, r-reload) — **differentiator** | Power-user speed that Gmail/Thunderbird users bring as muscle memory; trivial cost, high delight. | LOW | Add a `?` shortcut overlay; ensure list↔reader focus model is sane. |
-| Reading-pane density / font-size control — **differentiator** | Accessibility + personal-client fit for daily UTFPR use; almost free in React. | LOW | Comfortable/compact toggle; base font scale; respects system font. |
-| Connection diagnostics screen (log + "copy debug info") — **differentiator** | University mail servers have quirky TLS/certs; self-serve diagnostics cut support to zero for a personal tool. | LOW | Show last IMAP error, resolved host:port/mode, cert summary; one-click copy for bug reports. |
+| IDLE push for instant INBOX delivery | Mail arrives instantly like a messaging app instead of next poll tick; reduces "where is my mail" complaints | MEDIUM | RFC 2177/9051 IDLE: persistent connection on selected INBOX, server pushes EXISTS/RECENT; client then runs incremental sync. Constraints: one IDLE per folder (IDLE only watches the selected mailbox — keep it on INBOX), must re-IDLE every ~15–29 min (servers drop at 20–30 min), needs reconnect/backoff logic, falls back to polling when unsupported. Defer to post-v1.1: poll+manual is the accepted baseline and IDLE adds connection-lifecycle complexity. If added later, keep poll as fallback. |
+| UID gap backfill (no silent holes) | Robustness differentiator: most lightweight clients assume contiguous UIDs and silently miss messages when EXPUNGE/fetch races create gaps; guaranteeing completeness is a trust feature | MEDIUM | See dependency notes. Implementation: persist `last_seen_uid` + UIDVALIDITY per folder; on each sync, `UID SEARCH UID <last_seen+1>:*` and compare returned UID set vs local rows — fetch any UID in range missing locally (covers gaps from partial failures, EXPUNGE shifts, concurrent clients). On UIDVALIDITY change: full resync that folder (UIDs invalidated — dump and re-fetch headers). This is the correct scope for v1.1's "no silent gaps" requirement: gap-fill within a valid UIDVALIDITY epoch, full resync on epoch change. |
+| Multi-select bulk triage (mark read, flag) | Power-user triage speed: select N messages, one action syncs all | LOW | `UID STORE <uidset> +FLAGS (\Seen)` handles sets natively — one round-trip for bulk. Depends on flag sync working for single messages first. Include in v1.1 only if cheap (it is: same code path, uidset instead of single UID). |
+| \Flagged (star) sync | Cheap second flag that Thunderbird/Apple Mail users expect for pinning | LOW | Same STORE path as \Seen with `\Flagged` instead. Defer unless trivial — v1.1 requirement is Seen only; adding Flagged is a one-line extension of the same command builder, so it's a natural stretch goal, not a separate phase. |
 
 ### Anti-Features (Commonly Requested, Often Problematic)
 
@@ -48,130 +35,107 @@ Features that seem good but create problems.
 
 | Feature | Why Requested | Why Problematic | Alternative |
 |---------|---------------|-----------------|-------------|
-| Compose / send / reply via SMTP in M1 | "It's an email client, of course it sends" | Doubles scope (SMTP, drafts, quoting, MIME build, sent-state); PROJECT.md explicitly defers past M1 after user correction | Ship read-only M1; add SMTP as milestone 2 with its own send-queue design |
-| Full-mailbox bulk body download up front | "True offline" completeness | Stalls first paint for minutes on large boxes; huge SQLite bloat; violates headers-first decision | Lazy bodies + incremental backfill idle task post-M1 |
-| Auto-load remote images by default | Prettier newsletters | Tracking pixels leak IP/open events; XSS-adjacent surface; contradicts sanitization posture | Block by default + per-sender allowlist (differentiator above) |
-| Multi-folder / Sent / Drafts in M1 | "Sidebar looks empty with one folder" | Each folder needs sync state, UID tracking, semantics; explodes testing matrix for INBOX-only milestone | Single INBOX node; architect sidebar data-driven so folders plug in later |
-| OAuth / 2FA / magic-link in M1 | Modern auth expectation | Server-specific (Gmail vs generic IMAP); PROJECT.md scopes M1 to user+password; OAuth is a project of its own | Defer; keep auth module trait-based so OAuth fits later |
-| Message flag writes (mark read/delete/archive) in M1 | Triage feels read-write | IMAP flag STORE + UID expunge + conflict handling contradicts read-only scope; half-done writes corrupt trust | Display-only unread state in M1 (or local-only cache flag, clearly labeled); server writes in M2 |
-| Real-time IDLE push sync in M1 | "Live inbox" feel | Connection lifecycle + reconnect + battery/complexity; polling/manual refresh suffices to validate viewer | Manual refresh + poll interval; IDLE as post-validation enhancement |
+| Real-time sync of ALL folders (IDLE per folder / full STATUS storm every tick) | "Everything should always be fresh" | One connection per IDLE folder; STATUS-polling dozens of folders every minute hammers the server and drains battery; university servers (like UTFPR's) may throttle/rate-limit | Poll INBOX content on interval; STATUS unseen-counts for other folders on the same tick (cheap, no SELECT); full list sync only for the folder the user opens |
+| Auto-mark-read on preview/selection | Feels "smart" | Users rage when skimming the list marks everything read; destroys the unread triage signal; syncs unwanted \Seen to server affecting phone/other clients | Mark Seen only when the message is actually opened in the reader pane (or explicit user action); provide "mark all as read" per folder as the bulk escape hatch |
+| UID-based permanent local identity without UIDVALIDITY guard | "UIDs are stable, why check?" | UIDs are only valid within a UIDVALIDITY epoch; after server-side mailbox rebuild (migration, restore), stale UIDs silently corrupt sync state — the classic "mail disappeared / duplicated" bug | Always persist and check UIDVALIDITY per folder; on mismatch, discard UID state and full-resync (this is RFC-mandated, not optional) |
+| Deleting/expunging from client in v1.1 | "Triage means delete" | EXPUNGE semantics (UID vs sequence, UIDPLUS extension variance) plus Trash-model differences across servers are a whole feature area; half-implemented delete loses mail | Keep v1.1 triage = read-state + folders only; delete/move is the next milestone with its own research (Trash semantics, UIDPLUS MOVE, expunge policy) |
+| Full-body prefetch for all folders | "Offline everything" | Multiplies storage and initial sync time; M1 deliberately chose headers-first/bodies-on-demand | Keep headers-first per folder; bodies on demand everywhere; full-offline prefetch is a later opt-in setting |
 
 ## Feature Dependencies
 
 ```
-[Three-pane UI shell]
-    └──requires──> [IMAP login + security config]
-                       └──requires──> [Headers-first sync → SQLite]
-                                          └──requires──> [Message list (virtualized)]
-                                                             └──requires──> [Reading pane + sanitization]
-                                                                                └──enhances──> [Attachment list + download]
-                                                                                └──enhances──> [FTS5 search/filter]
+[Folder browsing]
+    └──requires──> [Per-folder sync state (uidvalidity, last_seen_uid, unseen_count)]
+                       └──requires──> [M1 INBOX sync engine] (generalize, don't rewrite)
 
-[Credential remember + auto-login] ──enhances──> [IMAP login + security config]
-[Sync status / offline badge] ──enhances──> [Headers-first sync → SQLite]
-[Empty/loading/error states] ──enhances──> [Three-pane UI shell]
-[Attachment download] ──conflicts──> [Compose/send] (no conflict technically — excluded by scope, not incompatibility)
-[Server flag writes] ──conflicts──> [Read-only M1 scope]
+[Poll + manual refresh]
+    └──requires──> [Incremental UID sync for one folder] (same function, two triggers)
+                       └──requires──> [Per-folder sync state]
+
+[UID gap backfill]
+    └──requires──> [Incremental UID sync] (gap detection rides on the same UID-range SEARCH)
+    └──requires──> [Per-folder sync state] (needs persisted last_seen_uid + UIDVALIDITY)
+
+[Read/unread flag sync]
+    └──enhances──> [Message list + reader] (M1 UI exists; add toggle affordances)
+    └──requires──> [Local seen-state column writable] (M1 stored flags read-only from sync)
+
+[Bulk triage] ──enhances──> [Read/unread flag sync] (same STORE path, uidset)
+[\Flagged sync] ──enhances──> [Read/unread flag sync] (same STORE path, different flag)
+[IDLE push] ──enhances──> [Poll + manual refresh] (replaces tick for INBOX; poll stays as fallback)
+[Delete/move] ──conflicts──> [v1.1 scope] (deferred milestone; do not mix expunge logic into flag sync)
 ```
 
 ### Dependency Notes
 
-- **Three-pane shell requires login+security config:** no connection, nothing to display; first-run state routes to login form.
-- **Login requires headers-first sync → SQLite:** connection alone isn't shippable; list must populate from local DB (DB-first reads, IMAP fallback only pre-sync).
-- **Message list requires virtualization from day one:** retrofitting virtualization after a naive `.map()` list is a rewrite of selection/scroll/keyboard logic.
-- **Reading pane requires sanitizer before first HTML render:** never render unsanitized mail even in dev; sandbox + CSP from the start.
-- **Attachment download enhances reader:** MIME structure parsing is shared; download is a small step once structure is parsed.
-- **FTS5 search enhances headers-first sync:** FTS index populates from the same sync pipeline; search over un-synced bodies must be labeled "headers only".
-- **Server flag writes conflict with M1 scope:** excluded deliberately; adding STORE/EXPUNGE mid-milestone breaks the read-only test story.
+- **Per-folder sync state is the foundation of all v1.1 work:** M1 keeps one sync cursor (INBOX UIDVALIDITY + max UID). v1.1 must promote this to a per-folder table before folder browsing, poll, or backfill can function. Do this first — it's the phase-ordering constraint everything else hangs on.
+- **Poll and manual refresh are one code path:** both trigger `sync_folder(selected)`; the only difference is trigger source (timer vs user). Build the sync function once, wire two triggers. Manual refresh must reuse — not duplicate — poll logic.
+- **Backfill is not a separate sync mode:** gap detection (`UID SEARCH` range vs local rows, fetch missing) runs inside every incremental sync. There is no "backfill phase" at runtime — it's a property of the sync function. Roadmap implication: don't plan backfill as a separate implementation step from incremental sync; plan it as acceptance criteria on the sync function.
+- **Flag sync conflicts with nothing in M1 but ends the read-only invariant:** every fetch path must be audited to keep using BODY.PEEK (a non-PEEK FETCH implicitly sets \Seen server-side and would corrupt read state). This is the highest-risk regression of v1.1 — a fetch-path audit, not new code, is the mitigation.
+- **Folder browsing enhances poll:** once per-folder state exists, poll cheaply extends to STATUS unseen-counts for background folders at marginal cost.
 
 ## MVP Definition
 
-### Launch With (v1 = M1 read-only viewer)
+v1.1 scope is fixed by PROJECT.md (triage & folders). Ruthless cut below is about ordering within v1.1, not scope removal.
 
-Minimum viable product — what's needed to validate the concept.
+### Launch With (v1.1)
 
-- [ ] IMAP login form + configurable security (host/port, SSL-TLS/STARTTLS) — without this nothing connects
-- [ ] Headers-first INBOX sync into SQLite + incremental refresh — the Core Value mechanism
-- [ ] Three-pane shell: INBOX sidebar + virtualized list + reader — the requested UX
-- [ ] Sanitized HTML + plaintext body rendering — safe display is non-negotiable
-- [ ] Local FTS5 search/filter — offline triage is the retention hook
-- [ ] Attachment list + download — Active requirement, completes "read" loop
-- [ ] Sync status + offline badge — makes offline-capable legible
-- [ ] Empty/loading/error states incl. auth-error copy — first-run and failure UX
-- [ ] Keyring remember + auto-login — daily-use expectation
-- [ ] Linux Tauri bundle — shippable artifact
+- [ ] Per-folder sync state table (mailbox, UIDVALIDITY, last_seen_uid, unseen_count) — foundation; nothing else works without it
+- [ ] Read/unread toggle with UID STORE \Seen sync (optimistic UI + rollback) + auto-Seen on reader open — ends read-only era, the headline feature
+- [ ] Folder tree from LIST + open/SELECT any folder with headers-first sync — browsing itself
+- [ ] Poll timer (default 5–10 min, configurable) + manual refresh button sharing one sync path — freshness
+- [ ] UID gap backfill inside incremental sync + UIDVALIDITY-mismatch full resync — no silent gaps
+- [ ] BODY.PEEK audit on all fetch paths (regression guard for flag integrity) — prevents the worst v1.1 bug class
 
-### Add After Validation (v1.x)
+### Add After Validation (v1.1.x)
 
-Features to add once core is working.
-
-- [ ] Remote-image per-sender allowlist — trigger: users complain newsletters look broken
-- [ ] Keyboard shortcuts + shortcut overlay — trigger: user does daily triage and wants speed
-- [ ] Background IDLE/poll refresh — trigger: manual refresh feels stale in daily use
-- [ ] Multi-folder sidebar (Sent, custom) — trigger: INBOX-only feels limiting after a week
-- [ ] Read/unread + flag server writes — trigger: triage actions requested; marks end of read-only era
+- [ ] Bulk multi-select mark read/unread — trigger: single-message flag sync proven stable against UTFPR server
+- [ ] \Flagged (star) sync — trigger: STORE path generalized; nearly free once flag sync ships
+- [ ] IDLE push for INBOX with poll fallback — trigger: users complain poll latency matters; needs connection-lifecycle work that doesn't fit v1.1
 
 ### Future Consideration (v2+)
 
-Features to defer until product-market fit is established.
-
-- [ ] Compose/send/reply via SMTP — why defer: explicitly out of M1; needs MIME build, drafts, error handling
-- [ ] OAuth / app-password flows — why defer: M1 is user+password; per-provider work
-- [ ] Threading/conversation view — why defer: needs References/In-Reply-To reconstruction; list-first is fine for M1
-- [ ] Full-text body index backfill + global search — why defer: needs idle backfill infra first
-- [ ] Windows/macOS builds — why defer: Linux-only constraint for M1
+- [ ] Delete/move with Trash semantics + UIDPLUS — why defer: separate protocol surface (EXPUNGE, per-server Trash models), deserves its own milestone and research
+- [ ] Full-offline body prefetch per folder — why defer: storage/sync-time cost; M1's on-demand model is the right default until users ask
+- [ ] \Answered / $Forwarded / custom keyword sync — why defer: compose/reply (which sets \Answered) is itself a later milestone
 
 ## Feature Prioritization Matrix
 
 | Feature | User Value | Implementation Cost | Priority |
 |---------|------------|---------------------|----------|
-| IMAP login + security config | HIGH | MEDIUM | P1 |
-| Headers-first sync → SQLite | HIGH | MEDIUM | P1 |
-| Virtualized message list | HIGH | MEDIUM | P1 |
-| Sanitized HTML + plaintext reader | HIGH | MEDIUM | P1 |
-| FTS5 local search/filter | HIGH | MEDIUM | P1 |
-| Attachment list + download | HIGH | LOW | P1 |
-| Sync status + offline badge | HIGH | LOW | P1 |
-| Empty/loading/error states | HIGH | LOW | P1 |
-| Keyring remember + auto-login | HIGH | MEDIUM | P1 |
-| Linux bundle | HIGH | MEDIUM | P1 |
-| Remote-image allowlist | MEDIUM | LOW | P2 |
-| Keyboard-first triage | MEDIUM | LOW | P2 |
-| Attachment quick-look/open-with | MEDIUM | LOW | P2 |
-| Connection diagnostics screen | MEDIUM | LOW | P2 |
-| Density/font control | LOW | LOW | P3 |
-| IDLE push sync | MEDIUM | HIGH | P3 |
-| Multi-folder support | MEDIUM | HIGH | P3 |
-| Compose/send (SMTP) | HIGH (later) | HIGH | P3 (v2) |
+| Per-folder sync state | HIGH (enabler) | MEDIUM | P1 |
+| Read/unread flag sync | HIGH (headline v1.1) | LOW | P1 |
+| Folder tree + per-folder browse | HIGH (headline v1.1) | MEDIUM | P1 |
+| Poll + manual refresh | HIGH | LOW | P1 |
+| UID gap backfill | HIGH (trust) | MEDIUM | P1 |
+| BODY.PEEK fetch audit | HIGH (regression guard) | LOW | P1 |
+| Bulk multi-select triage | MEDIUM | LOW | P2 |
+| \Flagged sync | MEDIUM | LOW | P2 |
+| IDLE push | MEDIUM | MEDIUM | P3 |
+| Delete/move | HIGH (later) | HIGH | P3 (next milestone) |
 
 **Priority key:**
-- P1: Must have for launch
-- P2: Should have, add when possible
+- P1: Must have for v1.1
+- P2: Should have, add when possible (v1.1.x stretch)
 - P3: Nice to have, future consideration
 
 ## Competitor Feature Analysis
 
-| Feature | Thunderbird | Geary (GNOME) | Our Approach (SGE M1) |
-|---------|-------------|---------------|----------------------|
-| Layout | Folder + list + message panes, multiple view modes | Conversation-centric three-pane, minimal chrome | Gmail-like three-pane fixed for M1; Thunderbird parity on panes, Geary-like simplicity |
-| Account setup | Autoconfig + manual IMAP/SMTP, cert exceptions | Simple service presets + custom IMAP | Manual host/port/security form (university-server-first, no magic autoconfig in M1) |
-| Sync model | Full sync + offline store, heavy on huge boxes | Lazy/efficient IMAP, fast feel | Headers-first + lazy bodies (fastest first paint; validated by proton-mail-mcp pattern) |
-| Search | Quick Filter bar + global index | Simple search with scope operators | FTS5 local search, Quick-Filter-like UX; body search labeled when uncached |
-| HTML display | Sanitized render, remote content blocked by default | HTML render with conservative defaults | DOMPurify-class sanitize + sandboxed iframe + remote-image block (match best practice) |
-| Attachments | Full list/preview/save/detach | List + save/open | M1: list + save (match); preview/open-with as fast-follow P2 |
-| Offline | Offline mode toggle + status | Transparent local cache | Sync-status pill + offline badge fed by SQLite cache state |
-| Auth persist | Password manager + master password | GNOME Keyring integration | OS keyring (Secret Service) + auto-login, same model as Geary |
+| Feature | Thunderbird | Apple Mail / eM Client | Our Approach (SGE v1.1) |
+|---------|-------------|------------------------|-------------------------|
+| Flag sync | STORE \Seen on open/toggle, multi-device consistent | Same; auto-Seen on open | Same: UID STORE ±FLAGS (\Seen), Seen on reader open, explicit unread toggle |
+| Refresh model | Poll every N min (default 10) + Get Mail button; no IMAP IDLE | IDLE push where supported + poll fallback | Thunderbird model: poll (5–10 min default) + manual refresh; IDLE deferred |
+| Folders | Real LIST tree, per-folder sync, STATUS counts | Same | Same: LIST tree, per-folder headers-first sync, STATUS unseen counts |
+| Gap robustness | CONDSTORE/QRESYNC (MODSEQ) on supporting servers | Same class of extensions | UID SEARCH range-diff (works on all servers incl. UTFPR's); CONDSTORE/QRESYNC is a later optimization, not v1.1 |
+| Bulk triage | Multi-select + mark read/unread | Same | v1.1.x stretch: uidset STORE |
 
 ## Sources
 
-- Thunderbird main-window/panes documentation (support.mozilla.org — Folder/Message-List/Message panes, Quick Filter bar, Views)
-- GNOME Geary feature set (IMAP client, HTML read, starring/archive, Gmail/Yahoo/IMAP compat)
-- AgentMail engineering: Rendering Email Safely (DOMPurify + sandboxed iframe + CSP pattern)
-- Email Markup Consortium vision (per-client sanitization divergence; iframe embedding contexts)
-- Dovecot FTS plugin docs (header vs body search cost distinction)
-- SQLite FTS5 official docs (MATCH, BM25 ranking, highlight snippets, prefix/phrase queries)
-- proton-mail-mcp / mail-memex / GiraffeMail (SQLite + FTS5 + headers-first/lazy-body + incremental sync precedent)
+- IMAP4rev1 / rev2 semantics (RFC 3501 / RFC 9051): STORE ±FLAGS, UID STORE, UIDVALIDITY epoch rules, BODY.PEEK vs BODY implicit-\Seen
+- IDLE extension (RFC 2177): single-mailbox scope, ~30 min session limit, re-IDLE practice (15–29 min), poll fallback
+- CONDSTORE/QRESYNC (RFC 4551/5162) as known-later-optimization (not v1.1)
+- Client conventions verified via web: Thunderbird polls IMAP (no IDLE) with configurable interval + manual Get Mail; eM Client/Apple Mail hold per-account IDLE with poll fallback; IDLE-per-folder cost and keepalive guidance corroborated across MailBee/Limilabs/vendor docs
 
 ---
-*Feature research for: Linux desktop IMAP email client (read-only M1)*
-*Researched: 2026-10-03*
+*Feature research for: SGE v1.1 Triage & Folders*
+*Researched: 2026-10-04*
