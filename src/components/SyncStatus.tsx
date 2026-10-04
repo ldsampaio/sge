@@ -8,6 +8,8 @@ interface SyncStatusInfo {
   uid_validity: number;
   uid_next: number;
   message_count: number;
+  /** Durable-outbox depth: read/unread toggles awaiting server acknowledgement. */
+  pending_count: number;
 }
 
 type Status =
@@ -70,10 +72,13 @@ export default function SyncStatus({ onSyncComplete }: SyncStatusProps) {
   const [status, setStatus] = useState<Status>({ kind: "idle" });
   const channelRef = useRef<Channel<SyncEvent> | null>(null);
   const syncingRef = useRef(false);
+  /** Last known outbox depth, so a replay failure can report N. */
+  const [lastPending, setLastPending] = useState(0);
 
   async function pollStatus() {
     try {
       const s: SyncStatusInfo = await invoke("sync_status");
+      setLastPending(s.pending_count);
       setStatus({ kind: "synced", status: s });
     } catch {
       setStatus({ kind: "idle" });
@@ -150,11 +155,23 @@ export default function SyncStatus({ onSyncComplete }: SyncStatusProps) {
                 ? `Em dia · última busca ${status.status.last_sync_at}`
                 : "Offline · nunca sincronizado"}
             </p>
+            {status.status.pending_count > 0 && !status.status.last_sync_at && (
+              <p className="sub">
+                Offline · alterações guardadas — serão enviadas ao reconectar
+              </p>
+            )}
             <p className="sub">
               {status.status.message_count}{" "}
               {status.status.message_count === 1 ? "aviso guardado" : "avisos guardados"} para
               estudar offline
             </p>
+            {status.status.pending_count > 0 && (
+              <p className="sub" role="status">
+                {status.status.pending_count === 1
+                  ? "1 alteração aguardando envio"
+                  : `${status.status.pending_count} alterações aguardando envio`}
+              </p>
+            )}
           </>
         )}
 
@@ -167,7 +184,30 @@ export default function SyncStatus({ onSyncComplete }: SyncStatusProps) {
           </>
         )}
 
-        {status.kind === "error" && <p role="alert">Falha na busca: {status.message}</p>}
+        {status.kind === "error" && (
+          <>
+            <p role="alert">
+              <span
+                title={`Falha na busca: ${status.message}`}
+                style={{
+                  display: "block",
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                Falha na busca: {status.message}
+              </span>
+            </p>
+            {lastPending > 0 && (
+              <p className="sub">
+                {lastPending === 1
+                  ? "Não foi possível enviar 1 alteração de leitura — tentando de novo na próxima busca."
+                  : `Não foi possível enviar ${lastPending} alterações de leitura — tentando de novo na próxima busca.`}
+              </p>
+            )}
+          </>
+        )}
       </div>
 
       {status.kind === "syncing" ? (
