@@ -24,9 +24,14 @@ use store::Store;
 /// `active_account` lets `start_sync` / `fetch_message` / `save_attachment`
 /// reconnect without requiring keyring persistence (remember-me unchecked).
 /// It is memory-only: never written to disk.
+///
+/// `session_manager` caches the single-session [`imap::manager::SessionManager`]
+/// for the active account so flag writes reuse one authenticated session;
+/// it is replaced when the account changes.
 pub struct AppState {
     pub store: Arc<Mutex<Store>>,
     pub active_account: Mutex<Option<ActiveAccount>>,
+    pub session_manager: Mutex<Option<Arc<imap::manager::SessionManager>>>,
 }
 
 /// In-memory credentials + server config for the connected session.
@@ -225,6 +230,7 @@ pub fn run() {
     let state = AppState {
         store,
         active_account: Mutex::new(None),
+        session_manager: Mutex::new(None),
     };
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -238,6 +244,7 @@ pub fn run() {
             clear_credentials,
             commands::sync::start_sync,
             commands::sync::sync_status,
+            commands::sync::set_seen,
             commands::sync::cancel_sync,
             commands::sync::list_messages,
             commands::sync::search_messages,

@@ -60,6 +60,21 @@ pub fn is_unread(flags_json: &str) -> bool {
 
 // ── mailbox / sync-state ─────────────────────────────────────────
 
+/// Look up the integer `mailboxes.id` for a name without creating it.
+/// Returns `None` when the mailbox was never synced (read-only paths like
+/// `sync_status` must not create rows as a side effect).
+pub fn mailbox_id(conn: &Connection, name: &str) -> StoreResult<Option<u64>> {
+    match conn.query_row(
+        "SELECT id FROM mailboxes WHERE name = ?1",
+        rusqlite::params![name],
+        |row| row.get::<_, u64>(0),
+    ) {
+        Ok(id) => Ok(Some(id)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(StoreError::Sql(e)),
+    }
+}
+
 /// Get-or-create a mailbox row by name; returns its integer id.
 ///
 /// `uid_validity` and `uid_next` default to 0 (meaning "never synced").
@@ -311,6 +326,24 @@ pub fn existing_uids(
         .query_map(params.as_slice(), |row| row.get::<_, u32>(0))?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// Current `flags` JSON for a message row, if it exists.
+/// Used by the pending-wins reconcile gate to keep optimistic local flags.
+pub fn message_flags(
+    conn: &Connection,
+    mailbox_id: u64,
+    uid: u32,
+) -> StoreResult<Option<String>> {
+    match conn.query_row(
+        "SELECT flags FROM messages WHERE mailbox_id = ?1 AND uid = ?2",
+        rusqlite::params![mailbox_id, uid],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(flags) => Ok(Some(flags)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(StoreError::Sql(e)),
+    }
 }
 
 /// Look up the integer `messages.id` for a given mailbox + IMAP UID.

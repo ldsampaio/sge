@@ -235,4 +235,47 @@ mod tests {
             .expect("query should succeed");
         assert_eq!(idx, 1, "outbox mailbox index should exist");
     }
+
+    #[test]
+    fn m2_upgrades_v1_database_forward_preserving_rows() {
+        // Simulate a v1 database (schema.sql only, as shipped before Phase 6).
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        Migrations::new(vec![M::up(include_str!("schema.sql"))])
+            .to_latest(&mut conn)
+            .unwrap();
+        // A message cached under v1.
+        conn.execute(
+            "INSERT INTO mailboxes (name, uid_validity, uid_next) VALUES ('INBOX', 100, 4)",
+            [],
+        )
+        .unwrap();
+        let mb: i64 = conn
+            .query_row("SELECT id FROM mailboxes WHERE name = 'INBOX'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO messages (mailbox_id, uid, subject, from_addr, date_utc, flags, preview) \
+             VALUES (?1, 1, 'Old', 'a@x.com', '2024-01-01T00:00:00Z', '[]', 'p')",
+            rusqlite::params![mb],
+        )
+        .unwrap();
+
+        // Opening through the store applies M2 forward.
+        Store::apply_migrations(&mut conn).unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name = 'flag_outbox'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "M2 must create flag_outbox on a v1 database");
+        let msgs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(msgs, 1, "forward migration must preserve cached rows");
+    }
 }

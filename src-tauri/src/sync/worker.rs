@@ -34,9 +34,110 @@ pub struct SyncWorker {
     store: Arc<std::sync::Mutex<Store>>,
 }
 
+/// Aggregate result of one outbox replay pass.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReplaySummary {
+    /// Ops acknowledged by the server (deleted from the queue).
+    pub acked: usize,
+    /// Ops dropped without a write (epoch mismatch or UID absent).
+    pub dropped: usize,
+    /// Ops that failed and stay queued for the next attempt.
+    pub failed: usize,
+}
+
 impl SyncWorker {
     pub fn new(store: Arc<std::sync::Mutex<Store>>) -> Self {
         Self { store }
+    }
+
+    /// Replay queued Seen toggles for `mailbox_id` through `session`.
+    ///
+    /// RFC 4549 playback rules (T-6-02):
+    /// - Every op stores its epoch (`uid_validity`) at enqueue; when the
+    ///   current epoch differs the whole mailbox queue drops — replaying
+    ///   stale UIDs against a renumbered mailbox would flag the wrong
+    ///   messages.
+    /// - Single ops whose UID is absent from `live_uids` drop (the message
+    ///   is gone server-side). `None` skips the absent check — used by the
+    ///   command path, which has no fresh SEARCH.
+    ///
+    /// Per-op failures are recorded (`attempts` + `last_error`) and stay
+    /// queued for the next sync; only store-level errors abort the pass.
+    /// The store lock is held only for brief synchronous sections, never
+    /// across the `set_seen` await.
+    pub async fn replay_outbox(
+        &self,
+        session: &mut dyn SyncSession,
+        mailbox_id: u64,
+        current_uid_validity: u32,
+        live_uids: Option<&HashSet<u32>>,
+    ) -> Result<ReplaySummary, SyncError> {
+        let ops = {
+            let guard = self.store.lock().unwrap();
+            queries::list_outbox(guard.conn(), mailbox_id)
+                .map_err(|e| SyncError::Protocol(format!("list outbox: {e}")))?
+        };
+        let mut summary = ReplaySummary::default();
+        if ops.is_empty() {
+            return Ok(summary);
+        }
+
+        // Epoch check first: a UIDVALIDITY generation change invalidates
+        // every queued UID at once.
+        if ops.iter().any(|op| op.uid_validity != current_uid_validity) {
+            let guard = self.store.lock().unwrap();
+            let n = queries::drop_outbox_for_mailbox(guard.conn(), mailbox_id)
+                .map_err(|e| SyncError::Protocol(format!("drop stale outbox: {e}")))?;
+            eprintln!(
+                "[SGE sync] outbox epoch mismatch (current uid_validity={current_uid_validity}) — dropped {n} stale op(s)"
+            );
+            summary.dropped = n;
+            return Ok(summary);
+        }
+
+        for op in &ops {
+            if let Some(live) = live_uids {
+                if !live.contains(&op.uid) {
+                    let guard = self.store.lock().unwrap();
+                    queries::delete_outbox_op(guard.conn(), mailbox_id, op.uid).map_err(|e| {
+                        SyncError::Protocol(format!("delete absent outbox op: {e}"))
+                    })?;
+                    eprintln!(
+                        "[SGE sync] outbox uid {} absent on server — dropped",
+                        op.uid
+                    );
+                    summary.dropped += 1;
+                    continue;
+                }
+            }
+            match session.set_seen(op.uid, op.seen).await {
+                Ok(()) => {
+                    let guard = self.store.lock().unwrap();
+                    queries::delete_outbox_op(guard.conn(), mailbox_id, op.uid).map_err(|e| {
+                        SyncError::Protocol(format!("ack outbox op: {e}"))
+                    })?;
+                    summary.acked += 1;
+                }
+                Err(e) => {
+                    let guard = self.store.lock().unwrap();
+                    queries::record_outbox_error(
+                        guard.conn(),
+                        mailbox_id,
+                        op.uid,
+                        &e.to_string(),
+                    )
+                    .map_err(|store_err| {
+                        SyncError::Protocol(format!("record outbox error: {store_err}"))
+                    })?;
+                    eprintln!(
+                        "[SGE sync] outbox uid {} replay failed ({e}) — stays queued",
+                        op.uid
+                    );
+                    summary.failed += 1;
+                }
+            }
+        }
+        Ok(summary)
     }
 
     /// Execute a full INBOX sync pass against an injected [`SyncSession`].
@@ -77,6 +178,10 @@ impl SyncWorker {
             let guard = self.store.lock().unwrap();
             queries::delete_missing_uids(guard.conn(), mailbox_id, &[])
                 .map_err(|e| SyncError::Protocol(format!("wipe on UIDVALIDITY bump: {e}")))?;
+            // Queued UIDs belong to the old generation — replaying them
+            // would flag the wrong messages (RFC 4549, T-6-02).
+            queries::drop_outbox_for_mailbox(guard.conn(), mailbox_id)
+                .map_err(|e| SyncError::Protocol(format!("drop outbox on UIDVALIDITY bump: {e}")))?;
         }
 
         let mut result = SyncSummary {
@@ -118,12 +223,32 @@ impl SyncWorker {
                 )
                 .map_err(|e| SyncError::Protocol(format!("set sync state: {e}")))?;
             }
+            // Every queued UID is absent — replay drops the queue.
+            let empty: HashSet<u32> = HashSet::new();
+            let replay = self
+                .replay_outbox(&mut *session, mailbox_id, summary.uid_validity, Some(&empty))
+                .await?;
+            eprintln!(
+                "[SGE sync] replay on empty mailbox: acked={} dropped={} failed={}",
+                replay.acked, replay.dropped, replay.failed
+            );
             session.logout().await?;
             cb(SyncEvent::SyncCompleted {
                 summary: result.clone(),
             });
             return Ok(result);
         }
+
+        // Pending-wins gate: UIDs with an unacknowledged optimistic toggle
+        // keep their local flags through the sweep below (FLAG-02). Fetched
+        // once per pass — the set is small (one row per toggled message).
+        let pending: HashSet<u32> = {
+            let guard = self.store.lock().unwrap();
+            queries::pending_uids(guard.conn(), mailbox_id)
+                .map_err(|e| SyncError::Protocol(format!("pending_uids: {e}")))?
+                .into_iter()
+                .collect()
+        };
 
         // ── Step 5: header sweep (BATCH_SIZE UIDs at a time) ──────
         let total_messages = server_uids.len() as u32;
@@ -180,6 +305,19 @@ impl SyncWorker {
                     let uid = header.uid;
                     let message_id = header.message_id.as_deref();
 
+                    // Pending-wins: a queued optimistic toggle owns this
+                    // row's flags — the server sweep must not clobber it.
+                    // Every other column still writes through.
+                    let flags = if pending.contains(&uid) {
+                        queries::message_flags(conn, mailbox_id, uid)
+                            .map_err(|e| {
+                                SyncError::Protocol(format!("pending flags uid {uid}: {e}"))
+                            })?
+                            .unwrap_or_else(|| header.flags.clone())
+                    } else {
+                        header.flags.clone()
+                    };
+
                     queries::upsert_message(
                         conn,
                         mailbox_id,
@@ -190,7 +328,7 @@ impl SyncWorker {
                         &header.to_addrs,
                         &header.cc_addrs,
                         &header.date_utc,
-                        &header.flags,
+                        &flags,
                         header.has_attachments,
                         &header.preview,
                     )
@@ -238,6 +376,18 @@ impl SyncWorker {
                 .map_err(|e| SyncError::Protocol(format!("set sync state: {e}")))?;
         }
 
+        // Post-sync replay: queued toggles go out on the still-open,
+        // INBOX-selected session; failures stay queued for the next pass.
+        // A replay failure never fails the sync itself.
+        let live: HashSet<u32> = server_uids.iter().copied().collect();
+        let replay = self
+            .replay_outbox(&mut *session, mailbox_id, summary.uid_validity, Some(&live))
+            .await?;
+        eprintln!(
+            "[SGE sync] replay: acked={} dropped={} failed={}",
+            replay.acked, replay.dropped, replay.failed
+        );
+
         session.logout().await?;
         {
             let guard = self.store.lock().unwrap();
@@ -279,6 +429,8 @@ mod tests {
         /// Recorded `(uid, seen)` pairs from `set_seen` — asserts the flag
         /// path addresses messages by UID (T-6-01), never by sequence number.
         pub set_seen_calls: Vec<(u32, bool)>,
+        /// When true, `set_seen` fails — drives replay-failure tests.
+        pub fail_set_seen: bool,
     }
 
     impl SyncSession for MockSession {
@@ -307,6 +459,11 @@ mod tests {
 
         fn set_seen(&mut self, uid: u32, seen: bool) -> PinBox<'_, Result<(), SyncError>> {
             self.set_seen_calls.push((uid, seen));
+            if self.fail_set_seen {
+                return Box::pin(async move {
+                    Err(SyncError::Protocol("mock set_seen failure".to_string()))
+                });
+            }
             Box::pin(async move { Ok(()) })
         }
 
@@ -343,6 +500,7 @@ mod tests {
             fetch_calls: AtomicUsize::new(0),
             logout_called: AtomicBool::new(false),
             set_seen_calls: Vec::new(),
+            fail_set_seen: false,
         }
     }
 
@@ -538,5 +696,254 @@ mod tests {
             vec![(42, true), (42, false), (7, true)],
             "flag writes must carry the message UID, never a sequence number"
         );
+    }
+
+    /// Seed helper: one INBOX row plus an optimistic Seen toggle, returning
+    /// the mailbox id. Mirrors what the `set_seen` command writes.
+    fn seed_pending(
+        store: &Arc<std::sync::Mutex<Store>>,
+        uid: u32,
+        seen: bool,
+        epoch: u32,
+    ) -> u64 {
+        let guard = store.lock().unwrap();
+        let conn = guard.conn();
+        let mb_id = queries::ensure_mailbox(conn, "INBOX").unwrap();
+        queries::upsert_message(
+            conn,
+            mb_id,
+            uid,
+            None,
+            &format!("Subject {uid}"),
+            "alice@example.com",
+            "[]",
+            "[]",
+            "2024-10-03T12:00:00Z",
+            "[]",
+            false,
+            &format!("Subject {uid}"),
+        )
+        .unwrap();
+        queries::set_local_seen(conn, mb_id, uid, seen).unwrap();
+        queries::enqueue_outbox(conn, mb_id, uid, seen, epoch).unwrap();
+        mb_id
+    }
+
+    /// Concurrent sync preserves a pending optimistic toggle (FLAG-02):
+    /// the server sweep still says unseen, but the local Seen flag wins,
+    /// and the post-sync replay acks the op through the mock session.
+    #[test]
+    fn pending_wins_reconcile_preserves_optimistic_flags() {
+        let store = inbox(MailboxSummary {
+            selected_mailbox: "INBOX".to_string(),
+            uid_validity: 100,
+            uid_next: Some(4),
+            exists: 2,
+        });
+        // UID 1: optimistic Seen + queued op at epoch 100. UID 2: untouched.
+        let mb_id = seed_pending(&store, 1, true, 100);
+        {
+            let guard = store.lock().unwrap();
+            queries::upsert_message(
+                guard.conn(),
+                mb_id,
+                2,
+                None,
+                "Subject 2",
+                "bob@example.com",
+                "[]",
+                "[]",
+                "2024-10-03T12:00:00Z",
+                "[]",
+                false,
+                "Subject 2",
+            )
+            .unwrap();
+        }
+        let worker = SyncWorker::new(store.clone());
+
+        // Server still reports both messages unseen (stale FLAGS).
+        let summary = MailboxSummary {
+            selected_mailbox: "INBOX".to_string(),
+            uid_validity: 100,
+            uid_next: Some(4),
+            exists: 2,
+        };
+        let mut hdr1 = mkhdr(1);
+        hdr1.flags = "[]".to_string();
+        let mut hdr2 = mkhdr(2);
+        hdr2.flags = "[]".to_string();
+        let session = mock(summary, vec![hdr1, hdr2]);
+
+        async_std::task::block_on(async {
+            worker.sync_with_session(Box::new(session), cb()).await
+        })
+        .unwrap();
+        // The sync consumed the session box; assert through the store: the
+        // post-sync replay acked the op through the mock session.
+        let guard = store.lock().unwrap();
+        let flags1 = queries::message_flags(guard.conn(), mb_id, 1)
+            .unwrap()
+            .unwrap();
+        assert!(
+            flags1.contains("\\Seen"),
+            "pending UID must keep optimistic Seen, got: {flags1}"
+        );
+        let flags2 = queries::message_flags(guard.conn(), mb_id, 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(flags2, "[]", "non-pending UID takes server flags");
+        assert!(
+            queries::pending_uids(guard.conn(), mb_id).unwrap().is_empty(),
+            "acked op must leave the queue"
+        );
+    }
+
+    /// Replay acks queued ops in creation order and deletes them.
+    #[test]
+    fn replay_acks_queued_ops_in_order() {
+        let store = inbox(MailboxSummary {
+            selected_mailbox: "INBOX".to_string(),
+            uid_validity: 100,
+            uid_next: Some(4),
+            exists: 2,
+        });
+        let mb_id = seed_pending(&store, 5, true, 100);
+        seed_pending(&store, 6, false, 100);
+        let worker = SyncWorker::new(store);
+
+        let mut session = mock(
+            MailboxSummary {
+                selected_mailbox: "INBOX".to_string(),
+                uid_validity: 100,
+                uid_next: Some(4),
+                exists: 2,
+            },
+            vec![],
+        );
+        let live: HashSet<u32> = [5, 6].into_iter().collect();
+        let summary = async_std::task::block_on(async {
+            worker
+                .replay_outbox(&mut session, mb_id, 100, Some(&live))
+                .await
+        })
+        .unwrap();
+
+        assert_eq!(summary.acked, 2);
+        assert_eq!(summary.dropped, 0);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(session.set_seen_calls, vec![(5, true), (6, false)]);
+        let guard = worker.store.lock().unwrap();
+        assert!(queries::pending_uids(guard.conn(), mb_id).unwrap().is_empty());
+    }
+
+    /// Epoch mismatch drops the whole mailbox queue without a single STORE.
+    #[test]
+    fn replay_epoch_mismatch_drops_queue() {
+        let store = inbox(MailboxSummary {
+            selected_mailbox: "INBOX".to_string(),
+            uid_validity: 200,
+            uid_next: Some(4),
+            exists: 1,
+        });
+        let mb_id = seed_pending(&store, 5, true, 100); // stale epoch
+        let worker = SyncWorker::new(store);
+
+        let mut session = mock(
+            MailboxSummary {
+                selected_mailbox: "INBOX".to_string(),
+                uid_validity: 200,
+                uid_next: Some(4),
+                exists: 1,
+            },
+            vec![],
+        );
+        let live: HashSet<u32> = [5].into_iter().collect();
+        let summary = async_std::task::block_on(async {
+            worker
+                .replay_outbox(&mut session, mb_id, 200, Some(&live))
+                .await
+        })
+        .unwrap();
+
+        assert_eq!(summary.dropped, 1);
+        assert_eq!(summary.acked, 0);
+        assert!(
+            session.set_seen_calls.is_empty(),
+            "stale UIDs must never reach the wire"
+        );
+    }
+
+    /// Ops whose UID is absent from the server drop without a STORE.
+    #[test]
+    fn replay_absent_uid_drops_single_op() {
+        let store = inbox(MailboxSummary {
+            selected_mailbox: "INBOX".to_string(),
+            uid_validity: 100,
+            uid_next: Some(4),
+            exists: 1,
+        });
+        let mb_id = seed_pending(&store, 5, true, 100);
+        seed_pending(&store, 6, false, 100);
+        let worker = SyncWorker::new(store);
+
+        let mut session = mock(
+            MailboxSummary {
+                selected_mailbox: "INBOX".to_string(),
+                uid_validity: 100,
+                uid_next: Some(4),
+                exists: 1,
+            },
+            vec![],
+        );
+        // UID 6 was expunged server-side.
+        let live: HashSet<u32> = [5].into_iter().collect();
+        let summary = async_std::task::block_on(async {
+            worker
+                .replay_outbox(&mut session, mb_id, 100, Some(&live))
+                .await
+        })
+        .unwrap();
+
+        assert_eq!(summary.acked, 1);
+        assert_eq!(summary.dropped, 1);
+        assert_eq!(session.set_seen_calls, vec![(5, true)]);
+    }
+
+    /// A failed STORE stays queued with attempts + error recorded.
+    #[test]
+    fn replay_failure_stays_queued_with_error() {
+        let store = inbox(MailboxSummary {
+            selected_mailbox: "INBOX".to_string(),
+            uid_validity: 100,
+            uid_next: Some(4),
+            exists: 1,
+        });
+        let mb_id = seed_pending(&store, 5, true, 100);
+        let worker = SyncWorker::new(store);
+
+        let summary_mm = MailboxSummary {
+            selected_mailbox: "INBOX".to_string(),
+            uid_validity: 100,
+            uid_next: Some(4),
+            exists: 1,
+        };
+        let mut session = mock(summary_mm, vec![]);
+        session.fail_set_seen = true;
+        let live: HashSet<u32> = [5].into_iter().collect();
+        let summary = async_std::task::block_on(async {
+            worker
+                .replay_outbox(&mut session, mb_id, 100, Some(&live))
+                .await
+        })
+        .unwrap();
+
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.acked, 0);
+        let guard = worker.store.lock().unwrap();
+        let ops = queries::list_outbox(guard.conn(), mb_id).unwrap();
+        assert_eq!(ops.len(), 1, "failed op must stay queued");
+        assert_eq!(ops[0].attempts, 1);
+        assert!(ops[0].last_error.is_some());
     }
 }

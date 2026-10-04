@@ -20,8 +20,77 @@ use crate::sync::bodies;
 use crate::sync::{SyncEvent, SyncCallback};
 use crate::creds::{CredentialStore, KeyringStore, SavedCredentials, ServerConfig};
 use crate::imap::{AccountConfig, SecurityMode};
+use crate::imap::manager::SessionManager;
 use crate::imap::session::connect_sync;
 use crate::imap::SyncSession;
+use crate::store::queries;
+
+/// Load the active account config: prefer in-memory `active_account`
+/// (set by `connect_account`), fall back to the OS keyring so sync works
+/// after restart. Shared by `start_sync` and `set_seen`.
+async fn load_account_config(
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<AccountConfig, String> {
+    // In-memory first (works even when "remember me" is unchecked).
+    if let Some(acc) = state.active_account.lock().unwrap().clone() {
+        eprintln!("[SGE sync] Using in-memory credentials for {}", acc.username);
+        return Ok(AccountConfig {
+            host: acc.host,
+            port: acc.port,
+            security: SecurityMode::parse(&acc.security).map_err(|e| e.to_string())?,
+            username: acc.username,
+            password: zeroize::Zeroizing::new(acc.password),
+            allow_untrusted: false,
+            plain_local_confirmed: false,
+        });
+    }
+    eprintln!("[SGE sync] No in-memory session -- loading from keyring...");
+    let server_cfg: ServerConfig = {
+        let kr = KeyringStore::new();
+        tauri::async_runtime::spawn_blocking(move || kr.load_server_config())
+            .await
+            .map_err(|e| format!("internal error: keyring task failed ({e})"))?
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "No server config saved -- log in first".to_string())?
+    };
+    let creds: SavedCredentials = {
+        let kr = KeyringStore::new();
+        tauri::async_runtime::spawn_blocking(move || kr.load())
+            .await
+            .map_err(|e| format!("internal error: keyring task failed ({e})"))?
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "No saved credentials -- log in first".to_string())?
+    };
+    eprintln!("[SGE sync] Using keyring credentials for {}", creds.username);
+    Ok(AccountConfig {
+        host: server_cfg.host,
+        port: server_cfg.port,
+        security: SecurityMode::parse(&server_cfg.security).map_err(|e| e.to_string())?,
+        username: creds.username,
+        password: zeroize::Zeroizing::new(creds.password),
+        allow_untrusted: false,
+        plain_local_confirmed: false,
+    })
+}
+
+/// Get the cached [`SessionManager`] for this account, creating it on first
+/// use and replacing it when the account changes. The slot holds only an
+/// `Arc` clone — never held across `.await`.
+fn manager_for(
+    state: &tauri::State<'_, crate::AppState>,
+    cfg: &AccountConfig,
+) -> Arc<SessionManager> {
+    let key = format!("{}:{}:{}", cfg.host, cfg.port, cfg.username);
+    let mut slot = state.session_manager.lock().unwrap();
+    if let Some(existing) = slot.as_ref() {
+        if existing.account_key() == key {
+            return existing.clone();
+        }
+    }
+    let manager = Arc::new(SessionManager::new(cfg.clone()));
+    *slot = Some(manager.clone());
+    manager
+}
 
 /// Start a sync pass against the stored IMAP server + credentials.
 ///
@@ -36,49 +105,7 @@ pub async fn start_sync(
     on_event: Channel<SyncEvent>,
 ) -> Result<(), String> {
     // Load credentials: prefer in-memory session, fall back to keyring.
-    let account_cfg: AccountConfig = {
-        let mem = state.active_account.lock().unwrap().clone();
-        if let Some(acc) = mem {
-            eprintln!("[SGE sync] Using in-memory credentials for {}", acc.username);
-            AccountConfig {
-                host: acc.host,
-                port: acc.port,
-                security: SecurityMode::parse(&acc.security).map_err(|e| e.to_string())?,
-                username: acc.username,
-                password: zeroize::Zeroizing::new(acc.password),
-                allow_untrusted: false,
-                plain_local_confirmed: false,
-            }
-        } else {
-            eprintln!("[SGE sync] No in-memory session -- loading from keyring...");
-            let server_cfg: ServerConfig = {
-                let kr = KeyringStore::new();
-                tauri::async_runtime::spawn_blocking(move || kr.load_server_config())
-                    .await
-                    .map_err(|e| format!("internal error: keyring task failed ({e})"))?
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| "No server config saved -- log in first".to_string())?
-            };
-            let creds: SavedCredentials = {
-                let kr = KeyringStore::new();
-                tauri::async_runtime::spawn_blocking(move || kr.load())
-                    .await
-                    .map_err(|e| format!("internal error: keyring task failed ({e})"))?
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| "No saved credentials -- log in first".to_string())?
-            };
-            eprintln!("[SGE sync] Using keyring credentials for {}", creds.username);
-            AccountConfig {
-                host: server_cfg.host,
-                port: server_cfg.port,
-                security: SecurityMode::parse(&server_cfg.security).map_err(|e| e.to_string())?,
-                username: creds.username,
-                password: zeroize::Zeroizing::new(creds.password),
-                allow_untrusted: false,
-                plain_local_confirmed: false,
-            }
-        }
-    };
+    let account_cfg: AccountConfig = load_account_config(state.clone()).await?;
 
     eprintln!("[SGE sync] Connecting to {}:{}...", account_cfg.host, account_cfg.port);
 
@@ -109,26 +136,151 @@ pub async fn start_sync(
     Ok(())
 }
 
+/// Outcome of a `set_seen` toggle returned to the frontend.
+///
+/// The toggle applies locally instantly (optimistic UI). `acked` tells the
+/// UI whether the server confirmed the write or the op stays queued in the
+/// durable outbox with `pending_count` shown as the pending indicator until
+/// a later sync acknowledges it.
+#[derive(Debug, Clone, Serialize)]
+pub struct SetSeenResult {
+    pub uid: u32,
+    pub seen: bool,
+    pub acked: bool,
+    pub pending_count: i64,
+    pub detail: String,
+}
+
+/// Mark a message read (`seen=true`) or unread (`seen=false`).
+///
+/// Optimistic + durable: under one store lock the local flags flip and the
+/// toggle enqueues in the outbox (latest-wins), then an immediate UID STORE
+/// goes out through the cached [`SessionManager`] lease. The outbox op
+/// deletes only on server acknowledgement — otherwise it stays queued with
+/// the failure recorded, and the next sync replays it. A still-open session
+/// also drains the rest of the queue opportunistically (replay on session
+/// open). Runs on a blocking thread; the store lock is never held across
+/// `.await`.
+#[tauri::command]
+pub async fn set_seen(
+    state: State<'_, crate::AppState>,
+    uid: u32,
+    seen: bool,
+) -> Result<SetSeenResult, String> {
+    let account_cfg: AccountConfig = load_account_config(state.clone()).await?;
+    let manager = manager_for(&state, &account_cfg);
+    let store = state.store.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        async_std::task::block_on(async {
+            // 1. Optimistic local write + durable enqueue under one lock.
+            let (mailbox_id, epoch) = {
+                let guard = store.lock().unwrap();
+                let conn = guard.conn();
+                let mb = queries::ensure_mailbox(conn, "INBOX")
+                    .map_err(|e| format!("store: {e}"))?;
+                let epoch = queries::get_sync_state(conn, "INBOX")
+                    .map_err(|e| format!("store: {e}"))?
+                    .map(|(v, _)| v)
+                    .unwrap_or(0);
+                queries::set_local_seen(conn, mb, uid, seen)
+                    .map_err(|e| format!("store: {e}"))?;
+                queries::enqueue_outbox(conn, mb, uid, seen, epoch)
+                    .map_err(|e| format!("store: {e}"))?;
+                (mb, epoch)
+            };
+
+            // 2. Immediate UID STORE; ack deletes the op, failure stays queued.
+            let fail_reason: Option<String> = match manager.set_seen(uid, seen).await {
+                Ok(()) => {
+                    let guard = store.lock().unwrap();
+                    let _ =
+                        queries::delete_outbox_op(guard.conn(), mailbox_id, uid);
+                    None
+                }
+                Err(e) => {
+                    let guard = store.lock().unwrap();
+                    let _ = queries::record_outbox_error(
+                        guard.conn(),
+                        mailbox_id,
+                        uid,
+                        &e.to_string(),
+                    );
+                    eprintln!(
+                        "[SGE sync] set_seen uid {uid} not acknowledged ({e}) — stays queued"
+                    );
+                    Some(e.to_string())
+                }
+            };
+
+            // 3. Session is open on success — drain the rest of the queue
+            // opportunistically (no fresh SEARCH here, so no absent-UID
+            // pruning; the next full sync handles that).
+            if fail_reason.is_none() {
+                match manager.lease().await {
+                    Ok(mut lease) => {
+                        let worker = SyncWorker::new(store.clone());
+                        match worker
+                            .replay_outbox(lease.session(), mailbox_id, epoch, None)
+                            .await
+                        {
+                            Ok(r) => eprintln!(
+                                "[SGE sync] set_seen replay: acked={} dropped={} failed={}",
+                                r.acked, r.dropped, r.failed
+                            ),
+                            Err(e) => eprintln!("[SGE sync] set_seen replay error: {e}"),
+                        }
+                    }
+                    Err(e) => eprintln!("[SGE sync] set_seen replay lease failed: {e}"),
+                }
+            }
+
+            let pending_count = {
+                let guard = store.lock().unwrap();
+                queries::outbox_count(guard.conn(), mailbox_id).unwrap_or(0)
+            };
+            Ok(SetSeenResult {
+                uid,
+                seen,
+                acked: fail_reason.is_none(),
+                pending_count,
+                detail: fail_reason.map_or_else(
+                    || "Seen flag confirmed on server".to_string(),
+                    |e| format!("Queued — will retry on next sync ({e})"),
+                ),
+            })
+        })
+    })
+    .await
+    .map_err(|e| format!("internal error: set_seen task failed ({e})"))?
+}
+
 /// Return the latest sync status from SQLite: last_sync_at + counts.
 ///
 /// Read-only -- no IMAP round-trip. Used by the frontend to show
 /// "Up-to-date <timestamp>" or "Offline -- last synced <timestamp>".
+/// `pending_count` is the durable-outbox depth (FLAG-02 pending indicator).
 #[tauri::command]
 pub async fn sync_status(state: State<'_, crate::AppState>) -> Result<SyncStatus, String> {
     let store = state.store.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let guard = store.lock().unwrap();
         let conn = guard.conn();
-        crate::store::queries::sync_status(conn, "INBOX")
-            .map_err(|e| format!("store: {e}"))
-            .map(|opt| opt.unwrap_or_default())
-            .map(|(last_sync_at, uidv, uid_next, count)| SyncStatus {
-                mailbox: "INBOX".to_string(),
-                last_sync_at,
-                uid_validity: uidv,
-                uid_next,
-                message_count: count,
-            })
+        let (last_sync_at, uidv, uid_next, count) =
+            queries::sync_status(conn, "INBOX")
+                .map_err(|e| format!("store: {e}"))?
+                .unwrap_or_default();
+        let pending_count = queries::mailbox_id(conn, "INBOX")
+            .map_err(|e| format!("store: {e}"))?
+            .map(|mb| queries::outbox_count(conn, mb).unwrap_or(0))
+            .unwrap_or(0);
+        Ok(SyncStatus {
+            mailbox: "INBOX".to_string(),
+            last_sync_at,
+            uid_validity: uidv,
+            uid_next,
+            message_count: count,
+            pending_count,
+        })
     })
     .await
     .map_err(|e| format!("internal error: sync status task failed ({e})"))?
@@ -201,6 +353,8 @@ pub struct SyncStatus {
     pub uid_validity: u32,
     pub uid_next: u32,
     pub message_count: i64,
+    /// Durable-outbox depth: toggles awaiting server acknowledgement.
+    pub pending_count: i64,
 }
 
 // Phase 4: Reader + Attachments
