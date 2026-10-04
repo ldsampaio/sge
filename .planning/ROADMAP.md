@@ -55,7 +55,12 @@ Full phase details archived under `.planning/milestones/archived-20261004-phases
   2. User can toggle flags while offline and see them replay to the server on reconnect with a pending indicator until acknowledged
   3. A flag toggle never flaps or lands on the wrong message when a sync runs concurrently (UID-only STORE, pending-wins reconcile)
   4. No fetch path in the app sets \Seen as a side effect (BODY.PEEK audit holds — read-only-era regression class closed)
-**Plans**: TBD
+**Plans**: 3 plans
+
+Plans:
+- [ ] 06-01-PLAN.md — Backend STORE + SessionManager + outbox + reconcile
+- [ ] 06-02-PLAN.md — Frontend toggle UX + pending states
+- [ ] 06-03-PLAN.md — BODY.PEEK audit + hardening + phase gate
 **UI hint**: yes
 
 ### Phase 7: Folders + Per-Folder Sync
