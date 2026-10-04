@@ -5,16 +5,16 @@ milestone_name: Triage & Folders
 current_phase: 6
 current_phase_name: Flag Sync + Outbox
 status: executing
-stopped_at: Phase 6 UI-SPEC approved
-last_updated: "2026-10-04T15:11:48.129Z"
+stopped_at: Completed 06-01-PLAN.md
+last_updated: "2026-10-04T15:23:01.191Z"
 last_activity: 2026-10-04
-last_activity_desc: v1.1 roadmap created (Phases 6-9)
-state_head: 15251c98859bb713004959e998f4bd1923b2a42b
+last_activity_desc: Phase 6 execution started
+state_head: 6d578f54cafa0518db182340440fb4523b1294bb
 progress:
   total_phases: 4
   completed_phases: 5
   total_plans: 3
-  completed_plans: 0
+  completed_plans: 1
 ---
 
 # Project State
@@ -24,14 +24,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-10-04)
 
 **Core value:** Connect to an IMAP server on Linux and read your mail locally in a fast Gmail-like UI.
-**Current focus:** v1.1 Triage & Folders — Phase 6 ready to plan (Flag Sync + Outbox).
+**Current focus:** Phase 6 — Flag Sync + Outbox
 
 ## Current Position
 
-Phase: 6 (Flag Sync + Outbox) — READY TO EXECUTE
-Plan: — (no plans yet)
+Phase: 6 (Flag Sync + Outbox) — EXECUTING
+Plan: 2 of 3
 Status: Ready to execute
-Last activity: 2026-10-04 — v1.1 roadmap created (Phases 6-9)
+Last activity: 2026-10-04 — Phase 6 execution started
 
 Progress: [░░░░░░░░░░] 0% (v1.1)
 
@@ -55,6 +55,11 @@ Progress: [░░░░░░░░░░] 0% (v1.1)
 - Trend: on track
 
 *Updated after each plan completion*
+**Per-Plan Metrics:**
+
+| Plan | Duration | Tasks | Files |
+|------|----------|-------|-------|
+| Phase 6 P01 | ~1 session | 3 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -67,6 +72,7 @@ Recent decisions affecting current work:
 - [v1.1 roadmap]: SessionManager single-session ownership lands in Phase 6; single-flight guard in Phase 8 before poll timer
 - [v1.1 roadmap]: BODY.PEEK audit ships in Phase 6 (ends read-only era)
 - [M1 Phase 5]: Keyring auto-login + Linux bundle shipped — M1 archived
+- [Phase 6]: 06-01: outbox replay is a SyncWorker method on &mut dyn SyncSession; set_seen returns Ok+acked=false when queued; opportunistic replay only after successful STORE
 
 ### Pending Todos
 
@@ -89,6 +95,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-04T15:02:07.157Z
-Stopped at: Phase 6 UI-SPEC approved
-Resume file: .planning/phases/06-flag-sync-outbox/06-UI-SPEC.md
+Last session: 2026-10-04T15:23:01.180Z
+Stopped at: Completed 06-01-PLAN.md
+Resume file: None

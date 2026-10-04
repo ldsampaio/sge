@@ -7,8 +7,8 @@
 
 ### Flag Sync (ends read-only era)
 
-- [ ] **FLAG-01**: User can mark a message read/unread with the Seen flag synced to the server (optimistic UI, reconciled on sync)
-- [ ] **FLAG-02**: Flag toggles made while offline queue durably in SQLite and replay on reconnect
+- [x] **FLAG-01**: User can mark a message read/unread with the Seen flag synced to the server (optimistic UI, reconciled on sync)
+- [x] **FLAG-02**: Flag toggles made while offline queue durably in SQLite and replay on reconnect
 
 ### Folders
 
@@ -95,8 +95,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| FLAG-01 | Phase 6 | Pending |
-| FLAG-02 | Phase 6 | Pending |
+| FLAG-01 | Phase 6 | Complete |
+| FLAG-02 | Phase 6 | Complete |
 | FOLD-01 | Phase 7 | Pending |
 | FOLD-02 | Phase 7 | Pending |
 | FOLD-03 | Phase 7 | Pending |

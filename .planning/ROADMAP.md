@@ -60,12 +60,12 @@ Full phase details archived under `.planning/milestones/archived-20261004-phases
   3. A flag toggle never flaps or lands on the wrong message when a sync runs concurrently (UID-only STORE, pending-wins reconcile)
   4. No fetch path in the app sets \Seen as a side effect (BODY.PEEK audit holds — read-only-era regression class closed)
 
-**Plans**: 3 plans
+**Plans**: 1/3 plans executed
 
 Plans:
 **Wave 1**
 
-- [ ] 06-01-PLAN.md — Backend STORE + SessionManager + outbox + reconcile
+- [x] 06-01-PLAN.md — Backend STORE + SessionManager + outbox + reconcile
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
@@ -141,7 +141,7 @@ Phases execute in numeric order: 6 → 7 → 8 → 9
 | 3. Mailbox UI Shell + Search | v1.0 | 3/3 | Complete | 2026-10-03 |
 | 4. Reader + Attachments | v1.0 | 3/3 | Complete | 2026-10-03 |
 | 5. Keyring + Packaging | v1.0 | 3/3 | Complete | 2026-10-03 |
-| 6. Flag Sync + Outbox | v1.1 | 0/TBD | Not started | - |
+| 6. Flag Sync + Outbox | v1.1 | 1/3 | In Progress|  |
 | 7. Folders + Per-Folder Sync | v1.1 | 0/TBD | Not started | - |
 | 8. Poll + Manual Refresh | v1.1 | 0/TBD | Not started | - |
 | 9. UID Backfill | v1.1 | 0/TBD | Not started | - |
