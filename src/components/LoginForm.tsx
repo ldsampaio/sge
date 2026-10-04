@@ -253,21 +253,6 @@ export default function LoginForm({ onConnect }: { onConnect?: () => void }) {
         <button type="submit" disabled={status.kind === "connecting"}>
           {status.kind === "connecting" ? "Conectando…" : "Conectar"}
         </button>
-
-        {/* 6. Forget saved login */}
-        <button type="button" onClick={() => void forgetSaved()}>
-          Esquecer login salvo
-        </button>
-
-        {/* 7. Other options */}
-        <label className="checkbox-row">
-          <input
-            type="checkbox"
-            checked={rememberMe}
-            onChange={(e) => setRememberMe(e.currentTarget.checked)}
-          />
-          Lembrar me (salvar usuario e senha no keyring do SO)
-        </label>
       </form>
 
       {keyringHint && <p className="hint">{keyringHint}</p>}
@@ -300,6 +285,25 @@ export default function LoginForm({ onConnect }: { onConnect?: () => void }) {
           </button>
         </div>
       )}
+
+      {/* 6+7: Sub-actions block (below main form) */}
+      <div className="login-sub-actions">
+        <button
+          type="button"
+          className="btn-secondary"
+          onClick={() => void forgetSaved()}
+        >
+          Esquecer login salvo
+        </button>
+        <label className="checkbox-row">
+          <input
+            type="checkbox"
+            checked={rememberMe}
+            onChange={(e) => setRememberMe(e.currentTarget.checked)}
+          />
+          Lembrar me (salvar usuario e senha no keyring do OS)
+        </label>
+      </div>
     </div>
   );
 }

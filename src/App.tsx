@@ -104,8 +104,8 @@ function App() {
       )}
       {!connected && !autoConnecting ? (
         <>
-          <SyncStatus />
           <LoginForm onConnect={handleConnect} />
+          <SyncStatus />
         </>
       ) : (
         <>

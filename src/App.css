@@ -163,6 +163,7 @@ form label {
 }
 
 input {
+  box-sizing: border-box;
   width: 100%;
   background: var(--raised-offline);
   color: var(--online);
@@ -295,16 +296,19 @@ details summary {
 .password-field {
   position: relative;
   display: flex;
-  align-items: center;
+  align-items: stretch;
 }
 
 .password-field input {
-  padding-right: 56px;
+  flex: 1;
+  padding-right: 12px;
 }
 
 .password-toggle {
   position: absolute;
   right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
   background: transparent;
   color: var(--spark);
   border: none;
@@ -372,6 +376,37 @@ details summary {
 .status-error p {
   font-size: 13px;
   color: var(--fog);
+}
+
+/* ── Login sub-actions (below main form) ── */
+.login-sub-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  align-items: flex-start;
+  margin-top: 16px;
+  padding: 16px;
+  background: var(--raised-offline);
+  border: 1.5px solid var(--graphite);
+  border-radius: 16px;
+}
+
+/* Spark outline pill (secondary button) */
+.btn-secondary {
+  background: transparent;
+  color: var(--spark);
+  border: 1.5px solid var(--spark);
+  border-radius: 999px;
+  padding: 12px 28px;
+  font-weight: 600;
+  font-size: 15px;
+  cursor: pointer;
+  transition: background-color 0.2s, color 0.2s;
+}
+
+.btn-secondary:hover {
+  background: var(--spark);
+  color: var(--offline);
 }
 
 /* h1 for app title */
