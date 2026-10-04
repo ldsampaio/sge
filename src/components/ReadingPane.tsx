@@ -1,9 +1,15 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
-import type { MessageRow, MessageView } from "../types";
+import type { MessageRow, MessageView, SetSeenResult } from "../types";
+import { isUnread, dispatchFlagUpdate } from "../types";
 import { IconBook, IconDownload, IconMail } from "./icons";
 import "./MailboxView.css";
+
+function isTauriRuntime(): boolean {
+  const w = window as unknown as Record<string, unknown>;
+  return w["__TAURI_INTERNALS__"] !== undefined || w["__TAURI__"] !== undefined;
+}
 
 interface ReadingPaneProps {
   selectedMessage: MessageRow | null;
@@ -14,6 +20,8 @@ export default function ReadingPane({ selectedMessage }: ReadingPaneProps) {
   const [status, setStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
   const [errorMsg, setErrorMsg] = useState("");
   const [savingPart, setSavingPart] = useState<string | null>(null);
+  /** Read/unread of the open message; drives the header toggle's target label. */
+  const [localUnread, setLocalUnread] = useState(false);
 
   useEffect(() => {
     if (!selectedMessage) {
@@ -23,20 +31,90 @@ export default function ReadingPane({ selectedMessage }: ReadingPaneProps) {
     }
 
     const uid = selectedMessage.uid;
+    const flags = selectedMessage.flags;
+    let stale = false;
     setStatus("loading");
     setErrorMsg("");
     setMessage(null);
+    setLocalUnread(isUnread(flags));
 
     invoke<MessageView>("fetch_message", { uid })
-      .then((result) => {
+      .then(async (result) => {
+        if (stale) return;
         setMessage(result);
         setStatus("ready");
+        // Thunderbird-style Seen-on-open: opening an unread message marks it
+        // read optimistically — no toast, browsing never blocked.
+        if (isUnread(flags)) {
+          setLocalUnread(false);
+          try {
+            const r = await invoke<SetSeenResult>("set_seen", { uid, seen: true });
+            if (stale) return;
+            dispatchFlagUpdate({
+              uid: r.uid,
+              seen: r.seen,
+              acked: r.acked,
+              pending_count: r.pending_count,
+              detail: r.detail,
+              origin: "reader",
+            });
+          } catch (err) {
+            if (stale) return;
+            // Invoke rejected: keep the row unread, no row-state notice.
+            setLocalUnread(true);
+            dispatchFlagUpdate({
+              uid,
+              seen: true,
+              acked: false,
+              pending_count: -1,
+              detail: String(err),
+              origin: "reader",
+            });
+          }
+        }
       })
       .catch((err: { message: string }) => {
+        if (stale) return;
         setErrorMsg(err.message || "Não foi possível abrir o aviso");
         setStatus("error");
       });
+
+    return () => {
+      stale = true;
+    };
   }, [selectedMessage]);
+
+  /**
+   * Explicit mark read/unread from the header. Optimistic flip of the local
+   * state plus the same set_seen invoke + rollback shape as the list toggle.
+   */
+  async function handleToggleSeen() {
+    if (!selectedMessage || !isTauriRuntime()) return;
+    const uid = selectedMessage.uid;
+    const targetSeen = localUnread; // unread -> read, read -> unread
+    setLocalUnread(!targetSeen);
+    try {
+      const r = await invoke<SetSeenResult>("set_seen", { uid, seen: targetSeen });
+      dispatchFlagUpdate({
+        uid: r.uid,
+        seen: r.seen,
+        acked: r.acked,
+        pending_count: r.pending_count,
+        detail: r.detail,
+        origin: "reader",
+      });
+    } catch (err) {
+      setLocalUnread(targetSeen);
+      dispatchFlagUpdate({
+        uid,
+        seen: targetSeen,
+        acked: false,
+        pending_count: -1,
+        detail: String(err),
+        origin: "reader",
+      });
+    }
+  }
 
   async function handleSaveAttachment(part_number: string, name: string) {
     setSavingPart(part_number);
@@ -118,6 +196,13 @@ export default function ReadingPane({ selectedMessage }: ReadingPaneProps) {
             {new Date(message.date_utc).toLocaleString("pt-BR")}
           </time>
         </div>
+        <button
+          type="button"
+          className="btn"
+          onClick={() => void handleToggleSeen()}
+        >
+          {localUnread ? "Marcar como lido" : "Marcar como não lido"}
+        </button>
       </header>
 
       {message.has_attachments && message.attachments.length > 0 && (
