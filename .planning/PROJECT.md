@@ -8,22 +8,36 @@ SGE is a Linux desktop email client built with Rust + Tauri v2 + React + SQLite.
 
 Connect to an IMAP server on Linux and read your mail locally in a fast Gmail-like UI — if this doesn't work, nothing else matters.
 
+## Current Milestone: v1.1 Triage & Folders
+
+**Goal:** User can triage mail across folders with server-synced state in the Linux desktop client.
+
+**Target features:**
+- Read/unread sync (toggle Seen flag, ends read-only era)
+- Folder browsing (Sent, Drafts, custom folders, per-folder sync)
+- Poll + manual refresh (periodic INBOX refresh)
+- UID backfill (fill gaps missed between syncs)
+
 ## Requirements
 
 ### Validated
 
 - ✓ User can log in with username, password, and IMAP server URL — Phase 1 (human-validated with real UTFPR account)
 - ✓ App connects over configurable IMAP security (host/port, SSL/TLS or STARTTLS) — Phase 1 (993/SSL live-verified; STARTTLS path unit-tested only, server is 993-only)
+- ✓ App syncs mail headers first, downloads bodies on demand into local SQLite (server copies preserved) — Phase 2 (M1 complete)
+- ✓ User sees Gmail-like three-pane UI (sidebar, message list, reading pane) — Phase 3 (M1 complete)
+- ✓ User can browse INBOX messages locally (offline-capable after sync) — Phase 3 (M1 complete)
+- ✓ User can search/filter Inbox messages — Phase 3 (M1 complete)
+- ✓ User can view attachment names and download/save attachments — Phase 4 (M1 complete)
+- ✓ App remembers credentials securely via OS keyring with auto-login — Phase 5 (M1 complete)
+- ✓ App ships as a Linux desktop build (Tauri v2 bundle) — Phase 5 (M1 complete)
 
-### Active
+### Active (v1.1)
 
-- [ ] App syncs mail headers first, downloads bodies on demand into local SQLite (server copies preserved)
-- [ ] User sees Gmail-like three-pane UI (sidebar, message list, reading pane)
-- [ ] User can browse INBOX messages locally (offline-capable after sync)
-- [ ] User can search/filter Inbox messages
-- [ ] User can view attachment names and download/save attachments
-- [ ] App remembers credentials securely via OS keyring with auto-login
-- [ ] App ships as a Linux desktop build (Tauri v2 bundle)
+- [ ] User can mark messages read/unread with Seen-flag sync to the server
+- [ ] User can browse Sent, Drafts, and custom folders with per-folder sync
+- [ ] App refreshes INBOX on poll interval plus manual refresh
+- [ ] App backfills UIDs missed between syncs (no silent gaps)
 
 ### Out of Scope
 
@@ -86,4 +100,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-10-03 after Phase 1*
+*Last updated: 2026-10-04 — Milestone v1.1 started*
