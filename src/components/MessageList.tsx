@@ -1,7 +1,14 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { MessageRow } from "../types";
-import { isUnread, formatRowDate } from "../types";
+import {
+  isUnread,
+  formatRowDate,
+  setSeenInFlags,
+  dispatchFlagUpdate,
+  FLAG_UPDATE_EVENT,
+} from "../types";
+import type { FlagUpdateDetail, SetSeenResult } from "../types";
 import { IconInbox, IconPaperclip } from "./icons";
 
 export interface ListState {
@@ -25,6 +32,7 @@ interface SyncStatusInfo {
   uid_validity: number;
   uid_next: number;
   message_count: number;
+  pending_count: number;
 }
 
 const PAGE_SIZE = 50;
@@ -59,6 +67,8 @@ export default function MessageList({
   const [page, setPage] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /** Uids with an optimistic toggle awaiting server acknowledgement (pending wash). */
+  const [pendingUids, setPendingUids] = useState<Set<number>>(new Set());
   const searchCache = useRef<{ query: string; rows: MessageRow[] } | null>(null);
   const countRef = useRef(onMessageCount);
   countRef.current = onMessageCount;
@@ -109,6 +119,10 @@ export default function MessageList({
           setMessages(rows);
           setTotal(status.message_count);
           countRef.current?.(status.message_count);
+          // Outbox drained (server acknowledged everything) → clear the wash.
+          if (status.pending_count === 0) {
+            setPendingUids(new Set());
+          }
         }
         reportState({ kind: "ready", message: "" });
       } catch (err) {
@@ -123,6 +137,96 @@ export default function MessageList({
     },
     [mailbox, searchQuery, reportState],
   );
+
+  /**
+   * Optimistic read/unread toggle (FLAG-01/FLAG-02): flips the row to the
+   * target state instantly, calls set_seen, and keeps the accent-soft wash
+   * until the server acknowledges. Rolls back only if the invoke rejects.
+   * Browsing is never blocked by the pending state.
+   */
+  const toggleFlag = useCallback(
+    async (uid: number, targetSeen: boolean, previousFlags: string) => {
+      if (!isTauriRuntime()) {
+        reportState({ kind: "error", message: OUTSIDE_DESKTOP_MESSAGE });
+        return;
+      }
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.uid === uid ? { ...m, flags: setSeenInFlags(m.flags, targetSeen) } : m,
+        ),
+      );
+      setPendingUids((prev) => new Set(prev).add(uid));
+      try {
+        const result = await invoke<SetSeenResult>("set_seen", { uid, seen: targetSeen });
+        dispatchFlagUpdate({
+          uid: result.uid,
+          seen: result.seen,
+          acked: result.acked,
+          pending_count: result.pending_count,
+          detail: result.detail,
+          origin: "list",
+        });
+        if (result.acked) {
+          setPendingUids((prev) => {
+            const next = new Set(prev);
+            next.delete(uid);
+            return next;
+          });
+        }
+      } catch (err) {
+        // Invoke rejected: the store write likely never happened — roll back
+        // the optimistic flip and surface via the established error path.
+        setMessages((prev) =>
+          prev.map((m) => (m.uid === uid ? { ...m, flags: previousFlags } : m)),
+        );
+        setPendingUids((prev) => {
+          const next = new Set(prev);
+          next.delete(uid);
+          return next;
+        });
+        const msg = String(err);
+        dispatchFlagUpdate({
+          uid,
+          seen: targetSeen,
+          acked: false,
+          pending_count: -1, // error sentinel: listeners must not apply as row state
+          detail: msg,
+          origin: "list",
+        });
+        setError(msg);
+        reportState({ kind: "error", message: msg });
+      }
+    },
+    [reportState],
+  );
+
+  // Keep rows in sync with toggles made from the reader pane (and re-apply
+  // our own dispatches idempotently). -1 pending_count = error notice: no
+  // row-state change is applied.
+  useEffect(() => {
+    function onFlagUpdate(e: Event) {
+      const detail = (e as CustomEvent<FlagUpdateDetail>).detail;
+      if (!detail || detail.pending_count === -1) return;
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.uid === detail.uid
+            ? { ...m, flags: setSeenInFlags(m.flags, detail.seen) }
+            : m,
+        ),
+      );
+      if (detail.acked) {
+        setPendingUids((prev) => {
+          const next = new Set(prev);
+          next.delete(detail.uid);
+          return next;
+        });
+      } else {
+        setPendingUids((prev) => new Set(prev).add(detail.uid));
+      }
+    }
+    window.addEventListener(FLAG_UPDATE_EVENT, onFlagUpdate);
+    return () => window.removeEventListener(FLAG_UPDATE_EVENT, onFlagUpdate);
+  }, []);
 
   useEffect(() => {
     searchCache.current = null;
@@ -199,6 +303,7 @@ export default function MessageList({
         {messages.map((msg) => {
           const unread = isUnread(msg.flags);
           const selected = selectedUid === msg.uid;
+          const pending = pendingUids.has(msg.uid);
           return (
             <button
               type="button"
@@ -206,11 +311,25 @@ export default function MessageList({
               role="option"
               aria-selected={selected}
               className={`message-row ${unread ? "unread" : "read"} ${selected ? "selected" : ""}`}
+              style={pending ? { backgroundColor: "var(--color-accent-soft)" } : undefined}
               onClick={() => onMessageSelect(msg)}
             >
               <span
                 className={`unread-dot ${unread ? "unread" : "read"}`}
+                role="button"
+                tabIndex={0}
                 aria-label={unread ? "Não lido" : "Lido"}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void toggleFlag(msg.uid, unread, msg.flags);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    void toggleFlag(msg.uid, unread, msg.flags);
+                  }
+                }}
               />
               <span className="message-sender-cell">
                 <span className="message-avatar" aria-hidden="true">
