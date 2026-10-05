@@ -28,10 +28,15 @@ use store::Store;
 /// `session_manager` caches the single-session [`imap::manager::SessionManager`]
 /// for the active account so flag writes reuse one authenticated session;
 /// it is replaced when the account changes.
+///
+/// `sync_gate` is the Phase 8 single-flight guard: at most one `start_sync`
+/// pass runs at a time, so a poll tick firing mid-sync skips instead of
+/// overlapping.
 pub struct AppState {
     pub store: Arc<Mutex<Store>>,
     pub active_account: Mutex<Option<ActiveAccount>>,
     pub session_manager: Mutex<Option<Arc<imap::manager::SessionManager>>>,
+    pub sync_gate: Arc<sync::SyncGate>,
 }
 
 /// In-memory credentials + server config for the connected session.
@@ -231,6 +236,7 @@ pub fn run() {
         store,
         active_account: Mutex::new(None),
         session_manager: Mutex::new(None),
+        sync_gate: Arc::new(sync::SyncGate::default()),
     };
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())

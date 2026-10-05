@@ -16,7 +16,23 @@ type Status =
   | { kind: "idle" }
   | { kind: "syncing"; progress: string }
   | { kind: "synced"; status: SyncStatusInfo }
+  | { kind: "reconnecting"; message: string }
   | { kind: "error"; message: string };
+
+/** Poll cadence (Phase 8): the timer and the manual button share one
+ *  `requestSync` entry, so refreshes never run two code paths. */
+const POLL_INTERVAL_MS = 5 * 60 * 1000;
+/** One automatic retry after a connection failure before surfacing an error. */
+const RETRY_DELAY_MS = 5 * 1000;
+
+/** Session-expiry shaped failures (vs. fatal sync bugs): the session may be
+ *  stale, so the UI shows "reconnecting…" and retries once — sync resumes
+ *  after keyring re-read + re-SELECT on the backend. */
+function isConnectionError(message: string): boolean {
+  return /imap connection|connection (refused|reset|failed)|timed? ?out|network|dns|econn|reconnect/i.test(
+    message,
+  );
+}
 
 interface BatchStartedEvent {
   BatchStarted: { range: string; server_total: number };
@@ -73,6 +89,7 @@ export default function SyncStatus({ onSyncComplete, mailbox = "INBOX" }: SyncSt
   const [status, setStatus] = useState<Status>({ kind: "idle" });
   const channelRef = useRef<Channel<SyncEvent> | null>(null);
   const syncingRef = useRef(false);
+  const retryTimerRef = useRef<number | null>(null);
   /** Last known outbox depth, so a replay failure can report N. */
   const [lastPending, setLastPending] = useState(0);
 
@@ -87,9 +104,22 @@ export default function SyncStatus({ onSyncComplete, mailbox = "INBOX" }: SyncSt
   }
 
   async function startSync() {
+    await requestSync("manual");
+  }
+
+  /**
+   * The ONE sync entry (Phase 8): poll timer, manual button, and the
+   * reconnect retry all funnel here, so every refresh runs the same
+   * `start_sync` path under the backend single-flight guard.
+   */
+  async function requestSync(source: "manual" | "poll" | "retry") {
     if (syncingRef.current) return;
     syncingRef.current = true;
-    setStatus({ kind: "syncing", progress: "Preparando a sala…" });
+    setStatus({
+      kind: "syncing",
+      progress:
+        source === "poll" ? "Verificação automática…" : "Preparando a sala…",
+    });
 
     const channel = new Channel<SyncEvent>();
     channelRef.current = channel;
@@ -123,7 +153,20 @@ export default function SyncStatus({ onSyncComplete, mailbox = "INBOX" }: SyncSt
       await pollStatus();
       onSyncComplete?.();
     } catch (err) {
-      setStatus({ kind: "error", message: String(err) });
+      const message = String(err);
+      if (source !== "retry" && isConnectionError(message)) {
+        // Honest "reconnecting…" (not a fatal disconnect): the session may
+        // have expired — retry once; the backend re-reads the keyring and
+        // re-SELECTs before the worker proceeds.
+        setStatus({ kind: "reconnecting", message });
+        syncingRef.current = false;
+        channelRef.current = null;
+        retryTimerRef.current = window.setTimeout(() => {
+          void requestSync("retry");
+        }, RETRY_DELAY_MS);
+        return;
+      }
+      setStatus({ kind: "error", message });
     } finally {
       syncingRef.current = false;
       channelRef.current = null;
@@ -141,6 +184,20 @@ export default function SyncStatus({ onSyncComplete, mailbox = "INBOX" }: SyncSt
 
   useEffect(() => {
     void pollStatus();
+    // Poll timer (Phase 8): fires through the same `requestSync` entry as
+    // the manual button; the backend single-flight guard skips the tick
+    // when a pass is already running, so polls never overlap.
+    const timer = window.setInterval(() => {
+      if (!syncingRef.current) {
+        void requestSync("poll");
+      }
+    }, POLL_INTERVAL_MS);
+    return () => {
+      window.clearInterval(timer);
+      if (retryTimerRef.current !== null) {
+        window.clearTimeout(retryTimerRef.current);
+      }
+    };
   }, []);
 
   return (
@@ -182,6 +239,16 @@ export default function SyncStatus({ onSyncComplete, mailbox = "INBOX" }: SyncSt
             <div className="sync-progress" aria-hidden="true">
               <span />
             </div>
+          </>
+        )}
+
+        {status.kind === "reconnecting" && (
+          <>
+            <p role="status">Reconectando… tentando buscar de novo.</p>
+            <div className="sync-progress" aria-hidden="true">
+              <span />
+            </div>
+            <p className="sub">A sessão pode ter expirado — nada foi apagado.</p>
           </>
         )}
 

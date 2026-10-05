@@ -112,8 +112,19 @@ pub async fn start_sync(
 
     // Run sync on a dedicated blocking thread.
     let store = state.store.clone();
+    let gate = state.sync_gate.clone();
     tauri::async_runtime::spawn_blocking(move || {
         async_std::task::block_on(async {
+            // Single-flight (Phase 8): a poll tick or second refresh that
+            // arrives mid-sync skips instead of overlapping. The guard
+            // releases on drop, so failures cannot wedge future syncs.
+            let _pass = match gate.try_begin() {
+                Some(guard) => guard,
+                None => {
+                    eprintln!("[SGE sync] Skipped: another sync pass is already running");
+                    return Ok(Default::default());
+                }
+            };
             let session = connect_sync(&account_cfg).await
                 .map_err(|e| format!("IMAP connection: {e}"))?;
             eprintln!("[SGE sync] Connected -- starting worker...");
