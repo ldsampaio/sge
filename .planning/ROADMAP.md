@@ -43,7 +43,7 @@ Full phase details archived under `.planning/milestones/archived-20261004-phases
 - [x] **Phase 6: Flag Sync + Outbox** - Mark read/unread with server-synced Seen flags and offline queue
 - [x] **Phase 7: Folders + Per-Folder Sync** - Browse Sent/Drafts/custom folders with unread counts
 - [x] **Phase 8: Poll + Manual Refresh** - Periodic and on-demand refresh over one single-flight path
-- [ ] **Phase 9: UID Backfill** - No silent gaps; missed UIDs converge on incremental sync
+- [x] **Phase 9: UID Backfill** - No silent gaps; missed UIDs converge on incremental sync
 
 ## Phase Details
 
@@ -127,7 +127,7 @@ Plans:
   2. Expunged-on-server UIDs stop being re-requested (tombstoned after empty results — no infinite backfill loop)
   3. Double-poll-zero-FETCH convergence holds: two consecutive polls with no server change issue no message FETCHes
 
-**Plans**: TBD
+**Plans**: 1/1 executed (09-01 gap detection + convergence) 2026-10-05
 
 ## Progress
 
