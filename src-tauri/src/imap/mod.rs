@@ -182,6 +182,20 @@ pub struct MailboxSummary {
     pub uid_next: Option<u32>,
 }
 
+/// Information about a discovered mailbox from `LIST "" "*"`.
+///
+/// Returned by [`SyncSession::list_mailboxes`] and surfaced to the
+/// frontend as the folder tree (FOLD-01). `delimiter` is the
+/// mailbox-hierarchy delimiter (e.g. `/` or `.`); `attributes` are
+/// the RFC 3501 LIST attributes (`\Marked`, `\Unmarked`, `\Noselect`,
+/// `\Noinferiors`, `\All`, `\Archive`, etc.).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailboxInfo {
+    pub name: String,
+    pub delimiter: String,
+    pub attributes: Vec<String>,
+}
+
 /// A boxed async stream satisfying async-imap's transport bound —
 /// `AsyncRead + AsyncWrite + Unpin + Debug + Send`.  Used to erase
 /// TLS/TCP stream types behind `Client<BoxedStream>`.
@@ -244,20 +258,29 @@ impl From<async_imap::error::Error> for SyncError {
     }
 }
 
-/// Object-safe trait abstracting an IMAP INBOX session.
+/// Object-safe trait abstracting an IMAP folder session.
 ///
 /// Implemented by:
 /// - [`BoxedSession`] — real IMAP session (Phase 1 connection core)
-/// - `MockSession` (in `sync::worker::tests`) — deterministic fixture
+/// - `MockSession` (in `sync::worker::tests` and `imap::bodies::tests`) — deterministic fixture
 ///
 /// Reads are ENVELOPE sweeps, `BODY.PEEK[]` bodies, SELECT, LOGOUT.
-/// The single write verb is [`SyncSession::set_seen`] (UID STORE `\Seen`,
-/// Phase 6 — ends the M1 read-only era). `EXPUNGE` and `APPEND` are
-/// **never** exposed.
+/// `LIST` discovers the folder tree. The single write verb is
+/// [`SyncSession::set_seen`] (UID STORE `\\Seen`, Phase 6 — ends the M1
+/// read-only era). `EXPUNGE` and `APPEND` are **never** exposed.
 pub trait SyncSession: Unpin + Send {
-    /// `SELECT INBOX` — validates the mailbox is selectable and returns
+    /// `SELECT <mailbox>` — selects any mailbox by name and returns
     /// UIDVALIDITY / UIDNEXT / exists counts.
-    fn select_inbox(&mut self) -> PinBox<'_, Result<MailboxSummary, SyncError>>;
+    fn select_mailbox(
+        &mut self,
+        name: &str,
+    ) -> PinBox<'_, Result<MailboxSummary, SyncError>>;
+
+    /// `SELECT INBOX` — convenience delegating to [`select_mailbox`](Self::select_mailbox)
+    /// with `"INBOX"`.
+    fn select_inbox(&mut self) -> PinBox<'_, Result<MailboxSummary, SyncError>> {
+        self.select_mailbox("INBOX")
+    }
 
     /// `UID SEARCH ALL` — returns all UIDs currently in the selected mailbox.
     fn search_uids(&mut self) -> PinBox<'_, Result<Vec<u32>, SyncError>>;
@@ -273,13 +296,32 @@ pub trait SyncSession: Unpin + Send {
     /// bytes for a single UID. Never sets `\\Seen`.
     fn fetch_body(&mut self, uid: u32) -> PinBox<'_, Result<Vec<u8>, SyncError>>;
 
-    /// `UID STORE <uid> ±FLAGS.SILENT (\Seen)` — set or clear the Seen
+    /// `UID STORE <uid> ±FLAGS.SILENT (\\Seen)` — set or clear the Seen
     /// flag on exactly one message by UID. UID-only addressing: sequence
-    /// numbers must never reach this path (T-6-01).
+    /// numbers must never reach this path (T-6-1).</
     fn set_seen(&mut self, uid: u32, seen: bool) -> PinBox<'_, Result<(), SyncError>>;
+
+    /// `LIST "" "*"` — discover all mailboxes on the server (FOLD-01).
+    /// Returns raw LIST results with name, delimiter, and attributes.
+    fn list_mailboxes(&mut self) -> PinBox<'_, Result<Vec<MailboxInfo>, SyncError>>;
+
+    /// `STATUS <mailbox> (UIDVALIDITY UIDNEXT UNSEEN)` — read-only triage
+    /// signals for one folder without SELECTing it (FOLD-02).
+    ///
+    /// `unseen` is the count of messages without `\Seen` (STATUS UNSEEN
+    /// datum), NOT the SELECT "first unseen sequence number" semantic.
+    fn mailbox_status(&mut self, name: &str) -> PinBox<'_, Result<MailboxStatus, SyncError>>;
 
     /// Graceful `LOGOUT`.  Idempotent on error.
     fn logout(&mut self) -> PinBox<'_, Result<(), SyncError>>;
+}
+
+/// Read-only per-folder triage signals from `STATUS` (FOLD-02).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailboxStatus {
+    pub uid_validity: u32,
+    pub uid_next: Option<u32>,
+    pub unseen: u32,
 }
 
 /// The UID STORE argument for a Seen toggle, in canonical form.
@@ -295,15 +337,38 @@ pub fn seen_store_arg(seen: bool) -> &'static str {
     }
 }
 
+/// Convert an IMAP `NameAttribute` to its canonical string form (e.g. `\Marked`).
+fn name_attribute_to_string(attr: &async_imap::types::NameAttribute) -> String {
+    match attr {
+        async_imap::types::NameAttribute::NoInferiors => "\\\\NoInferiors".to_string(),
+        async_imap::types::NameAttribute::NoSelect => "\\\\NoSelect".to_string(),
+        async_imap::types::NameAttribute::Marked => "\\\\Marked".to_string(),
+        async_imap::types::NameAttribute::Unmarked => "\\\\Unmarked".to_string(),
+        async_imap::types::NameAttribute::All => "\\\\All".to_string(),
+        async_imap::types::NameAttribute::Archive => "\\\\Archive".to_string(),
+        async_imap::types::NameAttribute::Drafts => "\\\\Drafts".to_string(),
+        async_imap::types::NameAttribute::Flagged => "\\\\Flagged".to_string(),
+        async_imap::types::NameAttribute::Junk => "\\\\Junk".to_string(),
+        async_imap::types::NameAttribute::Sent => "\\\\Sent".to_string(),
+        async_imap::types::NameAttribute::Trash => "\\\\Trash".to_string(),
+        async_imap::types::NameAttribute::Extension(s) => s.to_string(),
+        _ => format!("{:?}", attr),
+    }
+}
+
 impl SyncSession for BoxedSession {
-    fn select_inbox(&mut self) -> PinBox<'_, Result<MailboxSummary, SyncError>> {
+    fn select_mailbox(
+        &mut self,
+        name: &str,
+    ) -> PinBox<'_, Result<MailboxSummary, SyncError>> {
+        let mailbox_name = name.to_string();
         Box::pin(async move {
             let mailbox = self
-                .select("INBOX")
+                .select(&mailbox_name)
                 .await
-                .map_err(|e| SyncError::Protocol(format!("SELECT: {e}")))?;
+                .map_err(|e| SyncError::Protocol(format!("SELECT {mailbox_name}: {e}")))?;
             Ok(MailboxSummary {
-                selected_mailbox: "INBOX".to_string(),
+                selected_mailbox: mailbox_name,
                 uid_validity: mailbox
                     .uid_validity
                     .ok_or_else(|| SyncError::State("server did not return UIDVALIDITY".into()))?,
@@ -385,6 +450,51 @@ impl SyncSession for BoxedSession {
                 .await
                 .map_err(|e| SyncError::Protocol(format!("LOGOUT: {e}")))?;
             Ok(())
+        })
+    }
+
+    fn list_mailboxes(&mut self) -> PinBox<'_, Result<Vec<MailboxInfo>, SyncError>> {
+        Box::pin(async move {
+            let mut stream = self
+                .list(Some(""), Some("*"))
+                .await
+                .map_err(|e| SyncError::Protocol(format!("LIST: {e}")))?;
+            let mut out = Vec::new();
+            while let Some(name) = stream.try_next().await? {
+                out.push(MailboxInfo {
+                    name: name.name().to_string(),
+                    delimiter: name
+                        .delimiter()
+                        .map(|d| d.to_string())
+                        .unwrap_or_default(),
+                    attributes: name
+                        .attributes()
+                        .iter()
+                        .map(name_attribute_to_string)
+                        .collect(),
+                });
+            }
+            Ok(out)
+        })
+    }
+
+    fn mailbox_status(&mut self, name: &str) -> PinBox<'_, Result<MailboxStatus, SyncError>> {
+        let mailbox_name = name.to_string();
+        Box::pin(async move {
+            let mailbox = self
+                .status(&mailbox_name, "(UIDVALIDITY UIDNEXT UNSEEN)")
+                .await
+                .map_err(|e| SyncError::Protocol(format!("STATUS {mailbox_name}: {e}")))?;
+            Ok(MailboxStatus {
+                uid_validity: mailbox.uid_validity.ok_or_else(|| {
+                    SyncError::State(format!(
+                        "STATUS {mailbox_name} did not return UIDVALIDITY"
+                    ))
+                })?,
+                uid_next: mailbox.uid_next,
+                // STATUS UNSEEN datum = count of messages without \Seen.
+                unseen: mailbox.unseen.unwrap_or(0),
+            })
         })
     }
 }

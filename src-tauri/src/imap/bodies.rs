@@ -158,7 +158,8 @@ fn read_cached_body(conn: &Connection, message_id: u64) -> Result<BodyContent, S
 mod tests {
     use super::*;
     use crate::imap::headers::MessageHeader;
-    use crate::imap::{MailboxSummary, PinBox, SyncSession};
+    use crate::imap::{MailboxInfo, MailboxStatus, MailboxSummary, PinBox, SyncSession};
+    use super::SyncError;
     use crate::store::Store;
     use crate::store::queries;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -170,7 +171,10 @@ mod tests {
     }
 
     impl SyncSession for MockSession {
-        fn select_inbox(&mut self) -> PinBox<'_, Result<MailboxSummary, SyncError>> {
+        fn select_mailbox(
+            &mut self,
+            _name: &str,
+        ) -> PinBox<'_, Result<MailboxSummary, SyncError>> {
             let summary = MailboxSummary {
                 selected_mailbox: "INBOX".to_string(),
                 uid_validity: 100,
@@ -178,6 +182,20 @@ mod tests {
                 exists: 1,
             };
             Box::pin(async move { Ok(summary) })
+        }
+
+        fn list_mailboxes(&mut self) -> PinBox<'_, Result<Vec<MailboxInfo>, SyncError>> {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn mailbox_status(&mut self, _name: &str) -> PinBox<'_, Result<MailboxStatus, SyncError>> {
+            Box::pin(async move {
+                Ok(MailboxStatus {
+                    uid_validity: 100,
+                    uid_next: Some(1),
+                    unseen: 0,
+                })
+            })
         }
 
         fn search_uids(&mut self) -> PinBox<'_, Result<Vec<u32>, SyncError>> {

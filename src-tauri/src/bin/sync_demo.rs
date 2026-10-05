@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicU32;
 
 use sge_lib::store::{Store, queries};
-use sge_lib::imap::{MailboxSummary, SyncError, SyncSession};
+use sge_lib::imap::{MailboxInfo, MailboxStatus, MailboxSummary, SyncError, SyncSession};
 use sge_lib::imap::headers::MessageHeader;
 use sge_lib::sync::worker::SyncWorker;
 
@@ -29,13 +29,30 @@ impl MockSession {
 }
 
 impl SyncSession for MockSession {
-    fn select_inbox(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<MailboxSummary, SyncError>> + Send>> {
+    fn select_mailbox(
+        &mut self,
+        _name: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<MailboxSummary, SyncError>> + Send>> {
         Box::pin(async move {
             Ok(MailboxSummary {
                 selected_mailbox: "INBOX".to_string(),
                 uid_validity: 100,
                 exists: 5,
                 uid_next: Some(6),
+            })
+        })
+    }
+
+    fn list_mailboxes(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<MailboxInfo>, SyncError>> + Send>> {
+        Box::pin(async move { Ok(Vec::new()) })
+    }
+
+    fn mailbox_status(&mut self, _name: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<MailboxStatus, SyncError>> + Send>> {
+        Box::pin(async move {
+            Ok(MailboxStatus {
+                uid_validity: 100,
+                uid_next: Some(6),
+                unseen: 5,
             })
         })
     }
@@ -96,7 +113,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // ── Run the sync worker (full sweep) ──
         let worker = SyncWorker::new(store.clone());
         let session = MockSession::new();
-        let summary = worker.sync_with_session(Box::new(session), Arc::new(|_| {})).await?;
+        let summary = worker.sync_with_session(Box::new(session), "INBOX", Arc::new(|_| {})).await?;
         println!("✓ sync complete: new={} updated={} unchanged={} deleted={}",
                  summary.new, summary.updated, summary.unchanged, summary.deleted);
         assert_eq!(summary.new, 5, "expected 5 new messages on first sync");
@@ -112,7 +129,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // ── Test incremental: second sync should find 0 new ──
         let session2 = MockSession::new();
-        let summary2 = worker.sync_with_session(Box::new(session2), Arc::new(|_| {})).await?;
+        let summary2 = worker.sync_with_session(Box::new(session2), "INBOX", Arc::new(|_| {})).await?;
         assert_eq!(summary2.new, 0, "incremental sync: expected 0 new messages");
         println!("✓ incremental sync: 0 new messages (idempotent)");
 
@@ -123,7 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             queries::set_sync_state(conn, "INBOX", 99999, 1)?;
         }
         let session3 = MockSession::new();
-        let result = worker.sync_with_session(Box::new(session3), Arc::new(|_| {})).await?;
+        let result = worker.sync_with_session(Box::new(session3), "INBOX", Arc::new(|_| {})).await?;
         assert!(result.uid_validity_bump, "UIDVALIDITY mismatch should trigger resync");
         assert_eq!(result.new, 5, "UIDVALIDITY wipe should re-insert all messages");
         println!("✓ UIDVALIDITY mismatch triggered clean resync (uid_validity_bump=true)");

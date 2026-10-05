@@ -1,7 +1,7 @@
 //! Single-session IMAP ownership (Phase 6, Plan 06-01).
 //!
 //! [`SessionManager`] owns the one authenticated [`BoxedSession`] and hands
-//! out mailbox-scoped [`MailboxLease`]s: exclusive, INBOX-selected access
+//! out mailbox-scoped [`MailboxLease`]s: exclusive, folder-selected access
 //! with single-flight serialization. The first lease connects and SELECTs;
 //! after a transparent reconnect the mailbox is re-SELECTed before the
 //! caller proceeds, so every flag write lands on the intended mailbox.
@@ -32,7 +32,7 @@ pub struct SessionManager {
 #[derive(Default)]
 struct ManagerState {
     session: Option<BoxedSession>,
-    selected: bool,
+    selected_mailbox: Option<String>,
 }
 
 impl SessionManager {
@@ -53,31 +53,41 @@ impl SessionManager {
         )
     }
 
-    /// Exclusive, INBOX-selected access to the owned session.
+    /// Exclusive, mailbox-selected access to the owned session.
     ///
-    /// Connects on first use, (re-)SELECTs INBOX whenever the session is
-    /// fresh, and serializes concurrent callers through the state mutex.
-    pub async fn lease(&self) -> Result<MailboxLease<'_>, SyncError> {
+    /// Connects on first use, (re-)SELECTs `mailbox` whenever the session is
+    /// fresh or a different folder is selected, and serializes concurrent
+    /// callers through the state mutex (FOLD-03: per-folder leases).
+    pub async fn lease_for(&self, mailbox: &str) -> Result<MailboxLease<'_>, SyncError> {
         let mut guard = self.state.lock().await;
         if guard.session.is_none() {
             let session = connect_sync(&self.config).await.map_err(|e| {
                 SyncError::Protocol(format!("SessionManager connect: {e}"))
             })?;
             guard.session = Some(session);
-            guard.selected = false;
+            guard.selected_mailbox = None;
         }
-        if !guard.selected {
+        let needs_select = guard.selected_mailbox.as_deref() != Some(mailbox);
+        if needs_select {
             let session = guard.session.as_mut().expect("connected above");
-            let summary = session.select_inbox().await.map_err(|e| {
-                SyncError::Protocol(format!("SessionManager SELECT INBOX: {e}"))
+            let summary = session.select_mailbox(mailbox).await.map_err(|e| {
+                SyncError::Protocol(format!("SessionManager SELECT {mailbox}: {e}"))
             })?;
             eprintln!(
-                "[SGE imap] lease selected INBOX: uid_validity={} exists={}",
+                "[SGE imap] lease selected {mailbox}: uid_validity={} exists={}",
                 summary.uid_validity, summary.exists
             );
-            guard.selected = true;
+            guard.selected_mailbox = Some(mailbox.to_string());
         }
         Ok(MailboxLease { guard })
+    }
+
+    /// Exclusive, INBOX-selected access to the owned session.
+    ///
+    /// Back-compat delegate of [`lease_for`](Self::lease_for) for INBOX-only
+    /// (Phase 6) callers.
+    pub async fn lease(&self) -> Result<MailboxLease<'_>, SyncError> {
+        self.lease_for("INBOX").await
     }
 
     /// Drop the owned session; the next lease reconnects transparently.
@@ -88,29 +98,59 @@ impl SessionManager {
             SyncError::Protocol(format!("SessionManager reconnect: {e}"))
         })?;
         guard.session = Some(session);
-        guard.selected = false;
+        guard.selected_mailbox = None;
         Ok(())
     }
 
     /// UID STORE `\Seen` through the owned session with one transparent
     /// reconnect + retry: if the write fails the session may be stale, so
     /// reconnect, re-SELECT (via a fresh lease), and retry exactly once.
-    pub async fn set_seen(&self, uid: u32, seen: bool) -> Result<(), SyncError> {
-        let mut lease = self.lease().await?;
+    ///
+    /// The write lands on `mailbox`: the lease SELECTs it first, so a
+    /// `set_seen` for Sent never touches INBOX (FOLD-03).
+    pub async fn set_seen_in(
+        &self,
+        mailbox: &str,
+        uid: u32,
+        seen: bool,
+    ) -> Result<(), SyncError> {
+        let mut lease = self.lease_for(mailbox).await?;
         match lease.session().set_seen(uid, seen).await {
             Ok(()) => Ok(()),
             Err(first) => {
-                eprintln!("[SGE imap] set_seen uid {uid} failed ({first}) — reconnecting once");
+                eprintln!("[SGE imap] set_seen {mailbox} uid {uid} failed ({first}) — reconnecting once");
                 drop(lease);
                 self.reconnect().await?;
-                let mut lease = self.lease().await?;
+                let mut lease = self.lease_for(mailbox).await?;
                 lease.session().set_seen(uid, seen).await
             }
         }
     }
+
+    /// UID STORE `\Seen` on INBOX — back-compat delegate for Phase 6 callers.
+    pub async fn set_seen(&self, uid: u32, seen: bool) -> Result<(), SyncError> {
+        self.set_seen_in("INBOX", uid, seen).await
+    }
+
+    /// `LIST "" "*"` through the owned session (FOLD-01 folder discovery).
+    pub async fn list_mailboxes(&self) -> Result<Vec<super::MailboxInfo>, SyncError> {
+        let mut lease = self.lease_for("INBOX").await?;
+        lease.session().list_mailboxes().await
+    }
+
+    /// `STATUS <mailbox> (UIDVALIDITY UIDNEXT UNSEEN)` through the owned
+    /// session (FOLD-02 triage signals). Does not disturb the lease's
+    /// SELECTed folder — STATUS works on any mailbox.
+    pub async fn mailbox_status(
+        &self,
+        mailbox: &str,
+    ) -> Result<super::MailboxStatus, SyncError> {
+        let mut lease = self.lease_for("INBOX").await?;
+        lease.session().mailbox_status(mailbox).await
+    }
 }
 
-/// Exclusive, INBOX-selected access to the manager's session.
+/// Exclusive, mailbox-selected access to the manager's session.
 ///
 /// Holds the single-flight lock for its lifetime: while a lease exists no
 /// other caller can interleave IMAP commands on the owned session.
@@ -119,8 +159,8 @@ pub struct MailboxLease<'a> {
 }
 
 impl MailboxLease<'_> {
-    /// The live, INBOX-selected session. Never `None`: `lease()` connects
-    /// and SELECTs before handing out the guard.
+    /// The live, mailbox-selected session. Never `None`: `lease_for()`
+    /// connects and SELECTs before handing out the guard.
     pub fn session(&mut self) -> &mut BoxedSession {
         self.guard
             .session

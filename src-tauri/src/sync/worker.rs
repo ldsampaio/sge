@@ -2,7 +2,7 @@
 //!
 //! Algorithm (Plan 02-02, Wave 2):
 //! 1. Ensure mailbox row + read sync state
-//! 2. SELECT INBOX → MailboxSummary (UIDVALIDITY, UIDNEXT, exists)
+//! 2. SELECT mailbox → MailboxSummary (UIDVALIDITY, UIDNEXT, exists)
 //! 3. UIDVALIDITY guard — wipe if changed
 //! 4. Compute fetch_from (incremental or full resync)
 //! 5. Header sweep — 200-UID batches via fetch_envelopes
@@ -148,29 +148,56 @@ impl SyncWorker {
     pub async fn sync_with_session(
         &self,
         mut session: Box<dyn SyncSession>,
+        mailbox_name: &str,
         cb: SyncCallback,
     ) -> Result<SyncSummary, SyncError> {
         // ── Step 1: ensure mailbox row + read sync state ─────────
         let mailbox_id = {
             let guard = self.store.lock().unwrap();
             let conn = guard.conn();
-            queries::ensure_mailbox(conn, "INBOX")
+            queries::ensure_mailbox(conn, mailbox_name)
                 .map_err(|e| SyncError::Protocol(format!("ensure mailbox: {e}")))?
         };
         let (prev_uidv, _prev_next) = {
             let guard = self.store.lock().unwrap();
             let conn = guard.conn();
-            let prev = queries::get_sync_state(conn, "INBOX")
+            let prev = queries::get_sync_state(conn, mailbox_name)
                 .map_err(|e| SyncError::Protocol(format!("get sync state: {e}")))?;
             prev.unwrap_or((0u32, 0u32))
         };
 
-        // ── Step 2: SELECT INBOX ──────────────────────────────────
-        let summary: MailboxSummary = session.select_inbox().await?;
+        // ── Step 2: SELECT mailbox ──────────────────────────────────
+        let summary: MailboxSummary = session.select_mailbox(mailbox_name).await?;
         eprintln!(
-            "[SGE sync] SELECT INBOX: exists={} uid_validity={} uid_next={:?}",
-            summary.exists, summary.uid_validity, summary.uid_next
+            "[SGE sync] SELECT {}: exists={} uid_validity={} uid_next={:?}",
+            mailbox_name, summary.exists, summary.uid_validity, summary.uid_next
         );
+
+        // ── Step 2b: STATUS triage signals (FOLD-02) ────────────────
+        // Read-only: caches the server UNSEEN datum per folder for the
+        // sidebar badge fallback. Graceful — a STATUS failure must not
+        // fail the sync (some servers restrict it); the badge falls back
+        // to the dynamic local count.
+        match session.mailbox_status(mailbox_name).await {
+            Ok(status) => {
+                let guard = self.store.lock().unwrap();
+                if let Err(e) = queries::set_mailbox_status(
+                    guard.conn(),
+                    mailbox_name,
+                    status.uid_validity,
+                    status.uid_next.unwrap_or(summary.uid_next.unwrap_or(1)),
+                    status.unseen,
+                ) {
+                    eprintln!("[SGE sync] STATUS cache write failed ({e}) — continuing");
+                } else {
+                    eprintln!(
+                        "[SGE sync] STATUS {mailbox_name}: uid_validity={} unseen={}",
+                        status.uid_validity, status.unseen
+                    );
+                }
+            }
+            Err(e) => eprintln!("[SGE sync] STATUS {mailbox_name} failed ({e}) — continuing without unseen cache"),
+        }
 
         // ── Step 3: UIDVALIDITY guard ─────────────────────────────
         let uid_validity_bump = prev_uidv != 0 && prev_uidv != summary.uid_validity;
@@ -217,7 +244,7 @@ impl SyncWorker {
                     .map_err(|e| SyncError::Protocol(format!("wipe empty mailbox: {e}")))?;
                 queries::set_sync_state(
                     guard.conn(),
-                    "INBOX",
+                    mailbox_name,
                     summary.uid_validity,
                     summary.uid_next.unwrap_or(1),
                 )
@@ -372,7 +399,7 @@ impl SyncWorker {
         {
             let guard = self.store.lock().unwrap();
             let conn = guard.conn();
-            queries::set_sync_state(conn, "INBOX", summary.uid_validity, new_next)
+            queries::set_sync_state(conn, mailbox_name, summary.uid_validity, new_next)
                 .map_err(|e| SyncError::Protocol(format!("set sync state: {e}")))?;
         }
 
@@ -416,7 +443,7 @@ impl SyncWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::imap::PinBox;
+    use crate::imap::{MailboxInfo, MailboxStatus, PinBox};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// Deterministic `MockSession` — returns canned headers and tracks
@@ -431,10 +458,15 @@ mod tests {
         pub set_seen_calls: Vec<(u32, bool)>,
         /// When true, `set_seen` fails — drives replay-failure tests.
         pub fail_set_seen: bool,
+        /// STATUS UNSEEN datum returned by `mailbox_status` (FOLD-02).
+        pub status_unseen: u32,
     }
 
     impl SyncSession for MockSession {
-        fn select_inbox(&mut self) -> PinBox<'_, Result<MailboxSummary, SyncError>> {
+        fn select_mailbox(
+            &mut self,
+            _name: &str,
+        ) -> PinBox<'_, Result<MailboxSummary, SyncError>> {
             let summary = self.summary.clone();
             Box::pin(async move { Ok(summary) })
         }
@@ -465,6 +497,19 @@ mod tests {
                 });
             }
             Box::pin(async move { Ok(()) })
+        }
+
+        fn list_mailboxes(&mut self) -> PinBox<'_, Result<Vec<MailboxInfo>, SyncError>> {
+            Box::pin(async move { Ok(vec![]) })
+        }
+
+        fn mailbox_status(&mut self, _name: &str) -> PinBox<'_, Result<MailboxStatus, SyncError>> {
+            let status = MailboxStatus {
+                uid_validity: self.summary.uid_validity,
+                uid_next: self.summary.uid_next,
+                unseen: self.status_unseen,
+            };
+            Box::pin(async move { Ok(status) })
         }
 
         fn logout(&mut self) -> PinBox<'_, Result<(), SyncError>> {
@@ -501,6 +546,7 @@ mod tests {
             logout_called: AtomicBool::new(false),
             set_seen_calls: Vec::new(),
             fail_set_seen: false,
+            status_unseen: 0,
         }
     }
 
@@ -530,7 +576,7 @@ mod tests {
         let session = mock(summary, vec![mkhdr(1), mkhdr(2), mkhdr(3)]);
 
         let result = async_std::task::block_on(async {
-            worker.sync_with_session(Box::new(session), cb()).await
+            worker.sync_with_session(Box::new(session), "INBOX", cb()).await
         })
         .unwrap();
 
@@ -571,14 +617,14 @@ mod tests {
         // First run — inserts
         let session = mock(summary.clone(), vec![mkhdr(1), mkhdr(2), mkhdr(3)]);
         async_std::task::block_on(async {
-            worker.sync_with_session(Box::new(session), cb()).await
+            worker.sync_with_session(Box::new(session), "INBOX", cb()).await
         })
         .unwrap();
 
         // Second run — same data, should be all updates
         let session2 = mock(summary, vec![mkhdr(1), mkhdr(2), mkhdr(3)]);
         let result = async_std::task::block_on(async {
-            worker.sync_with_session(Box::new(session2), cb()).await
+            worker.sync_with_session(Box::new(session2), "INBOX", cb()).await
         })
         .unwrap();
 
@@ -606,7 +652,7 @@ mod tests {
             exists: 3,
         };
         let session = mock(s1, vec![mkhdr(1), mkhdr(2), mkhdr(3)]);
-        async_std::task::block_on(async { worker.sync_with_session(Box::new(session), cb()).await })
+        async_std::task::block_on(async { worker.sync_with_session(Box::new(session), "INBOX", cb()).await })
             .unwrap();
 
         // Second run with UIDVALIDITY=200 → wipe
@@ -619,7 +665,7 @@ mod tests {
         let session2 = mock(s2, vec![mkhdr(1), mkhdr(2), mkhdr(3)]);
         let result = async_std::task::block_on(async {
             worker
-                .sync_with_session(Box::new(session2), cb())
+                .sync_with_session(Box::new(session2), "INBOX", cb())
                 .await
         })
         .unwrap();
@@ -663,7 +709,7 @@ mod tests {
         let session = mock(summary, vec![]);
 
         let result = async_std::task::block_on(async {
-            worker.sync_with_session(Box::new(session), cb()).await
+            worker.sync_with_session(Box::new(session), "INBOX", cb()).await
         })
         .unwrap();
 
@@ -776,7 +822,7 @@ mod tests {
         let session = mock(summary, vec![hdr1, hdr2]);
 
         async_std::task::block_on(async {
-            worker.sync_with_session(Box::new(session), cb()).await
+            worker.sync_with_session(Box::new(session), "INBOX", cb()).await
         })
         .unwrap();
         // The sync consumed the session box; assert through the store: the
@@ -1195,5 +1241,142 @@ mod tests {
             "+FLAGS.SILENT (\\Seen)"
         );
         assert_eq!(queries::SEEN_FLAG, "\\Seen");
+    }
+
+    // ── Phase 7 Plan 07-02: per-folder sync gate tests ──
+    // `sync_command_mailbox` is the plan's verify command; these tests are
+    // the command-layer contract at worker/store level (Tauri `State`
+    // cannot be constructed in unit tests, so the gate lives here).
+
+    /// Two folders sync independently; a UIDVALIDITY bump in one wipes only
+    /// that folder (FOLD-03 criterion 4).
+    #[test]
+    fn sync_command_mailbox_per_folder_isolation() {
+        let store = inbox(MailboxSummary {
+            selected_mailbox: "INBOX".to_string(),
+            uid_validity: 100,
+            uid_next: Some(4),
+            exists: 2,
+        });
+        let worker = SyncWorker::new(store.clone());
+
+        let folder_a = |uidv: u32| MailboxSummary {
+            selected_mailbox: "FolderA".to_string(),
+            uid_validity: uidv,
+            uid_next: Some(4),
+            exists: 2,
+        };
+        let folder_b = MailboxSummary {
+            selected_mailbox: "FolderB".to_string(),
+            uid_validity: 200,
+            uid_next: Some(3),
+            exists: 1,
+        };
+
+        // Sync A (uidv 100) then B (uidv 200).
+        for (summary, box_name, uids) in [
+            (folder_a(100), "FolderA", vec![mkhdr(1), mkhdr(2)]),
+            (folder_b, "FolderB", vec![mkhdr(9)]),
+        ] {
+            let session = mock(summary, uids);
+            async_std::task::block_on(async {
+                worker
+                    .sync_with_session(Box::new(session), box_name, cb())
+                    .await
+            })
+            .unwrap();
+        }
+
+        // Bump A's epoch → wipe + resync touches only A.
+        let session_a2 = mock(folder_a(999), vec![mkhdr(1), mkhdr(2)]);
+        let result = async_std::task::block_on(async {
+            worker
+                .sync_with_session(Box::new(session_a2), "FolderA", cb())
+                .await
+        })
+        .unwrap();
+        assert!(result.uid_validity_bump);
+
+        // B's cache and sync state are untouched.
+        let guard = worker.store.lock().unwrap();
+        let b_count: i64 = guard
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM messages m JOIN mailboxes mb ON m.mailbox_id = mb.id WHERE mb.name = 'FolderB'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(b_count, 1, "FolderB cache must survive FolderA's epoch bump");
+        let b_uidv: u32 = guard
+            .conn()
+            .query_row(
+                "SELECT uid_validity FROM mailboxes WHERE name = 'FolderB'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(b_uidv, 200, "FolderB epoch must be untouched");
+        let a_uidv: u32 = guard
+            .conn()
+            .query_row(
+                "SELECT uid_validity FROM mailboxes WHERE name = 'FolderA'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(a_uidv, 999, "FolderA epoch must advance to 999");
+    }
+
+    /// STATUS UNSEEN datum is cached per folder and the badge query returns
+    /// it alongside the dynamic local count (FOLD-02).
+    #[test]
+    fn sync_command_mailbox_unseen_cache() {
+        let store = inbox(MailboxSummary {
+            selected_mailbox: "Sent".to_string(),
+            uid_validity: 300,
+            uid_next: Some(3),
+            exists: 2,
+        });
+        let worker = SyncWorker::new(store.clone());
+
+        let mut session = mock(
+            MailboxSummary {
+                selected_mailbox: "Sent".to_string(),
+                uid_validity: 300,
+                uid_next: Some(3),
+                exists: 2,
+            },
+            vec![mkhdr(1), mkhdr(2)],
+        );
+        session.status_unseen = 2; // server says both unseen
+        async_std::task::block_on(async {
+            worker
+                .sync_with_session(Box::new(session), "Sent", cb())
+                .await
+        })
+        .unwrap();
+
+        let guard = worker.store.lock().unwrap();
+        let rows = queries::list_mailboxes(guard.conn()).unwrap();
+        let sent = rows.iter().find(|r| r.name == "Sent").expect("Sent row cached");
+        assert_eq!(sent.unseen_count, 2, "STATUS UNSEEN must be cached");
+        assert_eq!(sent.unread_count, 2, "local count agrees pre-toggle");
+        assert!(sent.last_sync_at.is_some());
+    }
+
+    /// `set_mailbox_status` upserts STATUS data without disturbing messages.
+    #[test]
+    fn set_mailbox_status_upsert_roundtrip() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        queries::set_mailbox_status(conn, "Drafts", 42, 7, 3).unwrap();
+        queries::set_mailbox_status(conn, "Drafts", 42, 9, 1).unwrap();
+        let rows = queries::list_mailboxes(conn).unwrap();
+        let drafts = rows.iter().find(|r| r.name == "Drafts").expect("Drafts row");
+        assert_eq!(drafts.uid_validity, 42);
+        assert_eq!(drafts.uid_next, 9);
+        assert_eq!(drafts.unseen_count, 1);
+        assert_eq!(drafts.unread_count, 0, "no messages → local count 0");
     }
 }
