@@ -946,4 +946,254 @@ mod tests {
         assert_eq!(ops[0].attempts, 1);
         assert!(ops[0].last_error.is_some());
     }
+
+    // ── Phase 6 Plan 06-03: RFC 4549 playback + edge-case regression tests ──
+    // Tests prefixed `outbox_rfc4549` are the phase-gate for verify-work; they
+    // consolidate the RFC 4549 drop-rule contract in one name-space so the
+    // `cargo test outbox_rfc4549` verify command matches them all.
+
+    /// RFC 4549: a UIDVALIDITY generation change invalidates every queued UID
+    /// at once — the whole mailbox queue drops before any replay executes, so
+    /// stale UIDs never reach the wire against a renumbered mailbox.
+    #[test]
+    fn outbox_rfc4549_epoch_bump_drops_queue() {
+        let store = inbox(MailboxSummary {
+            selected_mailbox: "INBOX".to_string(),
+            uid_validity: 100,
+            uid_next: Some(4),
+            exists: 1,
+        });
+        let mb_id = seed_pending(&store, 5, true, 100); // enqueued at epoch 100
+        seed_pending(&store, 6, false, 100);
+        let worker = SyncWorker::new(store);
+
+        let mut session = mock(
+            MailboxSummary {
+                selected_mailbox: "INBOX".to_string(),
+                uid_validity: 200, // server-side bump
+                uid_next: Some(7),
+                exists: 2,
+            },
+            vec![],
+        );
+        let live: HashSet<u32> = [5, 6].into_iter().collect();
+        let summary = async_std::task::block_on(async {
+            worker
+                .replay_outbox(&mut session, mb_id, 200, Some(&live))
+                .await
+        })
+        .unwrap();
+
+        assert_eq!(summary.dropped, 2, "both ops must drop on epoch mismatch");
+        assert_eq!(summary.acked, 0);
+        assert!(
+            session.set_seen_calls.is_empty(),
+            "stale UIDs must never reach the wire"
+        );
+        let guard = worker.store.lock().unwrap();
+        assert!(
+            queries::pending_uids(guard.conn(), mb_id).unwrap().is_empty(),
+            "queue must be empty after epoch-bump drop"
+        );
+    }
+
+    /// RFC 4549: a single op whose UID is absent from the server set drops
+    /// without issuing a STORE; the remaining ops still acked normally.
+    #[test]
+    fn outbox_rfc4549_absent_uid_drops_single_op() {
+        let store = inbox(MailboxSummary {
+            selected_mailbox: "INBOX".to_string(),
+            uid_validity: 100,
+            uid_next: Some(4),
+            exists: 1,
+        });
+        let mb_id = seed_pending(&store, 5, true, 100);
+        seed_pending(&store, 6, false, 100);
+        let worker = SyncWorker::new(store);
+
+        let mut session = mock(
+            MailboxSummary {
+                selected_mailbox: "INBOX".to_string(),
+                uid_validity: 100,
+                uid_next: Some(7),
+                exists: 1,
+            },
+            vec![],
+        );
+        // UID 6 was expunged server-side.
+        let live: HashSet<u32> = [5].into_iter().collect();
+        let summary = async_std::task::block_on(async {
+            worker
+                .replay_outbox(&mut session, mb_id, 100, Some(&live))
+                .await
+        })
+        .unwrap();
+
+        assert_eq!(summary.acked, 1);
+        assert_eq!(summary.dropped, 1);
+        // Only the live UID got a STORE.
+        assert_eq!(session.set_seen_calls, vec![(5, true)]);
+    }
+
+    /// RFC 4549: replay preserves per-mailbox creation order — ops fire in
+    /// the sequence they were enqueued (by `id`), not by UID sorted order.
+    #[test]
+    fn outbox_rfc4549_preserves_creation_order() {
+        let store = inbox(MailboxSummary {
+            selected_mailbox: "INBOX".to_string(),
+            uid_validity: 100,
+            uid_next: Some(7),
+            exists: 0,
+        });
+        let mb_id = seed_pending(&store, 5, true, 100); // enrolled first
+        seed_pending(&store, 6, false, 100);            // enrolled second
+        let worker = SyncWorker::new(store);
+
+        let mut session = mock(
+            MailboxSummary {
+                selected_mailbox: "INBOX".to_string(),
+                uid_validity: 100,
+                uid_next: Some(7),
+                exists: 0,
+            },
+            vec![],
+        );
+        let live: HashSet<u32> = [5, 6].into_iter().collect();
+        let summary = async_std::task::block_on(async {
+            worker
+                .replay_outbox(&mut session, mb_id, 100, Some(&live))
+                .await
+        })
+        .unwrap();
+
+        assert_eq!(summary.acked, 2);
+        // Creation order: 5 then 6, not 6 then 5.
+        assert_eq!(session.set_seen_calls, vec![(5, true), (6, false)]);
+    }
+
+    /// RFC 4549: rapid flap (read→unread→read) collapses to the latest toggle
+    /// through the UNIQUE(mailbox_id, uid) constraint, replaying once with the
+    /// final state.
+    #[test]
+    fn outbox_rfc4549_rapid_flap_collapses_to_latest() {
+        let store = inbox(MailboxSummary {
+            selected_mailbox: "INBOX".to_string(),
+            uid_validity: 100,
+            uid_next: Some(2),
+            exists: 1,
+        });
+        let mb_id = seed_pending(&store, 1, true, 100); // read
+        seed_pending(&store, 1, false, 100); // unread (collapses)
+        seed_pending(&store, 1, true, 100); // read again (final)
+        let worker = SyncWorker::new(store);
+
+        let mut session = mock(
+            MailboxSummary {
+                selected_mailbox: "INBOX".to_string(),
+                uid_validity: 100,
+                uid_next: Some(2),
+                exists: 1,
+            },
+            vec![],
+        );
+        let live: HashSet<u32> = [1].into_iter().collect();
+        let summary = async_std::task::block_on(async {
+            worker
+                .replay_outbox(&mut session, mb_id, 100, Some(&live))
+                .await
+        })
+        .unwrap();
+
+        assert_eq!(summary.acked, 1, "flap must collapse to one stored op");
+        // Latest-wins: seen=true is the final toggle.
+        assert_eq!(session.set_seen_calls, vec![(1, true)]);
+    }
+
+    /// Edge: a message with no prior flags (`"[]"`) converges to the target
+    /// Seen state through a full sync round-trip including replay.
+    #[test]
+    fn outbox_rfc4549_empty_prior_flags_roundtrip() {
+        let store = inbox(MailboxSummary {
+            selected_mailbox: "INBOX".to_string(),
+            uid_validity: 100,
+            uid_next: Some(4),
+            exists: 1,
+        });
+        let worker = SyncWorker::new(store.clone());
+        let mb_id = seed_pending(&store, 1, true, 100); // optimistic read + op
+        // Server reports flags = "[]" (truly unread).
+        let mut hdr = mkhdr(1);
+        hdr.flags = "[]".to_string();
+
+        let session = mock(
+            MailboxSummary {
+                selected_mailbox: "INBOX".to_string(),
+                uid_validity: 100,
+                uid_next: Some(4),
+                exists: 1,
+            },
+            vec![hdr],
+        );
+        let result = async_std::task::block_on(async {
+            worker
+                .sync_with_session(Box::new(session), "INBOX", cb())
+                .await
+        })
+        .unwrap();
+
+        assert_eq!(result.updated, 1, "message should be updated, not new");
+        // Pending-wins: server said "[]" but local \Seen survives the sweep.
+        let guard = store.lock().unwrap();
+        let flags = queries::message_flags(guard.conn(), mb_id, 1)
+            .unwrap()
+            .unwrap();
+        assert!(
+            flags.contains("\\Seen"),
+            "empty prior flags must converge to target state, got: {flags}"
+        );
+        // And the op was acked (deleted from queue).
+        assert!(
+            queries::pending_uids(guard.conn(), mb_id).unwrap().is_empty(),
+            "op must be acked after successful replay"
+        );
+    }
+
+    /// Canonical `\Seen` encoding round-trip: the store arg and the JSON
+    /// flags column both use the exact backslash form.
+    #[test]
+    fn outbox_rfc4549_canonical_seen_encoding() {
+        let store = inbox(MailboxSummary {
+            selected_mailbox: "INBOX".to_string(),
+            uid_validity: 100,
+            uid_next: Some(2),
+            exists: 1,
+        });
+        let mb_id = queries::ensure_mailbox(store.lock().unwrap().conn(), "INBOX").unwrap();
+        {
+            let guard = store.lock().unwrap();
+            queries::upsert_message(
+                guard.conn(), mb_id, 1, None, "Subj",
+                "a@x.com", "[]", "[]", "2024-01-01T00:00:00Z",
+                "[]", false, "p",
+            )
+            .unwrap();
+        }
+        // Apply Seen via the optimistic local write path.
+        {
+            let guard = store.lock().unwrap();
+            queries::set_local_seen(guard.conn(), mb_id, 1, true).unwrap();
+        }
+        let guard = store.lock().unwrap();
+        let flags: Vec<String> =
+            serde_json::from_str(&queries::message_flags(guard.conn(), mb_id, 1).unwrap().unwrap())
+                .unwrap();
+        assert_eq!(flags, vec!["\\Seen".to_string()]);
+
+        // The STORE arg must be the same canonical token.
+        assert_eq!(
+            crate::imap::seen_store_arg(true),
+            "+FLAGS.SILENT (\\Seen)"
+        );
+        assert_eq!(queries::SEEN_FLAG, "\\Seen");
+    }
 }

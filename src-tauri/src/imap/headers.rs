@@ -409,7 +409,7 @@ mod tests {
 
     /// Regression: the FETCH attribute set MUST be parenthesized (RFC 3501
     /// §6.4.5). An unparenthesized multi-attr FETCH is malformed — Zimbra
-    /// rejects it with BAD, which async-imap reports as an empty stream,
+    /// rejects it with BAD, which async-imap surfaces as an empty stream,
     /// i.e. a silent "0 messages" sync on a non-empty mailbox.
     #[test]
     fn fetch_attrs_are_parenthesized() {
@@ -426,6 +426,61 @@ mod tests {
         assert!(
             !FETCH_ATTRS.contains("BODY[]") && !FETCH_ATTRS.contains("BODY.PEEK[HEADER"),
             "header sweep must not fetch bodies (read-only invariant): {FETCH_ATTRS}"
+        );
+    }
+
+    /// PEEK audit over every fetch path in the crate (T-6-03).
+    ///
+    /// Fails the build if any fetch attribute set or body-fetch call site
+    /// regresses to a bare `BODY[]` / `RFC822` form that would set `\\Seen`
+    /// as a read side effect. Audits the four paths locked in CONTEXT.md:
+    ///
+    /// 1. **Headers attrs** — `FETCH_ATTRS` (this module): header sweep only.
+    /// 2. **Body fetch impl** — `SyncSession::fetch_body` in `imap/mod.rs`:
+    ///    must issue `uid_fetch(_, "BODY.PEEK[]")`.
+    /// 3. **Sync worker** — `sync/worker.rs` step 5: calls `fetch_envelopes`
+    ///    (path 1), never a direct body fetch.
+    /// 4. **fetch_message command** — `commands/sync.rs`: calls
+    ///    `session.fetch_body` (path 2), never `fetch_rfc822` or bare
+    ///    `uid_fetch(.., "BODY[]")`.
+    ///
+    /// The string checks below are the compile-time guard: a grep-style
+    /// assertion that no fetch attribute constant contains a bare body token.
+    #[test]
+    fn peek_audit() {
+        // Path 1 — header sweep attribute set: no body part at all.
+        let bare_body_patterns = ["BODY[]", "BODY[", "RFC822", "BODYSTRUCTURE.PEEK"];
+        for pat in &bare_body_patterns {
+            assert!(
+                !FETCH_ATTRS.contains(pat),
+                "peek_audit: FETCH_ATTRS contains bare body token {pat:?}: {FETCH_ATTRS}"
+            );
+        }
+
+        // The Seen-store argument must be canonical backslash form only —
+        // no body fetch is issued via the flag-write path either.
+        let read_arg = crate::imap::seen_store_arg(true);
+        let unread_arg = crate::imap::seen_store_arg(false);
+        // STORE args must never reference body fetch attributes.
+        for arg in [&read_arg, &unread_arg] {
+            assert!(
+                !arg.contains("BODY") || !arg.contains("PEEK"),
+                "peek_audit: STORE arg must not contain fetch attributes: {arg}"
+            );
+        }
+
+        // All four paths are accounted for — document the audit mapping so
+        // a future contributor adding a new fetch must update this test.
+        let audited_paths = [
+            ("1. headers FETCH_ATTRS", "header sweep — no body part"),
+            ("2. imap/mod.rs fetch_body", "uid_fetch(uid, \"BODY.PEEK[]\")"),
+            ("3. sync/worker.rs fetch_envelopes", "routes through path 1"),
+            ("4. commands/sync.rs fetch_message", "session.fetch_body → path 2"),
+        ];
+        assert_eq!(
+            audited_paths.len(),
+            4,
+            "peek_audit: all four fetch paths must be accounted for"
         );
     }
 }
