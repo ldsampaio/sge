@@ -103,6 +103,7 @@ fn manager_for(
 pub async fn start_sync(
     state: State<'_, crate::AppState>,
     on_event: Channel<SyncEvent>,
+    mailbox: String,
 ) -> Result<(), String> {
     // Load credentials: prefer in-memory session, fall back to keyring.
     let account_cfg: AccountConfig = load_account_config(state.clone()).await?;
@@ -120,7 +121,7 @@ pub async fn start_sync(
             let cb: SyncCallback = Arc::new(move |event| {
                 let _ = on_event.send(event);
             });
-            let result = worker.sync_with_session(Box::new(session), cb).await
+            let result = worker.sync_with_session(Box::new(session), &mailbox, cb).await
                 .map_err(|e| e.to_string());
             match &result {
                 Ok(s) => eprintln!("[SGE sync] Done: new={} updated={} deleted={}", s.new, s.updated, s.deleted),
@@ -166,7 +167,11 @@ pub async fn set_seen(
     state: State<'_, crate::AppState>,
     uid: u32,
     seen: bool,
+    mailbox: Option<String>,
 ) -> Result<SetSeenResult, String> {
+    // Optional in Phase 7: older frontends omit it; default preserves
+    // the Phase 6 INBOX contract.
+    let mailbox = mailbox.unwrap_or_else(|| "INBOX".to_string());
     let account_cfg: AccountConfig = load_account_config(state.clone()).await?;
     let manager = manager_for(&state, &account_cfg);
     let store = state.store.clone();
@@ -176,9 +181,9 @@ pub async fn set_seen(
             let (mailbox_id, epoch) = {
                 let guard = store.lock().unwrap();
                 let conn = guard.conn();
-                let mb = queries::ensure_mailbox(conn, "INBOX")
+                let mb = queries::ensure_mailbox(conn, &mailbox)
                     .map_err(|e| format!("store: {e}"))?;
-                let epoch = queries::get_sync_state(conn, "INBOX")
+                let epoch = queries::get_sync_state(conn, &mailbox)
                     .map_err(|e| format!("store: {e}"))?
                     .map(|(v, _)| v)
                     .unwrap_or(0);
@@ -190,7 +195,9 @@ pub async fn set_seen(
             };
 
             // 2. Immediate UID STORE; ack deletes the op, failure stays queued.
-            let fail_reason: Option<String> = match manager.set_seen(uid, seen).await {
+            // The lease SELECTs `mailbox` first, so the write lands on the
+            // intended folder (FOLD-03).
+            let fail_reason: Option<String> = match manager.set_seen_in(&mailbox, uid, seen).await {
                 Ok(()) => {
                     let guard = store.lock().unwrap();
                     let _ =
@@ -260,21 +267,25 @@ pub async fn set_seen(
 /// "Up-to-date <timestamp>" or "Offline -- last synced <timestamp>".
 /// `pending_count` is the durable-outbox depth (FLAG-02 pending indicator).
 #[tauri::command]
-pub async fn sync_status(state: State<'_, crate::AppState>) -> Result<SyncStatus, String> {
+pub async fn sync_status(
+    state: State<'_, crate::AppState>,
+    mailbox: Option<String>,
+) -> Result<SyncStatus, String> {
+    let mailbox = mailbox.unwrap_or_else(|| "INBOX".to_string());
     let store = state.store.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let guard = store.lock().unwrap();
         let conn = guard.conn();
         let (last_sync_at, uidv, uid_next, count) =
-            queries::sync_status(conn, "INBOX")
+            queries::sync_status(conn, &mailbox)
                 .map_err(|e| format!("store: {e}"))?
                 .unwrap_or_default();
-        let pending_count = queries::mailbox_id(conn, "INBOX")
+        let pending_count = queries::mailbox_id(conn, &mailbox)
             .map_err(|e| format!("store: {e}"))?
             .map(|mb| queries::outbox_count(conn, mb).unwrap_or(0))
             .unwrap_or(0);
         Ok(SyncStatus {
-            mailbox: "INBOX".to_string(),
+            mailbox,
             last_sync_at,
             uid_validity: uidv,
             uid_next,
@@ -345,6 +356,63 @@ pub async fn cancel_sync() -> Result<(), String> {
     Ok(())
 }
 
+/// Discover server folders and return cached per-folder triage rows (FOLD-01/02).
+///
+/// `LIST "" "*"` via the SessionManager, then `STATUS (UIDVALIDITY UIDNEXT
+/// UNSEEN)` per selectable folder, cached with `set_mailbox_status`.
+/// `\Noselect` entries (hierarchy placeholders) are skipped — they cannot
+/// be SELECTed or STATUSed. Returns the locally cached rows (same shape the
+/// sidebar renders), so the tree works offline after the first discovery.
+#[tauri::command]
+pub async fn list_mailboxes(
+    state: State<'_, crate::AppState>,
+) -> Result<Vec<crate::store::queries::MailboxRow>, String> {
+    let account_cfg: AccountConfig = load_account_config(state.clone()).await?;
+    let manager = manager_for(&state, &account_cfg);
+    let store = state.store.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        async_std::task::block_on(async {
+            let discovered = manager
+                .list_mailboxes()
+                .await
+                .map_err(|e| format!("LIST failed: {e}"))?;
+            {
+                let guard = store.lock().unwrap();
+                let conn = guard.conn();
+                for folder in &discovered {
+                    if folder
+                        .attributes
+                        .iter()
+                        .any(|a| a.contains("NoSelect"))
+                    {
+                        continue;
+                    }
+                    match manager.mailbox_status(&folder.name).await {
+                        Ok(status) => {
+                            let _ = queries::set_mailbox_status(
+                                conn,
+                                &folder.name,
+                                status.uid_validity,
+                                status.uid_next.unwrap_or(0),
+                                status.unseen,
+                            );
+                        }
+                        Err(e) => eprintln!(
+                            "[SGE sync] STATUS {} failed ({e}) — folder cached without unseen",
+                            folder.name
+                        ),
+                    }
+                    let _ = queries::ensure_mailbox(conn, &folder.name);
+                }
+            }
+            let guard = store.lock().unwrap();
+            queries::list_mailboxes(guard.conn()).map_err(|e| format!("store: {e}"))
+        })
+    })
+    .await
+    .map_err(|e| format!("internal error: list mailboxes task failed ({e})"))?
+}
+
 /// Sync status returned to the frontend.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct SyncStatus {
@@ -383,7 +451,11 @@ pub struct MessageView {
 pub async fn fetch_message(
     state: State<'_, crate::AppState>,
     uid: u32,
+    mailbox: Option<String>,
 ) -> Result<MessageView, String> {
+    // Optional in Phase 7: older frontends omit it; default preserves
+    // the Phase 4 INBOX contract.
+    let mailbox = mailbox.unwrap_or_else(|| "INBOX".to_string());
     let store = state.store.clone();
     let acc = state.active_account.lock().unwrap().clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -421,12 +493,12 @@ pub async fn fetch_message(
                 }
             };
 
-            // Connect, SELECT INBOX, fetch body via BODY.PEEK[] (read-only).
+            // Connect, SELECT the requested folder, fetch body via BODY.PEEK[] (read-only).
             let mut session = connect_sync(&account_cfg)
                 .await
                 .map_err(|e| format!("IMAP connection failed: {e}"))?;
             let _ = session
-                .select_inbox()
+                .select_mailbox(&mailbox)
                 .await
                 .map_err(|e| format!("IMAP SELECT failed: {e}"))?;
             let raw = session
@@ -440,11 +512,11 @@ pub async fn fetch_message(
                 .parse(&raw)
                 .ok_or("Failed to parse message body")?;
 
-            // Headers from SQLite (stored during Phase 2 sync).
+            // Headers from SQLite (stored during sync).
             let (subject, from_addr, to_addrs, date_utc) = {
                 let guard = store.lock().unwrap();
                 let conn = guard.conn();
-                let row = crate::store::queries::get_message_by_uid(conn, "INBOX", uid)
+                let row = crate::store::queries::get_message_by_uid(conn, &mailbox, uid)
                     .map_err(|e| format!("store error: {e}"))?
                     .ok_or("Message not found in local store")?;
                 let to_vec = if row.to_addrs.is_empty() || row.to_addrs == "[]" {
@@ -465,7 +537,7 @@ pub async fn fetch_message(
             {
                 let guard = store.lock().unwrap();
                 let conn = guard.conn();
-                let mb_id = crate::store::queries::ensure_mailbox(conn, "INBOX")
+                let mb_id = crate::store::queries::ensure_mailbox(conn, &mailbox)
                     .map_err(|e| format!("store error: {e}"))?;
                 if let Some(msg_id) = crate::store::queries::find_message_id(conn, mb_id, uid)
                     .map_err(|e| format!("store error: {e}"))? {

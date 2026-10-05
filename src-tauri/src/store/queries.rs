@@ -153,6 +153,92 @@ pub fn sync_status(
     }
 }
 
+/// Cache a folder's `STATUS` datum after a successful sweep (FOLD-02).
+/// Creates the row when missing; stamps `last_sync_at` with the current
+/// UTC time. The sidebar badge shows the dynamic local unread count once
+/// synced and falls back to this server datum for never-synced folders.
+pub fn set_mailbox_status(
+    conn: &Connection,
+    mailbox: &str,
+    uid_validity: u32,
+    uid_next: u32,
+    unseen: u32,
+) -> StoreResult<()> {
+    conn.execute(
+        "INSERT INTO mailboxes (name, uid_validity, uid_next, unseen_count, last_sync_at)
+         VALUES (?1, ?2, ?3, ?4, datetime('now'))
+         ON CONFLICT(name) DO UPDATE SET
+           uid_validity = excluded.uid_validity,
+           uid_next     = excluded.uid_next,
+           unseen_count = excluded.unseen_count,
+           last_sync_at = excluded.last_sync_at",
+        rusqlite::params![mailbox, uid_validity, uid_next, unseen],
+    )?;
+    Ok(())
+}
+
+/// A cached mailbox row as surfaced to the UI layer.
+#[derive(Debug, Clone, Serialize)]
+pub struct MailboxRow {
+    pub id: u64,
+    pub name: String,
+    pub uid_validity: u32,
+    pub uid_next: u32,
+    pub last_sync_at: Option<String>,
+    pub unread_count: i64,
+    /// Last `STATUS (UNSEEN)` datum (M3). Badge fallback for never-synced folders.
+    pub unseen_count: i64,
+}
+
+/// List all mailboxes cached locally, with per-folder unread counts.
+///
+/// Returns rows ordered by name. Unread count is computed from
+/// `messages.flags` JSON (presence of `\\Seen` flag → read).
+pub fn list_mailboxes(conn: &Connection) -> StoreResult<Vec<MailboxRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, uid_validity, uid_next, last_sync_at, unseen_count,
+                (SELECT COUNT(*) FROM messages m
+                 WHERE m.mailbox_id = mailboxes.id
+                 AND NOT EXISTS (
+                   SELECT 1 FROM json_each(m.flags)
+                   WHERE json_each.value = '\\\\Seen'
+                 ))
+         FROM mailboxes
+         ORDER BY name",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(MailboxRow {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                uid_validity: row.get(2)?,
+                uid_next: row.get(3)?,
+                last_sync_at: row.get(4)?,
+                unseen_count: row.get(5)?,
+                unread_count: row.get(6)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::Sql)?;
+    Ok(rows)
+}
+
+/// Count unread messages in a named mailbox (FOLD-02).
+pub fn count_unread(conn: &Connection, mailbox: &str) -> StoreResult<i64> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM messages m
+         JOIN mailboxes mb ON m.mailbox_id = mb.id
+         WHERE mb.name = ?1
+         AND NOT EXISTS (
+           SELECT 1 FROM json_each(m.flags)
+           WHERE json_each.value = '\\\\Seen'
+         )",
+        rusqlite::params![mailbox],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
 // ── messages (upsert / expunge) ──────────────────────────────────
 
 const UPSERT_MESSAGE_SQL: &str = concat!(

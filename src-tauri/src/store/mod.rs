@@ -16,7 +16,7 @@ pub mod queries;
 pub const BODY_CACHE_CAP_BYTES: usize = 262144;
 
 /// Schema version managed by rusqlite_migration.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 // v1 = full schema.sql (canonical DDL from ARCHITECTURE.md)
 // M2 = flag_outbox durable queue (Phase 6, Plan 06-01). The schema.sql v1
@@ -82,6 +82,7 @@ impl Store {
         let migrations = Migrations::new(vec![
             M::up(include_str!("schema.sql")),
             M::up(M2_FLAG_OUTBOX_SQL),
+            M::up(M3_UNSEEN_COUNT_SQL),
         ]);
         migrations.to_latest(conn)?;
         Ok(())
@@ -125,6 +126,17 @@ const M2_FLAG_OUTBOX_SQL: &str = concat!(
     ");",
     "CREATE INDEX idx_outbox_mailbox ON flag_outbox(mailbox_id);",
 );
+
+/// M3 forward migration: STATUS UNSEEN cache per folder (Phase 7, Wave 2).
+///
+/// `unseen_count` holds the last `STATUS <folder> (UNSEEN)` datum written by
+/// `queries::set_mailbox_status` during folder sync. The sidebar badge shows
+/// the dynamic local unread count once a folder has synced (`last_sync_at`
+/// present) and falls back to this cached server datum for never-synced
+/// folders — so a fresh folder still shows an honest server-sourced signal
+/// (FOLD-02). Defaults to 0; existing rows backfill harmlessly.
+const M3_UNSEEN_COUNT_SQL: &str =
+    "ALTER TABLE mailboxes ADD COLUMN unseen_count INTEGER NOT NULL DEFAULT 0;";
 
 /// Returns the app-data attachment directory for a given mailbox UID.
 ///
@@ -214,8 +226,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_2_with_outbox_table() {
-        assert_eq!(SCHEMA_VERSION, 2);
+    fn schema_version_is_3_with_outbox_table() {
+        assert_eq!(SCHEMA_VERSION, 3);
         let store = Store::open_in_memory().expect("migration should succeed");
         let conn = store.conn();
         let count: i64 = conn
@@ -225,7 +237,7 @@ mod tests {
                 |r| r.get(0),
             )
             .expect("query should succeed");
-        assert_eq!(count, 1, "flag_outbox table should exist at schema v2");
+        assert_eq!(count, 1, "flag_outbox table should exist at schema v3");
         let idx: i64 = conn
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE type='index' AND name = 'idx_outbox_mailbox'",
@@ -234,6 +246,49 @@ mod tests {
             )
             .expect("query should succeed");
         assert_eq!(idx, 1, "outbox mailbox index should exist");
+        let unseen_cols: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('mailboxes') WHERE name = 'unseen_count'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("query should succeed");
+        assert_eq!(unseen_cols, 1, "mailboxes.unseen_count should exist at schema v3");
+    }
+
+    #[test]
+    fn m3_adds_unseen_count_column() {
+        // Simulate a v2 database (schema.sql + M2, as shipped after Phase 6).
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        Migrations::new(vec![
+            M::up(include_str!("schema.sql")),
+            M::up(M2_FLAG_OUTBOX_SQL),
+        ])
+        .to_latest(&mut conn)
+        .unwrap();
+        conn.execute(
+            "INSERT INTO mailboxes (name, uid_validity, uid_next) VALUES ('INBOX', 100, 4)",
+            [],
+        )
+        .unwrap();
+        // Forward-upgrade the v2 database with the production migration set —
+        // only the M3 delta applies (user_version 2 → 3).
+        Migrations::new(vec![
+            M::up(include_str!("schema.sql")),
+            M::up(M2_FLAG_OUTBOX_SQL),
+            M::up(M3_UNSEEN_COUNT_SQL),
+        ])
+        .to_latest(&mut conn)
+        .unwrap();
+        let unseen: i64 = conn
+            .query_row(
+                "SELECT unseen_count FROM mailboxes WHERE name = 'INBOX'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("unseen_count should default to 0 for pre-M3 rows");
+        assert_eq!(unseen, 0);
     }
 
     #[test]

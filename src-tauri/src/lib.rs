@@ -247,6 +247,7 @@ pub fn run() {
             commands::sync::set_seen,
             commands::sync::cancel_sync,
             commands::sync::list_messages,
+            commands::sync::list_mailboxes,
             commands::sync::search_messages,
             commands::sync::fetch_message,
             commands::sync::save_attachment,
