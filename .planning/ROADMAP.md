@@ -41,7 +41,7 @@ Full phase details archived under `.planning/milestones/archived-20261004-phases
 </details>
 
 - [x] **Phase 6: Flag Sync + Outbox** - Mark read/unread with server-synced Seen flags and offline queue
-- [ ] **Phase 7: Folders + Per-Folder Sync** - Browse Sent/Drafts/custom folders with unread counts
+- [x] **Phase 7: Folders + Per-Folder Sync** - Browse Sent/Drafts/custom folders with unread counts
 - [ ] **Phase 8: Poll + Manual Refresh** - Periodic and on-demand refresh over one single-flight path
 - [ ] **Phase 9: UID Backfill** - No silent gaps; missed UIDs converge on incremental sync
 
@@ -96,7 +96,7 @@ Plans:
   3. User sees an unread count badge per folder sourced from STATUS (UNSEEN)
   4. A UIDVALIDITY change in one folder triggers resync of only that folder — other folders' caches are untouched
 
-**Plans**: TBD
+**Plans**: 3/3 executed (07-01 backend, 07-02 commands+M3, 07-03 frontend) + gap closure 2026-10-05
 **UI hint**: yes
 
 ### Phase 8: Poll + Manual Refresh

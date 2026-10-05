@@ -39,8 +39,13 @@ Suite at audit: 90 passed, 0 failed (no folder-gate tests exist).
 
 ## Open Items → Gap Closure
 
-1. `list_mailboxes` Tauri command + `invoke_handler!` registration (runtime break).
-2. `set_mailbox_status` + STATUS UNSEEN wiring (FOLD-02 criterion literal).
-3. Mailbox params on sync_status / list_messages / fetch_message (verify or add).
-4. Per-folder UIDVALIDITY isolation test (FOLD-03 criterion 4).
-5. `sync_command_mailbox` gate test.
+All closed 2026-10-05 (commits f14715f, fbc0f20, 23a0637):
+
+1. ✅ `list_mailboxes` Tauri command + `invoke_handler!` registration — LIST via SessionManager, STATUS per selectable folder, `\Noselect` skipped, rows cached and returned.
+2. ✅ `set_mailbox_status` + STATUS UNSEEN wiring — `sync_with_session` step 2b persists per-folder STATUS; graceful on STATUS failure.
+3. ✅ Mailbox params on sync_status / list_messages / fetch_message / set_seen — `Option<String>` with INBOX default (Phase 6 contract preserved); `SessionManager::set_seen_in` SELECTs the target folder first.
+4. ✅ Per-folder UIDVALIDITY isolation test — `sync_command_mailbox_per_folder_isolation`.
+5. ✅ `sync_command_mailbox_*` gate tests (isolation, unseen cache, upsert roundtrip) + `m3_adds_unseen_count_column`.
+
+Bonus beyond the original plan: `SessionManager::lease_for` per-folder SELECT tracking (replaces INBOX-only `selected: bool`).
+Status: ✅ COMPLETE.
