@@ -42,7 +42,7 @@ Full phase details archived under `.planning/milestones/archived-20261004-phases
 
 - [x] **Phase 6: Flag Sync + Outbox** - Mark read/unread with server-synced Seen flags and offline queue
 - [x] **Phase 7: Folders + Per-Folder Sync** - Browse Sent/Drafts/custom folders with unread counts
-- [ ] **Phase 8: Poll + Manual Refresh** - Periodic and on-demand refresh over one single-flight path
+- [x] **Phase 8: Poll + Manual Refresh** - Periodic and on-demand refresh over one single-flight path
 - [ ] **Phase 9: UID Backfill** - No silent gaps; missed UIDs converge on incremental sync
 
 ## Phase Details
@@ -112,7 +112,7 @@ Plans:
   3. A poll firing mid-sync (or mid flag-STORE) never overlaps — one sync runs at a time on the single session
   4. User sees a honest "reconnecting…" state (not a fatal disconnect) when the session expires, and sync resumes after keyring re-read + re-SELECT
 
-**Plans**: TBD
+**Plans**: 1/1 executed (08-01 poll infrastructure) 2026-10-05
 **UI hint**: yes
 
 ### Phase 9: UID Backfill
