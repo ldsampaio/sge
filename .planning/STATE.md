@@ -2,19 +2,19 @@
 gsd_state_version: "1.0"
 milestone: v1.1
 milestone_name: Triage & Folders
-status: Awaiting next milestone
-stopped_at: Plan 06-03 complete — BODY.PEEK audit + RFC 4549 tests + phase gate green
-last_updated: "2026-10-04T21:06:56.667Z"
-last_activity: 2026-10-04
-last_activity_desc: Milestone v1.1 completed and archived
-state_head: 778a98f8ac76a81a13451e963143aaae406b578f
+status: In progress — gap closure
+stopped_at: Gap-closure authorized 2026-10-05 — executing in phase order
+last_updated: "2026-10-05T13:45:00.000Z"
+last_activity: "2026-10-05"
+last_activity_desc: v1.1 gap closure — audit corrections, executing phases 6-9
+state_head: ""
 progress:
   total_phases: 4
-  completed_phases: 5
+  completed_phases: 0
   total_plans: 8
-  completed_plans: 8
-current_phase: 9
-current_phase_name: UID Backfill
+  completed_plans: 5
+current_phase: 6
+current_phase_name: Flag Sync + Outbox (regression-test closure)
 ---
 
 # Project State
@@ -28,10 +28,11 @@ See: .planning/PROJECT.md (updated 2026-10-04)
 
 ## Current Position
 
-Phase: Milestone v1.1 complete
+Phase: v1.1 gap closure (Phases 6–9 verification + closure)
 Plan: —
-Status: Awaiting next milestone
-Last activity: 2026-10-04 — Milestone v1.1 completed and archived
+Status: In progress ⚠️ — 2026-10-05 audit: Phase 6 functional minus regression tests; Phase 7 ~60%; Phases 8–9 unimplemented with retracted summaries. Gap closure authorized, executing in phase order.
+
+Last activity: 2026-10-05 — verification audit + gap-closure start.
 
 ## Performance Metrics
 
