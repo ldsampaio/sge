@@ -16,7 +16,7 @@ pub mod queries;
 pub const BODY_CACHE_CAP_BYTES: usize = 262144;
 
 /// Schema version managed by rusqlite_migration.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 // v1 = full schema.sql (canonical DDL from ARCHITECTURE.md)
 // M2 = flag_outbox durable queue (Phase 6, Plan 06-01). The schema.sql v1
@@ -83,6 +83,7 @@ impl Store {
             M::up(include_str!("schema.sql")),
             M::up(M2_FLAG_OUTBOX_SQL),
             M::up(M3_UNSEEN_COUNT_SQL),
+            M::up(M4_BACKFILL_SQL),
         ]);
         migrations.to_latest(conn)?;
         Ok(())
@@ -137,6 +138,27 @@ const M2_FLAG_OUTBOX_SQL: &str = concat!(
 /// (FOLD-02). Defaults to 0; existing rows backfill harmlessly.
 const M3_UNSEEN_COUNT_SQL: &str =
     "ALTER TABLE mailboxes ADD COLUMN unseen_count INTEGER NOT NULL DEFAULT 0;";
+
+/// M4 forward migration: UID-backfill support (Phase 9).
+///
+/// `fetch_tombstones` records UIDs that repeatedly return empty FETCH
+/// results although SEARCH still lists them (flaky server path): after
+/// `TOMBSTONE_STRIKES` (see queries) the sweeper stops re-requesting them
+/// — no infinite backfill loop — until they vanish from SEARCH (pruned) or
+/// a periodic full sweep recovers them. `sweeps_since_full` counts
+/// consecutive converged (sweep-skipped) passes so remote flag changes
+/// still surface on a periodic full sweep.
+const M4_BACKFILL_SQL: &str = concat!(
+    "CREATE TABLE fetch_tombstones (",
+    "  mailbox_id    INTEGER NOT NULL REFERENCES mailboxes(id) ON DELETE CASCADE,",
+    "  uid           INTEGER NOT NULL,",
+    "  strikes       INTEGER NOT NULL DEFAULT 1,",
+    "  updated_at    TEXT NOT NULL DEFAULT (datetime('now')),",
+    "  PRIMARY KEY (mailbox_id, uid)",
+    ");",
+    "CREATE INDEX idx_tombstone_mailbox ON fetch_tombstones(mailbox_id);",
+    "ALTER TABLE mailboxes ADD COLUMN sweeps_since_full INTEGER NOT NULL DEFAULT 0;",
+);
 
 /// Returns the app-data attachment directory for a given mailbox UID.
 ///
@@ -226,8 +248,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_3_with_outbox_table() {
-        assert_eq!(SCHEMA_VERSION, 3);
+    fn schema_version_is_4_with_backfill_tables() {
+        assert_eq!(SCHEMA_VERSION, 4);
         let store = Store::open_in_memory().expect("migration should succeed");
         let conn = store.conn();
         let count: i64 = conn
@@ -237,7 +259,7 @@ mod tests {
                 |r| r.get(0),
             )
             .expect("query should succeed");
-        assert_eq!(count, 1, "flag_outbox table should exist at schema v3");
+        assert_eq!(count, 1, "flag_outbox table should exist at schema v4");
         let idx: i64 = conn
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE type='index' AND name = 'idx_outbox_mailbox'",
@@ -253,7 +275,51 @@ mod tests {
                 |r| r.get(0),
             )
             .expect("query should succeed");
-        assert_eq!(unseen_cols, 1, "mailboxes.unseen_count should exist at schema v3");
+        assert_eq!(unseen_cols, 1, "mailboxes.unseen_count should exist at schema v4");
+    }
+
+    #[test]
+    fn m4_adds_tombstones_and_sweep_counter() {
+        // Simulate a v3 database (schema.sql + M2 + M3, as shipped after Phase 7).
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        Migrations::new(vec![
+            M::up(include_str!("schema.sql")),
+            M::up(M2_FLAG_OUTBOX_SQL),
+            M::up(M3_UNSEEN_COUNT_SQL),
+        ])
+        .to_latest(&mut conn)
+        .unwrap();
+        // Forward-upgrade with the production set — only M4 applies.
+        Migrations::new(vec![
+            M::up(include_str!("schema.sql")),
+            M::up(M2_FLAG_OUTBOX_SQL),
+            M::up(M3_UNSEEN_COUNT_SQL),
+            M::up(M4_BACKFILL_SQL),
+        ])
+        .to_latest(&mut conn)
+        .unwrap();
+        for (kind, name) in [
+            ("table", "fetch_tombstones"),
+            ("index", "idx_tombstone_mailbox"),
+        ] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = ?1 AND name = ?2",
+                    rusqlite::params![kind, name],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{kind} {name} should exist at schema v4");
+        }
+        let cols: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('mailboxes') WHERE name = 'sweeps_since_full'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cols, 1, "mailboxes.sweeps_since_full should exist at schema v4");
     }
 
     #[test]

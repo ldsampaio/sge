@@ -239,6 +239,126 @@ pub fn count_unread(conn: &Connection, mailbox: &str) -> StoreResult<i64> {
     Ok(count)
 }
 
+// ── UID backfill (Phase 9) ─────────────────────────────────────
+
+/// Strikes after which a UID stops being re-requested (tombstoned).
+pub const TOMBSTONE_STRIKES: i64 = 3;
+
+/// Passes between periodic full sweeps: remote flag changes on an otherwise
+/// unchanged UID set still surface regularly (convergence shortcut blind
+/// spot mitigation).
+pub const FULL_SWEEP_EVERY: i64 = 5;
+
+/// All locally cached UIDs for a mailbox (convergence set-diff).
+pub fn all_local_uids(conn: &Connection, mailbox_id: u64) -> StoreResult<Vec<u32>> {
+    let mut stmt = conn.prepare("SELECT uid FROM messages WHERE mailbox_id = ?1")?;
+    let rows = stmt
+        .query_map(rusqlite::params![mailbox_id], |row| row.get::<_, u32>(0))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::Sql)?;
+    Ok(rows)
+}
+
+/// Record one empty-FETCH strike for a UID; returns the new strike count.
+/// A UID that FETCHes successfully must have its tombstone cleared via
+/// [`clear_tombstone`] instead.
+pub fn record_fetch_strike(
+    conn: &Connection,
+    mailbox_id: u64,
+    uid: u32,
+) -> StoreResult<i64> {
+    conn.execute(
+        "INSERT INTO fetch_tombstones (mailbox_id, uid, strikes)
+         VALUES (?1, ?2, 1)
+         ON CONFLICT(mailbox_id, uid) DO UPDATE SET
+           strikes = strikes + 1,
+           updated_at = datetime('now')",
+        rusqlite::params![mailbox_id, uid],
+    )?;
+    let strikes: i64 = conn.query_row(
+        "SELECT strikes FROM fetch_tombstones WHERE mailbox_id = ?1 AND uid = ?2",
+        rusqlite::params![mailbox_id, uid],
+        |row| row.get(0),
+    )?;
+    Ok(strikes)
+}
+
+/// Clear a UID's tombstone (fetched successfully, or vanished from SEARCH).
+pub fn clear_tombstone(conn: &Connection, mailbox_id: u64, uid: u32) -> StoreResult<()> {
+    conn.execute(
+        "DELETE FROM fetch_tombstones WHERE mailbox_id = ?1 AND uid = ?2",
+        rusqlite::params![mailbox_id, uid],
+    )?;
+    Ok(())
+}
+
+/// UIDs at or above [`TOMBSTONE_STRIKES`]: excluded from future sweeps
+/// until pruned (vanished from SEARCH) or recovered (periodic full sweep).
+pub fn tombstoned_uids(conn: &Connection, mailbox_id: u64) -> StoreResult<Vec<u32>> {
+    let mut stmt = conn.prepare(
+        "SELECT uid FROM fetch_tombstones WHERE mailbox_id = ?1 AND strikes >= ?2",
+    )?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params![mailbox_id, TOMBSTONE_STRIKES],
+            |row| row.get::<_, u32>(0),
+        )?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::Sql)?;
+    Ok(rows)
+}
+
+/// Drop tombstones for UIDs no longer on the server (expunged — Step 6
+/// deletes their messages, so the strike record is stale).
+pub fn prune_tombstones(
+    conn: &Connection,
+    mailbox_id: u64,
+    live_uids: &[u32],
+) -> StoreResult<()> {
+    if live_uids.is_empty() {
+        conn.execute(
+            "DELETE FROM fetch_tombstones WHERE mailbox_id = ?1",
+            rusqlite::params![mailbox_id],
+        )?;
+        return Ok(());
+    }
+    let placeholders = "?,".repeat(live_uids.len());
+    let in_clause = &placeholders[..placeholders.len() - 1];
+    let sql = format!(
+        "DELETE FROM fetch_tombstones WHERE mailbox_id = ?1 AND uid NOT IN ({in_clause})"
+    );
+    let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(live_uids.len() + 1);
+    params.push(&mailbox_id);
+    for uid in live_uids {
+        params.push(uid);
+    }
+    conn.execute(&sql, params.as_slice())?;
+    Ok(())
+}
+
+/// Consecutive converged (sweep-skipped) passes for a mailbox.
+pub fn sweeps_since_full(conn: &Connection, mailbox_id: u64) -> StoreResult<i64> {
+    let n: i64 = conn.query_row(
+        "SELECT sweeps_since_full FROM mailboxes WHERE id = ?1",
+        rusqlite::params![mailbox_id],
+        |row| row.get(0),
+    )?;
+    Ok(n)
+}
+
+/// Reset (full sweep ran) or bump (converged skip) the sweep counter.
+pub fn set_sweeps_since_full(
+    conn: &Connection,
+    mailbox_id: u64,
+    value: i64,
+) -> StoreResult<()> {
+    conn.execute(
+        "UPDATE mailboxes SET sweeps_since_full = ?1 WHERE id = ?2",
+        rusqlite::params![value, mailbox_id],
+    )?;
+    Ok(())
+}
+
 // ── messages (upsert / expunge) ──────────────────────────────────
 
 const UPSERT_MESSAGE_SQL: &str = concat!(

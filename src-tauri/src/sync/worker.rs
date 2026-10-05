@@ -1,12 +1,15 @@
 //! Sync worker: the 7-step header sweep + body fetch engine.
 //!
-//! Algorithm (Plan 02-02, Wave 2):
+//! Algorithm (Plan 02-02, Wave 2; extended Phase 7–9):
 //! 1. Ensure mailbox row + read sync state
 //! 2. SELECT mailbox → MailboxSummary (UIDVALIDITY, UIDNEXT, exists)
-//! 3. UIDVALIDITY guard — wipe if changed
-//! 4. Compute fetch_from (incremental or full resync)
-//! 5. Header sweep — 200-UID batches via fetch_envelopes
-//! 6. Expunge diff — delete UIDs not on server
+//! 2b. STATUS triage signals per folder (Phase 7, graceful)
+//! 3. UIDVALIDITY guard — wipe if changed (per folder, Phase 7)
+//! 4. Compute fetch set: SEARCH ALL minus tombstoned; convergence
+//!    shortcut skips the sweep when the UID set is unchanged (Phase 9)
+//! 5. Header sweep — 200-UID batches via fetch_envelopes, with in-pass
+//!    range-diff re-fetch of partial drops + strike counting (Phase 9)
+//! 6. Expunge diff — delete UIDs not on server (tombstoned join live set)
 //! 7. Write sync state + logout
 //!
 //! The Store is behind an `Arc<Mutex<>>` so it can be shared
@@ -278,9 +281,72 @@ impl SyncWorker {
         };
 
         // ── Step 5: header sweep (BATCH_SIZE UIDs at a time) ──────
-        let total_messages = server_uids.len() as u32;
+        // Phase 9 convergence shortcut: when the server UID set already
+        // matches local, with no epoch bump and no pending outbox ops, the
+        // sweep is skipped — two consecutive unchanged polls issue zero
+        // message FETCHes. A periodic full sweep still runs so remote flag
+        // changes on an unchanged UID set surface regularly.
+        let local_uids: HashSet<u32> = {
+            let guard = self.store.lock().unwrap();
+            queries::all_local_uids(guard.conn(), mailbox_id)
+                .map_err(|e| SyncError::Protocol(format!("local uids: {e}")))?
+                .into_iter()
+                .collect()
+        };
+        let server_set: HashSet<u32> = server_uids.iter().copied().collect();
+        let tombstoned: HashSet<u32> = {
+            let guard = self.store.lock().unwrap();
+            queries::prune_tombstones(guard.conn(), mailbox_id, &server_uids)
+                .map_err(|e| SyncError::Protocol(format!("prune tombstones: {e}")))?;
+            queries::tombstoned_uids(guard.conn(), mailbox_id)
+                .map_err(|e| SyncError::Protocol(format!("tombstoned uids: {e}")))?
+                .into_iter()
+                .collect()
+        };
+        let sweeps = {
+            let guard = self.store.lock().unwrap();
+            queries::sweeps_since_full(guard.conn(), mailbox_id)
+                .map_err(|e| SyncError::Protocol(format!("sweep counter: {e}")))?
+        };
+        let periodic_full = sweeps >= queries::FULL_SWEEP_EVERY;
+        let skip_sweep = !periodic_full
+            && !uid_validity_bump
+            && pending.is_empty()
+            && local_uids == server_set;
+        // Sweep set: tombstoned UIDs are excluded (no infinite backfill
+        // loop) except on the periodic full sweep, which retries them.
+        // A converged skip sweeps nothing at all.
+        let sweep_uids: Vec<u32> = if skip_sweep {
+            Vec::new()
+        } else if periodic_full {
+            server_uids.clone()
+        } else {
+            server_uids
+                .iter()
+                .copied()
+                .filter(|u| !tombstoned.contains(u))
+                .collect()
+        };
+        {
+            let guard = self.store.lock().unwrap();
+            queries::set_sweeps_since_full(
+                guard.conn(),
+                mailbox_id,
+                if skip_sweep { sweeps + 1 } else { 0 },
+            )
+            .map_err(|e| SyncError::Protocol(format!("sweep counter write: {e}")))?;
+        }
+        if skip_sweep {
+            result.converged = true;
+            eprintln!(
+                "[SGE sync] converged: {} uids unchanged, no FETCH issued (skip #{})",
+                server_uids.len(),
+                sweeps + 1
+            );
+        }
+        let total_messages = sweep_uids.len() as u32;
 
-        for chunk in server_uids.chunks(BATCH_SIZE as usize) {
+        for chunk in sweep_uids.chunks(BATCH_SIZE as usize) {
             let range_str = chunk
                 .iter()
                 .map(|u| u.to_string())
@@ -314,6 +380,51 @@ impl SyncWorker {
                      server may have rejected the command (see FETCH log line above)",
                     chunk.len()
                 )));
+            }
+            result.fetched += headers.len();
+
+            // Phase 9 range-diff: the batch asked for `chunk` but got fewer
+            // headers (partial drop — arrivals mid-sweep or flaky path).
+            // Re-request exactly the gap set once, in this pass, instead of
+            // waiting for the next poll. Still-missing UIDs earn a strike;
+            // at TOMBSTONE_STRIKES they stop being re-requested.
+            let mut headers = headers;
+            let returned: HashSet<u32> = headers.iter().map(|h| h.uid).collect();
+            let gap: Vec<u32> = chunk.iter().copied().filter(|u| !returned.contains(u)).collect();
+            if !gap.is_empty() {
+                let gap_str = gap
+                    .iter()
+                    .map(|u| u.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                eprintln!(
+                    "[SGE sync] gap detected: {} of {} missing ({gap_str}) — re-fetching",
+                    gap.len(),
+                    chunk.len()
+                );
+                let gap_headers: Vec<MessageHeader> =
+                    session.fetch_envelopes(&gap_str).await?;
+                result.fetched += gap_headers.len();
+                result.gap_refetches += 1;
+                let gap_returned: HashSet<u32> =
+                    gap_headers.iter().map(|h| h.uid).collect();
+                headers.extend(gap_headers);
+                let still_missing: Vec<u32> = gap
+                    .iter()
+                    .copied()
+                    .filter(|u| !gap_returned.contains(u))
+                    .collect();
+                if !still_missing.is_empty() {
+                    let guard = self.store.lock().unwrap();
+                    for uid in still_missing {
+                        match queries::record_fetch_strike(guard.conn(), mailbox_id, uid) {
+                            Ok(strikes) => eprintln!(
+                                "[SGE sync] uid {uid} still missing after refetch (strike {strikes})"
+                            ),
+                            Err(e) => eprintln!("[SGE sync] strike write failed ({e})"),
+                        }
+                    }
+                }
             }
 
             let batch_uids: Vec<u32> = headers.iter().map(|h| h.uid).collect();
@@ -361,6 +472,9 @@ impl SyncWorker {
                     )
                     .map_err(|e| SyncError::Protocol(format!("upsert uid {uid}: {e}")))?;
 
+                    // Fetched OK — any prior strike is stale (recovered).
+                    let _ = queries::clear_tombstone(conn, mailbox_id, uid);
+
                     if existing_set.contains(&uid) {
                         result.updated += 1;
                         cb(SyncEvent::MessageSynced {
@@ -385,10 +499,19 @@ impl SyncWorker {
         }
 
         // ── Step 6: expunge diff (delete UIDs no longer on server) ──
+        // Tombstoned UIDs are still on the server (SEARCH lists them) —
+        // they join the live set so the skip doesn't read as an expunge.
+        let live_union: Vec<u32> = server_uids
+            .iter()
+            .copied()
+            .chain(tombstoned.iter().copied())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
         result.deleted = {
             let guard = self.store.lock().unwrap();
             let conn = guard.conn();
-            queries::delete_missing_uids(conn, mailbox_id, &server_uids)
+            queries::delete_missing_uids(conn, mailbox_id, &live_union)
                 .map_err(|e| SyncError::Protocol(format!("delete_missing_uids: {e}")))?
         };
 
@@ -427,8 +550,9 @@ impl SyncWorker {
                 )
                 .unwrap_or(-1);
             eprintln!(
-                "[SGE sync] done: new={} updated={} deleted={} db_rows={}",
-                result.new, result.updated, result.deleted, db_count
+                "[SGE sync] done: new={} updated={} deleted={} db_rows={} fetched={} gap_refetches={} converged={}",
+                result.new, result.updated, result.deleted, db_count,
+                result.fetched, result.gap_refetches, result.converged
             );
         }
         cb(SyncEvent::SyncCompleted {
@@ -445,6 +569,7 @@ mod tests {
     use super::*;
     use crate::imap::{MailboxInfo, MailboxStatus, PinBox};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     /// Deterministic `MockSession` — returns canned headers and tracks
     /// call counts so tests can assert "no IMAP on cache hit".
@@ -460,6 +585,12 @@ mod tests {
         pub fail_set_seen: bool,
         /// STATUS UNSEEN datum returned by `mailbox_status` (FOLD-02).
         pub status_unseen: u32,
+        /// Requested ranges per `fetch_envelopes` call (gap/tombstone tests).
+        pub fetch_ranges: Mutex<Vec<String>>,
+        /// UIDs omitted from the FIRST fetch only (transient gap → refetch recovers).
+        pub gap_once: Mutex<Vec<u32>>,
+        /// UIDs omitted from EVERY fetch (flaky server path → tombstoned).
+        pub always_miss: Mutex<Vec<u32>>,
     }
 
     impl SyncSession for MockSession {
@@ -478,10 +609,28 @@ mod tests {
 
         fn fetch_envelopes<'a>(
             &'a mut self,
-            _range: &'a str,
+            range: &'a str,
         ) -> PinBox<'a, Result<Vec<MessageHeader>, SyncError>> {
             self.fetch_calls.fetch_add(1, Ordering::SeqCst);
-            let envelopes = self.envelopes.clone();
+            self.fetch_ranges.lock().unwrap().push(range.to_string());
+            // Honor the requested set like a real server: only requested
+            // UIDs come back. `gap_once` drops UIDs on the first call only
+            // (transient drop → range-diff refetch recovers); `always_miss`
+            // drops them every call (flaky path → strikes → tombstoned).
+            let requested: HashSet<u32> = range
+                .split(',')
+                .filter_map(|s| s.trim().parse::<u32>().ok())
+                .collect();
+            let once: Vec<u32> =
+                std::mem::take(&mut *self.gap_once.lock().unwrap());
+            let always = self.always_miss.lock().unwrap().clone();
+            let envelopes = self
+                .envelopes
+                .iter()
+                .filter(|h| requested.contains(&h.uid))
+                .filter(|h| !once.contains(&h.uid) && !always.contains(&h.uid))
+                .cloned()
+                .collect();
             Box::pin(async move { Ok(envelopes) })
         }
 
@@ -547,6 +696,9 @@ mod tests {
             set_seen_calls: Vec::new(),
             fail_set_seen: false,
             status_unseen: 0,
+            fetch_ranges: Mutex::new(Vec::new()),
+            gap_once: Mutex::new(Vec::new()),
+            always_miss: Mutex::new(Vec::new()),
         }
     }
 
@@ -596,7 +748,8 @@ mod tests {
         assert_eq!(count, 3);
     }
 
-    /// Second run with same data → no new, all updated.
+    /// Second run with same data → converged (no FETCH); the periodic full
+    /// sweep still refreshes (update path intact).
     #[test]
     fn incremental_sync_reports_updates() {
         let store = inbox(MailboxSummary {
@@ -621,16 +774,35 @@ mod tests {
         })
         .unwrap();
 
-        // Second run — same data, should be all updates
-        let session2 = mock(summary, vec![mkhdr(1), mkhdr(2), mkhdr(3)]);
+        // Second run — same data → converged, zero FETCHes (Phase 9).
+        let session2 = mock(summary.clone(), vec![mkhdr(1), mkhdr(2), mkhdr(3)]);
         let result = async_std::task::block_on(async {
             worker.sync_with_session(Box::new(session2), "INBOX", cb()).await
         })
         .unwrap();
 
         assert_eq!(result.new, 0);
-        assert_eq!(result.updated, 3);
+        assert_eq!(result.updated, 0);
         assert_eq!(result.deleted, 0);
+        assert!(result.converged);
+        assert_eq!(result.fetched, 0);
+
+        // Force the periodic full sweep → update path still refreshes.
+        {
+            let guard = worker.store.lock().unwrap();
+            let mb = queries::mailbox_id(guard.conn(), "INBOX").unwrap().unwrap();
+            queries::set_sweeps_since_full(guard.conn(), mb, queries::FULL_SWEEP_EVERY).unwrap();
+        }
+        let session3 = mock(summary, vec![mkhdr(1), mkhdr(2), mkhdr(3)]);
+        let result3 = async_std::task::block_on(async {
+            worker.sync_with_session(Box::new(session3), "INBOX", cb()).await
+        })
+        .unwrap();
+
+        assert!(!result3.converged);
+        assert_eq!(result3.new, 0);
+        assert_eq!(result3.updated, 3);
+        assert_eq!(result3.deleted, 0);
     }
 
     /// UIDVALIDITY change → wipe + full resync.
@@ -1378,5 +1550,129 @@ mod tests {
         assert_eq!(drafts.uid_next, 9);
         assert_eq!(drafts.unseen_count, 1);
         assert_eq!(drafts.unread_count, 0, "no messages → local count 0");
+    }
+
+    // ── Phase 9 Plan 09-01: UID gap + convergence gate tests ──
+
+    fn gap_summary(uidv: u32, exists: u32) -> MailboxSummary {
+        MailboxSummary {
+            selected_mailbox: "INBOX".to_string(),
+            uid_validity: uidv,
+            uid_next: Some(exists + 1),
+            exists,
+        }
+    }
+
+    /// A UID dropped from one batch FETCH is re-requested in the same pass
+    /// (range-diff) — no silent gap waiting for the next poll.
+    #[test]
+    fn uid_gap() {
+        let store = inbox(gap_summary(100, 3));
+        let worker = SyncWorker::new(store.clone());
+
+        let session = mock(gap_summary(100, 3), vec![mkhdr(1), mkhdr(2), mkhdr(3)]);
+        session.gap_once.lock().unwrap().push(2); // transient drop
+        let result = async_std::task::block_on(async {
+            worker.sync_with_session(Box::new(session), "INBOX", cb()).await
+        })
+        .unwrap();
+
+        assert_eq!(result.new, 3, "dropped uid must be recovered in-pass");
+        assert_eq!(result.gap_refetches, 1);
+        assert!(!result.converged);
+        let guard = worker.store.lock().unwrap();
+        let cached = queries::existing_uids(guard.conn(), 1, &[1, 2, 3]).unwrap();
+        assert_eq!(cached.len(), 3);
+    }
+
+    /// Double-poll-zero-FETCH convergence: two consecutive unchanged polls
+    /// issue no message FETCHes, and an arrival between syncs still lands.
+    #[test]
+    fn convergence_test() {
+        let store = inbox(gap_summary(100, 2));
+        let worker = SyncWorker::new(store.clone());
+
+        // Pass 1 — full sweep.
+        let s1 = mock(gap_summary(100, 2), vec![mkhdr(1), mkhdr(2)]);
+        let r1 = async_std::task::block_on(async {
+            worker.sync_with_session(Box::new(s1), "INBOX", cb()).await
+        })
+        .unwrap();
+        assert!(!r1.converged);
+        assert!(r1.fetched > 0);
+
+        // Pass 2 — nothing changed → converged, zero FETCHes.
+        let s2 = mock(gap_summary(100, 2), vec![mkhdr(1), mkhdr(2)]);
+        let r2 = async_std::task::block_on(async {
+            worker.sync_with_session(Box::new(s2), "INBOX", cb()).await
+        })
+        .unwrap();
+        assert!(r2.converged, "unchanged second poll must converge");
+        assert_eq!(r2.fetched, 0, "converged pass issues no FETCHes");
+        assert_eq!(r2.new, 0);
+        assert_eq!(r2.deleted, 0);
+
+        // Pass 3 — uid 3 arrived between syncs → fetched despite convergence.
+        let s3 = mock(gap_summary(100, 3), vec![mkhdr(1), mkhdr(2), mkhdr(3)]);
+        let r3 = async_std::task::block_on(async {
+            worker.sync_with_session(Box::new(s3), "INBOX", cb()).await
+        })
+        .unwrap();
+        assert!(!r3.converged);
+        assert_eq!(r3.new, 1, "arrival between syncs must land");
+    }
+
+    /// A UID missing from every FETCH earns strikes, then stops being
+    /// re-requested (no infinite backfill loop); expunge prunes the record.
+    #[test]
+    fn tombstoned_uids_stop_being_requested() {
+        let store = inbox(gap_summary(100, 2));
+        let worker = SyncWorker::new(store.clone());
+
+        // Passes 1–3: uid 2 in SEARCH, never in FETCH → strikes 1, 2, 3.
+        for pass in 1..=3 {
+            let session = mock(gap_summary(100, 2), vec![mkhdr(1), mkhdr(2)]);
+            session.always_miss.lock().unwrap().push(2);
+            let result = async_std::task::block_on(async {
+                worker.sync_with_session(Box::new(session), "INBOX", cb()).await
+            })
+            .unwrap();
+            assert!(!result.converged, "changed sets must sweep (pass {pass})");
+            let guard = worker.store.lock().unwrap();
+            let mb = queries::mailbox_id(guard.conn(), "INBOX").unwrap().unwrap();
+            let strikes: i64 = guard
+                .conn()
+                .query_row(
+                    "SELECT strikes FROM fetch_tombstones WHERE mailbox_id = ?1 AND uid = 2",
+                    rusqlite::params![mb],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(strikes, pass, "strike {pass} recorded");
+        }
+
+        // Pass 4: uid 2 is tombstoned → sweep requests only uid 1.
+        let session4 = mock(gap_summary(100, 2), vec![mkhdr(1), mkhdr(2)]);
+        let r4 = async_std::task::block_on(async {
+            worker.sync_with_session(Box::new(session4), "INBOX", cb()).await
+        })
+        .unwrap();
+        assert!(!r4.converged);
+        {
+            let guard = worker.store.lock().unwrap();
+            let cached = queries::existing_uids(guard.conn(), 1, &[1, 2]).unwrap();
+            assert_eq!(cached, vec![1], "flaky uid stays uncached, good uid intact");
+        }
+
+        // Pass 5: uid 2 expunged server-side → tombstone pruned, no residue.
+        let session5 = mock(gap_summary(100, 1), vec![mkhdr(1)]);
+        async_std::task::block_on(async {
+            worker.sync_with_session(Box::new(session5), "INBOX", cb()).await
+        })
+        .unwrap();
+        let guard = worker.store.lock().unwrap();
+        let mb = queries::mailbox_id(guard.conn(), "INBOX").unwrap().unwrap();
+        let remaining = queries::tombstoned_uids(guard.conn(), mb).unwrap();
+        assert!(remaining.is_empty(), "expunged uid's tombstone must prune");
     }
 }

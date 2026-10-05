@@ -46,6 +46,14 @@ pub struct SyncSummary {
     pub deleted: usize,
     /// `true` when UIDVALIDITY changed and a full wipe+resync occurred.
     pub uid_validity_bump: bool,
+    /// Envelope FETCH calls issued this pass (Phase 9 convergence signal).
+    pub fetched: usize,
+    /// Gap re-fetch batches issued this pass (Phase 9 range-diff).
+    pub gap_refetches: usize,
+    /// `true` when the sweep was skipped: server UID set already matched
+    /// local with no epoch bump and no pending outbox ops — two consecutive
+    /// `converged` passes issue zero message FETCHes (Phase 9).
+    pub converged: bool,
 }
 
 impl SyncSummary {
