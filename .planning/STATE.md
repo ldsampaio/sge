@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-10-04)
 
 Phase: v1.1 gap closure (Phases 6–9 verification + closure)
 Plan: —
-Status: In progress ⚠️ — 2026-10-05 audit: Phase 6 functional minus regression tests; Phase 7 ~60%; Phases 8–9 unimplemented with retracted summaries. Gap closure authorized, executing in phase order.
+Status: In progress ⚠️ — 2026-10-05 audit (corrected): Phase 6 complete incl. peek_audit + 6 rfc4549 tests (were uncommitted, now being committed); Phase 7 ~60% (list_mailboxes command + STATUS wiring open); Phases 8–9 unimplemented with summaries retracted. Gap closure authorized, executing in phase order.
 
 Last activity: 2026-10-05 — verification audit + gap-closure start.
 
