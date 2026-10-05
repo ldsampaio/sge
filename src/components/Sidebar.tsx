@@ -1,89 +1,80 @@
 import "./MailboxView.css";
-import { IconHome, IconInbox, IconBook, IconHelp } from "./icons";
+import { IconInbox } from "./icons";
+import type { MailboxRow } from "../types";
 
 interface SidebarProps {
-  messageCount: number;
-  unreadCount?: number;
   selectedMailbox: string;
+  mailboxes: MailboxRow[];
   onMailboxSelect: (mailbox: string) => void;
 }
 
 export default function Sidebar({
-  messageCount,
-  unreadCount = 0,
   selectedMailbox,
+  mailboxes = [],
   onMailboxSelect,
 }: SidebarProps) {
+  const showMailboxItems = mailboxes.length > 0;
+
+  /**
+   * Badge signal per folder (FOLD-02): the dynamic local unread count once
+   * the folder has synced, else the cached STATUS (UNSEEN) server datum —
+   * so never-synced folders still show an honest server-sourced signal.
+   */
+  function badgeCount(mb: MailboxRow): number {
+    if (mb.last_sync_at) return mb.unread_count;
+    return mb.unseen_count ?? 0;
+  }
+
   return (
     <nav className="sidebar" aria-label="Trilha de estudos">
       <div className="sidebar-head">
         <h3>Minha trilha</h3>
       </div>
       <ul className="sidebar-list">
-        <li>
-          <button
-            type="button"
-            className={`sidebar-item ${selectedMailbox === "INBOX" ? "active" : ""}`}
-            onClick={() => onMailboxSelect("INBOX")}
-            aria-current={selectedMailbox === "INBOX" ? "page" : undefined}
-          >
-            <span className="sidebar-icon" aria-hidden="true">
-              <IconInbox size={19} />
-            </span>
-            <span className="sidebar-label">Caixa de entrada</span>
-            {messageCount > 0 && (
-              <span className="sidebar-badge" aria-label={`${messageCount} mensagens`}>
-                {messageCount > 999 ? "999+" : messageCount}
-              </span>
+        {showMailboxItems
+          ? mailboxes.map((mb) => (
+              <li key={mb.id}>
+                <button
+                  type="button"
+                  className={`sidebar-item ${selectedMailbox === mb.name ? "active" : ""}`}
+                  onClick={() => onMailboxSelect(mb.name)}
+                  aria-current={selectedMailbox === mb.name ? "page" : undefined}
+                >
+                  <span className="sidebar-icon" aria-hidden="true">
+                    <IconInbox size={19} />
+                  </span>
+                  <span className="sidebar-label">{mb.name}</span>
+                  {badgeCount(mb) > 0 && (
+                    <span
+                      className="sidebar-badge"
+                      aria-label={`${badgeCount(mb)} mensagens`}
+                    >
+                      {badgeCount(mb) > 999 ? "999+" : badgeCount(mb)}
+                    </span>
+                  )}
+                </button>
+              </li>
+            ))
+          : (
+              <li>
+                <button
+                  type="button"
+                  className="sidebar-item"
+                  disabled
+                  aria-label="Sincronize para carregar pastas"
+                >
+                  <span className="sidebar-icon" aria-hidden="true">
+                    <IconInbox size={19} />
+                  </span>
+                  <span className="sidebar-label">Sincronize para carregar pastas</span>
+                </button>
+              </li>
             )}
-          </button>
-        </li>
-        <li>
-          <button
-            type="button"
-            className="sidebar-item"
-            onClick={() => onMailboxSelect("INBOX")}
-            title="Em breve: resumo do dia"
-          >
-            <span className="sidebar-icon" aria-hidden="true">
-              <IconHome size={19} />
-            </span>
-            <span className="sidebar-label">Início</span>
-          </button>
-        </li>
-        <li>
-          <button
-            type="button"
-            className="sidebar-item"
-            onClick={() => onMailboxSelect("INBOX")}
-            title="Em breve: só mensagens com anexo"
-          >
-            <span className="sidebar-icon" aria-hidden="true">
-              <IconBook size={19} />
-            </span>
-            <span className="sidebar-label">Materiais</span>
-          </button>
-        </li>
-        <li>
-          <button
-            type="button"
-            className="sidebar-item"
-            onClick={() => onMailboxSelect("INBOX")}
-            title="Em breve: ajuda de estudos"
-          >
-            <span className="sidebar-icon" aria-hidden="true">
-              <IconHelp size={19} />
-            </span>
-            <span className="sidebar-label">Ajuda</span>
-          </button>
-        </li>
       </ul>
       <div className="sidebar-foot">
-        <strong>{unreadCount > 0 ? `${unreadCount} para ler` : "Tudo em dia"}</strong>
+        <strong>Tudo em dia</strong>
         <p>
-          {unreadCount > 0
-            ? "Mensagens novas ficam com a borda laranja. Leia no seu ritmo — nada é apagado do servidor."
-            : "Nenhuma mensagem nova pendente. Sincronize para buscar avisos recentes."}
+          Nenhuma mensagem nova pendente. Sincronize para buscar avisos recentes.
         </p>
       </div>
     </nav>

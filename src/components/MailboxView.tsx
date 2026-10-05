@@ -1,10 +1,11 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import Sidebar from "./Sidebar";
 import MessageList, { type ListState } from "./MessageList";
 import ReadingPane from "./ReadingPane";
 import SyncStatus from "./SyncStatus";
 import SearchBar from "./SearchBar";
-import type { MessageRow } from "../types";
+import type { MessageRow, MailboxRow } from "../types";
 import { IconCap } from "./icons";
 import "./MailboxView.css";
 
@@ -13,14 +14,29 @@ interface MailboxViewProps {
 }
 
 export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
+  const [selectedMailbox, setSelectedMailbox] = useState(mailbox);
   const [selectedMessage, setSelectedMessage] = useState<MessageRow | null>(null);
   const [searchQuery, setSearchQuery] = useState<string | null>(null);
   const [messageCount, setMessageCount] = useState(0);
+  const [mailboxes, setMailboxes] = useState<MailboxRow[]>([]);
   const [listState, setListState] = useState<ListState>({
     kind: "ready",
     message: "",
   });
   const [refreshKey, setRefreshKey] = useState(0);
+
+  // FOLD-01: fetch mailbox list from the local store on mount.
+  useEffect(() => {
+    void (async () => {
+      try {
+        const rows = await invoke<MailboxRow[]>("list_mailboxes");
+        setMailboxes(rows ?? []);
+      } catch {
+        // No stored mailboxes yet — sidebar falls back to the INBOX bootstrap.
+        setMailboxes([]);
+      }
+    })();
+  }, []);
 
   function handleMessageSelect(msg: MessageRow) {
     setSelectedMessage(msg);
@@ -32,11 +48,22 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
   }, []);
 
   function handleMailboxSelect(m: string) {
-    void m;
+    setSelectedMailbox(m);
+    setSelectedMessage(null);
+    setRefreshKey((k) => k + 1);
   }
 
   const handleSyncComplete = useCallback(() => {
     setRefreshKey((k) => k + 1);
+    // Refresh mailbox list (unread counts may have changed).
+    void (async () => {
+      try {
+        const rows = await invoke<MailboxRow[]>("list_mailboxes");
+        setMailboxes(rows ?? []);
+      } catch {
+        // ignore — stale counts will refresh on next sync
+      }
+    })();
   }, []);
 
   return (
@@ -53,17 +80,20 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
             </p>
           </div>
         </div>
-        <SyncStatus onSyncComplete={handleSyncComplete} />
+        <SyncStatus mailbox={selectedMailbox} onSyncComplete={handleSyncComplete} />
       </header>
       <div className="mailbox-panes">
         <Sidebar
-          messageCount={messageCount}
-          selectedMailbox={mailbox}
+          selectedMailbox={selectedMailbox}
+          mailboxes={mailboxes}
           onMailboxSelect={handleMailboxSelect}
         />
         <main className="message-panel" aria-label="Fila de leitura">
           <div className="message-list-header">
-            <SearchBar onSearch={handleSearch} disabled={listState.kind === "loading"} />
+            <SearchBar
+              onSearch={handleSearch}
+              disabled={listState.kind === "loading"}
+            />
             {listState.kind === "ready" && (
               <span className="message-count" aria-live="polite">
                 {messageCount} {messageCount === 1 ? "mensagem" : "mensagens"}
@@ -71,7 +101,7 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
             )}
           </div>
           <MessageList
-            mailbox={mailbox}
+            mailbox={selectedMailbox}
             searchQuery={searchQuery}
             refreshKey={refreshKey}
             onMessageSelect={handleMessageSelect}
@@ -80,7 +110,7 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
             onMessageCount={setMessageCount}
           />
         </main>
-        <ReadingPane selectedMessage={selectedMessage} />
+        <ReadingPane selectedMessage={selectedMessage} mailbox={selectedMailbox} />
       </div>
     </div>
   );

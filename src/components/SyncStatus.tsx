@@ -66,9 +66,10 @@ function hasSyncError(e: SyncEvent): e is SyncErrorEvent {
 
 interface SyncStatusProps {
   onSyncComplete?: () => void;
+  mailbox?: string;
 }
 
-export default function SyncStatus({ onSyncComplete }: SyncStatusProps) {
+export default function SyncStatus({ onSyncComplete, mailbox = "INBOX" }: SyncStatusProps) {
   const [status, setStatus] = useState<Status>({ kind: "idle" });
   const channelRef = useRef<Channel<SyncEvent> | null>(null);
   const syncingRef = useRef(false);
@@ -77,7 +78,7 @@ export default function SyncStatus({ onSyncComplete }: SyncStatusProps) {
 
   async function pollStatus() {
     try {
-      const s: SyncStatusInfo = await invoke("sync_status");
+      const s: SyncStatusInfo = await invoke("sync_status", { mailbox });
       setLastPending(s.pending_count);
       setStatus({ kind: "synced", status: s });
     } catch {
@@ -118,7 +119,7 @@ export default function SyncStatus({ onSyncComplete }: SyncStatusProps) {
     };
 
     try {
-      await invoke("start_sync", { onEvent: channel });
+      await invoke("start_sync", { onEvent: channel, mailbox });
       await pollStatus();
       onSyncComplete?.();
     } catch (err) {

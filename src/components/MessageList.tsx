@@ -114,7 +114,7 @@ export default function MessageList({
               limit: PAGE_SIZE,
               offset: p * PAGE_SIZE,
             }),
-            invoke<SyncStatusInfo>("sync_status"),
+            invoke<SyncStatusInfo>("sync_status", { mailbox }),
           ]);
           setMessages(rows);
           setTotal(status.message_count);
@@ -157,7 +157,7 @@ export default function MessageList({
       );
       setPendingUids((prev) => new Set(prev).add(uid));
       try {
-        const result = await invoke<SetSeenResult>("set_seen", { uid, seen: targetSeen });
+        const result = await invoke<SetSeenResult>("set_seen", { uid, seen: targetSeen, mailbox });
         dispatchFlagUpdate({
           uid: result.uid,
           seen: result.seen,

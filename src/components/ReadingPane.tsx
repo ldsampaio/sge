@@ -13,9 +13,10 @@ function isTauriRuntime(): boolean {
 
 interface ReadingPaneProps {
   selectedMessage: MessageRow | null;
+  mailbox?: string;
 }
 
-export default function ReadingPane({ selectedMessage }: ReadingPaneProps) {
+export default function ReadingPane({ selectedMessage, mailbox = "INBOX" }: ReadingPaneProps) {
   const [message, setMessage] = useState<MessageView | null>(null);
   const [status, setStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
   const [errorMsg, setErrorMsg] = useState("");
@@ -38,7 +39,7 @@ export default function ReadingPane({ selectedMessage }: ReadingPaneProps) {
     setMessage(null);
     setLocalUnread(isUnread(flags));
 
-    invoke<MessageView>("fetch_message", { uid })
+    invoke<MessageView>("fetch_message", { uid, mailbox })
       .then(async (result) => {
         if (stale) return;
         setMessage(result);
@@ -48,7 +49,7 @@ export default function ReadingPane({ selectedMessage }: ReadingPaneProps) {
         if (isUnread(flags)) {
           setLocalUnread(false);
           try {
-            const r = await invoke<SetSeenResult>("set_seen", { uid, seen: true });
+            const r = await invoke<SetSeenResult>("set_seen", { uid, seen: true, mailbox });
             if (stale) return;
             dispatchFlagUpdate({
               uid: r.uid,
@@ -82,7 +83,7 @@ export default function ReadingPane({ selectedMessage }: ReadingPaneProps) {
     return () => {
       stale = true;
     };
-  }, [selectedMessage]);
+  }, [selectedMessage, mailbox]);
 
   /**
    * Explicit mark read/unread from the header. Optimistic flip of the local
@@ -94,7 +95,7 @@ export default function ReadingPane({ selectedMessage }: ReadingPaneProps) {
     const targetSeen = localUnread; // unread -> read, read -> unread
     setLocalUnread(!targetSeen);
     try {
-      const r = await invoke<SetSeenResult>("set_seen", { uid, seen: targetSeen });
+      const r = await invoke<SetSeenResult>("set_seen", { uid, seen: targetSeen, mailbox });
       dispatchFlagUpdate({
         uid: r.uid,
         seen: r.seen,

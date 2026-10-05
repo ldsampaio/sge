@@ -31,6 +31,18 @@ export interface MessageView {
   attachments: AttachmentInfo[];
 }
 
+/** Cached mailbox row from the local store, surfaced to the sidebar. */
+export interface MailboxRow {
+  id: number;
+  name: string;
+  uid_validity: number;
+  uid_next: number;
+  last_sync_at: string | null;
+  unread_count: number;
+  /** Last STATUS (UNSEEN) datum (M3) — badge fallback for never-synced folders. */
+  unseen_count: number;
+}
+
 export interface SyncStatusInfo {
   mailbox: string;
   last_sync_at: string;
