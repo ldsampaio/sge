@@ -51,18 +51,18 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| SEND-01 | TBD | Pending |
-| SEND-02 | TBD | Pending |
-| SEND-03 | TBD | Pending |
-| SEND-04 | TBD | Pending |
-| SEND-05 | TBD | Pending |
-| SEND-06 | TBD | Pending |
-| DEL-01 | TBD | Pending |
-| DEL-02 | TBD | Pending |
-| MOVE-01 | TBD | Pending |
-| FOLD-04 | TBD | Pending |
-| FOLD-05 | TBD | Pending |
-| FOLD-06 | TBD | Pending |
-| DRAFT-01 | TBD | Pending |
-| DRAFT-02 | TBD | Pending |
-| DRAFT-03 | TBD | Pending |
+| SEND-01 | 14 | Pending |
+| SEND-02 | 14 | Pending |
+| SEND-03 | 14 | Pending |
+| SEND-04 | 13 | Pending |
+| SEND-05 | 14 | Pending |
+| SEND-06 | 13 | Pending |
+| DEL-01 | 10 | Pending |
+| DEL-02 | 10 | Pending |
+| MOVE-01 | 10 | Pending |
+| FOLD-04 | 11 | Pending |
+| FOLD-05 | 11 | Pending |
+| FOLD-06 | 11 | Pending |
+| DRAFT-01 | 12 | Pending |
+| DRAFT-02 | 12 | Pending |
+| DRAFT-03 | 13 | Pending |

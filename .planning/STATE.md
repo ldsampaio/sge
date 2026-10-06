@@ -20,14 +20,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-10-05)
 
 **Core value:** Connect to an IMAP server on Linux and read your mail locally in a fast Gmail-like UI.
-**Current focus:** v1.2 scoping (run `/gsd-new-milestone`)
+**Current focus:** v1.2 Compose & Organize (Phases 10-14 planned, next: /gsd-discuss-phase 10)
 
 ## Current Position
 
-Phase: Not started (defining requirements)
+Phase: 10 (Delete + Move) — not started, roadmap created 2026-10-06
 Plan: —
-Status: Defining requirements
-Last activity: 2026-10-06 — Milestone v1.2 started
+Status: Roadmap ready, awaiting /gsd-discuss-phase 10
+Last activity: 2026-10-06 — Milestone v1.2 roadmap created (Phases 10-14)
 
 ## Performance Metrics
 
