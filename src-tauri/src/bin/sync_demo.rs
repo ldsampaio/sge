@@ -94,6 +94,36 @@ impl SyncSession for MockSession {
         Box::pin(async move { Ok(()) })
     }
 
+    // Plan 10-01 stubs: the demo harness never exercises delete/move
+    // verbs; arms exist only to satisfy the extended trait.
+    fn store_deleted(&mut self, _uid: u32, _deleted: bool) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SyncError>> + Send>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn expunge(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u32>, SyncError>> + Send>> {
+        Box::pin(async move { Ok(Vec::new()) })
+    }
+
+    fn uid_expunge(&mut self, _uid_set: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u32>, SyncError>> + Send>> {
+        Box::pin(async move { Ok(Vec::new()) })
+    }
+
+    fn uid_copy_to(&mut self, _uid_set: &str, _dest: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SyncError>> + Send>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn uid_move_to(&mut self, _uid_set: &str, _dest: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SyncError>> + Send>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn capabilities(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<String>, SyncError>> + Send>> {
+        Box::pin(async move { Ok(Vec::new()) })
+    }
+
+    fn create_mailbox(&mut self, _name: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SyncError>> + Send>> {
+        Box::pin(async move { Ok(()) })
+    }
+
     fn logout(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SyncError>> + Send>> {
         Box::pin(async move { Ok(()) })
     }

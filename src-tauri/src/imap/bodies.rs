@@ -219,6 +219,36 @@ mod tests {
             Box::pin(async move { Ok(()) })
         }
 
+        // Plan 10-01 stubs: body-fetch tests never exercise delete/move
+        // verbs; arms exist only to satisfy the extended trait.
+        fn store_deleted(&mut self, _uid: u32, _deleted: bool) -> PinBox<'_, Result<(), SyncError>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn expunge(&mut self) -> PinBox<'_, Result<Vec<u32>, SyncError>> {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn uid_expunge(&mut self, _uid_set: &str) -> PinBox<'_, Result<Vec<u32>, SyncError>> {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn uid_copy_to(&mut self, _uid_set: &str, _dest: &str) -> PinBox<'_, Result<(), SyncError>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn uid_move_to(&mut self, _uid_set: &str, _dest: &str) -> PinBox<'_, Result<(), SyncError>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn capabilities(&mut self) -> PinBox<'_, Result<Vec<String>, SyncError>> {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn create_mailbox(&mut self, _name: &str) -> PinBox<'_, Result<(), SyncError>> {
+            Box::pin(async move { Ok(()) })
+        }
+
         fn logout(&mut self) -> PinBox<'_, Result<(), SyncError>> {
             Box::pin(async move { Ok(()) })
         }

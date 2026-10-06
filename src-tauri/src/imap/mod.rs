@@ -306,6 +306,39 @@ pub trait SyncSession: Unpin + Send {
     /// numbers must never reach this path (T-6-1).</
     fn set_seen(&mut self, uid: u32, seen: bool) -> PinBox<'_, Result<(), SyncError>>;
 
+    /// `UID STORE <uid> ±FLAGS.SILENT (\\Deleted)` — set or clear the
+    /// Deleted flag on exactly one message by UID. UID-only addressing:
+    /// sequence numbers must never reach this path (T-6-1).
+    fn store_deleted(&mut self, uid: u32, deleted: bool) -> PinBox<'_, Result<(), SyncError>>;
+
+    /// `EXPUNGE` — permanently remove all `\\Deleted` messages in the
+    /// selected mailbox. Collect-and-drop: returned sequence numbers are
+    /// drained to completion but never trusted as UIDs. NEVER the default —
+    /// UID-scoped [`SyncSession::uid_expunge`] is the DEL-02 workhorse; bare
+    /// expunge exists only for the UIDPLUS-absent fallback dance (Plan 10-02).
+    fn expunge(&mut self) -> PinBox<'_, Result<Vec<u32>, SyncError>>;
+
+    /// `UID EXPUNGE <set>` (RFC 4315, requires UIDPLUS) — permanently
+    /// remove only `\\Deleted` messages whose UIDs are in `uid_set`.
+    /// Comma-joined `"1,2,3"` shape (see [`chunk_uid_set`]).
+    fn uid_expunge(&mut self, uid_set: &str) -> PinBox<'_, Result<Vec<u32>, SyncError>>;
+
+    /// `UID COPY <set> <dest>` — copy messages to `dest` (raw wire name,
+    /// never display_name). Fallback leg 1 when MOVE is unavailable.
+    fn uid_copy_to(&mut self, uid_set: &str, dest: &str) -> PinBox<'_, Result<(), SyncError>>;
+
+    /// `UID MOVE <set> <dest>` (RFC 6851, requires MOVE capability) —
+    /// server-side move as one action, flags + INTERNALDATE preserved.
+    /// Preferred over COPY + STORE + EXPUNGE.
+    fn uid_move_to(&mut self, uid_set: &str, dest: &str) -> PinBox<'_, Result<(), SyncError>>;
+
+    /// `CAPABILITY` — server capability atoms as owned strings
+    /// (object-safe return; no lifetime leak from the vendored struct).
+    fn capabilities(&mut self) -> PinBox<'_, Result<Vec<String>, SyncError>>;
+
+    /// `CREATE <name>` — create one mailbox (Phase 10: Trash fallback only).
+    fn create_mailbox(&mut self, name: &str) -> PinBox<'_, Result<(), SyncError>>;
+
     /// `LIST "" "*"` — discover all mailboxes on the server (FOLD-01).
     /// Returns raw LIST results with name, delimiter, and attributes.
     fn list_mailboxes(&mut self) -> PinBox<'_, Result<Vec<MailboxInfo>, SyncError>>;
@@ -340,6 +373,85 @@ pub fn seen_store_arg(seen: bool) -> &'static str {
     } else {
         "-FLAGS.SILENT (\\Seen)"
     }
+}
+
+/// The UID STORE argument for a Deleted toggle, in canonical form.
+///
+/// Mirrors [`seen_store_arg`]: exactly two variants, no user-input
+/// interpolation (the UID travels as a `u32` formatted by the caller).
+/// `.SILENT` suppresses the server's untagged FETCH replies.
+pub fn deleted_store_arg(deleted: bool) -> &'static str {
+    if deleted {
+        "+FLAGS.SILENT (\\Deleted)"
+    } else {
+        "-FLAGS.SILENT (\\Deleted)"
+    }
+}
+
+/// Which server verb carries a move, given the advertised capabilities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MovePath {
+    /// Server advertises MOVE — one-verb `UID MOVE`.
+    UidMove,
+    /// No MOVE — COPY + STORE + EXPUNGE fallback sequence (Plan 10-02).
+    FallbackCopy,
+}
+
+/// Which expunge path is safe, given the advertised capabilities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpungePath {
+    /// Server advertises UIDPLUS — scoped `UID EXPUNGE` (the default).
+    UidExpunge,
+    /// No UIDPLUS — the unmark-others dance behind a plain `EXPUNGE`
+    /// (Plan 10-02 executes it; see [`ExpungePath::Refuse`]).
+    UnmarkDance,
+    /// Loud failure when the [`ExpungePath::UnmarkDance`] preconditions
+    /// can't be verified — never expunge blindly. Constructed at runtime
+    /// by Plan 10-02, not by [`choose_expunge_path`].
+    Refuse,
+}
+
+fn has_capability(caps: &[String], atom: &str) -> bool {
+    caps.iter().any(|c| c.eq_ignore_ascii_case(atom))
+}
+
+/// Pick the move verb from a `CAPABILITY` atom list (case-insensitive).
+pub fn choose_move_path(caps: &[String]) -> MovePath {
+    if has_capability(caps, "MOVE") {
+        MovePath::UidMove
+    } else {
+        MovePath::FallbackCopy
+    }
+}
+
+/// Pick the expunge path from a `CAPABILITY` atom list (case-insensitive).
+///
+/// UIDPLUS present → scoped `UID EXPUNGE`; absent → the unmark-others
+/// dance. [`ExpungePath::Refuse`] is never returned here — Plan 10-02
+/// upgrades `UnmarkDance` to `Refuse` at runtime when the dance cannot
+/// be verified on the live session.
+pub fn choose_expunge_path(caps: &[String]) -> ExpungePath {
+    if has_capability(caps, "UIDPLUS") {
+        ExpungePath::UidExpunge
+    } else {
+        ExpungePath::UnmarkDance
+    }
+}
+
+/// Max UIDs per UID-set verb call (matches the sweep batch size).
+pub const UID_SET_CHUNK_SIZE: usize = 200;
+
+/// Split UIDs into comma-joined `"1,2,3"` sets of at most
+/// [`UID_SET_CHUNK_SIZE`] — keeps multi-message ops poll-responsive.
+pub fn chunk_uid_set(uids: &[u32]) -> Vec<String> {
+    uids.chunks(UID_SET_CHUNK_SIZE)
+        .map(|c| {
+            c.iter()
+                .map(|u| u.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .collect()
 }
 
 /// Convert an IMAP `NameAttribute` to its canonical string form (e.g. `\Marked`).
@@ -445,6 +557,107 @@ impl SyncSession for BoxedSession {
                 .try_collect()
                 .await
                 .map_err(|e| SyncError::Protocol(format!("UID STORE Seen uid {uid}: {e}")))?;
+            Ok(())
+        })
+    }
+
+    fn store_deleted(&mut self, uid: u32, deleted: bool) -> PinBox<'_, Result<(), SyncError>> {
+        Box::pin(async move {
+            let stream = self
+                .uid_store(uid.to_string(), deleted_store_arg(deleted))
+                .await
+                .map_err(|e| SyncError::Protocol(format!("UID STORE Deleted uid {uid}: {e}")))?;
+            // Same drain-to-completion discipline as `set_seen`: a dropped
+            // stream aborts the write, so the acknowledgement is the drain.
+            let _responses: Vec<_> = stream
+                .try_collect()
+                .await
+                .map_err(|e| SyncError::Protocol(format!("UID STORE Deleted uid {uid}: {e}")))?;
+            Ok(())
+        })
+    }
+
+    fn expunge(&mut self) -> PinBox<'_, Result<Vec<u32>, SyncError>> {
+        Box::pin(async move {
+            let stream = self
+                .expunge()
+                .await
+                .map_err(|e| SyncError::Protocol(format!("EXPUNGE: {e}")))?;
+            // Collect-and-drop: expunged sequence numbers are drained to
+            // completion but never trusted as UIDs — the local cache
+            // reconciles via the next SEARCH, not via expunge responses.
+            let seqs: Vec<u32> = stream
+                .try_collect()
+                .await
+                .map_err(|e| SyncError::Protocol(format!("EXPUNGE: {e}")))?;
+            Ok(seqs)
+        })
+    }
+
+    fn uid_expunge(&mut self, uid_set: &str) -> PinBox<'_, Result<Vec<u32>, SyncError>> {
+        let set = uid_set.to_string();
+        Box::pin(async move {
+            let stream = self
+                .uid_expunge(&set)
+                .await
+                .map_err(|e| SyncError::Protocol(format!("UID EXPUNGE {set}: {e}")))?;
+            let uids: Vec<u32> = stream
+                .try_collect()
+                .await
+                .map_err(|e| SyncError::Protocol(format!("UID EXPUNGE {set}: {e}")))?;
+            Ok(uids)
+        })
+    }
+
+    fn uid_copy_to(&mut self, uid_set: &str, dest: &str) -> PinBox<'_, Result<(), SyncError>> {
+        let set = uid_set.to_string();
+        let dest_owned = dest.to_string();
+        Box::pin(async move {
+            self.uid_copy(&set, &dest_owned)
+                .await
+                .map_err(|e| {
+                    SyncError::Protocol(format!("UID COPY {set} -> {dest_owned}: {e}"))
+                })?;
+            Ok(())
+        })
+    }
+
+    fn uid_move_to(&mut self, uid_set: &str, dest: &str) -> PinBox<'_, Result<(), SyncError>> {
+        let set = uid_set.to_string();
+        let dest_owned = dest.to_string();
+        Box::pin(async move {
+            self.uid_mv(&set, &dest_owned)
+                .await
+                .map_err(|e| {
+                    SyncError::Protocol(format!("UID MOVE {set} -> {dest_owned}: {e}"))
+                })?;
+            Ok(())
+        })
+    }
+
+    fn capabilities(&mut self) -> PinBox<'_, Result<Vec<String>, SyncError>> {
+        Box::pin(async move {
+            let caps = self
+                .capabilities()
+                .await
+                .map_err(|e| SyncError::Protocol(format!("CAPABILITY: {e}")))?;
+            Ok(caps
+                .iter()
+                .map(|c| match c {
+                    async_imap::types::Capability::Imap4rev1 => "IMAP4rev1".to_string(),
+                    async_imap::types::Capability::Auth(mech) => format!("AUTH={mech}"),
+                    async_imap::types::Capability::Atom(atom) => atom.clone(),
+                })
+                .collect())
+        })
+    }
+
+    fn create_mailbox(&mut self, name: &str) -> PinBox<'_, Result<(), SyncError>> {
+        let name_owned = name.to_string();
+        Box::pin(async move {
+            self.create(&name_owned)
+                .await
+                .map_err(|e| SyncError::Protocol(format!("CREATE {name_owned}: {e}")))?;
             Ok(())
         })
     }
@@ -674,5 +887,103 @@ mod tests {
             assert!(!arg.contains("UID"), "flag arg must not name identifiers: {arg}");
             assert!(arg.ends_with("(\\Seen)"), "canonical backslash-Seen form: {arg}");
         }
+    }
+
+    #[test]
+    fn deleted_store_arg_spelling() {
+        // T-10-01: UID-only STORE with the silent Deleted literals — the
+        // exact wire spelling the mock-based worker tests assert against.
+        assert_eq!(deleted_store_arg(true), "+FLAGS.SILENT (\\Deleted)");
+        assert_eq!(deleted_store_arg(false), "-FLAGS.SILENT (\\Deleted)");
+    }
+
+    #[test]
+    fn deleted_store_arg_never_sequence_addressed() {
+        // Same purity contract as `seen_store_arg`: no identifier in the
+        // flag expression, canonical backslash-Deleted form.
+        for deleted in [true, false] {
+            let arg = deleted_store_arg(deleted);
+            assert!(!arg.contains("UID"), "flag arg must not name identifiers: {arg}");
+            assert!(arg.ends_with("(\\Deleted)"), "canonical backslash-Deleted form: {arg}");
+        }
+    }
+
+    fn caps(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn move_path_capability_matrix() {
+        // MOVE + UIDPLUS → one-verb UID MOVE.
+        assert_eq!(
+            choose_move_path(&caps(&["IMAP4rev1", "UIDPLUS", "MOVE"])),
+            MovePath::UidMove
+        );
+        // Neither → COPY + STORE + EXPUNGE fallback.
+        assert_eq!(
+            choose_move_path(&caps(&["IMAP4rev1"])),
+            MovePath::FallbackCopy
+        );
+        // Mixed: MOVE without UIDPLUS still moves in one verb.
+        assert_eq!(
+            choose_move_path(&caps(&["IMAP4rev1", "MOVE"])),
+            MovePath::UidMove
+        );
+        // Mixed: UIDPLUS without MOVE still falls back to COPY.
+        assert_eq!(
+            choose_move_path(&caps(&["IMAP4rev1", "UIDPLUS"])),
+            MovePath::FallbackCopy
+        );
+        // Atom matching is case-insensitive (servers vary).
+        assert_eq!(choose_move_path(&caps(&["move"])), MovePath::UidMove);
+    }
+
+    #[test]
+    fn expunge_path_capability_matrix() {
+        // UIDPLUS (± MOVE) → scoped UID EXPUNGE.
+        assert_eq!(
+            choose_expunge_path(&caps(&["IMAP4rev1", "UIDPLUS", "MOVE"])),
+            ExpungePath::UidExpunge
+        );
+        assert_eq!(
+            choose_expunge_path(&caps(&["IMAP4rev1", "UIDPLUS"])),
+            ExpungePath::UidExpunge
+        );
+        // No UIDPLUS → unmark-others dance (Plan 10-02 executes it).
+        assert_eq!(
+            choose_expunge_path(&caps(&["IMAP4rev1", "MOVE"])),
+            ExpungePath::UnmarkDance
+        );
+        assert_eq!(
+            choose_expunge_path(&caps(&["IMAP4rev1"])),
+            ExpungePath::UnmarkDance
+        );
+        // Case-insensitive.
+        assert_eq!(
+            choose_expunge_path(&caps(&["uidplus"])),
+            ExpungePath::UidExpunge
+        );
+        // Refuse is the runtime loud-failure upgrade, never the pure pick.
+        assert_ne!(choose_expunge_path(&caps(&["IMAP4rev1"])), ExpungePath::Refuse);
+    }
+
+    #[test]
+    fn chunk_uid_set_shapes() {
+        assert!(chunk_uid_set(&[]).is_empty());
+        assert_eq!(chunk_uid_set(&[7]), vec!["7".to_string()]);
+        assert_eq!(chunk_uid_set(&[1, 2, 3]), vec!["1,2,3".to_string()]);
+        // 450 UIDs → 3 chunks of ≤200.
+        let uids: Vec<u32> = (1..=450).collect();
+        let chunks = chunk_uid_set(&uids);
+        assert_eq!(chunks.len(), 3);
+        for c in &chunks {
+            assert!(c.split(',').count() <= UID_SET_CHUNK_SIZE);
+        }
+        assert_eq!(chunks[0].split(',').count(), 200);
+        assert_eq!(chunks[1].split(',').count(), 200);
+        assert_eq!(chunks[2].split(',').count(), 50);
+        assert!(chunks[0].starts_with("1,2,3"));
+        assert!(chunks[2].starts_with("401,"));
+        assert!(chunks[2].ends_with(",450"));
     }
 }
