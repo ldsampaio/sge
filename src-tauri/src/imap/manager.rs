@@ -254,6 +254,10 @@ impl SessionManager {
     ) -> Result<MoveOutcome, SyncError> {
         match self.move_once(src, uid_set, dest).await {
             Ok(outcome) => Ok(outcome),
+            // A loud refusal (unverifiable unmark dance) is deterministic:
+            // retrying would re-COPY (duplicates in dest) only to refuse
+            // again, so it bypasses the reconnect-retry.
+            Err(refused @ SyncError::Refused(_)) => Err(refused),
             Err(first) => {
                 eprintln!(
                     "[SGE imap] move {src} -> {dest} set {uid_set} failed ({first}) — reconnecting once"
@@ -419,7 +423,7 @@ async fn unmark_dance_expunge(
             .join(",");
         for header in session.fetch_envelopes(&check).await? {
             if flags_carry_deleted(&header.flags) {
-                return Err(SyncError::Protocol(
+                return Err(SyncError::Refused(
                     "servidor não suporta UID EXPUNGE e a proteção de mensagens \
                      de outros clientes não pôde ser verificada — nenhuma mensagem \
                      foi apagada"
@@ -991,6 +995,110 @@ mod tests {
             let f = probe.lock().unwrap();
             assert!(f.moved_calls.is_empty());
             assert!(f.copied_calls.is_empty());
+        });
+    }
+
+    #[test]
+    fn lease_hold_single_select_across_chunked_fallback() {
+        run(async {
+            // 450 UIDs through the COPY + STORE + UID EXPUNGE fallback:
+            // 3 COPY + 450 STORE + 3 EXPUNGE verbs, yet exactly ONE SELECT
+            // — the lease is held across the whole sequence, so a second
+            // SELECT can never drift the expunge to the wrong folder.
+            let uids: Vec<u32> = (1..=450).collect();
+            let set = uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+            let fake = FakeHandle::new(&["IMAP4rev1", "UIDPLUS"], &uids);
+            let probe = fake.0.clone();
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            let outcome = manager.move_message_in("INBOX", &set, "Archive").await.unwrap();
+            assert_eq!(outcome, MoveOutcome { used_fallback: true });
+            let f = probe.lock().unwrap();
+            assert_eq!(f.copied_calls.len(), 3);
+            assert_eq!(f.deleted_calls.len(), 450);
+            assert_eq!(f.expunged_sets.len(), 3);
+            assert_eq!(
+                f.select_calls,
+                vec!["INBOX".to_string()],
+                "intermediate SELECT inside fallback: {:?}",
+                f.select_calls
+            );
+        });
+    }
+
+    #[test]
+    fn move_never_deadlocks_on_reentrant_lease() {
+        run(async {
+            // Any `self.lease_for()` call inside `move_message_in` while the
+            // sequence lease is held would wedge the async mutex forever
+            // (non-reentrant). The timeout turns that deadlock into a loud
+            // failure instead of a hung suite.
+            let fake = FakeHandle::new(&["IMAP4rev1"], &[1, 2]);
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            let outcome = async_std::future::timeout(
+                std::time::Duration::from_secs(5),
+                manager.move_message_in("INBOX", "1,2", "Trash"),
+            )
+            .await
+            .expect("move_message_in deadlocked — re-entrant lease_for?");
+            assert!(outcome.is_ok());
+        });
+    }
+
+    #[test]
+    fn unmark_dance_refuses_when_unverifiable() {
+        run(async {
+            // UID 4 ignores the `-FLAGS` unmark (sticky): the verify re-read
+            // still sees `\Deleted`, so the dance must refuse LOUDLY —
+            // no bare EXPUNGE, nothing removed.
+            let fake = FakeHandle::new(&["IMAP4rev1"], &[1, 2, 4]);
+            let probe = fake.0.clone();
+            {
+                let mut f = probe.lock().unwrap();
+                f.deleted.insert(4, true);
+                f.sticky_deleted.insert(4);
+            }
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            let err = manager
+                .move_message_in("INBOX", "1,2", "Trash")
+                .await
+                .expect_err("unverifiable dance must refuse");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("UID EXPUNGE"),
+                "plain-language refusal, got: {msg}"
+            );
+            let f = probe.lock().unwrap();
+            assert_eq!(f.plain_expunge_calls, 0, "blind expunge forbidden");
+            assert!(f.removed.is_empty(), "nothing removed on refusal");
+            assert!(f.expunged_sets.is_empty());
+            // COPY + mark legs ran before the refusal point (retry replays
+            // the whole sequence — 10-03 replay owns idempotence).
+            assert_eq!(f.copied_calls.len(), 1);
+        });
+    }
+
+    #[test]
+    fn foreign_deleted_survive_scoped_uid_expunge() {
+        run(async {
+            // UIDPLUS path with two foreign marks (9, 10): the scoped
+            // `UID EXPUNGE "1,2"` removes exactly our set; foreign marks
+            // are never unmarked, never touched.
+            let fake = FakeHandle::new(&["IMAP4rev1", "UIDPLUS"], &[1, 2, 9, 10]);
+            let probe = fake.0.clone();
+            {
+                let mut f = probe.lock().unwrap();
+                f.deleted.insert(9, true);
+                f.deleted.insert(10, true);
+            }
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            manager.move_message_in("INBOX", "1,2", "Trash").await.unwrap();
+            let f = probe.lock().unwrap();
+            assert_eq!(f.removed, vec![1, 2]);
+            assert_eq!(f.deleted.get(&9), Some(&true));
+            assert_eq!(f.deleted.get(&10), Some(&true));
+            // No unmark/restore traffic at all on the scoped path.
+            assert_eq!(f.deleted_calls, vec![(1, true), (2, true)]);
+            assert_eq!(f.plain_expunge_calls, 0);
         });
     }
 }

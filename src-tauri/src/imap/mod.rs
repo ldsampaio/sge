@@ -236,6 +236,11 @@ pub enum SyncError {
     Parse(String),
     /// Invariants violation (e.g. missing UIDVALIDITY, unexpected state).
     State(String),
+    /// Loud refusal: the op was NOT attempted because a safety
+    /// precondition failed (Plan 10-02: unverifiable unmark dance).
+    /// Deterministic — callers must NOT retry (a retry would re-COPY and
+    /// duplicate messages only to refuse again).
+    Refused(String),
 }
 
 impl std::fmt::Display for SyncError {
@@ -245,6 +250,7 @@ impl std::fmt::Display for SyncError {
             SyncError::Io(s) => write!(f, "IMAP I/O error: {s}"),
             SyncError::Parse(s) => write!(f, "IMAP parse error: {s}"),
             SyncError::State(s) => write!(f, "IMAP state error: {s}"),
+            SyncError::Refused(s) => write!(f, "IMAP refused: {s}"),
         }
     }
 }
