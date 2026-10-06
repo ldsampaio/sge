@@ -160,3 +160,27 @@ export function IconDownload({ size = 16, className }: IconProps) {
     </>,
   );
 }
+
+export function IconTrash({ size = 20, className }: IconProps) {
+  return base(
+    size,
+    className,
+    <>
+      <path d="M3 6h18" />
+      <path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" />
+      <path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" />
+    </>,
+  );
+}
+
+export function IconMove({ size = 20, className }: IconProps) {
+  return base(
+    size,
+    className,
+    <>
+      <path d="M9 18V5l12-2v13" />
+      <circle cx="6" cy="19" r="3" />
+      <circle cx="18" cy="5" r="3" />
+    </>,
+  );
+}

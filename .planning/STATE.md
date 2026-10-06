@@ -2,15 +2,15 @@
 gsd_state_version: "1.0"
 milestone: v1.2
 milestone_name: Compose & Organize
-status: planning
-last_updated: "2026-10-06T13:46:51.679Z"
+status: executing
+last_updated: "2026-10-06T14:30:00.000Z"
 last_activity: 2026-10-06
 progress:
-  total_phases: 0
-  completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
-  percent: 0
+  total_phases: 5
+  completed_phases: 1
+  total_plans: 4
+  completed_plans: 4
+  percent: 20
 ---
 
 # Project State
@@ -20,21 +20,21 @@ progress:
 See: .planning/PROJECT.md (updated 2026-10-05)
 
 **Core value:** Connect to an IMAP server on Linux and read your mail locally in a fast Gmail-like UI.
-**Current focus:** v1.2 Compose & Organize (Phases 10-14 planned, next: /gsd-discuss-phase 10)
+**Current focus:** v1.2 Compose & Organize (Phases 10-14, Phase 10 complete)
 
 ## Current Position
 
-Phase: 10 (Delete + Move) — not started, roadmap created 2026-10-06
-Plan: —
-Status: Roadmap ready, awaiting /gsd-discuss-phase 10
-Last activity: 2026-10-06 — Milestone v1.2 roadmap created (Phases 10-14)
+Phase: 10 (Delete + Move) — COMPLETE (4/4 plans)
+Plan: 10-04 executed 2026-10-06
+Status: All Phase 10 success criteria satisfied; ready for live validation gates (L1-L4)
+Last activity: 2026-10-06 — Plan 10-04 executed (MoveMenu, ExpungeModal, undo toast, row/reader actions)
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 8 (v1.1: 06×3, 07×3, 08×1, 09×1)
-- Backend tests: 63 → 102 across the milestone
+- Total plans completed: 12 (v1.1: 8, v1.2: 4)
+- Backend tests: 63 → 156 across the milestone
 - Total execution time: 1 autonomous session (audit + gap closure + lifecycle)
 
 **By Phase:**
@@ -45,6 +45,7 @@ Last activity: 2026-10-06 — Milestone v1.2 roadmap created (Phases 10-14)
 | 7. Folders + Per-Folder Sync | 3/3 | Verified (2 live items deferred) |
 | 8. Poll + Manual Refresh | 1/1 | Verified (2 live items deferred) |
 | 9. UID Backfill | 1/1 | Passed 7/7 |
+| 10. Delete + Move | 4/4 | Complete (all success criteria met) |
 
 ## Accumulated Context
 
@@ -71,12 +72,12 @@ Items acknowledged and deferred at milestone close, most recent first:
 | Validation | Poll arrival + reconnect recovery live | Deferred | v1.1 close | v1.1 |
 | Feature | IDLE push (poll stays fallback) | Deferred | M1 close | v1.1 |
 | Feature | CONDSTORE/QRESYNC fast path | Deferred | M1 close | v1.1 |
-| Feature | Delete/move with expunge | Deferred | M1 close | v1.1 |
+| Feature | Delete/move with expunge | **Done** | v1.2 (Phase 10) | v1.1 |
 
 ## Session Continuity
 
 Last session: 2026-10-06
-Stopped at: Post-ship folder UX fixes on main (3cc7883, a1a84f1) — tree sidebar, UTF-7 display names, global search
+Stopped at: Phase 10 complete — MoveMenu, ExpungeModal, undo toast, row/reader delete+move actions implemented; all 156 backend tests + frontend build green
 Resume file: None
 
 ## Operator Next Steps

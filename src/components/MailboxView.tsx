@@ -118,7 +118,7 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
             onMessageCount={setMessageCount}
           />
         </main>
-        <ReadingPane key={selectedMailbox} selectedMessage={selectedMessage} mailbox={selectedMailbox} />
+        <ReadingPane key={selectedMailbox} selectedMessage={selectedMessage} mailbox={selectedMailbox} mailboxes={mailboxes} />
       </div>
     </div>
   );

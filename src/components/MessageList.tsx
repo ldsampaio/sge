@@ -9,11 +9,21 @@ import {
   FLAG_UPDATE_EVENT,
 } from "../types";
 import type { FlagUpdateDetail, SetSeenResult } from "../types";
-import { IconInbox, IconPaperclip } from "./icons";
+import { IconInbox, IconPaperclip, IconTrash, IconMove } from "./icons";
+import MoveMenu from "./MoveMenu";
+import ExpungeModal from "./ExpungeModal";
 
 export interface ListState {
   kind: "loading" | "error" | "empty" | "ready";
   message: string;
+}
+
+interface UndoToastState {
+  visible: boolean;
+  message: string;
+  onUndo: () => void;
+  isDelete: boolean; // true = delete (Trash), false = move
+  destFolder?: string;
 }
 
 interface MessageListProps {
@@ -75,6 +85,30 @@ export default function MessageList({
   const searchCache = useRef<{ query: string; rows: MessageRow[] } | null>(null);
   const countRef = useRef(onMessageCount);
   countRef.current = onMessageCount;
+
+  // Refs for action buttons (move menu trigger)
+  const actionBtnRefs = useRef<Map<number, HTMLButtonElement>>(new Map());
+
+  // Undo toast state (single slot, replaced by newer ops)
+  const [undoToast, setUndoToast] = useState<UndoToastState>({
+    visible: false,
+    message: "",
+    onUndo: () => {},
+    isDelete: true,
+  });
+  // Move menu state
+  const [moveMenu, setMoveMenu] = useState<{
+    open: boolean;
+    uid: number | null;
+    triggerRef: React.MutableRefObject<HTMLButtonElement | null>;
+  }>({ open: false, uid: null, triggerRef: { current: null } });
+  // Expunge modal state
+  const [expungeModal, setExpungeModal] = useState<{
+    open: boolean;
+    uids: number[];
+    folderName: string;
+    triggerRef: React.MutableRefObject<HTMLButtonElement | null>;
+  }>({ open: false, uids: [], folderName: "", triggerRef: { current: null } });
 
   const reportState = useCallback(
     (state: ListState) => {
@@ -145,6 +179,210 @@ export default function MessageList({
   function folderLabel(raw: string): string {
     return mailboxes.find((mb) => mb.name === raw)?.display_name ?? raw;
   }
+
+  /** Show undo toast for delete/move operations. */
+  function showUndoToast(
+    isDelete: boolean,
+    count: number,
+    onUndo: () => void,
+    destFolder?: string
+  ) {
+    const folderLabelDisplay = destFolder
+      ? mailboxes.find((mb) => mb.name === destFolder)?.display_name ?? destFolder
+      : "Lixeira";
+    const msg = isDelete
+      ? count === 1
+        ? `Mensagem movida para a ${folderLabelDisplay}.`
+        : `${count} mensagens movidas para a ${folderLabelDisplay}.`
+      : count === 1
+      ? `Mensagem movida para ${folderLabelDisplay}.`
+      : `${count} mensagens movidas para ${folderLabelDisplay}.`;
+    setUndoToast({
+      visible: true,
+      message: msg,
+      onUndo,
+      isDelete,
+      destFolder,
+    });
+    // Toast persists until next sync / replaced / dismissed — no auto-dismiss timer
+    // (outbox entry is the anchor per CONTEXT.md decision)
+  }
+
+  /** Hide undo toast. */
+  function hideUndoToast() {
+    setUndoToast((prev) => ({ ...prev, visible: false }));
+  }
+
+  /** Handle delete: optimistic hide + invoke delete_message. */
+  const handleDelete = useCallback(
+    async (uid: number) => {
+      if (!isTauriRuntime()) {
+        reportState({ kind: "error", message: OUTSIDE_DESKTOP_MESSAGE });
+        return;
+      }
+      // Optimistic hide: remove from list immediately
+      const previousMessages = messages;
+      setMessages((prev) => prev.filter((m) => m.uid !== uid));
+      try {
+        const result = await invoke<{ acked: boolean; pending_count: number; detail: string }>(
+          "delete_message",
+          { uid, mailbox }
+        );
+        if (result.acked) {
+          showUndoToast(true, 1, () => handleUndoDelete(uid));
+        } else {
+          // Queued — show undo with "will retry on next sync"
+          showUndoToast(true, 1, () => handleUndoDelete(uid));
+        }
+      } catch (err) {
+        // Invoke rejected: rollback optimistic hide
+        setMessages(previousMessages);
+        const msg = String(err);
+        if (msg.startsWith("need_trash_confirm:")) {
+          // Special case: no Trash folder, need user confirm to create
+          setError(msg.replace("need_trash_confirm: ", ""));
+        } else {
+          setError(`Não foi possível apagar: ${msg}`);
+        }
+        reportState({ kind: "error", message: msg });
+      }
+    },
+    [mailbox, messages, mailboxes, reportState]
+  );
+
+  /** Handle move: optimistic hide + invoke move_message. */
+  const handleMove = useCallback(
+    async (uid: number, destRaw: string) => {
+      if (!isTauriRuntime()) {
+        reportState({ kind: "error", message: OUTSIDE_DESKTOP_MESSAGE });
+        return;
+      }
+      const previousMessages = messages;
+      setMessages((prev) => prev.filter((m) => m.uid !== uid));
+      try {
+        const result = await invoke<{ acked: boolean; pending_count: number; detail: string }>(
+          "move_message",
+          { uid, dest: destRaw, mailbox }
+        );
+        if (result.acked) {
+          showUndoToast(false, 1, () => handleUndoMove(uid, destRaw), destRaw);
+        } else {
+          showUndoToast(false, 1, () => handleUndoMove(uid, destRaw), destRaw);
+        }
+      } catch (err) {
+        setMessages(previousMessages);
+        const msg = String(err);
+        setError(`Não foi possível mover: ${msg}`);
+        // Show retry toast
+        setUndoToast({
+          visible: true,
+          message: `Não foi possível mover: ${msg}`,
+          onUndo: () => handleMove(uid, destRaw),
+          isDelete: false,
+          destFolder: destRaw,
+        });
+        reportState({ kind: "error", message: msg });
+      }
+    },
+    [mailbox, messages, mailboxes, reportState]
+  );
+
+  /** Undo delete: invoke undo_queued_op + restore row. */
+  const handleUndoDelete = useCallback(
+    async (uid: number) => {
+      try {
+        const result = await invoke<{ restored: boolean; detail: string }>("undo_queued_op", {
+          uid,
+          mailbox,
+        });
+        if (result.restored) {
+          // Restore the message row (it was hidden optimistically)
+          // The row will reappear on next loadPage since pending_delete is cleared
+          // For immediate feedback, we could re-fetch, but the toast dismisses
+          // and the row is restored server-side. We'll just reload.
+          void loadPage(safePage);
+        }
+        hideUndoToast();
+      } catch (err) {
+        const msg = String(err);
+        setError(`Não foi possível desfazer: ${msg}`);
+        hideUndoToast();
+      }
+    },
+    [mailbox, loadPage, safePage]
+  );
+
+  /** Undo move: invoke undo_queued_op + restore row. */
+  const handleUndoMove = useCallback(
+    async (uid: number, _destRaw: string) => {
+      try {
+        const result = await invoke<{ restored: boolean; detail: string }>("undo_queued_op", {
+          uid,
+          mailbox,
+        });
+        if (result.restored) {
+          void loadPage(safePage);
+        }
+        hideUndoToast();
+      } catch (err) {
+        const msg = String(err);
+        setError(`Não foi possível desfazer: ${msg}`);
+        hideUndoToast();
+      }
+    },
+    [mailbox, loadPage, safePage]
+  );
+
+  /** Open move menu for a UID. */
+  const openMoveMenu = useCallback(
+    (uid: number, triggerRef: React.MutableRefObject<HTMLButtonElement | null>) => {
+      setMoveMenu({ open: true, uid, triggerRef });
+    },
+    []
+  );
+
+  /** Close move menu. */
+  const closeMoveMenu = useCallback(() => {
+    setMoveMenu({ open: false, uid: null, triggerRef: { current: null } });
+  }, []);
+
+  /** Handle move menu selection. */
+  const onMoveSelect = useCallback(
+    (destRaw: string) => {
+      if (moveMenu.uid !== null) {
+        handleMove(moveMenu.uid, destRaw);
+      }
+      closeMoveMenu();
+    },
+    [moveMenu.uid, handleMove, closeMoveMenu]
+  );
+
+  /** Close expunge modal. */
+  const closeExpungeModal = useCallback(() => {
+    setExpungeModal({ open: false, uids: [], folderName: "", triggerRef: { current: null } });
+  }, []);
+
+  /** Confirm expunge. */
+  const onExpungeConfirm = useCallback(
+    async (uids: number[]) => {
+      try {
+        const result = await invoke<{ removed: number; acked: boolean; detail: string }>(
+          "expunge_messages",
+          { uids, mailbox }
+        );
+        if (result.acked) {
+          // Rows already hidden, will be removed from local store on next sync
+          void loadPage(safePage);
+        }
+        closeExpungeModal();
+      } catch (err) {
+        const msg = String(err);
+        setError(`Não foi possível apagar para sempre: ${msg}`);
+        closeExpungeModal();
+      }
+    },
+    [mailbox, loadPage, safePage, closeExpungeModal]
+  );
 
   /**
    * Optimistic read/unread toggle (FLAG-01/FLAG-02): flips the row to the
@@ -312,6 +550,13 @@ export default function MessageList({
           const unread = isUnread(msg.flags);
           const selected = selectedUid === msg.uid;
           const pending = pendingUids.has(msg.uid);
+          // Callback ref to capture the move button DOM element
+          const setMoveBtnRef = (el: HTMLButtonElement | null) => {
+            if (el) actionBtnRefs.current.set(msg.uid, el);
+            else actionBtnRefs.current.delete(msg.uid);
+          };
+          // Create a stable ref object for this message's move button
+          const moveBtnRef = { current: actionBtnRefs.current.get(msg.uid) ?? null } as React.MutableRefObject<HTMLButtonElement | null>;
           return (
             <button
               type="button"
@@ -361,6 +606,49 @@ export default function MessageList({
                 )}
               </span>
               <span className="message-date">{formatRowDate(msg.date_utc)}</span>
+              <div className="message-actions" role="group" aria-label="Ações da mensagem">
+                <button
+                  type="button"
+                  className="message-action-btn message-delete-btn"
+                  aria-label="Apagar mensagem"
+                  title="Apagar — vai para a Lixeira"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    e.preventDefault();
+                    handleDelete(msg.uid);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      handleDelete(msg.uid);
+                    }
+                  }}
+                >
+                  <IconTrash size={18} />
+                </button>
+                <button
+                  ref={setMoveBtnRef}
+                  type="button"
+                  className="message-action-btn message-move-btn"
+                  aria-label="Mover mensagem para…"
+                  title="Mover mensagem para…"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    e.preventDefault();
+                    openMoveMenu(msg.uid, moveBtnRef);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      openMoveMenu(msg.uid, moveBtnRef);
+                    }
+                  }}
+                >
+                  <IconMove size={18} />
+                </button>
+              </div>
               {searchQuery && msg.mailbox !== mailbox && (
                 <span
                   className="message-folder-chip"
@@ -422,6 +710,46 @@ export default function MessageList({
       <p className="pager-info" aria-live="polite">
         Mostrando {rangeStart}–{rangeEnd} de {total}
       </p>
+
+      {/* Undo Toast */}
+      {undoToast.visible && (
+        <div className="undo-toast" role="status" aria-live="polite">
+          <span>{undoToast.message}</span>
+          <button
+            type="button"
+            className="btn btn-undo"
+            onClick={() => {
+              undoToast.onUndo();
+              hideUndoToast();
+            }}
+          >
+            Desfazer
+          </button>
+        </div>
+      )}
+
+      {/* Move Menu */}
+      {moveMenu.open && moveMenu.uid !== null && (
+        <MoveMenu
+          sourceMailbox={mailbox}
+          mailboxes={mailboxes}
+          onSelect={onMoveSelect}
+          onClose={closeMoveMenu}
+          triggerRef={moveMenu.triggerRef}
+        />
+      )}
+
+      {/* Expunge Modal */}
+      {expungeModal.open && (
+        <ExpungeModal
+          count={expungeModal.uids.length}
+          folderName={expungeModal.folderName}
+          uids={expungeModal.uids}
+          onConfirm={onExpungeConfirm}
+          onCancel={closeExpungeModal}
+          isOpen={expungeModal.open}
+        />
+      )}
     </div>
   );
 }

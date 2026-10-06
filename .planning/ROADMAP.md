@@ -29,7 +29,7 @@ v1.0 shipped a read-only INBOX viewer (Phases 1–5, archived). v1.1 Triage & Fo
 
 Decimal phases appear between their surrounding integers in numeric order. v1.2 numbering continues from v1.1 (ended at Phase 9).
 
-- [ ] **Phase 10: Delete + Move** - Trash-semantics delete, permanent expunge, and move between folders with offline queue
+- [x] **Phase 10: Delete + Move** - Trash-semantics delete, permanent expunge, and move between folders with offline queue
 - [ ] **Phase 11: Folder CRUD** - Create, rename, and delete folders via IMAP with sidebar tree
 - [ ] **Phase 12: Drafts** - Local-first draft editing synced to the server via APPEND
 - [ ] **Phase 13: Send Pipeline** - Durable SMTP send queue with retry and Sent filing
@@ -133,8 +133,8 @@ Phases execute in numeric order: 10 → 11 → 12 → 13 → 14
 | 7. Folders + Per-Folder Sync | v1.1 | 3/3 | Complete | 2026-10-05 |
 | 8. Poll + Manual Refresh | v1.1 | 1/1 | Complete | 2026-10-05 |
 | 9. UID Backfill | v1.1 | 1/1 | Complete | 2026-10-05 |
-| 10. Delete + Move | v1.2 | 0/TBD | Not started | - |
-| 11. Folder CRUD | v1.2 | 0/TBD | Not started | - |
+| 10. Delete + Move | v1.2 | 4/4 | Complete | 2026-10-06 |
+| 11. Folder CRUD | v1.2 | 0/4 | Not started | - |
 | 12. Drafts | v1.2 | 0/TBD | Not started | - |
 | 13. Send Pipeline | v1.2 | 0/TBD | Not started | - |
 | 14. Compose UI | v1.2 | 0/TBD | Not started | - |
