@@ -80,11 +80,11 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-05
-Stopped at: Milestone v1.1 shipped
+Last session: 2026-10-06
+Stopped at: Post-ship folder UX fixes on main (3cc7883, a1a84f1) — tree sidebar, UTF-7 display names, global search
 Resume file: None
 
 ## Operator Next Steps
 
-- Validate live when convenient: `/gsd-verify-work 6` (then 7, 8)
+- Validate live when convenient: `/gsd-verify-work 6` (then 7, 8) + new folder UX (tree, accented names, global search)
 - Start the next milestone with /gsd-new-milestone
