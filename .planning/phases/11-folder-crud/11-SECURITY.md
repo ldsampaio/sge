@@ -6,7 +6,8 @@
 > system `libdbus-1-dev` for the `keyring`/`sync-secret-service` build);
 > verdicts below rest on source evidence + existing unit tests by name.
 
-**Verdict: OPEN_THREATS** (1 low-severity defense-in-depth gap; all else secured)
+**Verdict: SECURED** (single low-severity gap from the prior pass fixed
+2026-10-06 — see Fix record; static inspection only, no live runs)
 
 ---
 
@@ -16,7 +17,7 @@
 |---|--------|--------|----------|
 | T-11-01 | Wire-name injection (delimiter / UTF-7 / quoting) | ✅ SECURED | `validate_leaf` (`imap/mutf7.rs:135`) rejects empty, delimiter-bearing, and INBOX-variant leaves pre-wire. Only the user leaf is encoded; cached parent prefixes pass through byte-identical (`commands/sync.rs:1052-1055`, `1170-1172`; tests `prepare_create_wire_never_reencodes_parent`, `guard_rename_never_reencodes_parent_prefix`). CRLF cannot reach the wire: control chars fall into the base64 shift run (`mutf7.rs:91-97`). `"`/`\` pass through raw but async-imap 0.11 `quote!` escapes both (`client.rs:2266-2272`, `create`/`delete`/`rename` all via `quote!`). |
 | T-11-02 | Destructive verbs escape intended scope (blind expunge) | ✅ SECURED | No bare `expunge()` in folder paths. Message expunge is UID-scoped `UID EXPUNGE` in ~200-UID chunks (`commands/sync.rs:616-626` → `manager.uid_expunge_in` → `session.uid_expunge`, `imap/mod.rs:624-634`). MOVE fallback refuses loudly when the unmark-others dance is unverifiable — never a blind expunge (`manager.rs:318-322`). |
-| T-11-03 | INBOX protection bypass | ✅ SECURED | Triple layer: UI disables both ops for INBOX (`FolderContextMenu.tsx:52-63`); `guard_rename` (`sync.rs:1178`) and `guard_delete` (`sync.rs:1228`) refuse case-insensitively pre-wire; `delete_folder` repeats a fast refusal before any I/O (`sync.rs:1376`). `validate_leaf` reserves all INBOX case variants on any delimiter (`mutf7.rs:145`). Covered by `guard_rename_refusals_and_happy_paths`, `guard_delete_refusals_and_confirm_gates`. |
+| T-11-03 | INBOX protection bypass | ✅ SECURED | Triple layer: UI disables both ops for INBOX (`FolderContextMenu.tsx:52-63`); `guard_rename` (`sync.rs:1178`) and `guard_delete` (`sync.rs:1228`) refuse case-insensitively pre-wire; `delete_folder` repeats a fast refusal before any I/O (`sync.rs:1376`). `validate_leaf` reserves all INBOX case variants on any delimiter (`mutf7.rs:145`). Covered by `guard_rename_refusals_and_happy_paths`, `guard_delete_refusals_and_confirm_gates`. System-role DELETE is now refused backend-side too (see Fix record — same `resolve_roles` schema as rename, cached + fresh-LIST layers). |
 | T-11-04 | Wrong-target RENAME (hierarchy escape / stale selection) | ✅ SECURED | Pure `guard_rename` validates before any verb; unknown names refuse; `effective_delimiter` refuses ambiguous `/`+`.` wires instead of guessing (`sync.rs:1148-1162`). Verb runs under `lease_for(old)` which SELECTs the target first; single-flight mutex serializes callers (`manager.rs:69-103`). Post-rename UIDVALIDITY bump surfaces as warning, never silent accept (`manager.rs:287-292`, `sync.rs:1310-1323`). |
 | T-11-05 | Rename loses messages / orphans cache (mailbox_id churn) | ✅ SECURED | `rename_mailbox_cache` keeps `mailbox_id`/`uid_validity`/messages; subtree moves via LIKE-escaped prefix UPDATEs with byte-prefix check (`queries.rs:243-283`). Case-sensitivity test pins `Pai2` ≠ child of `Pai`. |
 | T-11-06 | Non-empty / parent delete without confirmation | ✅ SECURED | `guard_delete`: children check over all cached delimiters (`sync.rs:1234-1248`, `Pai2` lookalike test), fresh-STATUS message count → `NeedCount` gate → typed-name `NeedTyped` gate (`sync.rs:1249-1254`), both returning `need_*` errors with zero wire calls. Parent-with-children refuses loudly. Frontend double modal (`FolderDeleteModal.tsx`) + destructive item never default-focused. |
@@ -28,8 +29,42 @@
 
 ## Open threats
 
-1. **(Low) No backend system-role guard on DELETE.** `guard_rename` double-guards Trash/Sent/Drafts via the single `resolve_roles` schema (`sync.rs:1184`), and the UI disables rename for system roles — but `guard_delete` checks only INBOX/unknown/children/non-empty, and the context menu enables Excluir for system-role rows (`deleteDisabled = isInbox` only, `FolderContextMenu.tsx:60`). Deleting Trash/Sent/Drafts therefore depends on UI restraint alone; a direct `delete_folder` IPC invoke succeeds. Recommend mirroring the `is_system_role` refusal into `guard_delete` (resolved from the fresh LIST in `delete_folder`, same as the `\Noselect` check), or documenting system-role delete as intentional.
-   - Staleness note: both role guards read the cached M8 `role` column; pre-refresh empty roles resolve `Custom` and pass. UI-disabled states cover the common path; the backend gap above is the sharper instance.
+None — the single low-severity gap from the prior pass is fixed (record
+below); F1/F2 UI advisories remain future touch-ups per 11-UI-REVIEW.md.
+
+### Fix record (2026-10-06)
+
+1. **(Low, FIXED) Backend system-role guard on DELETE.** Mirrored the
+   rename path's double-guard server-side:
+   - `guard_delete` refuses Trash/Sent/Drafts via `is_system_role`
+     (same `resolve_roles` schema as `guard_rename`), placed after the
+     unknown-row lookup and before the children check — copy:
+     `"{Lixeira|Enviadas|Rascunhos} do sistema — a exclusão não é permitida."`
+     (gender-neutral, mirrors the rename `"{role} do sistema — …"` shape).
+     INBOX/`\Noselect` guards untouched.
+   - `delete_folder` additionally resolves the role from the **fresh LIST**
+     (`system_role_label(&discovered, …)`, new shared helper that
+     `is_system_role` now delegates to — one schema, no drift) right after
+     the `\Noselect` check, so a stale cache (empty `role` column →
+     `Custom`) cannot pass a direct IPC invoke. Both refusals return before
+     any verb call.
+   - Unit cover: `guard_delete_refusals_and_confirm_gates` asserts the
+     `Lixeira` refusal (fixture name-matches Trash via `resolve_roles`).
+   - Verification: `cargo test` unrunnable here (no cargo toolchain in this
+     environment); new assertion reviewed against the `resolve_roles`
+     name-match tables by inspection. Frontend `npx tsc --noEmit` passes;
+     `npx vite build` env-blocked (Node v18 vs vite 8 `styleText` import —
+     pre-existing, unrelated to this change).
+   - Fix commit: `fix(11-security): system-role delete guard + parent-picker
+     Noselect filter` (hash in session record / `git log --grep=11-security`).
+2. **F3 (FIXED) Parent picker skips `\Noselect`.** `parentOptions`
+   (`FolderDialog.tsx`) now filters `\Noselect`-attributed rows (same
+   spelling-agnostic `includes("NoSelect")` check as `Sidebar`/
+   `FolderContextMenu`) before `buildTree`; INBOX stays a valid parent
+   (INBOX/child is legitimate IMAP; CONTEXT + UI-SPEC require only the
+   `\Noselect` skip). Filter lives in the dialog — shared `buildTree`
+   untouched. F1/F2 left as-is (non-trivial: `aria-disabled` rework would
+   touch menu focus logic; item-ref plumbing in `Sidebar.openMenu`).
 
 ## Explicitly out of scope (manual live gates, per 11-VALIDATION.md)
 

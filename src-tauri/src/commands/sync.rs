@@ -1125,7 +1125,15 @@ fn is_system_role(cached: &[queries::MailboxRow], name: &str) -> Option<&'static
             attributes: r.attributes.split_whitespace().map(|s| s.to_string()).collect(),
         })
         .collect();
-    match resolve_roles(&infos)
+    system_role_label(&infos, name)
+}
+
+/// Role-label lookup over a fresh or cached [`MailboxInfo`] slice via the
+/// single `resolve_roles` schema. Shared by `is_system_role` (cached tree)
+/// and the `delete_folder` fresh-LIST check (stale caches resolve Custom
+/// and would pass — the fresh LIST is the authority, same as `\Noselect`).
+fn system_role_label(infos: &[MailboxInfo], name: &str) -> Option<&'static str> {
+    match resolve_roles(infos)
         .into_iter()
         .find(|(n, _)| n == name)
         .map(|(_, role)| role)?
@@ -1214,9 +1222,10 @@ pub(crate) enum DeleteDecision {
 }
 
 /// Pure pre-wire guard for `delete_folder` (Plan 11-02): INBOX refusal →
-/// unknown → children (`wire + delimiter` prefix over ALL cached
-/// delimiters) → non-empty confirm gates. The `\Noselect` check needs fresh
-/// LIST attributes, so the command applies it separately before calling
+/// unknown → system-role refusal (same `resolve_roles` schema as
+/// `guard_rename`, T-11-03) → children (`wire + delimiter` prefix over ALL
+/// cached delimiters) → non-empty confirm gates. The `\Noselect` check needs
+/// fresh LIST attributes, so the command applies it separately before calling
 /// this. Every refusal returns before any verb call (T-11-04/T-11-06).
 fn guard_delete(
     cached: &[queries::MailboxRow],
@@ -1231,6 +1240,9 @@ fn guard_delete(
     let row = cached.iter().find(|r| r.name == wire).ok_or_else(|| {
         "Essa pasta não existe mais na lista — atualize a lista e tente de novo.".to_string()
     })?;
+    if let Some(role) = is_system_role(cached, wire) {
+        return Err(format!("{role} do sistema — a exclusão não é permitida."));
+    }
     let mut delimiters: Vec<&str> = cached
         .iter()
         .map(|r| r.delimiter.as_str())
@@ -1357,8 +1369,8 @@ pub struct DeleteFolderResult {
 /// confirmation a non-empty folder returns `need_delete_confirm:{count}`
 /// (no wire call); with confirmation but a mismatched typed name returns
 /// `need_typed_confirm:{display}` (no wire call). Empty-then-delete is
-/// never automated — refuse loudly instead. Online-only, INBOX/`\Noselect`
-/// never reach the wire, selection falls back to INBOX.
+/// never automated — refuse loudly instead. Online-only, INBOX/`\Noselect`/
+/// system-role folders never reach the wire, selection falls back to INBOX.
 #[tauri::command]
 pub async fn delete_folder(
     state: State<'_, crate::AppState>,
@@ -1389,6 +1401,12 @@ pub async fn delete_folder(
                         decode_modified_utf7(&name)
                     ));
                 }
+            }
+            // 2b. Fresh-LIST system-role guard (same `resolve_roles` schema
+            // as `guard_rename`/`guard_delete`): a stale cache resolves
+            // Custom and would pass, so the fresh LIST is the authority.
+            if let Some(role) = system_role_label(&discovered, &name) {
+                return Err(format!("{role} do sistema — a exclusão não é permitida."));
             }
             // 3. Snapshot the cached tree (brief lock, never across `.await`).
             let cached = {
@@ -1992,8 +2010,9 @@ mod tests {
         );
     }
 
-    /// The delete guard refuses INBOX / unknown / parents before any verb
-    /// call, and gates non-empty folders behind the two confirm steps.
+    /// The delete guard refuses INBOX / unknown / system-role / parents
+    /// before any verb call, and gates non-empty folders behind the two
+    /// confirm steps.
     #[test]
     fn guard_delete_refusals_and_confirm_gates() {
         let tree = folder_tree_full();
@@ -2004,6 +2023,12 @@ mod tests {
         assert_eq!(
             guard_delete(&tree, "Fantasma", 0, false, None),
             Err("Essa pasta não existe mais na lista — atualize a lista e tente de novo.".to_string())
+        );
+        // System-role folders refuse backend-side too (same schema as
+        // guard_rename — direct IPC invoke cannot delete Trash/Sent/Drafts).
+        assert_eq!(
+            guard_delete(&tree, "Lixeira", 0, false, None),
+            Err("Lixeira do sistema — a exclusão não é permitida.".to_string())
         );
         // Parent with a child refuses loudly (move-out guidance, T-11-06).
         assert_eq!(

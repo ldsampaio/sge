@@ -41,9 +41,18 @@ function validateLeaf(name: string, delim: string): string | null {
   return null;
 }
 
+/** `\Noselect` placeholders can never be a CREATE parent (UI-SPEC state table). */
+function isNoselectAttrs(mb: MailboxRow): boolean {
+  return mb.attributes.split(/\s+/).some((a) => a.includes("NoSelect"));
+}
+
 /** Parent-picker options in buildTree order: top level, system, then depth-first. */
 function parentOptions(mailboxes: MailboxRow[]): Array<{ value: string; label: string }> {
-  const { system, roots } = buildTree(mailboxes);
+  // `\Noselect` placeholders are skipped (UI-SPEC); INBOX stays a valid
+  // parent (INBOX/child is legitimate IMAP). Filtered here — never inside
+  // shared `buildTree`, which the sidebar tree also renders from.
+  const selectable = mailboxes.filter((mb) => !isNoselectAttrs(mb));
+  const { system, roots } = buildTree(selectable);
   const out: Array<{ value: string; label: string }> = [{ value: "", label: "Nível superior" }];
   for (const mb of system) out.push({ value: mb.name, label: mb.display_name });
   const walk = (nodes: TreeNode[], depth: number) => {
