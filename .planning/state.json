@@ -1,7 +1,7 @@
 {
   "contract": "1.0.0",
   "flavor": "core",
-  "milestone": null,
+  "milestone": "v1.1 — Triage & Folders",
   "phases": [
     {
       "number": "1",
@@ -11,28 +11,48 @@
     {
       "number": "2",
       "name": "Sync Engine + Local Store",
-      "status": "pending"
+      "status": "complete"
     },
     {
       "number": "3",
       "name": "Mailbox UI Shell + Search",
-      "status": "pending"
+      "status": "complete"
     },
     {
       "number": "4",
       "name": "Reader + Attachments",
-      "status": "pending"
+      "status": "complete"
     },
     {
       "number": "5",
       "name": "Keyring + Packaging",
-      "status": "pending"
+      "status": "complete"
+    },
+    {
+      "number": "6",
+      "name": "Flag Sync + Outbox",
+      "status": "complete"
+    },
+    {
+      "number": "7",
+      "name": "Folders + Per-Folder Sync",
+      "status": "complete"
+    },
+    {
+      "number": "8",
+      "name": "Poll + Manual Refresh",
+      "status": "complete"
+    },
+    {
+      "number": "9",
+      "name": "UID Backfill",
+      "status": "complete"
     }
   ],
   "next": {
-    "command": "/gsd:progress --next",
-    "label": "Advance to the next step (plan phase 2)",
-    "reason": "Phase 2 of 5 — needs a plan"
+    "command": "/gsd-new-milestone",
+    "label": "Start next milestone",
+    "reason": "v1.1 shipped"
   },
-  "updated_at": "2026-10-03T02:25:11.628Z"
+  "updated_at": "2026-10-06T01:52:54.867163Z"
 }

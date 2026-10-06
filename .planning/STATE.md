@@ -2,89 +2,68 @@
 gsd_state_version: "1.0"
 milestone: v1.1
 milestone_name: Triage & Folders
-status: In progress — gap closure
-stopped_at: Gap-closure authorized 2026-10-05 — executing in phase order
-last_updated: "2026-10-05T13:45:00.000Z"
+status: Shipped — v1.1 Triage & Folders complete (audit: tech_debt, 6 live items deferred)
+stopped_at: Milestone archived + tagged v1.1
+last_updated: "2026-10-05T16:15:00.000Z"
 last_activity: "2026-10-05"
-last_activity_desc: v1.1 gap closure — audit corrections, executing phases 6-9
+last_activity_desc: v1.1 shipped for real — 4 phases verified, audit tech_debt, archived
 state_head: ""
 progress:
   total_phases: 4
-  completed_phases: 0
+  completed_phases: 4
   total_plans: 8
-  completed_plans: 5
-current_phase: 6
-current_phase_name: Flag Sync + Outbox (regression-test closure)
+  completed_plans: 8
+current_phase: 9
+current_phase_name: UID Backfill
 ---
 
 # Project State
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-10-04)
+See: .planning/PROJECT.md (updated 2026-10-05)
 
 **Core value:** Connect to an IMAP server on Linux and read your mail locally in a fast Gmail-like UI.
-**Current focus:** Phase 7 — Folders + Per-Folder Sync
+**Current focus:** v1.2 scoping (run `/gsd-new-milestone`)
 
 ## Current Position
 
-Phase: v1.1 gap closure (Phases 6–9 verification + closure)
+Phase: Milestone v1.1 complete
 Plan: —
-Status: In progress ⚠️ — 2026-10-05 audit (corrected): Phase 6 complete incl. peek_audit + 6 rfc4549 tests (were uncommitted, now being committed); Phase 7 ~60% (list_mailboxes command + STATUS wiring open); Phases 8–9 unimplemented with summaries retracted. Gap closure authorized, executing in phase order.
+Status: Shipped ✅ — 4 phases (6–9), 8 plans, 102 backend tests green, tsc + build clean. Audit: tech_debt (6 live-validation items deferred). Archives: `.planning/milestones/v1.1-ROADMAP.md`, `.planning/milestones/v1.1-REQUIREMENTS.md`, `.planning/v1.1-MILESTONE-AUDIT.md`. Tag: v1.1.
 
-Last activity: 2026-10-05 — verification audit + gap-closure start.
+Last activity: 2026-10-05 — milestone shipped.
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 15 (M1 Phases 1-5: 3+3+3+3+3)
-- Average duration: ~1 session per plan
-- Total execution time: ~7 sessions
+- Total plans completed: 8 (v1.1: 06×3, 07×3, 08×1, 09×1)
+- Backend tests: 63 → 102 across the milestone
+- Total execution time: 1 autonomous session (audit + gap closure + lifecycle)
 
 **By Phase:**
 
-| Phase | Plans | Total | Avg/Plan |
-|-------|-------|-------|----------|
-| 1-5 (M1) | 15 | 15 | ~1 session |
-
-**Recent Trend:**
-
-- Last 3 plans: 05-01, 05-02, 05-03 — all completed
-- Trend: on track
-
-*Updated after each plan completion*
-**Per-Plan Metrics:**
-
-| Plan | Duration | Tasks | Files |
-|------|----------|-------|-------|
-| Phase 6 P01 | ~1 session | 3 tasks | 9 files |
-| Phase 06 P02 | 10min | 3 tasks | 4 files |
-| Phase 06 P03 | ~15min | 3 tasks | 2 files |
+| Phase | Plans | Status |
+|-------|-------|--------|
+| 6. Flag Sync + Outbox | 3/3 | Verified (2 live items deferred) |
+| 7. Folders + Per-Folder Sync | 3/3 | Verified (2 live items deferred) |
+| 8. Poll + Manual Refresh | 1/1 | Verified (2 live items deferred) |
+| 9. UID Backfill | 1/1 | Passed 7/7 |
 
 ## Accumulated Context
 
 ### Decisions
 
 Decisions are logged in PROJECT.md Key Decisions table.
-Recent decisions affecting current work:
-
-- [v1.1 roadmap]: Flags-first build order (Position A) — reconcile + outbox ship with first STORE
-- [v1.1 roadmap]: SessionManager single-session ownership lands in Phase 6; single-flight guard in Phase 8 before poll timer
-- [v1.1 roadmap]: BODY.PEEK audit ships in Phase 6 (ends read-only era)
-- [M1 Phase 5]: Keyring auto-login + Linux bundle shipped — M1 archived
-- [Phase 6]: 06-01: outbox replay is a SyncWorker method on &mut dyn SyncSession; set_seen returns Ok+acked=false when queued; opportunistic replay only after successful STORE
-- [Phase 6]: 06-02: pending wash and error ellipsis use inline styles referencing existing tokens to stay within the plan's 4-file scope (no new CSS rules or tokens)
-- [Phase 6]: 06-02: offline-queued SyncStatus line fires on pending_count>0 AND last_sync_at empty (only frontend-visible session-down signal without new plumbing); replay-failure N from last polled outbox depth
 
 ### Pending Todos
 
-None yet.
+- Live validation (6 items): `/gsd-verify-work 6`, `/gsd-verify-work 7`, `/gsd-verify-work 8` against UTFPR account.
 
 ### Blockers/Concerns
 
-- UTFPR server capabilities unverified (CONDSTORE advertisement, `.SILENT` STORE acceptance, SPECIAL-USE/LIST-EXTENDED, idle timeout) — live CAPABILITY/LIST probe at start of Phase 6/7 planning, graceful fallbacks as defaults
-- Poll cadence default (60–120 s vs 5–10 min) unresolved — validate in Phase 8 planning
+- UTFPR server capabilities unverified (CONDSTORE advertisement, `.SILENT` STORE acceptance, SPECIAL-USE/LIST-EXTENDED, idle timeout) — still open, carried to v1.2.
 
 ## Deferred Items
 
@@ -92,16 +71,20 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 | Category | Item | Status | Deferred At | Milestone |
 |----------|------|--------|-------------|-----------|
+| Validation | Seen round-trip + offline replay vs live server | Deferred | v1.1 close | v1.1 |
+| Validation | Folder tree/browse/badges vs webmail | Deferred | v1.1 close | v1.1 |
+| Validation | Poll arrival + reconnect recovery live | Deferred | v1.1 close | v1.1 |
 | Feature | IDLE push (poll stays fallback) | Deferred | M1 close | v1.1 |
 | Feature | CONDSTORE/QRESYNC fast path | Deferred | M1 close | v1.1 |
 | Feature | Delete/move with expunge | Deferred | M1 close | v1.1 |
 
 ## Session Continuity
 
-Last session: 2026-10-04T15:43:14.480Z
-Stopped at: Completed 06-02-PLAN.md (flag toggle UX)
+Last session: 2026-10-05
+Stopped at: Milestone v1.1 shipped
 Resume file: None
 
 ## Operator Next Steps
 
+- Validate live when convenient: `/gsd-verify-work 6` (then 7, 8)
 - Start the next milestone with /gsd-new-milestone
