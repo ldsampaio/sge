@@ -265,8 +265,13 @@ pub fn rename_mailbox_cache(
             out
         };
         for child in children {
-            // LIKE matched the literal prefix, so slicing at the prefix
-            // byte length always lands on a char boundary.
+            // LIKE is ASCII case-insensitive, folder names are not: keep
+            // only true byte-prefix children (`PAI/X` must not follow a
+            // `Pai` → `Novo` rename). LIKE matched the literal prefix, so
+            // slicing at the prefix byte length lands on a char boundary.
+            if !child.starts_with(&old_prefix) {
+                continue;
+            }
             let new_name = format!("{new_prefix}{}", &child[old_prefix.len()..]);
             touched += conn.execute(
                 "UPDATE mailboxes SET name = ?1 WHERE name = ?2",
@@ -2104,6 +2109,34 @@ mod tests {
         assert_eq!(sub_id, sub);
         assert_eq!(count_messages(conn, sub_id), 1);
         assert_eq!(count_messages(conn, pai2), 0);
+    }
+
+    #[test]
+    fn rename_mailbox_cache_prefix_match_is_case_sensitive() {
+        // SQLite LIKE is ASCII case-insensitive, folder names are not:
+        // renaming `Pai` must leave a case-differing `PAI/X` subtree alone.
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        ensure_mailbox(conn, "Pai").unwrap();
+        set_mailbox_delimiter(conn, "Pai", "/").unwrap();
+        ensure_mailbox(conn, "Pai/Sub").unwrap();
+        set_mailbox_delimiter(conn, "Pai/Sub", "/").unwrap();
+        ensure_mailbox(conn, "PAI/X").unwrap();
+        set_mailbox_delimiter(conn, "PAI/X", "/").unwrap();
+
+        let touched = rename_mailbox_cache(conn, "Pai", "Novo", "/").unwrap();
+        assert_eq!(touched, 2, "exact row + one true child, PAI/X untouched");
+
+        let names: Vec<String> = conn
+            .prepare("SELECT name FROM mailboxes ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(names.contains(&"Novo/Sub".to_string()));
+        assert!(names.contains(&"PAI/X".to_string()));
+        assert!(!names.iter().any(|n| n.starts_with("Novo/X")));
     }
 
     #[test]

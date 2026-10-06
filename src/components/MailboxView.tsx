@@ -174,7 +174,7 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
       const res = await invoke<DeleteFolderResult>("delete_folder", {
         name: deleteTarget.wire,
         confirmed: deleteTarget.count > 0,
-        typedName,
+        typed_name: typedName,
       });
       setMailboxes(res.mailboxes ?? []);
       setSelectedMailbox(res.fallback);
@@ -189,7 +189,14 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
       if (needCount && deleteTarget) {
         setDeleteTarget({ ...deleteTarget, count: Number(needCount[1]) });
       } else {
-        setDeleteError(msg);
+        // Typed-name race (folder renamed between probe and confirm):
+        // surface the backend copy, never the raw wire protocol string.
+        const needTyped = /^need_typed_confirm:(.+)$/.exec(msg);
+        setDeleteError(
+          needTyped
+            ? `O nome da pasta mudou — digite ${needTyped[1]} para confirmar.`
+            : msg,
+        );
       }
     } finally {
       setDeletePending(false);

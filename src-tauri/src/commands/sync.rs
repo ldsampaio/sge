@@ -858,38 +858,51 @@ async fn refresh_mailbox_tree(
             return Ok(cached);
         }
     };
+    // Role schema (Plan 11-03): resolved once per refresh from the fresh
+    // LIST, persisted to the M8 columns — the column is a cache, LIST is
+    // truth (recomputed every refresh, T-11-07).
+    let roles = resolve_roles(&discovered);
+    let role_of = |name: &str| {
+        roles
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, r)| *r)
+            .unwrap_or(Role::Custom)
+    };
+    // STATUS probes run WITHOUT the store lock held: the mutex is a plain
+    // `std::sync::Mutex` and each probe is a network round-trip — holding
+    // the lock across `.await` would stall every other store reader for
+    // the whole refresh. Results are collected first, written in one
+    // brief locked section below.
+    let mut probed: Vec<(&MailboxInfo, Option<crate::imap::MailboxStatus>, String)> = Vec::new();
+    for folder in &discovered {
+        if has_noselect_attr(&folder.attributes) {
+            continue;
+        }
+        let status = match manager.mailbox_status(&folder.name).await {
+            Ok(status) => Some(status),
+            Err(e) => {
+                eprintln!(
+                    "[SGE sync] STATUS {} failed ({e}) — folder cached without unseen",
+                    folder.name
+                );
+                None
+            }
+        };
+        probed.push((folder, status, role_of(&folder.name).as_str().to_string()));
+    }
     {
         let guard = store.lock().unwrap();
         let conn = guard.conn();
-        // Role schema (Plan 11-03): resolved once per refresh from the fresh
-        // LIST, persisted to the M8 columns — the column is a cache, LIST is
-        // truth (recomputed every refresh, T-11-07).
-        let roles = resolve_roles(&discovered);
-        let role_of = |name: &str| {
-            roles
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, r)| *r)
-                .unwrap_or(Role::Custom)
-        };
-        for folder in &discovered {
-            if has_noselect_attr(&folder.attributes) {
-                continue;
-            }
-            match manager.mailbox_status(&folder.name).await {
-                Ok(status) => {
-                    let _ = queries::set_mailbox_status(
-                        conn,
-                        &folder.name,
-                        status.uid_validity,
-                        status.uid_next.unwrap_or(0),
-                        status.unseen,
-                    );
-                }
-                Err(e) => eprintln!(
-                    "[SGE sync] STATUS {} failed ({e}) — folder cached without unseen",
-                    folder.name
-                ),
+        for (folder, status, role) in &probed {
+            if let Some(status) = status {
+                let _ = queries::set_mailbox_status(
+                    conn,
+                    &folder.name,
+                    status.uid_validity,
+                    status.uid_next.unwrap_or(0),
+                    status.unseen,
+                );
             }
             let _ = queries::ensure_mailbox(conn, &folder.name);
             // Hierarchy delimiter for tree rendering (M6).
@@ -898,7 +911,7 @@ async fn refresh_mailbox_tree(
             let _ = queries::set_mailbox_role(
                 conn,
                 &folder.name,
-                role_of(&folder.name).as_str(),
+                role,
                 &folder.attributes.join(" "),
             );
         }
@@ -968,8 +981,18 @@ pub async fn create_folder(
                 queries::list_mailboxes(guard.conn()).map_err(|e| format!("store: {e}"))?
             };
             // 2. Resolve the delimiter from the parent's cached row;
-            // top-level creates join nothing.
+            // top-level creates join nothing. An unknown parent (stale
+            // picker selection) refuses instead of joining with an empty
+            // delimiter into a garbage top-level name — no verb fires.
             let parent_wire = parent.filter(|p| !p.is_empty());
+            if let Some(p) = &parent_wire {
+                if !cached.iter().any(|r| r.name == *p) {
+                    return Err(
+                        "Essa pasta não existe mais na lista — atualize a lista e tente de novo."
+                            .to_string(),
+                    );
+                }
+            }
             let delimiter = match &parent_wire {
                 Some(p) => cached
                     .iter()
@@ -978,6 +1001,15 @@ pub async fn create_folder(
                     .unwrap_or_default(),
                 None => String::new(),
             };
+            if parent_wire.is_some() && delimiter.is_empty() {
+                // Flat namespace (no hierarchy delimiter): there is no
+                // "inside" to create into — joining would concatenate two
+                // names into one garbage top-level folder on the server.
+                return Err(
+                    "Não foi possível criar dentro dessa pasta — ela não aceita subpastas."
+                        .to_string(),
+                );
+            }
             // 3. Validate + join + encode + exists pre-check (pure — no
             // verb has fired if this returns Err).
             let wire =
@@ -1013,10 +1045,14 @@ fn folder_name_error_copy(e: FolderNameError) -> String {
 }
 
 /// Pure pre-wire guard for `create_folder` (Plan 11-01): validate, then
-/// join `parent + delimiter + leaf`, encode, then exists pre-check against
+/// join `parent + delimiter + encoded leaf`, then exists pre-check against
 /// the cached tree. Returns the RAW wire name or the exact pt-BR UI-SPEC
 /// copy. Never touches the network — every `Err` here returns before any
 /// verb call (T-11-02 hierarchy escape, T-11-03 INBOX variant).
+///
+/// Only the user-typed leaf is encoded: `parent` is already a RAW wire
+/// name from the cached tree, and re-encoding it would corrupt the `&…-`
+/// shift sequences of non-ASCII parents (`Caf&AOk-` → `Caf&-AOk-`).
 fn prepare_create_wire(
     cached: &[queries::MailboxRow],
     parent: Option<&str>,
@@ -1027,11 +1063,11 @@ fn prepare_create_wire(
     if let Err(e) = validate_leaf(leaf, delimiter) {
         return Err(folder_name_error_copy(e));
     }
-    let joined = match parent {
-        Some(p) => format!("{p}{delimiter}{leaf}"),
-        None => leaf.to_string(),
+    let encoded_leaf = encode_modified_utf7(leaf);
+    let wire = match parent {
+        Some(p) => format!("{p}{delimiter}{encoded_leaf}"),
+        None => encoded_leaf,
     };
-    let wire = encode_modified_utf7(&joined);
     if cached.iter().any(|r| r.name == wire) {
         return Err("Já existe uma pasta com esse nome.".to_string());
     }
@@ -1101,11 +1137,39 @@ fn is_system_role(cached: &[queries::MailboxRow], name: &str) -> Option<&'static
     }
 }
 
+/// Effective hierarchy delimiter for a cached folder row.
+///
+/// The row's own delimiter normally; when the cache predates M6 (empty)
+/// but the RAW wire name visibly carries hierarchy, the unambiguous
+/// single-kind delimiter is inferred so a rename keeps its parent prefix
+/// instead of silently promoting the folder to top level. A wire name
+/// carrying BOTH `/` and `.` is ambiguous — refuse with the refresh copy
+/// rather than guess the wrong parent (T-11-04 wrong-target RENAME).
+fn effective_delimiter(old: &str, cached_delimiter: &str) -> Result<String, String> {
+    if !cached_delimiter.is_empty() {
+        return Ok(cached_delimiter.to_string());
+    }
+    let slash = old.contains('/');
+    let dot = old.contains('.');
+    match (slash, dot) {
+        (true, false) => Ok("/".to_string()),
+        (false, true) => Ok(".".to_string()),
+        (true, true) => Err(
+            "Essa pasta não existe mais na lista — atualize a lista e tente de novo.".to_string(),
+        ),
+        (false, false) => Ok(String::new()),
+    }
+}
+
 /// Pure pre-wire guard for `rename_folder` (Plan 11-02): INBOX refusal →
 /// system-role double-guard → `validate_leaf` on the new leaf (same
 /// delimiter rules as create) → join + encode → target-exists. Returns
 /// `(old_wire, new_wire)` or the exact pt-BR copy. Never touches the
 /// network — every `Err` returns before any verb call (T-11-04).
+///
+/// Only the user-typed leaf is encoded: the kept parent prefix is already
+/// a RAW wire name, and re-encoding it would corrupt the `&…-` shift
+/// sequences of non-ASCII parents.
 fn guard_rename(
     cached: &[queries::MailboxRow],
     old: &str,
@@ -1120,17 +1184,18 @@ fn guard_rename(
     if let Some(role) = is_system_role(cached, old) {
         return Err(format!("{role} do sistema — o nome é fixo."));
     }
+    let delimiter = effective_delimiter(old, &row.delimiter)?;
     let new_leaf = new_leaf.trim();
-    if let Err(e) = validate_leaf(new_leaf, &row.delimiter) {
+    if let Err(e) = validate_leaf(new_leaf, &delimiter) {
         return Err(folder_name_error_copy(e));
     }
-    let joined = match old.rsplit_once(row.delimiter.as_str()) {
-        Some((parent, _)) if !row.delimiter.is_empty() => {
-            format!("{parent}{}{new_leaf}", row.delimiter)
+    let encoded_leaf = encode_modified_utf7(new_leaf);
+    let new_wire = match old.rsplit_once(delimiter.as_str()) {
+        Some((parent, _)) if !delimiter.is_empty() => {
+            format!("{parent}{}{encoded_leaf}", delimiter)
         }
-        _ => new_leaf.to_string(),
+        _ => encoded_leaf,
     };
-    let new_wire = encode_modified_utf7(&joined);
     if cached.iter().any(|r| r.name == new_wire) {
         return Err("Já existe uma pasta com esse nome.".to_string());
     }
@@ -1229,10 +1294,15 @@ pub async fn rename_folder(
             };
             // 2. Pure guards (no verb has fired on Err).
             let (old_wire, new_wire) = guard_rename(&cached, &old, &new_leaf)?;
+            // Same effective delimiter the guard joined with, so the
+            // subtree prefix migration below moves exactly the children
+            // the guard assumed (infallible here — the guard just
+            // succeeded with the same inputs).
             let delimiter = cached
                 .iter()
                 .find(|r| r.name == old_wire)
-                .map(|r| r.delimiter.clone())
+                .map(|r| effective_delimiter(&old_wire, &r.delimiter))
+                .transpose()?
                 .unwrap_or_default();
             // 3. Wire RENAME; a UIDVALIDITY bump becomes a warning, not a
             // silent accept — the new name stands (epoch-change rule).
@@ -2006,6 +2076,128 @@ mod tests {
         );
         assert!(
             map_folder_error(&probe, "rename", "X").starts_with("Não foi possível renomear a pasta:")
+        );
+    }
+
+    /// Cached-tree fixture with a non-ASCII parent (RAW wire name, as the
+    /// refresh caches it): `Café` → `Caf&AOk-`.
+    fn folder_tree_nonascii_parent() -> Vec<queries::MailboxRow> {
+        vec![
+            queries::MailboxRow {
+                id: 1,
+                name: "INBOX".to_string(),
+                display_name: "INBOX".to_string(),
+                delimiter: "".to_string(),
+                role: "inbox".to_string(),
+                attributes: "".to_string(),
+                uid_validity: 100,
+                uid_next: 1,
+                last_sync_at: None,
+                unread_count: 0,
+                unseen_count: 0,
+            },
+            queries::MailboxRow {
+                id: 2,
+                name: "Caf&AOk-".to_string(),
+                display_name: "Café".to_string(),
+                delimiter: "/".to_string(),
+                role: "".to_string(),
+                attributes: "".to_string(),
+                uid_validity: 100,
+                uid_next: 1,
+                last_sync_at: None,
+                unread_count: 0,
+                unseen_count: 0,
+            },
+            queries::MailboxRow {
+                id: 3,
+                name: "Caf&AOk-/Sub".to_string(),
+                display_name: "Café/Sub".to_string(),
+                delimiter: "/".to_string(),
+                role: "".to_string(),
+                attributes: "".to_string(),
+                uid_validity: 100,
+                uid_next: 1,
+                last_sync_at: None,
+                unread_count: 0,
+                unseen_count: 0,
+            },
+        ]
+    }
+
+    /// Only the user-typed leaf is encoded: an already-encoded non-ASCII
+    /// parent passes through byte-identical (re-encoding would corrupt the
+    /// `&…-` shift into `&-…-` and CREATE on the wrong name).
+    #[test]
+    fn prepare_create_wire_never_reencodes_parent() {
+        let tree = folder_tree_nonascii_parent();
+        assert_eq!(
+            prepare_create_wire(&tree, Some("Caf&AOk-"), "Sub2", "/"),
+            Ok("Caf&AOk-/Sub2".to_string())
+        );
+        // Non-ASCII leaf under a non-ASCII parent: parent bytes intact,
+        // leaf encoded.
+        assert_eq!(
+            prepare_create_wire(&tree, Some("Caf&AOk-"), "Té", "/"),
+            Ok("Caf&AOk-/T&AOk-".to_string())
+        );
+    }
+
+    /// Rename keeps a non-ASCII parent prefix byte-identical (same
+    /// no-re-encode rule as create).
+    #[test]
+    fn guard_rename_never_reencodes_parent_prefix() {
+        let tree = folder_tree_nonascii_parent();
+        assert_eq!(
+            guard_rename(&tree, "Caf&AOk-/Sub", "Novo"),
+            Ok(("Caf&AOk-/Sub".to_string(), "Caf&AOk-/Novo".to_string()))
+        );
+        assert_eq!(
+            guard_rename(&tree, "Caf&AOk-", "Novo"),
+            Ok(("Caf&AOk-".to_string(), "Novo".to_string()))
+        );
+    }
+
+    /// Pre-M6 cache rows (empty delimiter) with a hierarchical wire name
+    /// infer the unambiguous delimiter instead of promoting to top level;
+    /// ambiguous (`/` + `.`) wires refuse with the refresh copy.
+    #[test]
+    fn guard_rename_infers_missing_delimiter() {
+        let mut tree = folder_tree();
+        tree.push(queries::MailboxRow {
+            id: 3,
+            name: "Pai/Sub".to_string(),
+            display_name: "Pai/Sub".to_string(),
+            delimiter: "".to_string(),
+            role: "".to_string(),
+            attributes: "".to_string(),
+            uid_validity: 100,
+            uid_next: 1,
+            last_sync_at: None,
+            unread_count: 0,
+            unseen_count: 0,
+        });
+        assert_eq!(
+            guard_rename(&tree, "Pai/Sub", "Novo"),
+            Ok(("Pai/Sub".to_string(), "Pai/Novo".to_string()))
+        );
+        // Ambiguous hierarchy: refuse, do not guess the parent.
+        tree.push(queries::MailboxRow {
+            id: 4,
+            name: "A/B.C".to_string(),
+            display_name: "A/B.C".to_string(),
+            delimiter: "".to_string(),
+            role: "".to_string(),
+            attributes: "".to_string(),
+            uid_validity: 100,
+            uid_next: 1,
+            last_sync_at: None,
+            unread_count: 0,
+            unseen_count: 0,
+        });
+        assert_eq!(
+            guard_rename(&tree, "A/B.C", "Novo"),
+            Err("Essa pasta não existe mais na lista — atualize a lista e tente de novo.".to_string())
         );
     }
 }
