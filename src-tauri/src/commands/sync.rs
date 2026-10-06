@@ -19,7 +19,8 @@ use crate::sync::worker::SyncWorker;
 use crate::sync::bodies;
 use crate::sync::{SyncEvent, SyncCallback};
 use crate::creds::{CredentialStore, KeyringStore, SavedCredentials, ServerConfig};
-use crate::imap::{AccountConfig, SecurityMode};
+use crate::imap::trash::{detect_trash, TrashResolution};
+use crate::imap::{AccountConfig, SecurityMode, SyncError};
 use crate::imap::manager::SessionManager;
 use crate::imap::session::connect_sync;
 use crate::imap::SyncSession;
@@ -119,6 +120,7 @@ pub async fn start_sync(
     let store = state.store.clone();
     let gate = state.sync_gate.clone();
     let cancel_flag = state.sync_cancel.clone();
+    let app_data = state.app_data.clone();
     tauri::async_runtime::spawn_blocking(move || {
         async_std::task::block_on(async {
             // Single-flight (Phase 8): a poll tick or second refresh that
@@ -139,7 +141,8 @@ pub async fn start_sync(
             let mut lease = manager.lease_for(&mailbox).await
                 .map_err(|e| format!("IMAP lease: {e}"))?;
             eprintln!("[SGE sync] Leased session -- starting worker...");
-            let worker = SyncWorker::with_cancel(store, cancel_flag);
+            let worker = SyncWorker::with_cancel(store, cancel_flag)
+                .with_attachment_root(app_data);
             let cb: SyncCallback = Arc::new(move |event| {
                 let _ = on_event.send(event);
             });
@@ -283,11 +286,433 @@ pub async fn set_seen(
     .map_err(|e| format!("internal error: set_seen task failed ({e})"))?
 }
 
+/// Combined durable-queue depth (flag + delete/move) for `mailbox_id`.
+/// Surfaced in every delete/move/expunge result and `sync_status` as the
+/// pending indicator.
+fn pending_depth(conn: &rusqlite::Connection, mailbox_id: u64) -> i64 {
+    queries::outbox_count(conn, mailbox_id).unwrap_or(0)
+        + queries::imap_outbox_count(conn, mailbox_id).unwrap_or(0)
+}
+
+/// Resolve the Trash wire name: per-account memory cache → LIST + detect.
+///
+/// Returns the RAW wire name (the only form valid for SELECT/MOVE), or
+/// `None` when the server has no Trash — the caller prompts confirm, then
+/// retries with `create_trash = true`.
+async fn resolve_trash(
+    state: &State<'_, crate::AppState>,
+    manager: &Arc<SessionManager>,
+    account_key: &str,
+) -> Result<Option<String>, String> {
+    if let Some(cached) = state
+        .trash_cache
+        .lock()
+        .unwrap()
+        .get(account_key)
+        .cloned()
+    {
+        return Ok(Some(cached));
+    }
+    let folders = manager
+        .list_mailboxes()
+        .await
+        .map_err(|e| e.to_string())?;
+    match detect_trash(&folders) {
+        TrashResolution::Found(name) => {
+            state
+                .trash_cache
+                .lock()
+                .unwrap()
+                .insert(account_key.to_string(), name.clone());
+            Ok(Some(name))
+        }
+        TrashResolution::Missing => Ok(None),
+    }
+}
+
+/// Outcome of a `delete_message` / `move_message` call returned to the frontend.
+///
+/// The message hides locally instantly (optimistic `pending_delete`).
+/// `acked` tells the UI whether the server confirmed the move or the op
+/// stays queued in the durable outbox (undo valid iff still queued).
+#[derive(Debug, Clone, Serialize)]
+pub struct DeleteMoveResult {
+    pub uid: u32,
+    pub acked: bool,
+    pub pending_count: i64,
+    pub detail: String,
+}
+
+/// Delete a message: optimistic hide + durable move-to-Trash.
+///
+/// Under one store lock the row hides (`pending_delete`) and a `delete` op
+/// (stored Trash dest) enqueues — consuming any same-key flag toggle —
+/// then an immediate `move_message_in(mailbox → Trash)` goes out through
+/// the cached [`SessionManager`] lease. Ack dequeues (row stays hidden
+/// until the next sweep's expunge-diff removes it); failure stays queued
+/// with the error recorded for pre-sweep replay. A loud refusal drops the
+/// op immediately (replay would drop it too — never re-COPY).
+///
+/// Trash resolution: SPECIAL-USE → name match → `Missing`. Without Trash
+/// and without `create_trash`, returns a `need_trash_confirm:` error for
+/// the UI confirm path; the confirmed retry passes `create_trash = true`
+/// and CREATEs `Trash` once. BODY.PEEK untouched; UID-only.
+#[tauri::command]
+pub async fn delete_message(
+    state: State<'_, crate::AppState>,
+    uid: u32,
+    mailbox: Option<String>,
+    create_trash: Option<bool>,
+) -> Result<DeleteMoveResult, String> {
+    let mailbox = mailbox.unwrap_or_else(|| "INBOX".to_string());
+    let account_cfg: AccountConfig = load_account_config(state.clone()).await?;
+    let account_key = format!(
+        "{}:{}:{}",
+        account_cfg.host, account_cfg.port, account_cfg.username
+    );
+    let manager = manager_for(&state, &account_cfg);
+    // Trash needs an async manager call — resolve before the blocking section.
+    let trash = match resolve_trash(&state, &manager, &account_key).await? {
+        Some(t) => t,
+        None if create_trash.unwrap_or(false) => {
+            manager
+                .create_trash()
+                .await
+                .map_err(|e| e.to_string())?;
+            let t = "Trash".to_string();
+            state
+                .trash_cache
+                .lock()
+                .unwrap()
+                .insert(account_key.clone(), t.clone());
+            t
+        }
+        None => {
+            return Err("need_trash_confirm: nenhuma pasta Trash encontrada no servidor — confirme para criar 'Trash'".to_string());
+        }
+    };
+    let store = state.store.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        async_std::task::block_on(async {
+            // 1. Optimistic hide + durable enqueue under one lock.
+            let (mailbox_id, _epoch) = {
+                let guard = store.lock().unwrap();
+                let conn = guard.conn();
+                let mb = queries::ensure_mailbox(conn, &mailbox)
+                    .map_err(|e| format!("store: {e}"))?;
+                let epoch = queries::get_sync_state(conn, &mailbox)
+                    .map_err(|e| format!("store: {e}"))?
+                    .map(|(v, _)| v)
+                    .unwrap_or(0);
+                queries::set_pending_delete(conn, mb, uid, true)
+                    .map_err(|e| format!("store: {e}"))?;
+                queries::enqueue_imap_outbox(
+                    conn,
+                    mb,
+                    uid,
+                    queries::IMAP_OP_DELETE,
+                    Some(&trash),
+                    epoch,
+                )
+                .map_err(|e| format!("store: {e}"))?;
+                (mb, epoch)
+            };
+
+            // 2. Immediate move-to-Trash; ack dequeues, failure stays queued.
+            let (acked, detail) = match manager
+                .move_message_in(&mailbox, &uid.to_string(), &trash)
+                .await
+            {
+                Ok(_) => {
+                    let guard = store.lock().unwrap();
+                    let _ =
+                        queries::delete_imap_outbox_op(guard.conn(), mailbox_id, uid);
+                    (true, format!("Mensagem movida para {trash}"))
+                }
+                Err(SyncError::Refused(msg)) => {
+                    let guard = store.lock().unwrap();
+                    let _ =
+                        queries::delete_imap_outbox_op(guard.conn(), mailbox_id, uid);
+                    let _ =
+                        queries::set_pending_delete(guard.conn(), mailbox_id, uid, false);
+                    (false, format!("IMAP refused: {msg}"))
+                }
+                Err(e) => {
+                    let guard = store.lock().unwrap();
+                    let _ = queries::record_imap_outbox_error(
+                        guard.conn(),
+                        mailbox_id,
+                        uid,
+                        &e.to_string(),
+                    );
+                    eprintln!(
+                        "[SGE sync] delete uid {uid} not acknowledged ({e}) — stays queued"
+                    );
+                    (
+                        false,
+                        format!("Sem conexão — será enviada no próximo sync ({e})"),
+                    )
+                }
+            };
+
+            let pending_count = {
+                let guard = store.lock().unwrap();
+                pending_depth(guard.conn(), mailbox_id)
+            };
+            Ok(DeleteMoveResult {
+                uid,
+                acked,
+                pending_count,
+                detail,
+            })
+        })
+    })
+    .await
+    .map_err(|e| format!("internal error: delete task failed ({e})"))?
+}
+
+/// Move a message to `dest` (raw wire name, never display_name).
+///
+/// Same optimistic + enqueue + immediate shape as [`delete_message`]:
+/// hides the src row, enqueues a `move` op (consuming any pending Seen
+/// toggle as dest-side intent), then `move_message_in(src → dest)`.
+/// Restoring out of Trash is the same call with `dest = INBOX`.
+#[tauri::command]
+pub async fn move_message(
+    state: State<'_, crate::AppState>,
+    uid: u32,
+    dest: String,
+    mailbox: Option<String>,
+) -> Result<DeleteMoveResult, String> {
+    let mailbox = mailbox.unwrap_or_else(|| "INBOX".to_string());
+    if dest == mailbox {
+        return Err("origem e destino são iguais — nada a mover".to_string());
+    }
+    let account_cfg: AccountConfig = load_account_config(state.clone()).await?;
+    let manager = manager_for(&state, &account_cfg);
+    let store = state.store.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        async_std::task::block_on(async {
+            // 1. Optimistic hide + durable enqueue under one lock.
+            let mailbox_id = {
+                let guard = store.lock().unwrap();
+                let conn = guard.conn();
+                let mb = queries::ensure_mailbox(conn, &mailbox)
+                    .map_err(|e| format!("store: {e}"))?;
+                let epoch = queries::get_sync_state(conn, &mailbox)
+                    .map_err(|e| format!("store: {e}"))?
+                    .map(|(v, _)| v)
+                    .unwrap_or(0);
+                queries::set_pending_delete(conn, mb, uid, true)
+                    .map_err(|e| format!("store: {e}"))?;
+                queries::enqueue_imap_outbox(
+                    conn,
+                    mb,
+                    uid,
+                    queries::IMAP_OP_MOVE,
+                    Some(&dest),
+                    epoch,
+                )
+                .map_err(|e| format!("store: {e}"))?;
+                mb
+            };
+
+            // 2. Immediate move; ack dequeues, failure stays queued.
+            let (acked, detail) = match manager
+                .move_message_in(&mailbox, &uid.to_string(), &dest)
+                .await
+            {
+                Ok(outcome) => {
+                    let guard = store.lock().unwrap();
+                    let _ =
+                        queries::delete_imap_outbox_op(guard.conn(), mailbox_id, uid);
+                    let via = if outcome.used_fallback {
+                        " (via cópia)"
+                    } else {
+                        ""
+                    };
+                    (true, format!("Mensagem movida para {dest}{via}"))
+                }
+                Err(SyncError::Refused(msg)) => {
+                    let guard = store.lock().unwrap();
+                    let _ =
+                        queries::delete_imap_outbox_op(guard.conn(), mailbox_id, uid);
+                    let _ =
+                        queries::set_pending_delete(guard.conn(), mailbox_id, uid, false);
+                    (false, format!("IMAP refused: {msg}"))
+                }
+                Err(e) => {
+                    let guard = store.lock().unwrap();
+                    let _ = queries::record_imap_outbox_error(
+                        guard.conn(),
+                        mailbox_id,
+                        uid,
+                        &e.to_string(),
+                    );
+                    eprintln!(
+                        "[SGE sync] move uid {uid} not acknowledged ({e}) — stays queued"
+                    );
+                    (
+                        false,
+                        format!("Sem conexão — será enviada no próximo sync ({e})"),
+                    )
+                }
+            };
+
+            let pending_count = {
+                let guard = store.lock().unwrap();
+                pending_depth(guard.conn(), mailbox_id)
+            };
+            Ok(DeleteMoveResult {
+                uid,
+                acked,
+                pending_count,
+                detail,
+            })
+        })
+    })
+    .await
+    .map_err(|e| format!("internal error: move task failed ({e})"))?
+}
+
+/// Outcome of an `expunge_messages` call returned to the frontend.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExpungeResult {
+    /// UIDs removed locally (== UIDs the server confirmed expunged).
+    pub removed: usize,
+    pub acked: bool,
+    pub pending_count: i64,
+    pub detail: String,
+}
+
+/// Permanently delete exactly `uids` (confirmed UID-scoped expunge).
+///
+/// UID-scoped `UID EXPUNGE` only (~200-UID chunks) — never a bare
+/// `expunge()`, so other clients' `\Deleted` marks are untouched. On
+/// success the local rows + bodies/parts + queued ops go and attachment
+/// dirs clean best-effort; on failure nothing changes locally (no
+/// optimistic write, so no rollback needed).
+#[tauri::command]
+pub async fn expunge_messages(
+    state: State<'_, crate::AppState>,
+    uids: Vec<u32>,
+    mailbox: Option<String>,
+) -> Result<ExpungeResult, String> {
+    let mailbox = mailbox.unwrap_or_else(|| "INBOX".to_string());
+    if uids.is_empty() {
+        return Err("nenhuma mensagem selecionada".to_string());
+    }
+    let account_cfg: AccountConfig = load_account_config(state.clone()).await?;
+    let manager = manager_for(&state, &account_cfg);
+    let store = state.store.clone();
+    let app_data = state.app_data.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        async_std::task::block_on(async {
+            // 1. Scoped removal on the server first (chunked, UID-only).
+            for chunk in uids.chunks(200) {
+                let set = chunk
+                    .iter()
+                    .map(|u| u.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                manager
+                    .uid_expunge_in(&mailbox, &set)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            // 2. Server confirmed: delete local rows + dependents + queued ops.
+            let (mailbox_id, epoch, removed) = {
+                let guard = store.lock().unwrap();
+                let conn = guard.conn();
+                let mb = queries::ensure_mailbox(conn, &mailbox)
+                    .map_err(|e| format!("store: {e}"))?;
+                let epoch = queries::get_sync_state(conn, &mailbox)
+                    .map_err(|e| format!("store: {e}"))?
+                    .map(|(v, _)| v)
+                    .unwrap_or(0);
+                let removed = queries::expunge_uids_local(conn, mb, &uids)
+                    .map_err(|e| format!("store: {e}"))?;
+                (mb, epoch, removed)
+            };
+            // 3. Best-effort attachment dirs (never fail the command on fs error).
+            for uid in &removed {
+                let dir = crate::store::attachment_dir(&app_data, epoch, *uid);
+                if dir.exists() {
+                    if let Err(e) = std::fs::remove_dir_all(&dir) {
+                        eprintln!("[SGE sync] expunge attachment cleanup uid {uid} failed ({e})");
+                    }
+                }
+            }
+            let pending_count = {
+                let guard = store.lock().unwrap();
+                pending_depth(guard.conn(), mailbox_id)
+            };
+            Ok(ExpungeResult {
+                removed: removed.len(),
+                acked: true,
+                pending_count,
+                detail: format!(
+                    "{} mensagem(ns) apagada(s) para sempre",
+                    removed.len()
+                ),
+            })
+        })
+    })
+    .await
+    .map_err(|e| format!("internal error: expunge task failed ({e})"))?
+}
+
+/// Outcome of an `undo_queued_op` call returned to the frontend.
+#[derive(Debug, Clone, Serialize)]
+pub struct UndoResult {
+    pub uid: u32,
+    pub restored: bool,
+    pub detail: String,
+}
+
+/// Undo a still-queued delete/move: clear the hidden flag and drop the
+/// outbox row (valid iff the op is still queued, i.e. until next sync).
+///
+/// Store-only path — no IMAP round-trip. Returns `restored = false` when
+/// the op already replayed (nothing to undo).
+#[tauri::command]
+pub async fn undo_queued_op(
+    state: State<'_, crate::AppState>,
+    uid: u32,
+    mailbox: Option<String>,
+) -> Result<UndoResult, String> {
+    let mailbox = mailbox.unwrap_or_else(|| "INBOX".to_string());
+    let store = state.store.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let guard = store.lock().unwrap();
+        let conn = guard.conn();
+        let restored = match queries::mailbox_id(conn, &mailbox)
+            .map_err(|e| format!("store: {e}"))?
+        {
+            Some(mb) => queries::undo_pending_op(conn, mb, uid)
+                .map_err(|e| format!("store: {e}"))?,
+            None => false,
+        };
+        Ok(UndoResult {
+            uid,
+            restored,
+            detail: if restored {
+                "Mensagem restaurada".to_string()
+            } else {
+                "Nada a desfazer — operação já sincronizada".to_string()
+            },
+        })
+    })
+    .await
+    .map_err(|e| format!("internal error: undo task failed ({e})"))?
+}
+
 /// Return the latest sync status from SQLite: last_sync_at + counts.
 ///
 /// Read-only -- no IMAP round-trip. Used by the frontend to show
 /// "Up-to-date <timestamp>" or "Offline -- last synced <timestamp>".
-/// `pending_count` is the durable-outbox depth (FLAG-02 pending indicator).
+/// `pending_count` sums BOTH durable-outbox depths (flag toggles +
+/// delete/move ops) for the pending indicator.
 #[tauri::command]
 pub async fn sync_status(
     state: State<'_, crate::AppState>,
@@ -304,7 +729,7 @@ pub async fn sync_status(
                 .unwrap_or_default();
         let pending_count = queries::mailbox_id(conn, &mailbox)
             .map_err(|e| format!("store: {e}"))?
-            .map(|mb| queries::outbox_count(conn, mb).unwrap_or(0))
+            .map(|mb| pending_depth(conn, mb))
             .unwrap_or(0);
         Ok(SyncStatus {
             mailbox,
@@ -713,6 +1138,8 @@ mod tests {
     use crate::store::queries;
     use crate::store::Store;
 
+    use super::pending_depth;
+
     /// Verify the list_messages + search_messages query path against an
     /// in-memory store (same pattern as queries.rs tests but exercising
     /// the command-level integration).
@@ -758,5 +1185,37 @@ mod tests {
         let results = queries::fts_search(conn, Some("INBOX"), "World").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].uid, 2);
+    }
+
+    /// The pending indicator backing delete/move/expunge results sums BOTH
+    /// durable queues (flag toggles + delete/move ops).
+    #[test]
+    fn pending_depth_sums_both_outboxes() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let mb_id = queries::ensure_mailbox(conn, "INBOX").unwrap();
+        assert_eq!(pending_depth(conn, mb_id), 0);
+
+        queries::enqueue_outbox(conn, mb_id, 1, true, 100).unwrap();
+        assert_eq!(pending_depth(conn, mb_id), 1);
+
+        queries::enqueue_imap_outbox(
+            conn, mb_id, 2, queries::IMAP_OP_DELETE, Some("Trash"), 100,
+        )
+        .unwrap();
+        assert_eq!(pending_depth(conn, mb_id), 2);
+
+        // Enqueueing the delete consumed no flag row here (different UID),
+        // but same-UID enqueue collapses: flag row drops, imap row stands.
+        queries::enqueue_outbox(conn, mb_id, 3, false, 100).unwrap();
+        queries::enqueue_imap_outbox(
+            conn, mb_id, 3, queries::IMAP_OP_MOVE, Some("Archive"), 100,
+        )
+        .unwrap();
+        assert_eq!(pending_depth(conn, mb_id), 3);
+
+        // Other mailboxes are isolated.
+        let other = queries::ensure_mailbox(conn, "Sent").unwrap();
+        assert_eq!(pending_depth(conn, other), 0);
     }
 }

@@ -41,6 +41,9 @@ use store::Store;
 /// `session_manager`) to the resolved Trash wire name from
 /// [`imap::trash::detect_trash`]. Memory-only, re-detected on LIST refresh;
 /// consumed by the delete/move commands (Phase 10, Plan 10-03).
+///
+/// `app_data` is the `<data>/sge` dir owning `sge.db` and `attachments/`;
+/// the expunge paths clean `<app_data>/attachments/<uidv>/<uid>/` best-effort.
 pub struct AppState {
     pub store: Arc<Mutex<Store>>,
     pub active_account: Mutex<Option<ActiveAccount>>,
@@ -48,6 +51,7 @@ pub struct AppState {
     pub sync_gate: Arc<sync::SyncGate>,
     pub sync_cancel: Arc<std::sync::atomic::AtomicBool>,
     pub trash_cache: Mutex<std::collections::HashMap<String, String>>,
+    pub app_data: std::path::PathBuf,
 }
 
 /// In-memory credentials + server config for the connected session.
@@ -226,12 +230,17 @@ async fn load_server_config() -> Result<Option<ServerConfig>, String> {
 }
 
 fn default_db_path() -> Option<std::path::PathBuf> {
+    app_data_dir().map(|d| d.join("sge.db"))
+}
+
+/// App-data dir owning `sge.db` + `attachments/` (`<data>/sge`).
+fn app_data_dir() -> Option<std::path::PathBuf> {
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| {
             std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local").join("share"))
         })?;
-    Some(base.join("sge").join("sge.db"))
+    Some(base.join("sge"))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -243,6 +252,7 @@ pub fn run() {
                 .expect("in-memory store should always succeed")
         });
     let store = Arc::new(Mutex::new(store_instance));
+    let app_data = app_data_dir().unwrap_or_else(|| std::env::temp_dir().join("sge"));
     let state = AppState {
         store,
         active_account: Mutex::new(None),
@@ -250,6 +260,7 @@ pub fn run() {
         sync_gate: Arc::new(sync::SyncGate::default()),
         sync_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         trash_cache: Mutex::new(std::collections::HashMap::new()),
+        app_data,
     };
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -264,6 +275,10 @@ pub fn run() {
             commands::sync::start_sync,
             commands::sync::sync_status,
             commands::sync::set_seen,
+            commands::sync::delete_message,
+            commands::sync::move_message,
+            commands::sync::expunge_messages,
+            commands::sync::undo_queued_op,
             commands::sync::cancel_sync,
             commands::sync::list_messages,
             commands::sync::list_mailboxes,
