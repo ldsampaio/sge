@@ -1463,3 +1463,68 @@
   background: var(--primitive-slate-100);
   border-color: var(--color-border-strong);
 }
+
+/* ── Folder context menu (Phase 11, Plan 11-03) ── */
+.folder-menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  background: transparent;
+}
+
+.folder-menu {
+  position: fixed;
+  z-index: 71;
+  min-width: 200px;
+  background: var(--card-bg);
+  border: 2.5px solid var(--card-border);
+  border-radius: var(--primitive-radius-md);
+  box-shadow: var(--card-shadow), 0 12px 32px rgba(30, 27, 75, 0.22);
+  padding: 6px;
+  display: grid;
+  gap: 2px;
+  animation: modal-pop-in 120ms var(--primitive-ease) forwards;
+  font-family: var(--font-body);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .folder-menu {
+    animation: none;
+  }
+}
+
+.folder-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 12px;
+  font-size: 14px;
+  font-weight: 400;
+  font-family: var(--font-body);
+  color: var(--color-foreground);
+  background: transparent;
+  border: none;
+  border-radius: var(--primitive-radius-md);
+  cursor: pointer;
+  text-align: left;
+}
+
+.folder-menu-item:hover:not([disabled]),
+.folder-menu-item:focus-visible:not([disabled]) {
+  background: var(--primitive-indigo-50);
+  outline: none;
+}
+
+.folder-menu-item:focus-visible:not([disabled]) {
+  box-shadow: 0 0 0 4px rgba(79, 70, 229, 0.16);
+}
+
+.folder-menu-item[disabled] {
+  color: var(--color-muted-foreground);
+  cursor: not-allowed;
+}
+
+.folder-menu-item-destructive:not([disabled]) {
+  color: var(--color-destructive);
+}

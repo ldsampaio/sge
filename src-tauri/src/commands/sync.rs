@@ -20,6 +20,7 @@ use crate::sync::bodies;
 use crate::sync::{SyncEvent, SyncCallback};
 use crate::creds::{CredentialStore, KeyringStore, SavedCredentials, ServerConfig};
 use crate::imap::trash::{detect_trash, TrashResolution};
+use crate::imap::roles::{resolve_roles, Role};
 use crate::imap::{AccountConfig, MailboxInfo, SecurityMode, SyncError};
 use crate::imap::mutf7::{
     decode_modified_utf7, encode_modified_utf7, validate_leaf, FolderNameError,
@@ -860,6 +861,17 @@ async fn refresh_mailbox_tree(
     {
         let guard = store.lock().unwrap();
         let conn = guard.conn();
+        // Role schema (Plan 11-03): resolved once per refresh from the fresh
+        // LIST, persisted to the M8 columns — the column is a cache, LIST is
+        // truth (recomputed every refresh, T-11-07).
+        let roles = resolve_roles(&discovered);
+        let role_of = |name: &str| {
+            roles
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, r)| *r)
+                .unwrap_or(Role::Custom)
+        };
         for folder in &discovered {
             if has_noselect_attr(&folder.attributes) {
                 continue;
@@ -882,6 +894,13 @@ async fn refresh_mailbox_tree(
             let _ = queries::ensure_mailbox(conn, &folder.name);
             // Hierarchy delimiter for tree rendering (M6).
             let _ = queries::set_mailbox_delimiter(conn, &folder.name, &folder.delimiter);
+            // Resolved role + raw attributes for the role-aware guards (M8).
+            let _ = queries::set_mailbox_role(
+                conn,
+                &folder.name,
+                role_of(&folder.name).as_str(),
+                &folder.attributes.join(" "),
+            );
         }
     }
     let guard = store.lock().unwrap();
@@ -1054,16 +1073,12 @@ fn has_noselect_attr(attributes: &[String]) -> bool {
     attributes.iter().any(|a| a.contains("NoSelect"))
 }
 
-/// System-role detection for the rename/delete double-guard (Plan 11-02).
+/// System-role detection for the rename/delete double-guard (Plan 11-03).
 ///
-/// Trash resolves through the single `detect_trash` detector (its cached
-/// rows synthesize empty attributes — the name layers still apply);
-/// Sent/Drafts match the Sidebar `SYSTEM_ORDER` ranks 1-2 name lists.
-/// Returns the pt-BR role label for the disabled-state copy.
-///
-/// HANDOFF 11-03: `imap/roles.rs resolve_roles` owns these lists — this
-/// guard delegates (Trash) or mirrors-then-moves (Sent/Drafts) so there is
-/// never a second detector to drift (T-11-08).
+/// Delegates to the single [`resolve_roles`](crate::imap::roles::resolve_roles)
+/// schema over the cached M8 rows (attributes included, so SPECIAL-USE wins
+/// exactly like the server view) — no name lists live here, never a second
+/// detector (T-11-08). Returns the pt-BR role label for the disabled-state copy.
 fn is_system_role(cached: &[queries::MailboxRow], name: &str) -> Option<&'static str> {
     let infos: Vec<MailboxInfo> = cached
         .iter()
@@ -1071,31 +1086,19 @@ fn is_system_role(cached: &[queries::MailboxRow], name: &str) -> Option<&'static
             name: r.name.clone(),
             display_name: r.display_name.clone(),
             delimiter: r.delimiter.clone(),
-            attributes: Vec::new(),
+            attributes: r.attributes.split_whitespace().map(|s| s.to_string()).collect(),
         })
         .collect();
-    if detect_trash(&infos) == TrashResolution::Found(name.to_string()) {
-        return Some("Lixeira");
+    match resolve_roles(&infos)
+        .into_iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, role)| role)?
+    {
+        Role::Trash => Some("Lixeira"),
+        Role::Sent => Some("Enviadas"),
+        Role::Drafts => Some("Rascunhos"),
+        Role::Inbox | Role::Custom => None,
     }
-    let row = cached.iter().find(|r| r.name == name)?;
-    let mut candidates = vec![row.name.to_lowercase(), row.display_name.to_lowercase()];
-    for s in [&row.name, &row.display_name] {
-        for d in ['/', '.'] {
-            if let Some(leaf) = s.rsplit(d).next() {
-                candidates.push(leaf.to_lowercase());
-            }
-        }
-    }
-    let lists: &[(&[&str], &str)] = &[
-        (&["sent", "sent messages", "enviadas", "enviados", "[gmail]/sent mail"], "Enviadas"),
-        (&["drafts", "rascunhos", "[gmail]/drafts"], "Rascunhos"),
-    ];
-    for (names, role) in lists {
-        if names.iter().any(|n| candidates.iter().any(|c| c == n)) {
-            return Some(role);
-        }
-    }
-    None
 }
 
 /// Pure pre-wire guard for `rename_folder` (Plan 11-02): INBOX refusal →
@@ -1729,6 +1732,8 @@ mod tests {
                 name: "INBOX".to_string(),
                 display_name: "INBOX".to_string(),
                 delimiter: "".to_string(),
+                role: "inbox".to_string(),
+                attributes: "".to_string(),
                 uid_validity: 100,
                 uid_next: 1,
                 last_sync_at: None,
@@ -1740,6 +1745,8 @@ mod tests {
                 name: "Pai".to_string(),
                 display_name: "Pai".to_string(),
                 delimiter: "/".to_string(),
+                role: "".to_string(),
+                attributes: "".to_string(),
                 uid_validity: 100,
                 uid_next: 1,
                 last_sync_at: None,
@@ -1758,6 +1765,8 @@ mod tests {
             name: name.to_string(),
             display_name: name.to_string(),
             delimiter: delimiter.to_string(),
+            role: "".to_string(),
+            attributes: "".to_string(),
             uid_validity: 100,
             uid_next: 1,
             last_sync_at: None,

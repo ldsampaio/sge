@@ -1,17 +1,16 @@
-//! Trash auto-detect (Phase 10, Plan 10-02).
+//! Trash auto-detect (Phase 10, Plan 10-02; generalized in Phase 11).
 //!
-//! Layers, in order (RESEARCH §6): 1. SPECIAL-USE `\Trash` LIST attribute
-//! via the existing attribute mapping; 2. case-insensitive name match
-//! (reusing the Sidebar `SYSTEM_ORDER` rank-4 list plus Gmail-style and
-//! PT/ES variants); 3. `Missing` — the caller prompts for confirmation and
-//! then [`SessionManager::create_trash`](super::manager::SessionManager::create_trash).
-//! Silent CREATE behind a differently-named Trash would twin trash folders.
+//! Thin delegating wrapper over [`roles::resolve_roles`](super::roles::resolve_roles):
+//! layers, name lists, and `\Noselect` handling live in exactly one place
+//! (`roles.rs`) — this function only picks the Trash entry, so there is
+//! never a second detector to drift (T-11-08). The 8 tests below pass
+//! UNCHANGED as the parity proof.
 //!
 //! Always returns the RAW wire name (modified UTF-7) — the only form valid
 //! for SELECT. The resolved name is cached per account in
-//! `AppState::trash_cache` and re-detected on LIST refresh (Phase 11 owns
-//! the general roles schema — nothing is invented here).
+//! `AppState::trash_cache` and re-detected on LIST refresh.
 
+use super::roles::{self, Role};
 use super::MailboxInfo;
 
 /// Where a delete should land.
@@ -23,74 +22,23 @@ pub enum TrashResolution {
     Missing,
 }
 
-/// Full wire-name candidates (compared lowercased). Mirrors the Sidebar
-/// `SYSTEM_ORDER` rank-4 list (`trash/deleted/deleted messages/lixeira`)
-/// plus Gmail-style and ES variants from the live-LIST probe plan.
-const TRASH_FULL_NAMES: &[&str] = &[
-    "trash",
-    "deleted",
-    "deleted items",
-    "deleted messages",
-    "lixeira",
-    "papelera",
-    "[gmail]/trash",
-    "[gmail]/lixeira",
-];
-
-/// Last-segment candidates for nested hierarchies (`Archive/Trash`).
-const TRASH_LEAF_NAMES: &[&str] = &["trash", "deleted", "lixeira", "papelera"];
-
-/// Hierarchy placeholders can never be SELECTed — never a Trash target.
-fn is_noselect(mb: &MailboxInfo) -> bool {
-    mb.attributes.iter().any(|a| a.contains("NoSelect"))
-}
-
-/// Resolve the Trash folder from a LIST result, layers in order.
+/// Resolve the Trash folder from a LIST result: the first Trash-role entry
+/// from [`roles::resolve_roles`](super::roles::resolve_roles), with
+/// `\Trash`-attributed folders preferred over Trash-named ones (preserves
+/// the original layer-1-before-name priority — e.g. `Archive` with `\Trash`
+/// beats a plain folder named `Trash`).
 pub fn detect_trash(mailboxes: &[MailboxInfo]) -> TrashResolution {
-    // Layer 1: SPECIAL-USE `\Trash` attribute (RFC 6154). Backslashes are
-    // stripped so one- and two-backslash spellings both match.
-    for mb in mailboxes {
-        if is_noselect(mb) {
-            continue;
-        }
-        if mb
-            .attributes
-            .iter()
-            .any(|a| a.trim_matches('\\').eq_ignore_ascii_case("trash"))
-        {
+    let roles = roles::resolve_roles(mailboxes);
+    let is_trash = |i: usize| roles.get(i).is_some_and(|(_, r)| *r == Role::Trash);
+    // Attribute-sourced Trash first (input order).
+    for (i, mb) in mailboxes.iter().enumerate() {
+        if is_trash(i) && roles::has_special_use(mb, "trash") {
             return TrashResolution::Found(mb.name.clone());
         }
     }
-    // Layer 2a: full-name match on wire or display form (non-ASCII names
-    // differ between the two — either may carry the recognizable spelling).
-    for mb in mailboxes {
-        if is_noselect(mb) {
-            continue;
-        }
-        let wire = mb.name.to_lowercase();
-        let display = mb.display_name.to_lowercase();
-        if TRASH_FULL_NAMES.contains(&wire.as_str())
-            || TRASH_FULL_NAMES.contains(&display.as_str())
-        {
-            return TrashResolution::Found(mb.name.clone());
-        }
-    }
-    // Layer 2b: last hierarchy segment (`/` and `.` delimiters).
-    for mb in mailboxes {
-        if is_noselect(mb) {
-            continue;
-        }
-        let leaf_of = |s: &str| {
-            s.split(['/', '.'])
-                .next_back()
-                .unwrap_or(s)
-                .to_lowercase()
-        };
-        let wire_leaf = leaf_of(&mb.name);
-        let display_leaf = leaf_of(&mb.display_name);
-        if TRASH_LEAF_NAMES.contains(&wire_leaf.as_str())
-            || TRASH_LEAF_NAMES.contains(&display_leaf.as_str())
-        {
+    // Then any Trash-role entry (input order).
+    for (i, mb) in mailboxes.iter().enumerate() {
+        if is_trash(i) {
             return TrashResolution::Found(mb.name.clone());
         }
     }

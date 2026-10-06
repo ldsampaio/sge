@@ -722,6 +722,34 @@ mod tests {
             assert!(after.is_none(), "expected poisoned reads, got: {after:?}");
         });
     }
+
+    /// Source-scan tripwire extension (Plan 11-03): the folder verbs
+    /// (`rename_mailbox` / `delete_mailbox` in `imap/mod.rs`) must never
+    /// gain a call to the banned command above — the vendored parser cannot
+    /// read its responses, so issuing one would poison the session exactly
+    /// like the replay above. The needle is built, not written, so the
+    /// imap-wide source-scan gate keeps returning only this file
+    /// (the tripwire itself).
+    #[test]
+    fn folder_verbs_send_no_banned_command() {
+        const MOD_SRC: &str = include_str!("mod.rs");
+        const MANAGER_SRC: &str = include_str!("manager.rs");
+        let needle: String = ["name", "space"].join("");
+        for (path, src) in [("imap/mod.rs", MOD_SRC), ("imap/manager.rs", MANAGER_SRC)] {
+            for (i, line) in src.lines().enumerate() {
+                // Doc/comment lines may discuss the ban (pre-existing Phase 1
+                // notes); only code lines can issue a call.
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                assert!(
+                    !line.to_lowercase().contains(&needle),
+                    "{path} line {} calls the banned command: {line:?}",
+                    i + 1
+                );
+            }
+        }
+    }
 }
 
 // ── Sync-path connection (keeps the session open for SyncSession) ──────

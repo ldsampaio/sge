@@ -42,6 +42,10 @@ export interface MailboxRow {
   display_name: string;
   /** LIST hierarchy delimiter ('' = flat). */
   delimiter: string;
+  /** Resolved role (`inbox|trash|sent|drafts|custom`; '' = not yet resolved). */
+  role: string;
+  /** Space-joined LIST attributes ('' = none cached). */
+  attributes: string;
   uid_validity: number;
   uid_next: number;
   last_sync_at: string | null;
@@ -58,6 +62,28 @@ export interface MailboxRow {
 export interface FolderTreeResult {
   created: string;
   mailboxes: MailboxRow[];
+}
+
+/**
+ * Outcome of the `rename_folder` Tauri command: old + new RAW wire names
+ * (the UI migrates selection atomically) plus the refreshed tree.
+ * `warning` carries the post-rename UIDVALIDITY-bump notice, if any.
+ */
+export interface RenameFolderResult {
+  old: string;
+  new: string;
+  warning: string | null;
+  mailboxes: MailboxRow[];
+}
+
+/**
+ * Outcome of the `delete_folder` Tauri command: the deleted RAW wire name,
+ * the refreshed tree, and the INBOX fallback hint for selection.
+ */
+export interface DeleteFolderResult {
+  deleted: string;
+  mailboxes: MailboxRow[];
+  fallback: string;
 }
 
 export interface SyncStatusInfo {
@@ -117,9 +143,7 @@ export function dispatchFlagUpdate(detail: FlagUpdateDetail): void {
 export function setSeenInFlags(flags: string, seen: boolean): string {
   try {
     const parsed: unknown = JSON.parse(flags);
-    const rest = Array.isArray(parsed)
-      ? parsed.filter((f: unknown) => f !== "\\Seen")
-      : [];
+    const rest = Array.isArray(parsed) ? parsed.filter((f: unknown) => f !== "\\Seen") : [];
     if (seen) rest.push("\\Seen");
     return JSON.stringify(rest);
   } catch {

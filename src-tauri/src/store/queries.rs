@@ -198,6 +198,29 @@ pub fn set_mailbox_delimiter(
     Ok(())
 }
 
+/// Record a folder's resolved role + LIST attributes (M8, Plan 11-03).
+///
+/// `role` is one of `inbox|trash|sent|drafts|custom`
+/// (`imap::roles::Role::as_str`); `attributes` the space-joined LIST
+/// attributes. A CACHE rewritten on every LIST refresh — never trusted
+/// without one (T-11-07).
+pub fn set_mailbox_role(
+    conn: &Connection,
+    name: &str,
+    role: &str,
+    attributes: &str,
+) -> StoreResult<()> {
+    conn.execute(
+        "INSERT INTO mailboxes (name, uid_validity, uid_next, role, attributes)
+         VALUES (?1, 0, 0, ?2, ?3)
+         ON CONFLICT(name) DO UPDATE SET
+           role = excluded.role,
+           attributes = excluded.attributes",
+        rusqlite::params![name, role, attributes],
+    )?;
+    Ok(())
+}
+
 /// Escape SQLite LIKE wildcards so a folder prefix matches literally —
 /// `Pai` must never match `Pai2` (T-11-05).
 fn escape_like(s: &str) -> String {
@@ -289,6 +312,11 @@ pub struct MailboxRow {
     pub display_name: String,
     /// LIST hierarchy delimiter ('' = flat).
     pub delimiter: String,
+    /// Resolved role (`inbox|trash|sent|drafts|custom`, M8 cache — empty
+    /// means not yet resolved, never assumed).
+    pub role: String,
+    /// Space-joined LIST attributes (M8 cache, e.g. `\HasNoChildren`).
+    pub attributes: String,
     pub uid_validity: u32,
     pub uid_next: u32,
     pub last_sync_at: Option<String>,
@@ -303,7 +331,7 @@ pub struct MailboxRow {
 /// `messages.flags` JSON (presence of `\\Seen` flag → read).
 pub fn list_mailboxes(conn: &Connection) -> StoreResult<Vec<MailboxRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, delimiter, uid_validity, uid_next, last_sync_at, unseen_count,
+        "SELECT id, name, delimiter, role, attributes, uid_validity, uid_next, last_sync_at, unseen_count,
                 (SELECT COUNT(*) FROM messages m
                  WHERE m.mailbox_id = mailboxes.id
                  AND NOT EXISTS (
@@ -322,11 +350,13 @@ pub fn list_mailboxes(conn: &Connection) -> StoreResult<Vec<MailboxRow>> {
                 name,
                 display_name,
                 delimiter: row.get(2)?,
-                uid_validity: row.get(3)?,
-                uid_next: row.get(4)?,
-                last_sync_at: row.get(5)?,
-                unseen_count: row.get(6)?,
-                unread_count: row.get(7)?,
+                role: row.get(3)?,
+                attributes: row.get(4)?,
+                uid_validity: row.get(5)?,
+                uid_next: row.get(6)?,
+                last_sync_at: row.get(7)?,
+                unseen_count: row.get(8)?,
+                unread_count: row.get(9)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()
@@ -2116,5 +2146,35 @@ mod tests {
         let conn = store.conn();
         // Unknown folder: no row, no id, nothing to drop — still Ok.
         delete_mailbox_cache(conn, "Nunca-Existiu").unwrap();
+    }
+
+    // ── Plan 11-03: role bookkeeping ─────────────────────────────
+
+    #[test]
+    fn set_mailbox_role_upsert_roundtrip() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        // Fresh M8 rows default empty (not-yet-resolved, never assumed).
+        ensure_mailbox(conn, "Lixeira").unwrap();
+        let rows = list_mailboxes(conn).unwrap();
+        let row = rows.iter().find(|r| r.name == "Lixeira").unwrap();
+        assert_eq!(row.role, "");
+        assert_eq!(row.attributes, "");
+
+        set_mailbox_role(conn, "Lixeira", "trash", "\\HasNoChildren \\Trash").unwrap();
+        let rows = list_mailboxes(conn).unwrap();
+        let row = rows.iter().find(|r| r.name == "Lixeira").unwrap();
+        assert_eq!(row.role, "trash");
+        assert_eq!(row.attributes, "\\HasNoChildren \\Trash");
+
+        // Re-resolve overwrites (LIST is truth — T-11-07).
+        set_mailbox_role(conn, "Lixeira", "custom", "\\HasNoChildren").unwrap();
+        let rows = list_mailboxes(conn).unwrap();
+        let row = rows.iter().find(|r| r.name == "Lixeira").unwrap();
+        assert_eq!(row.role, "custom");
+
+        // Upsert creates the row when missing (refresh path).
+        set_mailbox_role(conn, "Nova", "custom", "").unwrap();
+        assert!(list_mailboxes(conn).unwrap().iter().any(|r| r.name == "Nova"));
     }
 }

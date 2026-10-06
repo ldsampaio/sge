@@ -18,6 +18,7 @@ pub mod headers;
 pub mod manager;
 pub mod mutf7;
 pub mod probe;
+pub mod roles;
 pub mod session;
 pub mod trash;
 

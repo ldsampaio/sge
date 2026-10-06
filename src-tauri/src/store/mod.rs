@@ -16,7 +16,7 @@ pub mod queries;
 pub const BODY_CACHE_CAP_BYTES: usize = 262144;
 
 /// Schema version managed by rusqlite_migration.
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 
 // v1 = full schema.sql (canonical DDL from ARCHITECTURE.md)
 // M2 = flag_outbox durable queue (Phase 6, Plan 06-01). The schema.sql v1
@@ -87,6 +87,7 @@ impl Store {
             M::up(M5_STATUS_TS_SQL),
             M::up(M6_DELIMITER_SQL),
             M::up(M7_IMAP_OUTBOX_SQL),
+            M::up(M8_ROLES_SQL),
         ]);
         migrations.to_latest(conn)?;
         Ok(())
@@ -214,6 +215,21 @@ const M7_IMAP_OUTBOX_SQL: &str = concat!(
     "ALTER TABLE messages ADD COLUMN pending_delete INTEGER NOT NULL DEFAULT 0;",
 );
 
+/// M8 forward migration: role + attributes bookkeeping per folder
+/// (Phase 11, Plan 11-03).
+///
+/// `role` holds the resolved folder role (`inbox|trash|sent|drafts|custom`
+/// per `imap::roles::Role::as_str`); `attributes` the space-joined LIST
+/// attributes for `\Noselect`/`\Noinferiors`/SPECIAL-USE checks. Both are a
+/// CACHE: recomputed on every LIST refresh and persisted here, so guards
+/// stay role-aware across restarts without trusting stale values (the
+/// refresh always rewrites them — T-11-07). Defaults keep pre-M8 rows
+/// meaningful (`custom` is never assumed — empty means "not yet resolved").
+const M8_ROLES_SQL: &str = concat!(
+    "ALTER TABLE mailboxes ADD COLUMN role TEXT NOT NULL DEFAULT '';",
+    "ALTER TABLE mailboxes ADD COLUMN attributes TEXT NOT NULL DEFAULT '';",
+);
+
 /// Returns the app-data attachment directory for a given mailbox UID.
 ///
 /// Files live under `<app_data>/attachments/<uid_validity>/<uid>/` —
@@ -302,8 +318,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_7_with_imap_outbox() {
-        assert_eq!(SCHEMA_VERSION, 7);
+    fn schema_version_is_8_with_roles() {
+        assert_eq!(SCHEMA_VERSION, 8);
         let store = Store::open_in_memory().expect("migration should succeed");
         let conn = store.conn();
         let count: i64 = conn
@@ -330,6 +346,14 @@ mod tests {
             )
             .expect("query should succeed");
         assert_eq!(unseen_cols, 1, "mailboxes.unseen_count should exist at schema v6");
+        let role_cols: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('mailboxes') WHERE name IN ('role', 'attributes')",
+                [],
+                |r| r.get(0),
+            )
+            .expect("query should succeed");
+        assert_eq!(role_cols, 2, "mailboxes.role + attributes should exist at schema v8");
     }
 
     #[test]
@@ -584,6 +608,62 @@ mod tests {
             )
             .unwrap();
         assert_eq!(extra, 0, "flag_outbox schema must stay untouched");
+    }
+
+    #[test]
+    fn m8_adds_role_and_attributes_preserving_rows() {
+        // Simulate a v7 database (through M7, as shipped after Plan 11-02).
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        Migrations::new(vec![
+            M::up(include_str!("schema.sql")),
+            M::up(M2_FLAG_OUTBOX_SQL),
+            M::up(M3_UNSEEN_COUNT_SQL),
+            M::up(M4_BACKFILL_SQL),
+            M::up(M5_STATUS_TS_SQL),
+            M::up(M6_DELIMITER_SQL),
+            M::up(M7_IMAP_OUTBOX_SQL),
+        ])
+        .to_latest(&mut conn)
+        .unwrap();
+        // Seed v7 rows with delimiter values.
+        conn.execute(
+            "INSERT INTO mailboxes (name, uid_validity, uid_next, delimiter) \
+             VALUES ('INBOX', 100, 4, ''), ('Pai/Sub', 100, 2, '/')",
+            [],
+        )
+        .unwrap();
+        let mb: i64 = conn
+            .query_row("SELECT id FROM mailboxes WHERE name = 'INBOX'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO messages (mailbox_id, uid, subject, from_addr, date_utc, flags, preview) \
+             VALUES (?1, 1, 'Old', 'a@x.com', '2024-01-01T00:00:00Z', '[]', 'p')",
+            rusqlite::params![mb],
+        )
+        .unwrap();
+
+        // Forward-upgrade with the production set — only M8 applies.
+        Store::apply_migrations(&mut conn).unwrap();
+
+        // v7 rows survive with data intact and role/attributes defaulted.
+        let msgs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(msgs, 1, "forward migration must preserve cached rows");
+        let (name, delim, role, attrs): (String, String, String, String) = conn
+            .query_row(
+                "SELECT name, delimiter, role, attributes FROM mailboxes WHERE name = 'Pai/Sub'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(name, "Pai/Sub");
+        assert_eq!(delim, "/", "M6 delimiter values survive the M8 upgrade");
+        assert_eq!(role, "", "role defaults empty (not-yet-resolved, never assumed)");
+        assert_eq!(attrs, "");
     }
 
     #[test]

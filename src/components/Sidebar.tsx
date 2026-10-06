@@ -1,6 +1,8 @@
 import type { ReactNode } from "react";
+import { useState } from "react";
 import "./MailboxView.css";
-import { IconFolderPlus, IconInbox } from "./icons";
+import FolderContextMenu from "./FolderContextMenu";
+import { IconBook, IconFolderPlus, IconInbox, IconMail, IconTrash } from "./icons";
 import type { MailboxRow } from "../types";
 
 interface SidebarProps {
@@ -9,6 +11,10 @@ interface SidebarProps {
   onMailboxSelect: (mailbox: string) => void;
   /** Opens the create-folder dialog (owned by MailboxView). */
   onCreateFolder: () => void;
+  /** Opens the rename dialog for a RAW wire mailbox name. */
+  onRenameFolder: (mailbox: string) => void;
+  /** Opens the delete confirm for a RAW wire mailbox name. */
+  onDeleteFolder: (mailbox: string) => void;
 }
 
 /**
@@ -23,6 +29,30 @@ const SYSTEM_ORDER: Array<{ rank: number; names: string[] }> = [
   { rank: 3, names: ["spam", "junk", "junk e-mail"] },
   { rank: 4, names: ["trash", "deleted", "deleted messages", "lixeira"] },
 ];
+
+/** System role for glyph treatment (Plan 11-03): the M8 `role` column
+ * first, Sidebar name lists as fallback for pre-M8 caches. Visual only —
+ * ordering and behavior never change. */
+function systemKind(mb: MailboxRow): "trash" | "sent" | "drafts" | null {
+  if (mb.role === "trash" || mb.role === "sent" || mb.role === "drafts") {
+    return mb.role;
+  }
+  const lower = mb.name.toLocaleLowerCase();
+  if (["trash", "deleted", "deleted messages", "lixeira"].includes(lower)) {
+    return "trash";
+  }
+  if (["sent", "sent messages", "enviadas", "enviados"].includes(lower)) {
+    return "sent";
+  }
+  if (["drafts", "rascunhos"].includes(lower)) {
+    return "drafts";
+  }
+  return null;
+}
+
+function isNoselectAttrs(mb: MailboxRow): boolean {
+  return mb.attributes.split(/\s+/).some((a) => a.includes("NoSelect"));
+}
 
 function systemRank(rawName: string): number | null {
   const lower = rawName.toLocaleLowerCase();
@@ -57,15 +87,11 @@ export function buildTree(mailboxes: MailboxRow[]): FolderTree {
   const custom = mailboxes.filter((mb) => systemRank(mb.name) === null);
   const byPath = new Map<string, TreeNode>();
   // Ordena antes para montagem determinística.
-  const sorted = [...custom].sort((a, b) =>
-    a.display_name.localeCompare(b.display_name, "pt-BR"),
-  );
+  const sorted = [...custom].sort((a, b) => a.display_name.localeCompare(b.display_name, "pt-BR"));
   for (const mb of sorted) {
     const delim = mb.delimiter || "";
-    const segments =
-      delim && mb.name.includes(delim) ? mb.name.split(delim) : [mb.name];
-    const parentPath =
-      segments.length > 1 ? segments.slice(0, -1).join(delim) : null;
+    const segments = delim && mb.name.includes(delim) ? mb.name.split(delim) : [mb.name];
+    const parentPath = segments.length > 1 ? segments.slice(0, -1).join(delim) : null;
     const node: TreeNode = { mailbox: mb, shortLabel: "", children: [] };
     byPath.set(mb.name, node);
     if (parentPath && byPath.has(parentPath)) {
@@ -90,9 +116,7 @@ export function buildTree(mailboxes: MailboxRow[]): FolderTree {
     const parentPath = node.mailbox.name.split(delim).slice(0, -1).join(delim);
     return !byPath.has(parentPath);
   });
-  roots.sort((a, b) =>
-    a.mailbox.display_name.localeCompare(b.mailbox.display_name, "pt-BR"),
-  );
+  roots.sort((a, b) => a.mailbox.display_name.localeCompare(b.mailbox.display_name, "pt-BR"));
   return { system, roots };
 }
 
@@ -101,9 +125,23 @@ export default function Sidebar({
   mailboxes = [],
   onMailboxSelect,
   onCreateFolder,
+  onRenameFolder,
+  onDeleteFolder,
 }: SidebarProps) {
   const showMailboxItems = mailboxes.length > 0;
   const tree = buildTree(mailboxes);
+  const [menu, setMenu] = useState<{ name: string; x: number; y: number } | null>(null);
+
+  /** Open the folder context menu (right-click or keyboard), clamped to viewport. */
+  function openMenu(mb: MailboxRow, clientX: number, clientY: number) {
+    // `\Noselect` placeholders never get a menu (filtered upstream too).
+    if (isNoselectAttrs(mb)) return;
+    setMenu({
+      name: mb.name,
+      x: Math.max(8, Math.min(clientX, window.innerWidth - 220)),
+      y: Math.max(8, Math.min(clientY, window.innerHeight - 140)),
+    });
+  }
 
   /**
    * Badge signal per folder (FOLD-02): the dynamic local unread count once
@@ -117,6 +155,18 @@ export default function Sidebar({
 
   function renderItem(mb: MailboxRow, label: string, depth: number) {
     const count = badgeCount(mb);
+    const kind = systemKind(mb);
+    const size = depth > 0 ? 15 : 19;
+    const glyph =
+      kind === "trash" ? (
+        <IconTrash size={size} />
+      ) : kind === "sent" ? (
+        <IconMail size={size} />
+      ) : kind === "drafts" ? (
+        <IconBook size={size} />
+      ) : (
+        <IconInbox size={size} />
+      );
     return (
       <button
         type="button"
@@ -125,9 +175,21 @@ export default function Sidebar({
         title={mb.display_name}
         onClick={() => onMailboxSelect(mb.name)}
         aria-current={selectedMailbox === mb.name ? "page" : undefined}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          openMenu(mb, e.clientX, e.clientY);
+        }}
+        onKeyDown={(e) => {
+          // Keyboard menu key or Shift+F10 opens the folder menu.
+          if (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) {
+            e.preventDefault();
+            const rect = e.currentTarget.getBoundingClientRect();
+            openMenu(mb, rect.left + 24, rect.bottom + 4);
+          }
+        }}
       >
         <span className="sidebar-icon" aria-hidden="true">
-          <IconInbox size={depth > 0 ? 15 : 19} />
+          {glyph}
         </span>
         <span className="sidebar-label">{label}</span>
         {count > 0 && (
@@ -194,10 +256,23 @@ export default function Sidebar({
           <span>Nova pasta</span>
         </button>
         <strong>Tudo em dia</strong>
-        <p>
-          Nenhuma mensagem nova pendente. Sincronize para buscar avisos recentes.
-        </p>
+        <p>Nenhuma mensagem nova pendente. Sincronize para buscar avisos recentes.</p>
       </div>
+      {menu !== null &&
+        (() => {
+          const menuRow = mailboxes.find((m) => m.name === menu.name);
+          if (!menuRow) return null;
+          return (
+            <FolderContextMenu
+              mailbox={menuRow}
+              x={menu.x}
+              y={menu.y}
+              onRename={() => onRenameFolder(menuRow.name)}
+              onDelete={() => onDeleteFolder(menuRow.name)}
+              onClose={() => setMenu(null)}
+            />
+          );
+        })()}
     </nav>
   );
 }
