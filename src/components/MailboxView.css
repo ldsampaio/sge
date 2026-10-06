@@ -193,6 +193,48 @@
   color: #fff;
 }
 
+/* Folder tree: subfolders nest under their parent with a smaller,
+// quieter item that keeps the same clay look. Depth indent comes from
+// the inline paddingLeft (12px + 14px per level). */
+.sidebar-sublist {
+  list-style: none;
+  margin: 2px 0 2px;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.sidebar-item.sidebar-subitem {
+  padding-top: 7px;
+  padding-bottom: 7px;
+  font-size: 13px;
+  font-weight: 600;
+  border-width: 2px;
+}
+
+.sidebar-item.sidebar-subitem .sidebar-badge {
+  font-size: 11px;
+  padding: 0 8px;
+  min-width: 24px;
+}
+
+/* Global-search folder chip: which folder a result belongs to. */
+.message-folder-chip {
+  flex-shrink: 0;
+  font-family: var(--font-body);
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--color-primary-ink);
+  background: var(--badge-count-bg);
+  border: 1.5px solid var(--color-border);
+  border-radius: var(--primitive-radius-pill);
+  padding: 1px 8px;
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .sidebar-foot {
   margin: 0 12px 12px;
   background: linear-gradient(150deg, var(--primitive-teal-50), var(--primitive-indigo-50));

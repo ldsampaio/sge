@@ -45,7 +45,7 @@ export default function SearchBar({ onSearch, disabled }: SearchBarProps) {
       <input
         type="search"
         className="search-input"
-        placeholder="Buscar avisos: remetente, assunto…"
+        placeholder="Buscar em todas as pastas: remetente, assunto…"
         value={value}
         onChange={handleChange}
         disabled={disabled}

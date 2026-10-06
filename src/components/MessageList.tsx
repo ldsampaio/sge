@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { MessageRow } from "../types";
+import type { MessageRow, MailboxRow } from "../types";
 import {
   isUnread,
   formatRowDate,
@@ -19,6 +19,8 @@ export interface ListState {
 interface MessageListProps {
   mailbox: string;
   searchQuery: string | null;
+  /** Folder rows for the search-result folder chip (raw → display lookup). */
+  mailboxes?: MailboxRow[];
   onMessageSelect: (msg: MessageRow) => void;
   selectedUid: number | null;
   onStateChange?: (state: ListState) => void;
@@ -56,6 +58,7 @@ function avatarInitial(addr: string): string {
 export default function MessageList({
   mailbox,
   searchQuery,
+  mailboxes = [],
   onMessageSelect,
   selectedUid,
   onStateChange,
@@ -98,7 +101,7 @@ export default function MessageList({
         if (searchQuery) {
           if (!searchCache.current || searchCache.current.query !== searchQuery) {
             const rows: MessageRow[] = await invoke("search_messages", {
-              mailbox,
+              mailbox: null,
               query: searchQuery,
             });
             searchCache.current = { query: searchQuery, rows };
@@ -137,6 +140,11 @@ export default function MessageList({
     },
     [mailbox, searchQuery, reportState],
   );
+
+  /** Raw folder name → display name for the search-result chip. */
+  function folderLabel(raw: string): string {
+    return mailboxes.find((mb) => mb.name === raw)?.display_name ?? raw;
+  }
 
   /**
    * Optimistic read/unread toggle (FLAG-01/FLAG-02): flips the row to the
@@ -353,6 +361,14 @@ export default function MessageList({
                 )}
               </span>
               <span className="message-date">{formatRowDate(msg.date_utc)}</span>
+              {searchQuery && msg.mailbox !== mailbox && (
+                <span
+                  className="message-folder-chip"
+                  title={`Pasta: ${folderLabel(msg.mailbox)}`}
+                >
+                  {folderLabel(msg.mailbox)}
+                </span>
+              )}
             </button>
           );
         })}

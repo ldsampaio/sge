@@ -39,6 +39,12 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
   }, []);
 
   function handleMessageSelect(msg: MessageRow) {
+    // Global search can surface a message from another folder — switch to
+    // it so the reader fetches from the right mailbox.
+    if (msg.mailbox && msg.mailbox !== selectedMailbox) {
+      setSelectedMailbox(msg.mailbox);
+      setRefreshKey((k) => k + 1);
+    }
     setSelectedMessage(msg);
   }
 
@@ -103,6 +109,7 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
           <MessageList
             key={selectedMailbox}
             mailbox={selectedMailbox}
+            mailboxes={mailboxes}
             searchQuery={searchQuery}
             refreshKey={refreshKey}
             onMessageSelect={handleMessageSelect}

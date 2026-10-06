@@ -3,6 +3,8 @@
 
 export interface MessageRow {
   uid: number;
+  /** Raw wire mailbox name — lets global search jump to the right folder. */
+  mailbox: string;
   subject: string;
   from_addr: string;
   to_addrs: string;
@@ -34,7 +36,12 @@ export interface MessageView {
 /** Cached mailbox row from the local store, surfaced to the sidebar. */
 export interface MailboxRow {
   id: number;
+  /** Raw wire name (modified UTF-7) — protocol use only, never display. */
   name: string;
+  /** Decoded display name for the folder tree. */
+  display_name: string;
+  /** LIST hierarchy delimiter ('' = flat). */
+  delimiter: string;
   uid_validity: number;
   uid_next: number;
   last_sync_at: string | null;
