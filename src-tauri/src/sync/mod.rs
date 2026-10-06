@@ -17,7 +17,7 @@ pub enum SyncEvent {
     MessageSynced { uid: u32, flag: SyncFlag },
 
     /// A sweep batch finished.
-    BatchCompleted { new: usize, updated: usize, deleted: usize },
+    BatchCompleted { new: usize, updated: usize, deleted: usize, moved: usize, expunged: usize },
 
     /// The full pass completed.
     SyncCompleted { summary: SyncSummary },
@@ -44,6 +44,14 @@ pub struct SyncSummary {
     pub unchanged: usize,
     /// Messages deleted from the server (wiped from local store).
     pub deleted: usize,
+    /// Delete/move outbox ops acknowledged this pass (Plan 10-03 pre-sweep
+    /// replay). Both `delete` (move-to-Trash) and `move` move server-side,
+    /// so every acked `imap_outbox` op counts here.
+    pub moved: usize,
+    /// Locally-initiated permanent deletes acked this pass. The expunge
+    /// command path deletes rows directly (no sync pass), so this stays 0
+    /// until a pass-attributed expunge exists — reserved, not dead.
+    pub expunged: usize,
     /// `true` when UIDVALIDITY changed and a full wipe+resync occurred.
     pub uid_validity_bump: bool,
     /// Envelope FETCH calls issued this pass (Phase 9 convergence signal).

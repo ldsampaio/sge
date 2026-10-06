@@ -316,6 +316,23 @@ pub struct MoveOutcome {
     pub used_fallback: bool,
 }
 
+/// Capability-gated move on an already-selected session, without a manager
+/// lease (Plan 10-03 pre-sweep replay entry).
+///
+/// The sync worker borrows the pass session (already SELECTed to the source
+/// mailbox) and replays queued delete/move ops through the same
+/// [`run_move_sequence`] body the manager uses — one implementation, two
+/// callers. Issues no `select_mailbox` itself; dest-side Seen resolution
+/// (which SELECTs) is the caller's job to bracket with a re-SELECT.
+pub async fn run_move_on_session(
+    session: &mut dyn SyncSession,
+    uids: &[u32],
+    dest: &str,
+    caps: &[String],
+) -> Result<MoveOutcome, SyncError> {
+    run_move_sequence(session, uids, dest, caps).await
+}
+
 /// Parse a comma-joined UID set (`"1,2,3"`) into UIDs. Fail-closed on any
 /// malformed segment — a bad set must never reach the wire.
 fn parse_uid_set(uid_set: &str) -> Result<Vec<u32>, SyncError> {

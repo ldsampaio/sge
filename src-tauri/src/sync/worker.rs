@@ -18,9 +18,11 @@
 //! never across `.await` points (IMAP fetches).
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::imap::headers::MessageHeader;
+use crate::imap::manager::run_move_on_session;
 use crate::imap::{MailboxSummary, SyncError, SyncSession};
 use crate::store::queries;
 use crate::store::Store;
@@ -38,6 +40,10 @@ pub struct SyncWorker {
     /// Cooperative cancellation: `cancel_sync` sets it; the sweep checks
     /// it between batches and aborts cleanly (writes no partial state).
     cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// App-data root for best-effort attachment-dir cleanup on expunge
+    /// (`<root>/attachments/<uid_validity>/<uid>/`). `None` (tests, unset
+    /// callers) skips fs cleanup — DB rows still clean explicitly.
+    attachment_root: Option<PathBuf>,
 }
 
 /// Aggregate result of one outbox replay pass.
@@ -49,6 +55,9 @@ pub struct ReplaySummary {
     pub dropped: usize,
     /// Ops that failed and stay queued for the next attempt.
     pub failed: usize,
+    /// Delete/move ops acknowledged (every acked `imap_outbox` op moved
+    /// server-side) — feeds `SyncSummary.moved`.
+    pub moved: usize,
 }
 
 impl SyncWorker {
@@ -56,6 +65,7 @@ impl SyncWorker {
         Self {
             store,
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            attachment_root: None,
         }
     }
 
@@ -65,7 +75,17 @@ impl SyncWorker {
         store: Arc<std::sync::Mutex<Store>>,
         cancel: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
-        Self { store, cancel }
+        Self {
+            store,
+            cancel,
+            attachment_root: None,
+        }
+    }
+
+    /// Set the app-data root for attachment-dir cleanup on expunge.
+    pub fn with_attachment_root(mut self, root: PathBuf) -> Self {
+        self.attachment_root = Some(root);
+        self
     }
 
     fn cancelled(&self) -> bool {
@@ -163,6 +183,281 @@ impl SyncWorker {
         Ok(summary)
     }
 
+    /// Replay queued delete/move ops for `mailbox_id` through `session`.
+    ///
+    /// PRE-SWEEP position (non-negotiable): the pass calls this BEFORE the
+    /// header sweep so locally-moved mail is gone server-side before the
+    /// sweep can re-insert it (same-pass resurrection). `flag_outbox`
+    /// deliberately stays post-sync: moves consume same-key flag ops at
+    /// enqueue, so the two queues are disjoint by construction.
+    ///
+    /// Rules mirror [`replay_outbox`](Self::replay_outbox) (RFC 4549):
+    /// epoch check first (whole-mailbox drop, hidden flags cleared so the
+    /// sweep reconciles those rows as ordinary mail), absent-UID single
+    /// drop, per-op failure stays queued with attempts. Both `delete`
+    /// (stored Trash dest) and `move` replay as a server-side move —
+    /// delete IS move-to-Trash, so no separate STORE-\Deleted path exists.
+    ///
+    /// A loud [`SyncError::Refused`](crate::imap::SyncError::Refused)
+    /// (unverifiable unmark dance after the COPY leg already ran — the
+    /// Wave-B residual) drops the op with a log instead of retrying:
+    /// retrying would re-COPY duplicates only to refuse again. The src is
+    /// untouched in that corner; dest-side partial copies converge on the
+    /// next sweep.
+    ///
+    /// `mailbox_name` is the source wire name — re-SELECTed after any
+    /// dest-side Seen resolution so the sweep below still lands on the
+    /// right folder. The store lock is held only for brief synchronous
+    /// sections, never across awaits.
+    pub async fn replay_imap_outbox(
+        &self,
+        session: &mut dyn SyncSession,
+        mailbox_id: u64,
+        mailbox_name: &str,
+        current_uid_validity: u32,
+        live_uids: Option<&HashSet<u32>>,
+    ) -> Result<ReplaySummary, SyncError> {
+        let ops = {
+            let guard = self.store.lock().unwrap();
+            queries::list_imap_outbox(guard.conn(), mailbox_id)
+                .map_err(|e| SyncError::Protocol(format!("list imap outbox: {e}")))?
+        };
+        let mut summary = ReplaySummary::default();
+        if ops.is_empty() {
+            return Ok(summary);
+        }
+
+        // Epoch check first: a UIDVALIDITY generation change invalidates
+        // every queued UID at once.
+        if ops.iter().any(|op| op.uid_validity != current_uid_validity) {
+            let guard = self.store.lock().unwrap();
+            for op in &ops {
+                let _ = queries::set_pending_delete(guard.conn(), mailbox_id, op.uid, false);
+            }
+            let n = queries::drop_imap_outbox_for_mailbox(guard.conn(), mailbox_id)
+                .map_err(|e| SyncError::Protocol(format!("drop stale imap outbox: {e}")))?;
+            eprintln!(
+                "[SGE sync] imap outbox epoch mismatch (current uid_validity={current_uid_validity}) — dropped {n} stale op(s)"
+            );
+            summary.dropped = n;
+            return Ok(summary);
+        }
+
+        for op in &ops {
+            if let Some(live) = live_uids {
+                if !live.contains(&op.uid) {
+                    let guard = self.store.lock().unwrap();
+                    queries::delete_imap_outbox_op(guard.conn(), mailbox_id, op.uid).map_err(
+                        |e| SyncError::Protocol(format!("delete absent imap op: {e}")),
+                    )?;
+                    let _ = queries::set_pending_delete(guard.conn(), mailbox_id, op.uid, false);
+                    eprintln!(
+                        "[SGE sync] imap outbox uid {} absent on server — dropped",
+                        op.uid
+                    );
+                    summary.dropped += 1;
+                    continue;
+                }
+            }
+            let Some(dest) = op.dest_mailbox.as_deref() else {
+                // Defensive only: enqueue always stores a dest.
+                let guard = self.store.lock().unwrap();
+                queries::delete_imap_outbox_op(guard.conn(), mailbox_id, op.uid).map_err(
+                    |e| SyncError::Protocol(format!("delete destless imap op: {e}")),
+                )?;
+                eprintln!(
+                    "[SGE sync] imap outbox uid {} has no dest — dropped",
+                    op.uid
+                );
+                summary.dropped += 1;
+                continue;
+            };
+            let caps = session.capabilities().await.map_err(|e| {
+                SyncError::Protocol(format!("imap replay CAPABILITY: {e}"))
+            })?;
+            match run_move_on_session(session, &[op.uid], dest, &caps).await {
+                Ok(_) => {
+                    // Move-carries-toggle: apply captured Seen state at the
+                    // destination UID (best-effort, never fails the replay).
+                    if let Some(seen) = op.seen_intent {
+                        self.apply_seen_intent(
+                            session,
+                            mailbox_id,
+                            mailbox_name,
+                            op.uid,
+                            dest,
+                            seen,
+                        )
+                        .await;
+                    }
+                    let guard = self.store.lock().unwrap();
+                    queries::delete_imap_outbox_op(guard.conn(), mailbox_id, op.uid).map_err(
+                        |e| SyncError::Protocol(format!("ack imap op: {e}")),
+                    )?;
+                    // Hidden flag stays set: the sweep's expunge-diff removes
+                    // the row this same pass (the UID is gone server-side).
+                    summary.acked += 1;
+                    summary.moved += 1;
+                }
+                Err(SyncError::Refused(detail)) => {
+                    let guard = self.store.lock().unwrap();
+                    queries::delete_imap_outbox_op(guard.conn(), mailbox_id, op.uid).map_err(
+                        |e| SyncError::Protocol(format!("drop refused imap op: {e}")),
+                    )?;
+                    let _ = queries::set_pending_delete(guard.conn(), mailbox_id, op.uid, false);
+                    eprintln!(
+                        "[SGE sync] imap outbox uid {} refused ({detail}) — dropped, src untouched",
+                        op.uid
+                    );
+                    summary.dropped += 1;
+                }
+                Err(e) => {
+                    let guard = self.store.lock().unwrap();
+                    queries::record_imap_outbox_error(
+                        guard.conn(),
+                        mailbox_id,
+                        op.uid,
+                        &e.to_string(),
+                    )
+                    .map_err(|store_err| {
+                        SyncError::Protocol(format!("record imap error: {store_err}"))
+                    })?;
+                    eprintln!(
+                        "[SGE sync] imap outbox uid {} replay failed ({e}) — stays queued",
+                        op.uid
+                    );
+                    summary.failed += 1;
+                }
+            }
+        }
+        Ok(summary)
+    }
+
+    /// Best-effort Seen apply at a move destination (move-carries-toggle).
+    ///
+    /// The server assigns a new UID on move (no COPYUID parsing — the
+    /// imap-proto 0.16 tripwire class), so the dest UID resolves by
+    /// Message-ID SEARCH over `dest_mailbox`. Unresolvable rows, missing
+    /// Message-IDs, and every IO error log-and-drop: the op is already
+    /// acked and the next sync converges flags. Always re-SELECTs the
+    /// source mailbox before returning so the sweep still lands on the
+    /// right folder. Never fails the replay.
+    async fn apply_seen_intent(
+        &self,
+        session: &mut dyn SyncSession,
+        mailbox_id: u64,
+        src_mailbox: &str,
+        src_uid: u32,
+        dest_mailbox: &str,
+        seen: bool,
+    ) {
+        let mid: Option<String> = {
+            let guard = self.store.lock().unwrap();
+            queries::message_rfc_id(guard.conn(), mailbox_id, src_uid).unwrap_or(None)
+        };
+        let Some(mid) = mid else {
+            eprintln!("[SGE sync] seen-intent uid {src_uid}: no local row left — dropped");
+            return;
+        };
+        // Select dest; any failure restores src selection and drops.
+        if let Err(e) = session.select_mailbox(dest_mailbox).await {
+            eprintln!("[SGE sync] seen-intent uid {src_uid}: SELECT {dest_mailbox} failed ({e}) — dropped");
+            let _ = session.select_mailbox(src_mailbox).await;
+            return;
+        }
+        let mut dest_uid: Option<u32> = None;
+        match session.search_uids().await {
+            Ok(uids) => {
+                'search: for chunk in uids.chunks(200) {
+                    let set = chunk
+                        .iter()
+                        .map(|u| u.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    match session.fetch_envelopes(&set).await {
+                        Ok(headers) => {
+                            for h in &headers {
+                                if h.message_id.as_deref() == Some(mid.as_str()) {
+                                    dest_uid = Some(h.uid);
+                                    break 'search;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[SGE sync] seen-intent uid {src_uid}: dest FETCH failed ({e}) — dropped");
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => eprintln!("[SGE sync] seen-intent uid {src_uid}: dest SEARCH failed ({e}) — dropped"),
+        }
+        if let Some(duid) = dest_uid {
+            match session.set_seen(duid, seen).await {
+                Ok(()) => eprintln!(
+                    "[SGE sync] seen-intent uid {src_uid} applied at {dest_mailbox}:{duid} (seen={seen})"
+                ),
+                Err(e) => eprintln!(
+                    "[SGE sync] seen-intent uid {src_uid}: STORE at {dest_mailbox}:{duid} failed ({e}) — dropped"
+                ),
+            }
+        } else {
+            eprintln!("[SGE sync] seen-intent uid {src_uid}: message-id {mid} not found in {dest_mailbox} — dropped");
+        }
+        if let Err(e) = session.select_mailbox(src_mailbox).await {
+            eprintln!("[SGE sync] WARN: re-SELECT {src_mailbox} failed ({e}) — sweep may drift");
+        }
+    }
+
+    /// Delete UIDs absent from `live_union` plus best-effort attachment-dir
+    /// cleanup for the removed rows. Single choke point for the three
+    /// expunge sites (bump wipe, empty shortcut, Step 6 diff) so DB rows,
+    /// FTS ghosts, bodies/parts, and on-disk dirs clean together.
+    /// Returns the removed-row count for the summary.
+    fn expunge_absent(
+        &self,
+        mailbox_id: u64,
+        live_union: &[u32],
+        uid_validity: u32,
+    ) -> Result<usize, SyncError> {
+        let live_set: HashSet<u32> = live_union.iter().copied().collect();
+        let local: Vec<u32> = {
+            let guard = self.store.lock().unwrap();
+            queries::all_local_uids(guard.conn(), mailbox_id)
+                .map_err(|e| SyncError::Protocol(format!("local uids for cleanup: {e}")))?
+        };
+        let removed: Vec<u32> = local
+            .into_iter()
+            .filter(|u| !live_set.contains(u))
+            .collect();
+        let n = {
+            let guard = self.store.lock().unwrap();
+            queries::delete_missing_uids(guard.conn(), mailbox_id, live_union)
+                .map_err(|e| SyncError::Protocol(format!("delete_missing_uids: {e}")))?
+        };
+        self.cleanup_attachment_dirs(uid_validity, &removed);
+        Ok(n)
+    }
+
+    /// Best-effort removal of `<root>/attachments/<uidv>/<uid>/` dirs for
+    /// expunged UIDs. Fs errors log and never fail the sync; `None` root
+    /// (tests, unset callers) skips silently.
+    fn cleanup_attachment_dirs(&self, uid_validity: u32, uids: &[u32]) {
+        let Some(root) = self.attachment_root.as_ref() else {
+            return;
+        };
+        for uid in uids {
+            let dir = crate::store::attachment_dir(root, uid_validity, *uid);
+            if dir.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&dir) {
+                    eprintln!(
+                        "[SGE sync] attachment cleanup uid {uid} failed ({e}) — continuing"
+                    );
+                }
+            }
+        }
+    }
+
     /// Execute a full sync pass against an injected [`SyncSession`].
     ///
     /// The session is consumed (boxed trait object) — the caller
@@ -243,11 +538,11 @@ impl SyncWorker {
         // ── Step 3: UIDVALIDITY guard ─────────────────────────────
         let uid_validity_bump = prev_uidv != 0 && prev_uidv != summary.uid_validity;
         if uid_validity_bump {
-            let guard = self.store.lock().unwrap();
-            queries::delete_missing_uids(guard.conn(), mailbox_id, &[])
-                .map_err(|e| SyncError::Protocol(format!("wipe on UIDVALIDITY bump: {e}")))?;
+            self.expunge_absent(mailbox_id, &[], summary.uid_validity)?;
             // Queued UIDs belong to the old generation — replaying them
-            // would flag the wrong messages (RFC 4549, T-6-02).
+            // would flag the wrong messages (RFC 4549, T-6-02). The wipe
+            // path already dropped the imap queue; the flag queue drops here.
+            let guard = self.store.lock().unwrap();
             queries::drop_outbox_for_mailbox(guard.conn(), mailbox_id)
                 .map_err(|e| SyncError::Protocol(format!("drop outbox on UIDVALIDITY bump: {e}")))?;
         }
@@ -281,8 +576,6 @@ impl SyncWorker {
         if server_uids.is_empty() {
             {
                 let guard = self.store.lock().unwrap();
-                queries::delete_missing_uids(guard.conn(), mailbox_id, &[])
-                    .map_err(|e| SyncError::Protocol(format!("wipe empty mailbox: {e}")))?;
                 queries::set_sync_state(
                     guard.conn(),
                     mailbox_name,
@@ -291,7 +584,8 @@ impl SyncWorker {
                 )
                 .map_err(|e| SyncError::Protocol(format!("set sync state: {e}")))?;
             }
-            // Every queued UID is absent — replay drops the queue.
+            result.deleted = self.expunge_absent(mailbox_id, &[], summary.uid_validity)?;
+            // Every queued UID is absent — both replays drop their queues.
             let empty: HashSet<u32> = HashSet::new();
             let replay = self
                 .replay_outbox(&mut *session, mailbox_id, summary.uid_validity, Some(&empty))
@@ -300,6 +594,20 @@ impl SyncWorker {
                 "[SGE sync] replay on empty mailbox: acked={} dropped={} failed={}",
                 replay.acked, replay.dropped, replay.failed
             );
+            let imap_replay = self
+                .replay_imap_outbox(
+                    &mut *session,
+                    mailbox_id,
+                    mailbox_name,
+                    summary.uid_validity,
+                    Some(&empty),
+                )
+                .await?;
+            eprintln!(
+                "[SGE sync] imap replay on empty mailbox: acked={} dropped={} failed={} moved={}",
+                imap_replay.acked, imap_replay.dropped, imap_replay.failed, imap_replay.moved
+            );
+            result.moved += imap_replay.moved;
             session.logout().await?;
             cb(SyncEvent::SyncCompleted {
                 summary: result.clone(),
@@ -307,15 +615,43 @@ impl SyncWorker {
             return Ok(result);
         }
 
+        // ── Step 4b: pre-sweep imap_outbox replay (Plan 10-03) ──
+        // NON-NEGOTIABLE ORDER: queued delete/move ops replay BEFORE the
+        // header sweep so locally-moved mail is gone server-side before
+        // the sweep can re-insert it (same-pass resurrection). flag_outbox
+        // stays post-sync (Step 7b): disjoint by construction — enqueue
+        // consumes same-key flag ops — so flag toggles never race moves.
+        let live_pre: HashSet<u32> = server_uids.iter().copied().collect();
+        let imap_replay = self
+            .replay_imap_outbox(
+                &mut *session,
+                mailbox_id,
+                mailbox_name,
+                summary.uid_validity,
+                Some(&live_pre),
+            )
+            .await?;
+        eprintln!(
+            "[SGE sync] imap replay: acked={} dropped={} failed={} moved={}",
+            imap_replay.acked, imap_replay.dropped, imap_replay.failed, imap_replay.moved
+        );
+        result.moved += imap_replay.moved;
+
         // Pending-wins gate: UIDs with an unacknowledged optimistic toggle
-        // keep their local flags through the sweep below (FLAG-02). Fetched
-        // once per pass — the set is small (one row per toggled message).
+        // (flag queue) or delete/move (imap queue) keep their local flags
+        // through the sweep below (FLAG-02). Fetched once per pass — the
+        // sets are small (one row per touched message).
         let pending: HashSet<u32> = {
             let guard = self.store.lock().unwrap();
-            queries::pending_uids(guard.conn(), mailbox_id)
+            let mut pending: HashSet<u32> = queries::pending_uids(guard.conn(), mailbox_id)
                 .map_err(|e| SyncError::Protocol(format!("pending_uids: {e}")))?
                 .into_iter()
-                .collect()
+                .collect();
+            pending.extend(
+                queries::pending_imap_uids(guard.conn(), mailbox_id)
+                    .map_err(|e| SyncError::Protocol(format!("pending_imap_uids: {e}")))?,
+            );
+            pending
         };
 
         // ── Step 5: header sweep (BATCH_SIZE UIDs at a time) ──────
@@ -560,6 +896,8 @@ impl SyncWorker {
                 new: result.new,
                 updated: result.updated,
                 deleted: result.deleted,
+                moved: result.moved,
+                expunged: result.expunged,
             });
         }
 
@@ -573,12 +911,7 @@ impl SyncWorker {
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
-        result.deleted = {
-            let guard = self.store.lock().unwrap();
-            let conn = guard.conn();
-            queries::delete_missing_uids(conn, mailbox_id, &live_union)
-                .map_err(|e| SyncError::Protocol(format!("delete_missing_uids: {e}")))?
-        };
+        result.deleted = self.expunge_absent(mailbox_id, &live_union, summary.uid_validity)?;
 
         // ── Step 7: write sync state + logout ──────────────────────
         let new_next = summary.uid_next.unwrap_or_else(|| {
@@ -591,8 +924,10 @@ impl SyncWorker {
                 .map_err(|e| SyncError::Protocol(format!("set sync state: {e}")))?;
         }
 
-        // Post-sync replay: queued toggles go out on the still-open,
-        // INBOX-selected session; failures stay queued for the next pass.
+        // Post-sync flag replay: queued Seen toggles go out on the
+        // still-open session; failures stay queued for the next pass. The
+        // imap queue already replayed pre-sweep (Step 4b) — the flag queue
+        // stays here by design (disjoint queues, documented at Step 4b).
         // A replay failure never fails the sync itself.
         let live: HashSet<u32> = server_uids.iter().copied().collect();
         let replay = self
@@ -615,8 +950,8 @@ impl SyncWorker {
                 )
                 .unwrap_or(-1);
             eprintln!(
-                "[SGE sync] done: new={} updated={} deleted={} db_rows={} fetched={} gap_refetches={} converged={}",
-                result.new, result.updated, result.deleted, db_count,
+                "[SGE sync] done: new={} updated={} deleted={} moved={} db_rows={} fetched={} gap_refetches={} converged={}",
+                result.new, result.updated, result.deleted, result.moved, db_count,
                 result.fetched, result.gap_refetches, result.converged
             );
         }
@@ -680,6 +1015,9 @@ mod tests {
         pub fail_copy: bool,
         pub fail_move: bool,
         pub fail_create: bool,
+        /// When true, `uid_move_to` refuses loudly (`SyncError::Refused`,
+        /// the unmark-dance shape) — drives the replay refusal-cleanup test.
+        pub fail_move_refused: bool,
     }
 
     impl SyncSession for MockSession {
@@ -780,6 +1118,11 @@ mod tests {
 
         fn uid_move_to(&mut self, uid_set: &str, dest: &str) -> PinBox<'_, Result<(), SyncError>> {
             self.moved_calls.push((uid_set.to_string(), dest.to_string()));
+            if self.fail_move_refused {
+                return Box::pin(async move {
+                    Err(SyncError::Refused("mock unmark dance unverifiable".to_string()))
+                });
+            }
             if self.fail_move {
                 return Box::pin(async move {
                     Err(SyncError::Protocol("mock uid_move failure".to_string()))
@@ -871,6 +1214,7 @@ mod tests {
             fail_copy: false,
             fail_move: false,
             fail_create: false,
+            fail_move_refused: false,
         }
     }
 
@@ -2009,4 +2353,360 @@ mod tests {
             .unwrap();
         assert_eq!(count, 0, "aborted pass caches no messages");
     }
-}
+
+    // ── Phase 10 Plan 10-03 Wave 2: imap_outbox pre-sweep replay ──
+
+    /// Seed helper: one INBOX row + hidden flag + queued delete/move op,
+    /// mirroring what the delete/move commands write. Returns mailbox id.
+    fn seed_imap_op(
+        store: &Arc<std::sync::Mutex<Store>>,
+        uid: u32,
+        op: &str,
+        dest: Option<&str>,
+        epoch: u32,
+    ) -> u64 {
+        let guard = store.lock().unwrap();
+        let conn = guard.conn();
+        let mb_id = queries::ensure_mailbox(conn, "INBOX").unwrap();
+        queries::upsert_message(
+            conn,
+            mb_id,
+            uid,
+            Some(&format!("<msg{uid}@example.com>")),
+            &format!("Subject {uid}"),
+            "alice@example.com",
+            "[]",
+            "[]",
+            "2024-10-03T12:00:00Z",
+            "[]",
+            false,
+            &format!("Subject {uid}"),
+        )
+        .unwrap();
+        queries::set_pending_delete(conn, mb_id, uid, true).unwrap();
+        queries::enqueue_imap_outbox(conn, mb_id, uid, op, dest, epoch).unwrap();
+        mb_id
+    }
+
+    /// RFC 4549 parity: epoch bump drops the whole imap queue with zero
+    /// verb calls, and optimistically hidden rows become visible again
+    /// (their op is dead — the sweep reconciles them as ordinary mail).
+    #[test]
+    fn imap_replay_rfc4549_epoch_bump_drops_queue_and_unhides() {
+        let store = inbox(gap_summary(200, 1));
+        let mb_id = seed_imap_op(&store, 5, queries::IMAP_OP_DELETE, Some("Trash"), 100);
+        seed_imap_op(&store, 6, queries::IMAP_OP_MOVE, Some("Archive"), 100);
+        let worker = SyncWorker::new(store);
+
+        let mut session = mock(gap_summary(200, 1), vec![]);
+        let live: HashSet<u32> = [5, 6].into_iter().collect();
+        let summary = async_std::task::block_on(async {
+            worker
+                .replay_imap_outbox(&mut session, mb_id, "INBOX", 200, Some(&live))
+                .await
+        })
+        .unwrap();
+
+        assert_eq!(summary.dropped, 2);
+        assert_eq!(summary.acked, 0);
+        assert_eq!(summary.moved, 0);
+        assert!(
+            session.moved_calls.is_empty() && session.copied_calls.is_empty(),
+            "stale UIDs must never reach the wire"
+        );
+        let guard = worker.store.lock().unwrap();
+        assert!(queries::pending_imap_uids(guard.conn(), mb_id).unwrap().is_empty());
+        assert!(!queries::is_pending_delete(guard.conn(), mb_id, 5).unwrap());
+    }
+
+    /// RFC 4549 parity: an absent UID drops its single op; the live op
+    /// still replays as a server-side move to the STORED dest.
+    #[test]
+    fn imap_replay_rfc4549_absent_uid_drops_single_op() {
+        let store = inbox(gap_summary(100, 1));
+        let mb_id = seed_imap_op(&store, 5, queries::IMAP_OP_DELETE, Some("Trash"), 100);
+        seed_imap_op(&store, 6, queries::IMAP_OP_MOVE, Some("Archive"), 100);
+        let worker = SyncWorker::new(store);
+
+        let mut session = mock(gap_summary(100, 1), vec![mkhdr(5)]);
+        let live: HashSet<u32> = [5].into_iter().collect();
+        let summary = async_std::task::block_on(async {
+            worker
+                .replay_imap_outbox(&mut session, mb_id, "INBOX", 100, Some(&live))
+                .await
+        })
+        .unwrap();
+
+        assert_eq!(summary.acked, 1);
+        assert_eq!(summary.dropped, 1);
+        assert_eq!(summary.moved, 1);
+        assert_eq!(
+            session.moved_calls,
+            vec![("5".to_string(), "Trash".to_string())],
+            "delete replays as move-to-Trash with the stored dest"
+        );
+        let guard = worker.store.lock().unwrap();
+        assert!(
+            queries::pending_imap_uids(guard.conn(), mb_id).unwrap().is_empty(),
+            "acked + absent-dropped ops must leave the queue empty"
+        );
+    }
+
+    /// RFC 4549 parity: a failed move stays queued with attempts recorded,
+    /// and the row stays hidden.
+    #[test]
+    fn imap_replay_rfc4549_failure_stays_queued() {
+        let store = inbox(gap_summary(100, 1));
+        let mb_id = seed_imap_op(&store, 5, queries::IMAP_OP_MOVE, Some("Archive"), 100);
+        let worker = SyncWorker::new(store);
+
+        let mut session = mock(gap_summary(100, 1), vec![mkhdr(5)]);
+        session.fail_move = true;
+        let live: HashSet<u32> = [5].into_iter().collect();
+        let summary = async_std::task::block_on(async {
+            worker
+                .replay_imap_outbox(&mut session, mb_id, "INBOX", 100, Some(&live))
+                .await
+        })
+        .unwrap();
+
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.acked, 0);
+        let guard = worker.store.lock().unwrap();
+        let ops = queries::list_imap_outbox(guard.conn(), mb_id).unwrap();
+        assert_eq!(ops.len(), 1, "failed op must stay queued");
+        assert_eq!(ops[0].attempts, 1);
+        assert!(ops[0].last_error.is_some());
+        assert!(queries::is_pending_delete(guard.conn(), mb_id, 5).unwrap());
+    }
+
+    /// Wave-B residual: a loud refusal after the COPY leg drops the op with
+    /// a log (never retries — retrying would re-COPY duplicates only to
+    /// refuse again) and un-hides the untouched src row.
+    #[test]
+    fn imap_replay_refusal_drops_with_log() {
+        let store = inbox(gap_summary(100, 1));
+        let mb_id = seed_imap_op(&store, 5, queries::IMAP_OP_MOVE, Some("Archive"), 100);
+        let worker = SyncWorker::new(store);
+
+        let mut session = mock(gap_summary(100, 1), vec![mkhdr(5)]);
+        session.fail_move_refused = true;
+        let live: HashSet<u32> = [5].into_iter().collect();
+        let summary = async_std::task::block_on(async {
+            worker
+                .replay_imap_outbox(&mut session, mb_id, "INBOX", 100, Some(&live))
+                .await
+        })
+        .unwrap();
+
+        assert_eq!(summary.dropped, 1);
+        assert_eq!(summary.failed, 0, "refusal must not linger as retryable");
+        assert_eq!(session.moved_calls.len(), 1, "wire attempt happened");
+        let guard = worker.store.lock().unwrap();
+        assert!(queries::pending_imap_uids(guard.conn(), mb_id).unwrap().is_empty());
+        assert!(!queries::is_pending_delete(guard.conn(), mb_id, 5).unwrap());
+    }
+
+    /// Move-carries-toggle: a move enqueued over a pending Seen toggle
+    /// applies the captured intent at the destination UID (resolved by
+    /// Message-ID), then re-SELECTs the source mailbox for the sweep.
+    #[test]
+    fn imap_replay_move_applies_seen_intent_at_dest() {
+        let store = inbox(gap_summary(100, 1));
+        let mb_id = {
+            let guard = store.lock().unwrap();
+            let conn = guard.conn();
+            let mb_id = queries::ensure_mailbox(conn, "INBOX").unwrap();
+            queries::upsert_message(
+                conn, mb_id, 5, Some("<msg5@example.com>"), "Subject 5",
+                "alice@example.com", "[]", "[]", "2024-10-03T12:00:00Z",
+                "[]", false, "Subject 5",
+            )
+            .unwrap();
+            // Pending Seen toggle first — the move consumes it as intent.
+            queries::set_local_seen(conn, mb_id, 5, true).unwrap();
+            queries::enqueue_outbox(conn, mb_id, 5, true, 100).unwrap();
+            queries::set_pending_delete(conn, mb_id, 5, true).unwrap();
+            queries::enqueue_imap_outbox(conn, mb_id, 5, queries::IMAP_OP_MOVE, Some("Archive"), 100)
+                .unwrap();
+            mb_id
+        };
+        let worker = SyncWorker::new(store);
+
+        let mut session = mock(gap_summary(100, 1), vec![mkhdr(5)]);
+        let live: HashSet<u32> = [5].into_iter().collect();
+        let summary = async_std::task::block_on(async {
+            worker
+                .replay_imap_outbox(&mut session, mb_id, "INBOX", 100, Some(&live))
+                .await
+        })
+        .unwrap();
+
+        assert_eq!(summary.acked, 1);
+        assert_eq!(
+            session.set_seen_calls,
+            vec![(5, true)],
+            "captured Seen intent must reach the dest UID"
+        );
+        assert_eq!(
+            session.select_calls,
+            vec!["Archive".to_string(), "INBOX".to_string()],
+            "dest resolution must bracket with a source re-SELECT"
+        );
+    }
+
+    /// Pre-sweep order: an offline delete (queued, failing replay) survives
+    /// a full sync pass still hidden — the sweep never resurrects it.
+    #[test]
+    fn imap_presweep_order_no_same_pass_resurrection() {
+        let store = inbox(gap_summary(100, 1));
+        let worker = SyncWorker::new(store.clone());
+        seed_imap_op(&store, 5, queries::IMAP_OP_DELETE, Some("Trash"), 100);
+
+        // Server still lists the UID (move not yet replayed); replay fails.
+        let mut session = mock(gap_summary(100, 1), vec![mkhdr(5)]);
+        session.fail_move = true;
+        async_std::task::block_on(async {
+            worker.sync_with_session(Box::new(session), "INBOX", cb()).await
+        })
+        .unwrap();
+
+        let guard = store.lock().unwrap();
+        let rows = queries::list_messages(guard.conn(), "INBOX", 100, 0).unwrap();
+        assert!(
+            rows.iter().all(|r| r.uid != 5),
+            "locally-deleted row must stay hidden after the pass"
+        );
+        assert_eq!(
+            queries::pending_imap_uids(
+                guard.conn(),
+                queries::mailbox_id(guard.conn(), "INBOX").unwrap().unwrap()
+            )
+            .unwrap(),
+            vec![5],
+            "failed op stays queued for the next pass"
+        );
+    }
+
+    /// Convergence gate: a queued imap op blocks the converged shortcut —
+    /// a pending delete never reads as "unchanged".
+    #[test]
+    fn imap_pending_blocks_convergence() {
+        let store = inbox(gap_summary(100, 2));
+        let worker = SyncWorker::new(store.clone());
+
+        // Pass 1 — full sweep, converges the UID set.
+        let s1 = mock(gap_summary(100, 2), vec![mkhdr(1), mkhdr(2)]);
+        async_std::task::block_on(async {
+            worker.sync_with_session(Box::new(s1), "INBOX", cb()).await
+        })
+        .unwrap();
+
+        // Offline delete of uid 2 (replay will fail — stays queued).
+        {
+            let guard = store.lock().unwrap();
+            let mb_id = queries::mailbox_id(guard.conn(), "INBOX").unwrap().unwrap();
+            queries::set_pending_delete(guard.conn(), mb_id, 2, true).unwrap();
+            queries::enqueue_imap_outbox(
+                guard.conn(), mb_id, 2, queries::IMAP_OP_DELETE, Some("Trash"), 100,
+            )
+            .unwrap();
+        }
+        let mut s2 = mock(gap_summary(100, 2), vec![mkhdr(1), mkhdr(2)]);
+        s2.fail_move = true;
+        let r2 = async_std::task::block_on(async {
+            worker.sync_with_session(Box::new(s2), "INBOX", cb()).await
+        })
+        .unwrap();
+        assert!(!r2.converged, "queued delete must block convergence");
+        assert!(r2.fetched > 0, "sweep must run while ops are queued");
+    }
+
+    /// Acked pre-sweep moves feed `SyncSummary.moved` (both delete and move
+    /// move server-side).
+    #[test]
+    fn imap_replay_success_counts_moved_in_summary() {
+        let store = inbox(gap_summary(100, 2));
+        let worker = SyncWorker::new(store.clone());
+        seed_imap_op(&store, 1, queries::IMAP_OP_DELETE, Some("Trash"), 100);
+        seed_imap_op(&store, 2, queries::IMAP_OP_MOVE, Some("Archive"), 100);
+
+        let session = mock(gap_summary(100, 2), vec![mkhdr(1), mkhdr(2)]);
+        let result = async_std::task::block_on(async {
+            worker.sync_with_session(Box::new(session), "INBOX", cb()).await
+        })
+        .unwrap();
+
+        assert_eq!(result.moved, 2);
+        assert_eq!(result.deleted, 0, "moves are not server-side disappearances");
+        let guard = store.lock().unwrap();
+        let mb_id = queries::mailbox_id(guard.conn(), "INBOX").unwrap().unwrap();
+        assert!(queries::pending_imap_uids(guard.conn(), mb_id).unwrap().is_empty());
+    }
+
+    /// Expunge cleanup: a server-side disappearance removes the row, its FTS
+    /// ghost, bodies/parts, AND the on-disk attachment dir (best-effort).
+    #[test]
+    fn expunge_cleans_row_fts_bodies_and_attachment_dir() {
+        let store = inbox(gap_summary(100, 1));
+        let worker = SyncWorker::new(store.clone());
+
+        // Pass 1 — cache uid 7 with body + attachment metadata.
+        let s1 = mock(gap_summary(100, 1), vec![mkhdr(7)]);
+        async_std::task::block_on(async {
+            worker.sync_with_session(Box::new(s1), "INBOX", cb()).await
+        })
+        .unwrap();
+        let mb_id = {
+            let guard = store.lock().unwrap();
+            let conn = guard.conn();
+            let mb_id = queries::mailbox_id(conn, "INBOX").unwrap().unwrap();
+            let msg_id = queries::find_message_id(conn, mb_id, 7).unwrap().unwrap();
+            queries::insert_body(conn, msg_id, Some("t"), None).unwrap();
+            queries::insert_attachment_meta(conn, msg_id, "2", "f.pdf", "application/pdf", 5)
+                .unwrap();
+            mb_id
+        };
+        // Fake the on-disk dir the reader cache would own.
+        let root = std::env::temp_dir().join(format!("sge_att_test_{}", std::process::id()));
+        let dir = root.join("attachments").join("100").join("7");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f.pdf"), b"bytes").unwrap();
+        let worker = SyncWorker::with_attachment_root(
+            SyncWorker::new(store.clone()),
+            root.clone(),
+        );
+        let _ = mb_id;
+
+        // Pass 2 — server expunged uid 7 (empty mailbox, EXISTS=0).
+        let s2 = mock(
+            MailboxSummary {
+                selected_mailbox: "INBOX".to_string(),
+                uid_validity: 100,
+                uid_next: Some(8),
+                exists: 0,
+            },
+            vec![],
+        );
+        let r2 = async_std::task::block_on(async {
+            worker.sync_with_session(Box::new(s2), "INBOX", cb()).await
+        })
+        .unwrap();
+        assert_eq!(r2.deleted, 1);
+
+        let guard = store.lock().unwrap();
+        assert!(queries::get_message_by_uid(guard.conn(), "INBOX", 7).unwrap().is_none());
+        assert!(queries::fts_search(guard.conn(), Some("INBOX"), "Subject 7").unwrap().is_empty());
+        let bodies: i64 = guard
+            .conn()
+            .query_row("SELECT COUNT(*) FROM message_bodies", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(bodies, 0);
+        let parts: i64 = guard
+            .conn()
+            .query_row("SELECT COUNT(*) FROM attachment_parts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(parts, 0);
+        assert!(!dir.exists(), "attachment dir must be removed best-effort");
+        let _ = std::fs::remove_dir_all(&root);
+    }}

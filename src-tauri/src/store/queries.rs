@@ -629,6 +629,24 @@ pub fn find_message_id(
     }
 }
 
+/// RFC822 Message-ID display field for a cached row (dest-side Seen
+/// resolution matches on it after a move assigns a new UID). Never a key.
+pub fn message_rfc_id(
+    conn: &Connection,
+    mailbox_id: u64,
+    uid: u32,
+) -> StoreResult<Option<String>> {
+    match conn.query_row(
+        "SELECT message_id FROM messages WHERE mailbox_id = ?1 AND uid = ?2",
+        rusqlite::params![mailbox_id, uid],
+        |row| row.get::<_, Option<String>>(0),
+    ) {
+        Ok(mid) => Ok(mid),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(StoreError::Sql(e)),
+    }
+}
+
 // ── message list / search ────────────────────────────────────────────
 
 fn row_to_message(row: &Row<'_>) -> Result<MessageRow, rusqlite::Error> {
