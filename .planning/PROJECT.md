@@ -37,9 +37,10 @@ Connect to an IMAP server on Linux and read your mail locally in a fast Gmail-li
 
 ### Active (v1.2)
 
-- [ ] User can delete messages (expunge) and move them between folders
+- [x] User can delete messages (expunge) and move them between folders — Phase 10 (Trash/move/offline queue; live gates deferred)
+- [x] User can create/rename/delete folders via IMAP — Phase 11 (CREATE/RENAME/DELETE verbs, roles schema, guards; live gates deferred)
 - [ ] User can save/edit drafts
-- [ ] User can create/rename/delete folders via IMAP
+- [x] User can create/rename/delete folders via IMAP — Phase 11 (CREATE/RENAME/DELETE verbs, roles schema, guards; live gates deferred)
 - [ ] User can compose + reply/forward with attachments via SMTP
 
 ### Shipped (v1.1 — 2026-10-05)
@@ -91,6 +92,9 @@ Previous Active items all delivered (see Validated above + `.planning/v1.1-MILES
 | 2026-10-04 milestone marked shipped without verification | Previous session archived + claimed completion with 8/9 unimplemented; audit retracted 3 false SUMMARYs, restored phase dirs, rebuilt for real | ✓ Good — verify-then-claim enforced |
 | STATUS UNSEEN cached, badge prefers local count | Server datum seeds never-synced folders (M3/M5); dynamic flag-derived count stays authoritative once synced (offline-consistent) | ✓ Good |
 | Poll timer in UI layer, not Tauri runtime | Same start_sync path + backend SyncGate; simpler, visible, testable; busy ticks skip silently | ✓ Good |
+| Folder ops reuse Phase 10 verb pattern (lease + reconnect-retry + drain) | Proven surface for CREATE/RENAME/DELETE; roles schema generalizes trash.rs (SPECIAL-USE first, name match, cached per account) | ✓ Good |
+| Destructive folder guards enforced backend-side, not UI-only | Direct IPC invoke must refuse INBOX/system-role/\Noselect/non-empty-without-confirm; UI restraint is bypassable | ✓ Good |
+| Leaf-only modified-UTF-7 encoding for hierarchical names | Encoding whole parent+leaf path corrupts non-ASCII parent shift sequences; encode leaf, join with raw delimiter | ✓ Good |
 | Convergence skips sweeps; full sweep every 5th pass | Zero-FETCH idle polls; remote flag-only changes surface within ~5 intervals (documented blind spot) | ✓ Good |
 
 ## Evolution

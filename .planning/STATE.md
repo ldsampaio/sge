@@ -2,19 +2,20 @@
 gsd_state_version: "1.0"
 milestone: v1.2
 milestone_name: Compose & Organize
-current_phase: 11
-current_phase_name: folder-crud
-status: executing
-stopped_at: Phase 10 complete — MoveMenu, ExpungeModal, undo toast, row/reader delete+move actions implemented; all 156 backend tests + frontend build green
-last_updated: "2026-10-06T23:25:38.613Z"
+current_phase: 12
+current_phase_name: Drafts
+status: planning
+stopped_at: Phase 11 complete, ready to plan Phase 12
+last_updated: "2026-10-06T23:59:36.335Z"
 last_activity: 2026-10-06
-last_activity_desc: Plan 10-04 executed (MoveMenu, ExpungeModal, undo toast, row/reader actions)
-state_head: f03bf6fde78cb3aa9b1542299dd539f44cffc841
+last_activity_desc: Phase 11 complete, transitioned to Phase 12
+state_head: 3b94402a79ceb78c187644426410e49915c1375e
 progress:
   total_phases: 5
-  completed_phases: 1
+  completed_phases: 11
   total_plans: 7
-  completed_plans: 4
+  completed_plans: 7
+  percent: 79
 ---
 
 # Project State
@@ -28,10 +29,10 @@ See: .planning/PROJECT.md (updated 2026-10-05)
 
 ## Current Position
 
-Phase: 11 (folder-crud) — READY TO EXECUTE
-Plan: 10-04 executed 2026-10-06
-Status: All Phase 10 success criteria satisfied; ready for live validation gates (L1-L4)
-Last activity: 2026-10-06 — Plan 10-04 executed (MoveMenu, ExpungeModal, undo toast, row/reader actions)
+Phase: 12 — Drafts
+Plan: Not started
+Status: Ready to plan
+Last activity: 2026-10-06 — Phase 11 complete, transitioned to Phase 12
 
 ## Performance Metrics
 
@@ -81,7 +82,7 @@ Items acknowledged and deferred at milestone close, most recent first:
 ## Session Continuity
 
 Last session: 2026-10-06
-Stopped at: Phase 10 complete — MoveMenu, ExpungeModal, undo toast, row/reader delete+move actions implemented; all 156 backend tests + frontend build green
+Stopped at: Phase 11 complete, ready to plan Phase 12
 Resume file: None
 
 ## Operator Next Steps

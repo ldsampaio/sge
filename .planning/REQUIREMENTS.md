@@ -22,9 +22,9 @@
 
 ### Pastas
 
-- [ ] **FOLD-04**: User can create a new folder via IMAP CREATE (respects hierarchy delimiter)
-- [ ] **FOLD-05**: User can rename a folder (cache + outbox invalidated)
-- [ ] **FOLD-06**: User can delete a folder via IMAP DELETE (INBOX protected, non-empty guarded)
+- [x] **FOLD-04**: User can create a new folder via IMAP CREATE (respects hierarchy delimiter)
+- [x] **FOLD-05**: User can rename a folder (cache + outbox invalidated)
+- [x] **FOLD-06**: User can delete a folder via IMAP DELETE (INBOX protected, non-empty guarded)
 
 ### Rascunhos
 
@@ -60,9 +60,9 @@ Which phases cover which requirements. Updated during roadmap creation.
 | DEL-01 | 10 | Pending |
 | DEL-02 | 10 | Pending |
 | MOVE-01 | 10 | Pending |
-| FOLD-04 | 11 | Pending |
-| FOLD-05 | 11 | Pending |
-| FOLD-06 | 11 | Pending |
+| FOLD-04 | 11 | Complete |
+| FOLD-05 | 11 | Complete |
+| FOLD-06 | 11 | Complete |
 | DRAFT-01 | 12 | Pending |
 | DRAFT-02 | 12 | Pending |
 | DRAFT-03 | 13 | Pending |
