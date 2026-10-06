@@ -15,7 +15,7 @@
 //! the password) is only cloned into `connect_sync`. No log line in this
 //! module formats the config, the password, or credentials.
 
-use super::{AccountConfig, BoxedSession, SyncError, SyncSession};
+use super::{AccountConfig, SyncError, SyncSession};
 use crate::imap::session::connect_sync;
 
 /// Owns one authenticated IMAP session for the active account.
@@ -31,8 +31,12 @@ pub struct SessionManager {
 
 #[derive(Default)]
 struct ManagerState {
-    session: Option<BoxedSession>,
+    session: Option<Box<dyn SyncSession>>,
     selected_mailbox: Option<String>,
+    /// `CAPABILITY` atoms queried once per fresh connection (the set is
+    /// stable per session). Filled in [`SessionManager::lease_for`],
+    /// invalidated by `reconnect()` — Plan 10-02 capability cache.
+    cached_capabilities: Option<Vec<String>>,
 }
 
 impl SessionManager {
@@ -64,8 +68,9 @@ impl SessionManager {
             let session = connect_sync(&self.config).await.map_err(|e| {
                 SyncError::Protocol(format!("SessionManager connect: {e}"))
             })?;
-            guard.session = Some(session);
+            guard.session = Some(Box::new(session));
             guard.selected_mailbox = None;
+            guard.cached_capabilities = None;
         }
         let needs_select = guard.selected_mailbox.as_deref() != Some(mailbox);
         if needs_select {
@@ -78,6 +83,17 @@ impl SessionManager {
                 summary.uid_validity, summary.exists
             );
             guard.selected_mailbox = Some(mailbox.to_string());
+        }
+        // Capability cache: the atom set is stable per connection, so one
+        // `CAPABILITY` per fresh session serves every gated op until the
+        // next reconnect. Failing closed here surfaces a broken session
+        // immediately instead of misrouting MOVE/expunge fallbacks.
+        if guard.cached_capabilities.is_none() {
+            let session = guard.session.as_mut().expect("connected above");
+            let caps = session.capabilities().await.map_err(|e| {
+                SyncError::Protocol(format!("SessionManager CAPABILITY: {e}"))
+            })?;
+            guard.cached_capabilities = Some(caps);
         }
         Ok(MailboxLease { guard })
     }
@@ -97,9 +113,27 @@ impl SessionManager {
         let session = connect_sync(&self.config).await.map_err(|e| {
             SyncError::Protocol(format!("SessionManager reconnect: {e}"))
         })?;
-        guard.session = Some(session);
+        guard.session = Some(Box::new(session));
         guard.selected_mailbox = None;
+        // Capabilities belong to the old connection — the next lease
+        // re-queries them (Plan 10-02 invalidation rule).
+        guard.cached_capabilities = None;
         Ok(())
+    }
+
+    /// Cached `CAPABILITY` atoms for the owned connection (Plan 10-02).
+    ///
+    /// Served from the per-connection cache filled by [`lease_for`](Self::lease_for);
+    /// the `INBOX` lease is the stable default (same as `list_mailboxes`).
+    pub async fn capabilities_cached(&self) -> Result<Vec<String>, SyncError> {
+        let mut lease = self.lease_for("INBOX").await?;
+        if let Some(caps) = lease.cached_capabilities() {
+            return Ok(caps);
+        }
+        // Defensive only: `lease_for` fills the cache, so this runs solely
+        // when a future lease path skips the fill — never a second lease
+        // (no re-entrant `lease_for` while holding one).
+        lease.session().capabilities().await
     }
 
     /// UID STORE `\Seen` through the owned session with one transparent
@@ -132,6 +166,72 @@ impl SessionManager {
         self.set_seen_in("INBOX", uid, seen).await
     }
 
+    /// UID STORE `\Deleted` through the owned session with one transparent
+    /// reconnect + retry (Plan 10-02, DEL slice). Same shape as
+    /// [`set_seen_in`](Self::set_seen_in): the lease SELECTs `mailbox`
+    /// first, so the flag lands on the intended folder.
+    pub async fn mark_deleted_in(
+        &self,
+        mailbox: &str,
+        uid: u32,
+        deleted: bool,
+    ) -> Result<(), SyncError> {
+        let mut lease = self.lease_for(mailbox).await?;
+        match lease.session().store_deleted(uid, deleted).await {
+            Ok(()) => Ok(()),
+            Err(first) => {
+                eprintln!("[SGE imap] store_deleted {mailbox} uid {uid} failed ({first}) — reconnecting once");
+                drop(lease);
+                self.reconnect().await?;
+                let mut lease = self.lease_for(mailbox).await?;
+                lease.session().store_deleted(uid, deleted).await
+            }
+        }
+    }
+
+    /// Scoped `UID EXPUNGE <set>` (RFC 4315, requires UIDPLUS) through the
+    /// owned session with one transparent reconnect + retry (Plan 10-02,
+    /// DEL-02 slice). Returns the expunged UIDs as reported by the server
+    /// (drained to completion, never trusted for local cache — the next
+    /// SEARCH reconciles). The lease SELECTs `mailbox` first so the expunge
+    /// cannot drift to the wrong folder.
+    pub async fn uid_expunge_in(
+        &self,
+        mailbox: &str,
+        uid_set: &str,
+    ) -> Result<Vec<u32>, SyncError> {
+        let set = uid_set.to_string();
+        let mut lease = self.lease_for(mailbox).await?;
+        match lease.session().uid_expunge(&set).await {
+            Ok(uids) => Ok(uids),
+            Err(first) => {
+                eprintln!("[SGE imap] UID EXPUNGE {mailbox} set {set} failed ({first}) — reconnecting once");
+                drop(lease);
+                self.reconnect().await?;
+                let mut lease = self.lease_for(mailbox).await?;
+                lease.session().uid_expunge(&set).await
+            }
+        }
+    }
+
+    /// `CREATE Trash` through the owned session with one transparent
+    /// reconnect + retry (Plan 10-02 Trash fallback). `CREATE` needs no
+    /// particular folder selected, so the stable `INBOX` lease suffices.
+    /// Raw ASCII name — no modified-UTF-7 encoding needed.
+    pub async fn create_trash(&self) -> Result<(), SyncError> {
+        let mut lease = self.lease_for("INBOX").await?;
+        match lease.session().create_mailbox("Trash").await {
+            Ok(()) => Ok(()),
+            Err(first) => {
+                eprintln!("[SGE imap] CREATE Trash failed ({first}) — reconnecting once");
+                drop(lease);
+                self.reconnect().await?;
+                let mut lease = self.lease_for("INBOX").await?;
+                lease.session().create_mailbox("Trash").await
+            }
+        }
+    }
+
     /// `LIST "" "*"` through the owned session (FOLD-01 folder discovery).
     pub async fn list_mailboxes(&self) -> Result<Vec<super::MailboxInfo>, SyncError> {
         let mut lease = self.lease_for("INBOX").await?;
@@ -161,10 +261,420 @@ pub struct MailboxLease<'a> {
 impl MailboxLease<'_> {
     /// The live, mailbox-selected session. Never `None`: `lease_for()`
     /// connects and SELECTs before handing out the guard.
-    pub fn session(&mut self) -> &mut BoxedSession {
+    ///
+    /// Returned as a trait object so manager internals (and the sync
+    /// worker's borrowed entry) drive verbs without a second connection —
+    /// and so tests can inject a fake session without network.
+    pub fn session(&mut self) -> &mut dyn SyncSession {
         self.guard
             .session
             .as_mut()
+            .map(|boxed| boxed.as_mut())
             .expect("lease guarantees a live session")
+    }
+
+    /// Clone of the connection's cached `CAPABILITY` atoms, if the lease
+    /// fill already ran. Read through the held lease — never a second
+    /// `lease_for` while holding one (async mutex → deadlock).
+    pub fn cached_capabilities(&self) -> Option<Vec<String>> {
+        self.guard.cached_capabilities.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::headers::MessageHeader;
+    use super::*;
+    use crate::imap::PinBox;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::{Arc, Mutex};
+
+    /// Stateful fake session: records every verb, tracks `\Deleted` flag
+    /// state per UID, and actually removes expunged UIDs — so fallback
+    /// sequences, the unmark dance, and multi-client survival are
+    /// exercisable with zero network.
+    struct FakeSession {
+        select_calls: Vec<String>,
+        caps_calls: usize,
+        caps: Vec<String>,
+        all_uids: Vec<u32>,
+        deleted: HashMap<u32, bool>,
+        deleted_calls: Vec<(u32, bool)>,
+        copied_calls: Vec<(String, String)>,
+        moved_calls: Vec<(String, String)>,
+        expunged_sets: Vec<String>,
+        /// UIDs actually removed by (uid-)expunge, in call order.
+        removed: Vec<u32>,
+        plain_expunge_calls: usize,
+        created_mailboxes: Vec<String>,
+        set_seen_calls: Vec<(u32, bool)>,
+        fail_store_deleted: bool,
+        fail_expunge: bool,
+        fail_copy: bool,
+        fail_move: bool,
+        /// UIDs whose `\Deleted` survives a `-FLAGS` write (simulates a
+        /// server that won't honor the unmark — drives the loud-refusal
+        /// path of the UIDPLUS-absent dance).
+        sticky_deleted: HashSet<u32>,
+    }
+
+    impl FakeSession {
+        fn live_uids(&self) -> Vec<u32> {
+            self.all_uids
+                .iter()
+                .copied()
+                .filter(|u| !self.removed.contains(u))
+                .collect()
+        }
+
+        fn flags_json(&self, uid: u32) -> String {
+            if *self.deleted.get(&uid).unwrap_or(&false) {
+                // JSON encoding of the canonical `["\Deleted"]` flag list.
+                "[\"\\Deleted\"]".to_string()
+            } else {
+                "[]".to_string()
+            }
+        }
+    }
+
+    /// Shareable handle around [`FakeSession`]: the manager owns one clone
+    /// (boxed as the session), tests keep another for assertions. Every
+    /// trait method locks briefly and never holds the lock across `.await`.
+    #[derive(Clone)]
+    struct FakeHandle(Arc<Mutex<FakeSession>>);
+
+    impl FakeHandle {
+        fn new(caps: &[&str], uids: &[u32]) -> Self {
+            Self(Arc::new(Mutex::new(FakeSession {
+                select_calls: Vec::new(),
+                caps_calls: 0,
+                caps: caps.iter().map(|s| s.to_string()).collect(),
+                all_uids: uids.to_vec(),
+                deleted: HashMap::new(),
+                deleted_calls: Vec::new(),
+                copied_calls: Vec::new(),
+                moved_calls: Vec::new(),
+                expunged_sets: Vec::new(),
+                removed: Vec::new(),
+                plain_expunge_calls: 0,
+                created_mailboxes: Vec::new(),
+                set_seen_calls: Vec::new(),
+                fail_store_deleted: false,
+                fail_expunge: false,
+                fail_copy: false,
+                fail_move: false,
+                sticky_deleted: HashSet::new(),
+            })))
+        }
+    }
+
+    fn parse_set(set: &str) -> HashSet<u32> {
+        set.split(',')
+            .filter_map(|s| s.trim().parse::<u32>().ok())
+            .collect()
+    }
+
+    impl SyncSession for FakeHandle {
+        fn select_mailbox(
+            &mut self,
+            name: &str,
+        ) -> PinBox<'_, Result<super::super::MailboxSummary, SyncError>> {
+            let summary = {
+                let mut f = self.0.lock().unwrap();
+                f.select_calls.push(name.to_string());
+                super::super::MailboxSummary {
+                    selected_mailbox: name.to_string(),
+                    uid_validity: 100,
+                    uid_next: None,
+                    exists: f.live_uids().len() as u32,
+                }
+            };
+            Box::pin(async move { Ok(summary) })
+        }
+
+        fn search_uids(&mut self) -> PinBox<'_, Result<Vec<u32>, SyncError>> {
+            let uids = self.0.lock().unwrap().live_uids();
+            Box::pin(async move { Ok(uids) })
+        }
+
+        fn fetch_envelopes<'a>(
+            &'a mut self,
+            range: &'a str,
+        ) -> PinBox<'a, Result<Vec<MessageHeader>, SyncError>> {
+            let out = {
+                let f = self.0.lock().unwrap();
+                let wanted = parse_set(range);
+                let live: HashSet<u32> = f.live_uids().into_iter().collect();
+                wanted
+                    .into_iter()
+                    .filter(|u| live.contains(u))
+                    .map(|uid| MessageHeader {
+                        uid,
+                        message_id: Some(format!("<msg{uid}@example.com>")),
+                        subject: format!("Subject {uid}"),
+                        from_addr: "alice@example.com".to_string(),
+                        to_addrs: String::new(),
+                        cc_addrs: String::new(),
+                        date_utc: "2024-10-03T12:00:00Z".to_string(),
+                        flags: f.flags_json(uid),
+                        has_attachments: false,
+                        preview: format!("Subject {uid}"),
+                    })
+                    .collect::<Vec<_>>()
+            };
+            Box::pin(async move { Ok(out) })
+        }
+
+        fn fetch_body(&mut self, _uid: u32) -> PinBox<'_, Result<Vec<u8>, SyncError>> {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn set_seen(&mut self, uid: u32, seen: bool) -> PinBox<'_, Result<(), SyncError>> {
+            self.0.lock().unwrap().set_seen_calls.push((uid, seen));
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn store_deleted(
+            &mut self,
+            uid: u32,
+            deleted: bool,
+        ) -> PinBox<'_, Result<(), SyncError>> {
+            let fail = {
+                let mut f = self.0.lock().unwrap();
+                f.deleted_calls.push((uid, deleted));
+                if f.fail_store_deleted {
+                    true
+                } else {
+                    // Sticky UIDs ignore the unmark write (refusal fixture).
+                    if !(f.sticky_deleted.contains(&uid) && !deleted) {
+                        f.deleted.insert(uid, deleted);
+                    }
+                    false
+                }
+            };
+            Box::pin(async move {
+                if fail {
+                    Err(SyncError::Protocol("fake store_deleted failure".to_string()))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        fn expunge(&mut self) -> PinBox<'_, Result<Vec<u32>, SyncError>> {
+            let (gone, fail) = {
+                let mut f = self.0.lock().unwrap();
+                f.plain_expunge_calls += 1;
+                if f.fail_expunge {
+                    (Vec::new(), true)
+                } else {
+                    let gone: Vec<u32> = f
+                        .live_uids()
+                        .into_iter()
+                        .filter(|u| *f.deleted.get(u).unwrap_or(&false))
+                        .collect();
+                    f.removed.extend(gone.iter().copied());
+                    (gone, false)
+                }
+            };
+            Box::pin(async move {
+                if fail {
+                    Err(SyncError::Protocol("fake expunge failure".to_string()))
+                } else {
+                    Ok(gone)
+                }
+            })
+        }
+
+        fn uid_expunge(&mut self, uid_set: &str) -> PinBox<'_, Result<Vec<u32>, SyncError>> {
+            let (gone, fail) = {
+                let mut f = self.0.lock().unwrap();
+                f.expunged_sets.push(uid_set.to_string());
+                if f.fail_expunge {
+                    (Vec::new(), true)
+                } else {
+                    let wanted = parse_set(uid_set);
+                    // Scoped: only marked UIDs inside the set are removed —
+                    // foreign `\Deleted` outside the set always survives.
+                    let gone: Vec<u32> = f
+                        .live_uids()
+                        .into_iter()
+                        .filter(|u| wanted.contains(u) && *f.deleted.get(u).unwrap_or(&false))
+                        .collect();
+                    f.removed.extend(gone.iter().copied());
+                    (gone, false)
+                }
+            };
+            Box::pin(async move {
+                if fail {
+                    Err(SyncError::Protocol("fake uid_expunge failure".to_string()))
+                } else {
+                    Ok(gone)
+                }
+            })
+        }
+
+        fn uid_copy_to(
+            &mut self,
+            uid_set: &str,
+            dest: &str,
+        ) -> PinBox<'_, Result<(), SyncError>> {
+            let fail = {
+                let mut f = self.0.lock().unwrap();
+                f.copied_calls
+                    .push((uid_set.to_string(), dest.to_string()));
+                f.fail_copy
+            };
+            Box::pin(async move {
+                if fail {
+                    Err(SyncError::Protocol("fake uid_copy failure".to_string()))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        fn uid_move_to(
+            &mut self,
+            uid_set: &str,
+            dest: &str,
+        ) -> PinBox<'_, Result<(), SyncError>> {
+            let fail = {
+                let mut f = self.0.lock().unwrap();
+                f.moved_calls
+                    .push((uid_set.to_string(), dest.to_string()));
+                f.fail_move
+            };
+            Box::pin(async move {
+                if fail {
+                    Err(SyncError::Protocol("fake uid_move failure".to_string()))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        fn capabilities(&mut self) -> PinBox<'_, Result<Vec<String>, SyncError>> {
+            let caps = {
+                let mut f = self.0.lock().unwrap();
+                f.caps_calls += 1;
+                f.caps.clone()
+            };
+            Box::pin(async move { Ok(caps) })
+        }
+
+        fn create_mailbox(&mut self, name: &str) -> PinBox<'_, Result<(), SyncError>> {
+            self.0
+                .lock()
+                .unwrap()
+                .created_mailboxes
+                .push(name.to_string());
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn list_mailboxes(
+            &mut self,
+        ) -> PinBox<'_, Result<Vec<super::super::MailboxInfo>, SyncError>> {
+            Box::pin(async move { Ok(vec![]) })
+        }
+
+        fn mailbox_status(
+            &mut self,
+            _name: &str,
+        ) -> PinBox<'_, Result<super::super::MailboxStatus, SyncError>> {
+            let status = super::super::MailboxStatus {
+                uid_validity: 100,
+                uid_next: None,
+                unseen: 0,
+            };
+            Box::pin(async move { Ok(status) })
+        }
+
+        fn logout(&mut self) -> PinBox<'_, Result<(), SyncError>> {
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
+    #[cfg(test)]
+    impl SessionManager {
+        /// Test-only constructor with a pre-connected session: `lease_for`
+        /// never dials the network, so destructive-lease tests run offline.
+        fn for_test_session(session: Box<dyn SyncSession>) -> Self {
+            Self {
+                config: AccountConfig {
+                    host: "test.invalid".to_string(),
+                    port: 993,
+                    security: super::super::SecurityMode::ImplicitTls,
+                    username: "test".to_string(),
+                    password: zeroize::Zeroizing::new("test".to_string()),
+                    allow_untrusted: false,
+                    plain_local_confirmed: false,
+                },
+                state: async_std::sync::Mutex::new(ManagerState {
+                    session: Some(session),
+                    selected_mailbox: None,
+                    cached_capabilities: None,
+                }),
+            }
+        }
+    }
+
+    fn run<F>(f: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        async_std::task::block_on(f);
+    }
+
+    #[test]
+    fn capabilities_queried_once_per_connection() {
+        run(async {
+            let fake = FakeHandle::new(&["IMAP4rev1", "UIDPLUS", "MOVE"], &[1, 2]);
+            let probe = fake.0.clone();
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            // Two gated ops on different folders: CAPABILITY must issue
+            // exactly once — the second lease reads the cache.
+            manager.mark_deleted_in("INBOX", 1, true).await.unwrap();
+            let caps = manager.capabilities_cached().await.unwrap();
+            assert!(caps.iter().any(|c| c == "MOVE"));
+            manager.uid_expunge_in("Archive", "1").await.unwrap();
+            let f = probe.lock().unwrap();
+            assert_eq!(f.caps_calls, 1, "CAPABILITY re-queried: {:?}", f.caps_calls);
+            assert_eq!(f.select_calls, vec!["INBOX".to_string(), "Archive".to_string()]);
+        });
+    }
+
+    #[test]
+    fn mark_deleted_selects_folder_and_records_uid() {
+        run(async {
+            let fake = FakeHandle::new(&["IMAP4rev1"], &[7]);
+            let probe = fake.0.clone();
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            manager.mark_deleted_in("Sent", 7, true).await.unwrap();
+            // A follow-up lease on the same folder reuses the selection —
+            // no re-SELECT, no extra CAPABILITY.
+            manager.mark_deleted_in("Sent", 7, false).await.unwrap();
+            let f = probe.lock().unwrap();
+            assert_eq!(f.select_calls, vec!["Sent".to_string()]);
+            assert_eq!(f.deleted_calls, vec![(7, true), (7, false)]);
+            assert_eq!(f.caps_calls, 1);
+        });
+    }
+
+    #[test]
+    fn uid_expunge_and_create_trash_record_verbs() {
+        run(async {
+            let fake = FakeHandle::new(&["IMAP4rev1", "UIDPLUS"], &[1, 2]);
+            let probe = fake.0.clone();
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            let gone = manager.uid_expunge_in("INBOX", "1,2").await.unwrap();
+            assert!(gone.is_empty(), "nothing was marked, nothing removed");
+            manager.create_trash().await.unwrap();
+            let f = probe.lock().unwrap();
+            assert_eq!(f.expunged_sets, vec!["1,2".to_string()]);
+            assert_eq!(f.created_mailboxes, vec!["Trash".to_string()]);
+            // CREATE reuses the INBOX selection from the expunge lease.
+            assert_eq!(f.select_calls, vec!["INBOX".to_string()]);
+        });
     }
 }
