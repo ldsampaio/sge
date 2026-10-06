@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef } from "react";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { IconSync } from "./icons";
+import type { MailboxRow } from "../types";
 
 interface SyncStatusInfo {
   mailbox: string;
@@ -83,19 +84,26 @@ function hasSyncError(e: SyncEvent): e is SyncErrorEvent {
 interface SyncStatusProps {
   onSyncComplete?: () => void;
   mailbox?: string;
+  /** All known folders — a refresh syncs every one so search covers the account. */
+  mailboxes?: MailboxRow[];
 }
 
-export default function SyncStatus({ onSyncComplete, mailbox = "INBOX" }: SyncStatusProps) {
+export default function SyncStatus({ onSyncComplete, mailbox = "INBOX", mailboxes = [] }: SyncStatusProps) {
   const [status, setStatus] = useState<Status>({ kind: "idle" });
   const channelRef = useRef<Channel<SyncEvent> | null>(null);
   const syncingRef = useRef(false);
   const retryTimerRef = useRef<number | null>(null);
+  /** Live mirror — the poll interval closure always sees current folders. */
+  const mailboxesRef = useRef<MailboxRow[]>(mailboxes);
+  mailboxesRef.current = mailboxes;
+  const mailboxRef = useRef(mailbox);
+  mailboxRef.current = mailbox;
   /** Last known outbox depth, so a replay failure can report N. */
   const [lastPending, setLastPending] = useState(0);
 
   async function pollStatus() {
     try {
-      const s: SyncStatusInfo = await invoke("sync_status", { mailbox });
+      const s: SyncStatusInfo = await invoke("sync_status", { mailbox: mailboxRef.current });
       setLastPending(s.pending_count);
       setStatus({ kind: "synced", status: s });
     } catch {
@@ -109,16 +117,27 @@ export default function SyncStatus({ onSyncComplete, mailbox = "INBOX" }: SyncSt
 
   /**
    * The ONE sync entry (Phase 8): poll timer, manual button, and the
-   * reconnect retry all funnel here, so every refresh runs the same
-   * `start_sync` path under the backend single-flight guard.
+   * reconnect retry all funnel here. Every refresh syncs ALL known folders
+   * sequentially through the same `start_sync` path (backend single-flight
+   * guard serializes), so account-wide search always has fresh local data.
    */
   async function requestSync(source: "manual" | "poll" | "retry") {
     if (syncingRef.current) return;
     syncingRef.current = true;
+
+    const known = mailboxesRef.current;
+    const targets =
+      known.length > 0 ? known.map((mb) => mb.name) : [mailboxRef.current];
+    const labelOf = (raw: string) =>
+      known.find((mb) => mb.name === raw)?.display_name ?? raw;
     setStatus({
       kind: "syncing",
       progress:
-        source === "poll" ? "Verificação automática…" : "Preparando a sala…",
+        source === "poll"
+          ? `Verificação automática… (${targets.length} pastas)`
+          : targets.length > 1
+            ? `Preparando a sala… (1/${targets.length})`
+            : "Preparando a sala…",
     });
 
     const channel = new Channel<SyncEvent>();
@@ -149,7 +168,16 @@ export default function SyncStatus({ onSyncComplete, mailbox = "INBOX" }: SyncSt
     };
 
     try {
-      await invoke("start_sync", { onEvent: channel, mailbox });
+      for (let i = 0; i < targets.length; i++) {
+        const target = targets[i];
+        if (targets.length > 1) {
+          setStatus({
+            kind: "syncing",
+            progress: `Buscando ${labelOf(target)}… (${i + 1}/${targets.length})`,
+          });
+        }
+        await invoke("start_sync", { onEvent: channel, mailbox: target });
+      }
       await pollStatus();
       onSyncComplete?.();
     } catch (err) {

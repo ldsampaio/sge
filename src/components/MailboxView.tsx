@@ -86,7 +86,7 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
             </p>
           </div>
         </div>
-        <SyncStatus key={selectedMailbox} mailbox={selectedMailbox} onSyncComplete={handleSyncComplete} />
+        <SyncStatus key={selectedMailbox} mailbox={selectedMailbox} mailboxes={mailboxes} onSyncComplete={handleSyncComplete} />
       </header>
       <div className="mailbox-panes">
         <Sidebar
