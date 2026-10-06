@@ -638,13 +638,38 @@ mod tests {
         pub gap_once: Mutex<Vec<u32>>,
         /// UIDs omitted from EVERY fetch (flaky server path → tombstoned).
         pub always_miss: Mutex<Vec<u32>>,
+        /// Mailbox names passed to `select_mailbox` — asserts the Plan 10-02
+        /// lease-hold rule (no intermediate SELECT inside a fallback run).
+        pub select_calls: Vec<String>,
+        /// Recorded `(uid, deleted)` pairs from `store_deleted` — asserts
+        /// UID-only addressing on the Deleted path (T-10-01).
+        pub deleted_calls: Vec<(u32, bool)>,
+        /// Recorded `(uid_set, dest)` pairs from `uid_copy_to`.
+        pub copied_calls: Vec<(String, String)>,
+        /// Recorded `(uid_set, dest)` pairs from `uid_move_to`.
+        pub moved_calls: Vec<(String, String)>,
+        /// UID sets passed to `uid_expunge`, in call order.
+        pub expunged_sets: Vec<String>,
+        /// Bare-`expunge()` invocations (must stay 0 in UID-scoped paths).
+        pub plain_expunge_calls: usize,
+        /// Mailbox names passed to `create_mailbox` (Trash-CREATE path).
+        pub created_mailboxes: Vec<String>,
+        /// Canned `CAPABILITY` atoms (default MOVE + UIDPLUS).
+        pub canned_capabilities: Vec<String>,
+        /// When true, the matching verb fails — drives fallback tests.
+        pub fail_deleted: bool,
+        pub fail_expunge: bool,
+        pub fail_copy: bool,
+        pub fail_move: bool,
+        pub fail_create: bool,
     }
 
     impl SyncSession for MockSession {
         fn select_mailbox(
             &mut self,
-            _name: &str,
+            name: &str,
         ) -> PinBox<'_, Result<MailboxSummary, SyncError>> {
+            self.select_calls.push(name.to_string());
             let summary = self.summary.clone();
             Box::pin(async move { Ok(summary) })
         }
@@ -690,6 +715,71 @@ mod tests {
             if self.fail_set_seen {
                 return Box::pin(async move {
                     Err(SyncError::Protocol("mock set_seen failure".to_string()))
+                });
+            }
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn store_deleted(&mut self, uid: u32, deleted: bool) -> PinBox<'_, Result<(), SyncError>> {
+            self.deleted_calls.push((uid, deleted));
+            if self.fail_deleted {
+                return Box::pin(async move {
+                    Err(SyncError::Protocol("mock store_deleted failure".to_string()))
+                });
+            }
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn expunge(&mut self) -> PinBox<'_, Result<Vec<u32>, SyncError>> {
+            self.plain_expunge_calls += 1;
+            if self.fail_expunge {
+                return Box::pin(async move {
+                    Err(SyncError::Protocol("mock expunge failure".to_string()))
+                });
+            }
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn uid_expunge(&mut self, uid_set: &str) -> PinBox<'_, Result<Vec<u32>, SyncError>> {
+            self.expunged_sets.push(uid_set.to_string());
+            if self.fail_expunge {
+                return Box::pin(async move {
+                    Err(SyncError::Protocol("mock uid_expunge failure".to_string()))
+                });
+            }
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn uid_copy_to(&mut self, uid_set: &str, dest: &str) -> PinBox<'_, Result<(), SyncError>> {
+            self.copied_calls.push((uid_set.to_string(), dest.to_string()));
+            if self.fail_copy {
+                return Box::pin(async move {
+                    Err(SyncError::Protocol("mock uid_copy failure".to_string()))
+                });
+            }
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn uid_move_to(&mut self, uid_set: &str, dest: &str) -> PinBox<'_, Result<(), SyncError>> {
+            self.moved_calls.push((uid_set.to_string(), dest.to_string()));
+            if self.fail_move {
+                return Box::pin(async move {
+                    Err(SyncError::Protocol("mock uid_move failure".to_string()))
+                });
+            }
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn capabilities(&mut self) -> PinBox<'_, Result<Vec<String>, SyncError>> {
+            let caps = self.canned_capabilities.clone();
+            Box::pin(async move { Ok(caps) })
+        }
+
+        fn create_mailbox(&mut self, name: &str) -> PinBox<'_, Result<(), SyncError>> {
+            self.created_mailboxes.push(name.to_string());
+            if self.fail_create {
+                return Box::pin(async move {
+                    Err(SyncError::Protocol("mock create failure".to_string()))
                 });
             }
             Box::pin(async move { Ok(()) })
@@ -746,6 +836,23 @@ mod tests {
             fetch_ranges: Mutex::new(Vec::new()),
             gap_once: Mutex::new(Vec::new()),
             always_miss: Mutex::new(Vec::new()),
+            select_calls: Vec::new(),
+            deleted_calls: Vec::new(),
+            copied_calls: Vec::new(),
+            moved_calls: Vec::new(),
+            expunged_sets: Vec::new(),
+            plain_expunge_calls: 0,
+            created_mailboxes: Vec::new(),
+            canned_capabilities: vec![
+                "IMAP4rev1".to_string(),
+                "UIDPLUS".to_string(),
+                "MOVE".to_string(),
+            ],
+            fail_deleted: false,
+            fail_expunge: false,
+            fail_copy: false,
+            fail_move: false,
+            fail_create: false,
         }
     }
 
@@ -962,6 +1069,92 @@ mod tests {
             vec![(42, true), (42, false), (7, true)],
             "flag writes must carry the message UID, never a sequence number"
         );
+    }
+
+    /// The Deleted flag path records UID-addressed writes (T-10-01): the
+    /// UID reaching `store_deleted` is the message UID, and no
+    /// sequence-number store call exists on the delete path.
+    #[test]
+    fn mock_store_deleted_records_uid_calls() {
+        let summary = MailboxSummary {
+            selected_mailbox: "INBOX".to_string(),
+            uid_validity: 100,
+            uid_next: Some(4),
+            exists: 3,
+        };
+        let mut session = mock(summary, vec![mkhdr(1), mkhdr(2), mkhdr(3)]);
+
+        async_std::task::block_on(async {
+            session.store_deleted(42, true).await.unwrap();
+            session.store_deleted(42, false).await.unwrap();
+            session.store_deleted(7, true).await.unwrap();
+        });
+
+        assert_eq!(
+            session.deleted_calls,
+            vec![(42, true), (42, false), (7, true)],
+            "Deleted writes must carry the message UID, never a sequence number"
+        );
+    }
+
+    /// New transport arms record their wire arguments, honor `fail_*`
+    /// toggles, and report the canned capability set (T-10-01). The
+    /// `select_mailbox` recording backs the Plan 10-02 lease-hold test.
+    #[test]
+    fn mock_delete_move_arms_record_and_fail() {
+        let summary = MailboxSummary {
+            selected_mailbox: "INBOX".to_string(),
+            uid_validity: 100,
+            uid_next: Some(4),
+            exists: 2,
+        };
+        let mut session = mock(summary, vec![mkhdr(1), mkhdr(2)]);
+
+        async_std::task::block_on(async {
+            session.select_mailbox("INBOX").await.unwrap();
+            session.uid_copy_to("1,2", "Trash").await.unwrap();
+            session.uid_move_to("1,2", "Trash").await.unwrap();
+            session.uid_expunge("1,2").await.unwrap();
+            session.expunge().await.unwrap();
+            session.create_mailbox("Trash").await.unwrap();
+            let caps = session.capabilities().await.unwrap();
+            assert_eq!(caps, vec!["IMAP4rev1".to_string(), "UIDPLUS".to_string(), "MOVE".to_string()]);
+        });
+
+        assert_eq!(session.select_calls, vec!["INBOX".to_string()]);
+        assert_eq!(
+            session.copied_calls,
+            vec![("1,2".to_string(), "Trash".to_string())]
+        );
+        assert_eq!(
+            session.moved_calls,
+            vec![("1,2".to_string(), "Trash".to_string())]
+        );
+        assert_eq!(session.expunged_sets, vec!["1,2".to_string()]);
+        assert_eq!(session.plain_expunge_calls, 1);
+        assert_eq!(session.created_mailboxes, vec!["Trash".to_string()]);
+
+        // Failure toggles surface errors without recording loss.
+        session.fail_deleted = true;
+        session.fail_expunge = true;
+        session.fail_copy = true;
+        session.fail_move = true;
+        session.fail_create = true;
+        async_std::task::block_on(async {
+            assert!(session.store_deleted(1, true).await.is_err());
+            assert!(session.uid_expunge("1").await.is_err());
+            assert!(session.expunge().await.is_err());
+            assert!(session.uid_copy_to("1", "Trash").await.is_err());
+            assert!(session.uid_move_to("1", "Trash").await.is_err());
+            assert!(session.create_mailbox("Trash").await.is_err());
+        });
+        // Calls still record under failure (wire attempt happened).
+        assert_eq!(session.deleted_calls, vec![(1, true)]);
+        assert_eq!(session.expunged_sets.len(), 2);
+        assert_eq!(session.plain_expunge_calls, 2);
+        assert_eq!(session.copied_calls.len(), 2);
+        assert_eq!(session.moved_calls.len(), 2);
+        assert_eq!(session.created_mailboxes.len(), 2);
     }
 
     /// Seed helper: one INBOX row plus an optimistic Seen toggle, returning
