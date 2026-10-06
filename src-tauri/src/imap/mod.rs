@@ -19,6 +19,7 @@ pub mod manager;
 pub mod mutf7;
 pub mod probe;
 pub mod session;
+pub mod trash;
 
 pub use errors::ImapError;
 

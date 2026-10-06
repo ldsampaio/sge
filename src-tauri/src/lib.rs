@@ -36,12 +36,18 @@ use store::Store;
 /// `sync_cancel` is the cooperative cancel flag: `cancel_sync` sets it,
 /// `start_sync` clears it when a pass begins, and the worker checks it
 /// between sweep batches.
+///
+/// `trash_cache` maps account key (`host:port:username`, same key as
+/// `session_manager`) to the resolved Trash wire name from
+/// [`imap::trash::detect_trash`]. Memory-only, re-detected on LIST refresh;
+/// consumed by the delete/move commands (Phase 10, Plan 10-03).
 pub struct AppState {
     pub store: Arc<Mutex<Store>>,
     pub active_account: Mutex<Option<ActiveAccount>>,
     pub session_manager: Mutex<Option<Arc<imap::manager::SessionManager>>>,
     pub sync_gate: Arc<sync::SyncGate>,
     pub sync_cancel: Arc<std::sync::atomic::AtomicBool>,
+    pub trash_cache: Mutex<std::collections::HashMap<String, String>>,
 }
 
 /// In-memory credentials + server config for the connected session.
@@ -243,6 +249,7 @@ pub fn run() {
         session_manager: Mutex::new(None),
         sync_gate: Arc::new(sync::SyncGate::default()),
         sync_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        trash_cache: Mutex::new(std::collections::HashMap::new()),
     };
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
