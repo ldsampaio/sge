@@ -16,6 +16,7 @@ pub mod bodies;
 pub mod errors;
 pub mod headers;
 pub mod manager;
+pub mod mutf7;
 pub mod probe;
 pub mod session;
 
@@ -191,7 +192,11 @@ pub struct MailboxSummary {
 /// `\Noinferiors`, `\All`, `\Archive`, etc.).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MailboxInfo {
+    /// Raw wire name (modified UTF-7) — the ONLY form valid for
+    /// SELECT/STATUS. Never display this directly.
     pub name: String,
+    /// Decoded display form for the folder tree.
+    pub display_name: String,
     pub delimiter: String,
     pub attributes: Vec<String>,
 }
@@ -461,8 +466,10 @@ impl SyncSession for BoxedSession {
                 .map_err(|e| SyncError::Protocol(format!("LIST: {e}")))?;
             let mut out = Vec::new();
             while let Some(name) = stream.try_next().await? {
+                let raw = name.name().to_string();
                 out.push(MailboxInfo {
-                    name: name.name().to_string(),
+                    display_name: mutf7::decode_modified_utf7(&raw),
+                    name: raw,
                     delimiter: name
                         .delimiter()
                         .map(|d| d.to_string())

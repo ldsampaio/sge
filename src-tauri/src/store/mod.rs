@@ -16,7 +16,7 @@ pub mod queries;
 pub const BODY_CACHE_CAP_BYTES: usize = 262144;
 
 /// Schema version managed by rusqlite_migration.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 // v1 = full schema.sql (canonical DDL from ARCHITECTURE.md)
 // M2 = flag_outbox durable queue (Phase 6, Plan 06-01). The schema.sql v1
@@ -85,6 +85,7 @@ impl Store {
             M::up(M3_UNSEEN_COUNT_SQL),
             M::up(M4_BACKFILL_SQL),
             M::up(M5_STATUS_TS_SQL),
+            M::up(M6_DELIMITER_SQL),
         ]);
         migrations.to_latest(conn)?;
         Ok(())
@@ -171,6 +172,14 @@ const M4_BACKFILL_SQL: &str = concat!(
 /// (`set_sync_state`), and the badge gates on it.
 const M5_STATUS_TS_SQL: &str =
     "ALTER TABLE mailboxes ADD COLUMN status_synced_at TEXT;";
+
+/// M6 forward migration: hierarchy delimiter per folder (folder tree).
+///
+/// `delimiter` holds the LIST hierarchy delimiter (`/`, `.`, …) so the
+/// sidebar can nest subfolders offline. Written by `set_mailbox_delimiter`
+/// during folder discovery; empty means flat (unknown — render top-level).
+const M6_DELIMITER_SQL: &str =
+    "ALTER TABLE mailboxes ADD COLUMN delimiter TEXT NOT NULL DEFAULT '';";
 
 /// Returns the app-data attachment directory for a given mailbox UID.
 ///
@@ -260,8 +269,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_5_with_status_ts() {
-        assert_eq!(SCHEMA_VERSION, 5);
+    fn schema_version_is_6_with_delimiter() {
+        assert_eq!(SCHEMA_VERSION, 6);
         let store = Store::open_in_memory().expect("migration should succeed");
         let conn = store.conn();
         let count: i64 = conn
@@ -271,7 +280,7 @@ mod tests {
                 |r| r.get(0),
             )
             .expect("query should succeed");
-        assert_eq!(count, 1, "flag_outbox table should exist at schema v5");
+        assert_eq!(count, 1, "flag_outbox table should exist at schema v6");
         let idx: i64 = conn
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE type='index' AND name = 'idx_outbox_mailbox'",
@@ -287,7 +296,7 @@ mod tests {
                 |r| r.get(0),
             )
             .expect("query should succeed");
-        assert_eq!(unseen_cols, 1, "mailboxes.unseen_count should exist at schema v5");
+        assert_eq!(unseen_cols, 1, "mailboxes.unseen_count should exist at schema v6");
     }
 
     #[test]
@@ -322,7 +331,7 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(n, 1, "{kind} {name} should exist at schema v5");
+            assert_eq!(n, 1, "{kind} {name} should exist at schema v6");
         }
         let cols: i64 = conn
             .query_row(
@@ -331,7 +340,55 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(cols, 1, "mailboxes.sweeps_since_full should exist at schema v5");
+        assert_eq!(cols, 1, "mailboxes.sweeps_since_full should exist at schema v6");
+    }
+
+    #[test]
+    fn m6_adds_delimiter_column() {
+        // Simulate a v5 database (through M5).
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        Migrations::new(vec![
+            M::up(include_str!("schema.sql")),
+            M::up(M2_FLAG_OUTBOX_SQL),
+            M::up(M3_UNSEEN_COUNT_SQL),
+            M::up(M4_BACKFILL_SQL),
+            M::up(M5_STATUS_TS_SQL),
+        ])
+        .to_latest(&mut conn)
+        .unwrap();
+        Migrations::new(vec![
+            M::up(include_str!("schema.sql")),
+            M::up(M2_FLAG_OUTBOX_SQL),
+            M::up(M3_UNSEEN_COUNT_SQL),
+            M::up(M4_BACKFILL_SQL),
+            M::up(M5_STATUS_TS_SQL),
+            M::up(M6_DELIMITER_SQL),
+        ])
+        .to_latest(&mut conn)
+        .unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('mailboxes') WHERE name = 'delimiter'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "mailboxes.delimiter should exist at schema v6");
+        // Pre-M6 rows default to '' (flat — render top-level).
+        conn.execute(
+            "INSERT INTO mailboxes (name, uid_validity, uid_next) VALUES ('INBOX', 100, 4)",
+            [],
+        )
+        .unwrap();
+        let d: String = conn
+            .query_row(
+                "SELECT delimiter FROM mailboxes WHERE name = 'INBOX'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(d, "");
     }
 
     #[test]

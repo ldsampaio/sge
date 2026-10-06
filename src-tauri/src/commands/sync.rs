@@ -336,22 +336,24 @@ pub async fn list_messages(
     .map_err(|e| format!("internal error: list messages task failed ({e})"))?
 }
 
-/// Full-text search over the local FTS5 index for a mailbox (offline, no IMAP).
+/// Full-text search over the local FTS5 index (offline, no IMAP).
 ///
 /// Calls `queries::fts_search` which joins `messages_fts` against `messages`
 /// with BM25 ranking. The search query string is passed as a parameter
 /// binding to FTS5 -- no string interpolation (T-03-05 mitigations).
+/// `mailbox = None` searches the whole account (all folders); every row
+/// carries its folder in `mailbox` so results can jump to the right folder.
 #[tauri::command]
 pub async fn search_messages(
     state: State<'_, crate::AppState>,
-    mailbox: String,
+    mailbox: Option<String>,
     query: String,
 ) -> Result<Vec<crate::store::queries::MessageRow>, String> {
     let store = state.store.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let guard = store.lock().unwrap();
         let conn = guard.conn();
-        crate::store::queries::fts_search(conn, &mailbox, &query)
+        crate::store::queries::fts_search(conn, mailbox.as_deref(), &query)
             .map_err(|e| format!("store: {e}"))
     })
     .await
@@ -430,6 +432,8 @@ pub async fn list_mailboxes(
                         ),
                     }
                     let _ = queries::ensure_mailbox(conn, &folder.name);
+                    // Hierarchy delimiter for tree rendering (M6).
+                    let _ = queries::set_mailbox_delimiter(conn, &folder.name, &folder.delimiter);
                 }
             }
             let guard = store.lock().unwrap();
@@ -738,12 +742,12 @@ mod tests {
         assert!(queries::is_unread(&rows[2].flags));   // unread
 
         // FTS search by sender term -> finds alice
-        let results = queries::fts_search(conn, "INBOX", "alice").unwrap();
+        let results = queries::fts_search(conn, Some("INBOX"), "alice").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].from_addr, "alice@example.com");
 
         // FTS search by subject term
-        let results = queries::fts_search(conn, "INBOX", "World").unwrap();
+        let results = queries::fts_search(conn, Some("INBOX"), "World").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].uid, 2);
     }

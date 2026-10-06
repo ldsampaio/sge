@@ -15,6 +15,9 @@ use super::{StoreError, StoreResult};
 #[derive(Debug, Clone, Serialize)]
 pub struct MessageRow {
     pub uid: u32,
+    /// Raw wire mailbox name (modified UTF-7) the message belongs to —
+    /// lets global search jump to the right folder.
+    pub mailbox: String,
     pub subject: String,
     pub from_addr: String,
     pub to_addrs: String,
@@ -179,11 +182,32 @@ pub fn set_mailbox_status(
     Ok(())
 }
 
+/// Record a folder's LIST hierarchy delimiter (`/`, `.`, …) for tree
+/// rendering (M6). Empty means flat/unknown.
+pub fn set_mailbox_delimiter(
+    conn: &Connection,
+    mailbox: &str,
+    delimiter: &str,
+) -> StoreResult<()> {
+    conn.execute(
+        "INSERT INTO mailboxes (name, uid_validity, uid_next, delimiter)
+         VALUES (?1, 0, 0, ?2)
+         ON CONFLICT(name) DO UPDATE SET delimiter = excluded.delimiter",
+        rusqlite::params![mailbox, delimiter],
+    )?;
+    Ok(())
+}
+
 /// A cached mailbox row as surfaced to the UI layer.
 #[derive(Debug, Clone, Serialize)]
 pub struct MailboxRow {
     pub id: u64,
+    /// Raw wire name (modified UTF-7) — protocol use only.
     pub name: String,
+    /// Decoded display name for the folder tree.
+    pub display_name: String,
+    /// LIST hierarchy delimiter ('' = flat).
+    pub delimiter: String,
     pub uid_validity: u32,
     pub uid_next: u32,
     pub last_sync_at: Option<String>,
@@ -198,7 +222,7 @@ pub struct MailboxRow {
 /// `messages.flags` JSON (presence of `\\Seen` flag → read).
 pub fn list_mailboxes(conn: &Connection) -> StoreResult<Vec<MailboxRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, uid_validity, uid_next, last_sync_at, unseen_count,
+        "SELECT id, name, delimiter, uid_validity, uid_next, last_sync_at, unseen_count,
                 (SELECT COUNT(*) FROM messages m
                  WHERE m.mailbox_id = mailboxes.id
                  AND NOT EXISTS (
@@ -210,14 +234,18 @@ pub fn list_mailboxes(conn: &Connection) -> StoreResult<Vec<MailboxRow>> {
     )?;
     let rows = stmt
         .query_map([], |row| {
+            let name: String = row.get(1)?;
+            let display_name = crate::imap::mutf7::decode_modified_utf7(&name);
             Ok(MailboxRow {
                 id: row.get(0)?,
-                name: row.get(1)?,
-                uid_validity: row.get(2)?,
-                uid_next: row.get(3)?,
-                last_sync_at: row.get(4)?,
-                unseen_count: row.get(5)?,
-                unread_count: row.get(6)?,
+                name,
+                display_name,
+                delimiter: row.get(2)?,
+                uid_validity: row.get(3)?,
+                uid_next: row.get(4)?,
+                last_sync_at: row.get(5)?,
+                unseen_count: row.get(6)?,
+                unread_count: row.get(7)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()
@@ -583,6 +611,7 @@ fn row_to_message(row: &Row<'_>) -> Result<MessageRow, rusqlite::Error> {
         flags: row.get::<_, String>(5)?,
         has_attachments: row.get::<_, bool>(6)?,
         preview: row.get::<_, String>(7)?,
+        mailbox: row.get::<_, String>(8)?,
     })
 }
 
@@ -594,7 +623,7 @@ pub fn get_message_by_uid(
 ) -> StoreResult<Option<MessageRow>> {
     match conn.query_row(
         "SELECT m.uid, m.subject, m.from_addr, m.to_addrs, m.date_utc, \
-         m.flags, m.has_attachments, m.preview \
+         m.flags, m.has_attachments, m.preview, mb.name \
          FROM messages m JOIN mailboxes mb ON m.mailbox_id = mb.id \
          WHERE mb.name = ?1 AND m.uid = ?2",
         rusqlite::params![mailbox, uid],
@@ -647,7 +676,7 @@ pub fn list_messages(
 ) -> StoreResult<Vec<MessageRow>> {
     let sql = concat!(
         "SELECT m.uid, m.subject, m.from_addr, m.to_addrs, ",
-        "m.date_utc, m.flags, m.has_attachments, m.preview ",
+        "m.date_utc, m.flags, m.has_attachments, m.preview, mb.name ",
         "FROM messages m ",
         "JOIN mailboxes mb ON m.mailbox_id = mb.id ",
         "WHERE mb.name = ?1 ",
@@ -667,15 +696,23 @@ pub fn list_messages(
     Ok(result)
 }
 
-/// Full-text search over `messages_fts` with BM25 ranking, scoped to a mailbox.
-pub fn fts_search(conn: &Connection, mailbox: &str, query: &str) -> StoreResult<Vec<MessageRow>> {
+/// Full-text search over `messages_fts` with BM25 ranking.
+/// `mailbox = None` searches the whole account (all folders); `Some(name)`
+/// scopes to one folder. Every row carries its folder in `mailbox` so
+/// global results can jump to the right folder.
+pub fn fts_search(
+    conn: &Connection,
+    mailbox: Option<&str>,
+    query: &str,
+) -> StoreResult<Vec<MessageRow>> {
     let sql = concat!(
         "SELECT m.uid, m.subject, m.from_addr, m.to_addrs, ",
-        "m.date_utc, m.flags, m.has_attachments, m.preview ",
+        "m.date_utc, m.flags, m.has_attachments, m.preview, mb.name ",
         "FROM messages_fts ",
         "JOIN messages m ON messages_fts.rowid = m.id ",
         "JOIN mailboxes mb ON m.mailbox_id = mb.id ",
-        "WHERE messages_fts MATCH ?1 AND mb.name = ?2 ",
+        "WHERE messages_fts MATCH ?1 ",
+        "AND (?2 IS NULL OR mb.name = ?2) ",
         "ORDER BY rank",
     );
     let mut stmt = conn.prepare(sql)?;
@@ -1004,9 +1041,55 @@ mod tests {
         assert_eq!(uids, vec![1, 3]);
 
         // FTS search finds the sender offline (no IMAP needed)
-        let results = fts_search(conn, "INBOX", "alice").unwrap();
+        let results = fts_search(conn, Some("INBOX"), "alice").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].from_addr, "alice@example.com");
+    }
+
+    /// Global search (`mailbox = None`) spans all folders; every row
+    /// carries its folder so results can jump to it.
+    #[test]
+    fn fts_search_none_scopes_whole_account() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+
+        let inbox = ensure_mailbox(conn, "INBOX").unwrap();
+        let sent = ensure_mailbox(conn, "Sent").unwrap();
+        insert_msg(conn, inbox, 1, "Boletim mensal", "escola@example.com", "[]");
+        insert_msg(conn, sent, 2, "Boletim resposta", "eu@example.com", "[]");
+
+        // Scoped search: one folder only.
+        let scoped = fts_search(conn, Some("INBOX"), "Boletim").unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].mailbox, "INBOX");
+
+        // Global search: both folders, folder attributed per row.
+        let mut all = fts_search(conn, None, "Boletim").unwrap();
+        assert_eq!(all.len(), 2);
+        all.sort_by(|a, b| a.mailbox.cmp(&b.mailbox));
+        assert_eq!(all[0].mailbox, "INBOX");
+        assert_eq!(all[1].mailbox, "Sent");
+    }
+
+    /// Delimiter persistence + display-name decoding for the folder tree.
+    #[test]
+    fn mailbox_tree_fields_roundtrip() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+
+        ensure_mailbox(conn, "Orienta&AOcA9Q-es").unwrap();
+        set_mailbox_delimiter(conn, "Orienta&AOcA9Q-es", "/").unwrap();
+        set_mailbox_delimiter(conn, "INBOX", "/").unwrap();
+
+        let rows = list_mailboxes(conn).unwrap();
+        let folder = rows
+            .iter()
+            .find(|r| r.name == "Orienta&AOcA9Q-es")
+            .expect("folder cached");
+        assert_eq!(folder.display_name, "Orientações");
+        assert_eq!(folder.delimiter, "/");
+        let inbox = rows.iter().find(|r| r.name == "INBOX").expect("inbox");
+        assert_eq!(inbox.display_name, "INBOX");
     }
 
     #[test]
@@ -1080,7 +1163,7 @@ mod tests {
 
         // Wipe → old content must disappear from FTS
         delete_missing_uids(conn, mb_id, &[]).unwrap();
-        let stale = fts_search(conn, "INBOX", "StaleSubject").unwrap();
+        let stale = fts_search(conn, Some("INBOX"), "StaleSubject").unwrap();
         assert!(stale.is_empty(), "FTS must be empty after wipe");
     }
 
@@ -1123,7 +1206,7 @@ mod tests {
         );
 
         // FTS search must return non-empty
-        let results = fts_search(conn, "INBOX", "user42").unwrap();
+        let results = fts_search(conn, Some("INBOX"), "user42").unwrap();
         assert!(!results.is_empty(), "FTS should find user42 hits");
     }
 
