@@ -1007,6 +1007,10 @@ mod tests {
         pub plain_expunge_calls: usize,
         /// Mailbox names passed to `create_mailbox` (Trash-CREATE path).
         pub created_mailboxes: Vec<String>,
+        /// Recorded `(old, new)` pairs from `rename_mailbox` (Plan 11-02).
+        pub renamed_calls: Vec<(String, String)>,
+        /// Mailbox names passed to `delete_mailbox` (Plan 11-02).
+        pub deleted_mailboxes: Vec<String>,
         /// Canned `CAPABILITY` atoms (default MOVE + UIDPLUS).
         pub canned_capabilities: Vec<String>,
         /// When true, the matching verb fails — drives fallback tests.
@@ -1015,6 +1019,11 @@ mod tests {
         pub fail_copy: bool,
         pub fail_move: bool,
         pub fail_create: bool,
+        /// When true, `rename_mailbox` / `delete_mailbox` fail (Plan 11-02
+        /// folder-verb arms; the worker never drives them, but the trait
+        /// requires the methods).
+        pub fail_rename: bool,
+        pub fail_delete: bool,
         /// When true, `uid_move_to` refuses loudly (`SyncError::Refused`,
         /// the unmark-dance shape) — drives the replay refusal-cleanup test.
         pub fail_move_refused: bool,
@@ -1146,6 +1155,26 @@ mod tests {
             Box::pin(async move { Ok(()) })
         }
 
+        fn rename_mailbox(&mut self, old: &str, new: &str) -> PinBox<'_, Result<(), SyncError>> {
+            self.renamed_calls.push((old.to_string(), new.to_string()));
+            if self.fail_rename {
+                return Box::pin(async move {
+                    Err(SyncError::Protocol("mock rename failure".to_string()))
+                });
+            }
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn delete_mailbox(&mut self, name: &str) -> PinBox<'_, Result<(), SyncError>> {
+            self.deleted_mailboxes.push(name.to_string());
+            if self.fail_delete {
+                return Box::pin(async move {
+                    Err(SyncError::Protocol("mock delete failure".to_string()))
+                });
+            }
+            Box::pin(async move { Ok(()) })
+        }
+
         fn list_mailboxes(&mut self) -> PinBox<'_, Result<Vec<MailboxInfo>, SyncError>> {
             Box::pin(async move { Ok(vec![]) })
         }
@@ -1155,6 +1184,9 @@ mod tests {
                 uid_validity: self.summary.uid_validity,
                 uid_next: self.summary.uid_next,
                 unseen: self.status_unseen,
+                // The worker never drives folder verbs: no MESSAGES fixture
+                // needed here (folder guards read it via the manager stub).
+                messages: 0,
             };
             Box::pin(async move { Ok(status) })
         }
@@ -1204,6 +1236,8 @@ mod tests {
             expunged_sets: Vec::new(),
             plain_expunge_calls: 0,
             created_mailboxes: Vec::new(),
+            renamed_calls: Vec::new(),
+            deleted_mailboxes: Vec::new(),
             canned_capabilities: vec![
                 "IMAP4rev1".to_string(),
                 "UIDPLUS".to_string(),
@@ -1214,6 +1248,8 @@ mod tests {
             fail_copy: false,
             fail_move: false,
             fail_create: false,
+            fail_rename: false,
+            fail_delete: false,
             fail_move_refused: false,
         }
     }

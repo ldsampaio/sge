@@ -53,6 +53,7 @@ impl SyncSession for MockSession {
                 uid_validity: 100,
                 uid_next: Some(6),
                 unseen: 5,
+                messages: 5,
             })
         })
     }
@@ -121,6 +122,14 @@ impl SyncSession for MockSession {
     }
 
     fn create_mailbox(&mut self, _name: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SyncError>> + Send>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn rename_mailbox(&mut self, _old: &str, _new: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SyncError>> + Send>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn delete_mailbox(&mut self, _name: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SyncError>> + Send>> {
         Box::pin(async move { Ok(()) })
     }
 

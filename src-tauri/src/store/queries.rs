@@ -4,7 +4,7 @@
 //! expunge-diff, body/attachment insert — is channelled through the
 //! functions below. No raw SQL escapes this module.
 
-use rusqlite::{Connection, Row};
+use rusqlite::{Connection, OptionalExtension, Row};
 use serde::Serialize;
 
 use super::{StoreError, StoreResult};
@@ -194,6 +194,87 @@ pub fn set_mailbox_delimiter(
          VALUES (?1, 0, 0, ?2)
          ON CONFLICT(name) DO UPDATE SET delimiter = excluded.delimiter",
         rusqlite::params![mailbox, delimiter],
+    )?;
+    Ok(())
+}
+
+/// Escape SQLite LIKE wildcards so a folder prefix matches literally —
+/// `Pai` must never match `Pai2` (T-11-05).
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == '%' || c == '_' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Rename a cached mailbox row plus its whole subtree (Plan 11-02).
+///
+/// Keeps `mailbox_id`, `uid_validity`, and messages untouched; children
+/// move via prefix UPDATEs (`old + delimiter` → `new + delimiter`).
+/// Returns rows touched. Children share the parent's delimiter; an exact
+/// `Pai2` row never matches a `Pai` prefix (LIKE-escape).
+pub fn rename_mailbox_cache(
+    conn: &Connection,
+    old: &str,
+    new: &str,
+    delimiter: &str,
+) -> StoreResult<usize> {
+    let mut touched = conn.execute(
+        "UPDATE mailboxes SET name = ?1 WHERE name = ?2",
+        rusqlite::params![new, old],
+    )?;
+    if !delimiter.is_empty() {
+        let old_prefix = format!("{old}{delimiter}");
+        let new_prefix = format!("{new}{delimiter}");
+        let pattern = format!("{}%", escape_like(&old_prefix));
+        let children: Vec<String> = {
+            let mut stmt =
+                conn.prepare("SELECT name FROM mailboxes WHERE name LIKE ?1 ESCAPE '\\'")?;
+            let mut rows = stmt.query(rusqlite::params![pattern])?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next()? {
+                out.push(row.get(0)?);
+            }
+            out
+        };
+        for child in children {
+            // LIKE matched the literal prefix, so slicing at the prefix
+            // byte length always lands on a char boundary.
+            let new_name = format!("{new_prefix}{}", &child[old_prefix.len()..]);
+            touched += conn.execute(
+                "UPDATE mailboxes SET name = ?1 WHERE name = ?2",
+                rusqlite::params![new_name, child],
+            )?;
+        }
+    }
+    Ok(touched)
+}
+
+/// Delete a cached mailbox row and its dependent cache state (Plan 11-02).
+///
+/// Messages cascade via FK; both durable outboxes (`flag_outbox`,
+/// `imap_outbox`) drop in the same lock section. Children must already be
+/// gone (the command refuses deletes with subfolders) — deleting a parent
+/// row never orphans: callers assert zero remaining `LIKE` rows in tests.
+pub fn delete_mailbox_cache(conn: &Connection, name: &str) -> StoreResult<()> {
+    let id: Option<u64> = conn
+        .query_row(
+            "SELECT id FROM mailboxes WHERE name = ?1",
+            rusqlite::params![name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(mailbox_id) = id {
+        drop_outbox_for_mailbox(conn, mailbox_id)?;
+        drop_imap_outbox_for_mailbox(conn, mailbox_id)?;
+    }
+    conn.execute(
+        "DELETE FROM mailboxes WHERE name = ?1",
+        rusqlite::params![name],
     )?;
     Ok(())
 }
@@ -1944,5 +2025,96 @@ mod tests {
             assert_eq!(n, 0, "{table} must be empty after wipe");
         }
         assert!(fts_search(conn, Some("INBOX"), "Old").unwrap().is_empty());
+    }
+
+    // ── Plan 11-02: folder cache rename / delete ────────────────────
+
+    #[test]
+    fn rename_mailbox_cache_moves_subtree_preserving_rows() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let pai = ensure_mailbox(conn, "Pai").unwrap();
+        set_mailbox_delimiter(conn, "Pai", "/").unwrap();
+        let sub = ensure_mailbox(conn, "Pai/Sub").unwrap();
+        set_mailbox_delimiter(conn, "Pai/Sub", "/").unwrap();
+        let pai2 = ensure_mailbox(conn, "Pai2").unwrap();
+        insert_msg(conn, pai, 1, "Old", "a@x.com", "[]");
+        insert_msg(conn, sub, 2, "Kid", "b@x.com", "[]");
+        set_sync_state(conn, "Pai", 100, 4).unwrap();
+
+        let touched = rename_mailbox_cache(conn, "Pai", "Novo", "/").unwrap();
+        assert_eq!(touched, 2, "exact row + one child, Pai2 untouched");
+
+        // Exact `Pai2` never matched the prefix (LIKE-escape, T-11-05).
+        let names: Vec<String> = conn
+            .prepare("SELECT name FROM mailboxes ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(names.contains(&"Novo".to_string()));
+        assert!(names.contains(&"Novo/Sub".to_string()));
+        assert!(names.contains(&"Pai2".to_string()));
+        assert!(!names.iter().any(|n| n.starts_with("Pai/")));
+
+        // id / uid_validity / messages untouched (UIDs preserved, no refetch).
+        let novo_id: u64 = conn
+            .query_row("SELECT id FROM mailboxes WHERE name = 'Novo'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(novo_id, pai);
+        let validity: u32 = conn
+            .query_row("SELECT uid_validity FROM mailboxes WHERE name = 'Novo'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(validity, 100);
+        assert_eq!(count_messages(conn, novo_id), 1);
+        let sub_id: u64 = conn
+            .query_row("SELECT id FROM mailboxes WHERE name = 'Novo/Sub'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sub_id, sub);
+        assert_eq!(count_messages(conn, sub_id), 1);
+        assert_eq!(count_messages(conn, pai2), 0);
+    }
+
+    #[test]
+    fn delete_mailbox_cache_cascades_and_drops_queues() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let mb_id = ensure_mailbox(conn, "Velha").unwrap();
+        let sibling = ensure_mailbox(conn, "Irmã").unwrap();
+        insert_msg(conn, mb_id, 1, "Old", "a@x.com", "[]");
+        enqueue_outbox(conn, mb_id, 1, true, 100).unwrap();
+        enqueue_imap_outbox(conn, mb_id, 2, IMAP_OP_DELETE, Some("Trash"), 100).unwrap();
+        insert_msg(conn, sibling, 9, "Keep", "c@x.com", "[]");
+
+        delete_mailbox_cache(conn, "Velha").unwrap();
+
+        // Row gone, messages cascaded, both outbox rows dropped.
+        let gone: i64 = conn
+            .query_row("SELECT COUNT(*) FROM mailboxes WHERE name = 'Velha'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(gone, 0);
+        assert_eq!(count_messages(conn, mb_id), 0);
+        assert_eq!(outbox_count(conn, mb_id).unwrap(), 0);
+        assert_eq!(imap_outbox_count(conn, mb_id).unwrap(), 0);
+        // Sibling folders and their messages survive.
+        assert_eq!(count_messages(conn, sibling), 1);
+        // No orphan LIKE rows remain under the deleted prefix.
+        let orphans: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mailboxes WHERE name LIKE 'Velha/%' ESCAPE '\\'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphans, 0);
+    }
+
+    #[test]
+    fn delete_mailbox_cache_missing_name_is_noop() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        // Unknown folder: no row, no id, nothing to drop — still Ok.
+        delete_mailbox_cache(conn, "Nunca-Existiu").unwrap();
     }
 }

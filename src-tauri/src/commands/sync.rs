@@ -20,8 +20,10 @@ use crate::sync::bodies;
 use crate::sync::{SyncEvent, SyncCallback};
 use crate::creds::{CredentialStore, KeyringStore, SavedCredentials, ServerConfig};
 use crate::imap::trash::{detect_trash, TrashResolution};
-use crate::imap::{AccountConfig, SecurityMode, SyncError};
-use crate::imap::mutf7::{encode_modified_utf7, validate_leaf, FolderNameError};
+use crate::imap::{AccountConfig, MailboxInfo, SecurityMode, SyncError};
+use crate::imap::mutf7::{
+    decode_modified_utf7, encode_modified_utf7, validate_leaf, FolderNameError,
+};
 use crate::imap::manager::SessionManager;
 use crate::imap::session::connect_sync;
 use crate::imap::SyncSession;
@@ -859,11 +861,7 @@ async fn refresh_mailbox_tree(
         let guard = store.lock().unwrap();
         let conn = guard.conn();
         for folder in &discovered {
-            if folder
-                .attributes
-                .iter()
-                .any(|a| a.contains("NoSelect"))
-            {
+            if has_noselect_attr(&folder.attributes) {
                 continue;
             }
             match manager.mailbox_status(&folder.name).await {
@@ -981,6 +979,20 @@ pub async fn create_folder(
     .map_err(|e| format!("internal error: create folder task failed ({e})"))?
 }
 
+/// Exact pt-BR UI-SPEC copy for a rejected folder leaf (shared by the
+/// create and rename pre-wire guards).
+fn folder_name_error_copy(e: FolderNameError) -> String {
+    match e {
+        FolderNameError::Empty => "Dê um nome para a pasta.".to_string(),
+        FolderNameError::ContainsDelimiter(d) => format!(
+            "O nome não pode conter '{d}' — ele separa pastas. Crie uma pasta por vez."
+        ),
+        FolderNameError::ReservedInbox => {
+            "INBOX é uma pasta reservada do servidor — escolha outro nome.".to_string()
+        }
+    }
+}
+
 /// Pure pre-wire guard for `create_folder` (Plan 11-01): validate, then
 /// join `parent + delimiter + leaf`, encode, then exists pre-check against
 /// the cached tree. Returns the RAW wire name or the exact pt-BR UI-SPEC
@@ -994,15 +1006,7 @@ fn prepare_create_wire(
 ) -> Result<String, String> {
     let leaf = leaf.trim();
     if let Err(e) = validate_leaf(leaf, delimiter) {
-        return Err(match e {
-            FolderNameError::Empty => "Dê um nome para a pasta.".to_string(),
-            FolderNameError::ContainsDelimiter(d) => format!(
-                "O nome não pode conter '{d}' — ele separa pastas. Crie uma pasta por vez."
-            ),
-            FolderNameError::ReservedInbox => {
-                "INBOX é uma pasta reservada do servidor — escolha outro nome.".to_string()
-            }
-        });
+        return Err(folder_name_error_copy(e));
     }
     let joined = match parent {
         Some(p) => format!("{p}{delimiter}{leaf}"),
@@ -1019,6 +1023,14 @@ fn prepare_create_wire(
 /// (no queue exists), already-exists repeats the exists copy, anything
 /// else surfaces the server detail instead of a bare NO.
 fn map_create_error(e: &SyncError) -> String {
+    map_folder_error(e, "create", "")
+}
+
+/// Map a failed folder op to plain language (Plan 11-02): offline is loud
+/// (no queue exists for any folder op), already-exists repeats the exists
+/// copy, otherwise the op shapes the message — DELETE has an exact UI-SPEC
+/// server-refusal copy, probe failures (LIST/STATUS reads) stay neutral.
+fn map_folder_error(e: &SyncError, op: &str, display: &str) -> String {
     let msg = e.to_string();
     if is_connectivity_error(&msg) {
         return "Sem conexão — pastas só podem ser alteradas online. Tente de novo ao reconectar."
@@ -1028,7 +1040,337 @@ fn map_create_error(e: &SyncError) -> String {
     if lower.contains("already exist") || lower.contains("mailbox exists") {
         return "Já existe uma pasta com esse nome.".to_string();
     }
-    format!("Não foi possível criar a pasta: {msg}")
+    match op {
+        "delete" => format!("O servidor não permitiu excluir {display}: {msg}."),
+        "rename" => format!("Não foi possível renomear a pasta: {msg}"),
+        "probe" => format!("Não foi possível ler as pastas do servidor: {msg}"),
+        _ => format!("Não foi possível criar a pasta: {msg}"),
+    }
+}
+
+/// True when a LIST attribute marks a hierarchy placeholder (`\Noselect`
+/// in any backslash spelling) — never a rename/delete target.
+fn has_noselect_attr(attributes: &[String]) -> bool {
+    attributes.iter().any(|a| a.contains("NoSelect"))
+}
+
+/// System-role detection for the rename/delete double-guard (Plan 11-02).
+///
+/// Trash resolves through the single `detect_trash` detector (its cached
+/// rows synthesize empty attributes — the name layers still apply);
+/// Sent/Drafts match the Sidebar `SYSTEM_ORDER` ranks 1-2 name lists.
+/// Returns the pt-BR role label for the disabled-state copy.
+///
+/// HANDOFF 11-03: `imap/roles.rs resolve_roles` owns these lists — this
+/// guard delegates (Trash) or mirrors-then-moves (Sent/Drafts) so there is
+/// never a second detector to drift (T-11-08).
+fn is_system_role(cached: &[queries::MailboxRow], name: &str) -> Option<&'static str> {
+    let infos: Vec<MailboxInfo> = cached
+        .iter()
+        .map(|r| MailboxInfo {
+            name: r.name.clone(),
+            display_name: r.display_name.clone(),
+            delimiter: r.delimiter.clone(),
+            attributes: Vec::new(),
+        })
+        .collect();
+    if detect_trash(&infos) == TrashResolution::Found(name.to_string()) {
+        return Some("Lixeira");
+    }
+    let row = cached.iter().find(|r| r.name == name)?;
+    let mut candidates = vec![row.name.to_lowercase(), row.display_name.to_lowercase()];
+    for s in [&row.name, &row.display_name] {
+        for d in ['/', '.'] {
+            if let Some(leaf) = s.rsplit(d).next() {
+                candidates.push(leaf.to_lowercase());
+            }
+        }
+    }
+    let lists: &[(&[&str], &str)] = &[
+        (&["sent", "sent messages", "enviadas", "enviados", "[gmail]/sent mail"], "Enviadas"),
+        (&["drafts", "rascunhos", "[gmail]/drafts"], "Rascunhos"),
+    ];
+    for (names, role) in lists {
+        if names.iter().any(|n| candidates.iter().any(|c| c == n)) {
+            return Some(role);
+        }
+    }
+    None
+}
+
+/// Pure pre-wire guard for `rename_folder` (Plan 11-02): INBOX refusal →
+/// system-role double-guard → `validate_leaf` on the new leaf (same
+/// delimiter rules as create) → join + encode → target-exists. Returns
+/// `(old_wire, new_wire)` or the exact pt-BR copy. Never touches the
+/// network — every `Err` returns before any verb call (T-11-04).
+fn guard_rename(
+    cached: &[queries::MailboxRow],
+    old: &str,
+    new_leaf: &str,
+) -> Result<(String, String), String> {
+    if old.eq_ignore_ascii_case("inbox") {
+        return Err("A INBOX não pode ser renomeada — ela é fixa do servidor.".to_string());
+    }
+    let row = cached.iter().find(|r| r.name == old).ok_or_else(|| {
+        "Essa pasta não existe mais na lista — atualize a lista e tente de novo.".to_string()
+    })?;
+    if let Some(role) = is_system_role(cached, old) {
+        return Err(format!("{role} do sistema — o nome é fixo."));
+    }
+    let new_leaf = new_leaf.trim();
+    if let Err(e) = validate_leaf(new_leaf, &row.delimiter) {
+        return Err(folder_name_error_copy(e));
+    }
+    let joined = match old.rsplit_once(row.delimiter.as_str()) {
+        Some((parent, _)) if !row.delimiter.is_empty() => {
+            format!("{parent}{}{new_leaf}", row.delimiter)
+        }
+        _ => new_leaf.to_string(),
+    };
+    let new_wire = encode_modified_utf7(&joined);
+    if cached.iter().any(|r| r.name == new_wire) {
+        return Err("Já existe uma pasta com esse nome.".to_string());
+    }
+    Ok((old.to_string(), new_wire))
+}
+
+/// Outcome of the pure delete pre-wire guard (Plan 11-02).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DeleteDecision {
+    /// All guards passed — issue the DELETE verb.
+    Proceed { wire: String, display: String },
+    /// Non-empty folder without confirmation — surface the count modal.
+    NeedCount(u32),
+    /// Confirmed but the typed name does not match — surface typed confirm.
+    NeedTyped(String),
+}
+
+/// Pure pre-wire guard for `delete_folder` (Plan 11-02): INBOX refusal →
+/// unknown → children (`wire + delimiter` prefix over ALL cached
+/// delimiters) → non-empty confirm gates. The `\Noselect` check needs fresh
+/// LIST attributes, so the command applies it separately before calling
+/// this. Every refusal returns before any verb call (T-11-04/T-11-06).
+fn guard_delete(
+    cached: &[queries::MailboxRow],
+    wire: &str,
+    messages: u32,
+    confirmed: bool,
+    typed_name: Option<&str>,
+) -> Result<DeleteDecision, String> {
+    if wire.eq_ignore_ascii_case("inbox") {
+        return Err("A INBOX não pode ser excluída — ela é fixa do servidor.".to_string());
+    }
+    let row = cached.iter().find(|r| r.name == wire).ok_or_else(|| {
+        "Essa pasta não existe mais na lista — atualize a lista e tente de novo.".to_string()
+    })?;
+    let mut delimiters: Vec<&str> = cached
+        .iter()
+        .map(|r| r.delimiter.as_str())
+        .filter(|d| !d.is_empty())
+        .collect();
+    delimiters.push(row.delimiter.as_str());
+    let has_children = cached.iter().any(|r| {
+        r.name != wire && delimiters.iter().any(|d| !d.is_empty() && r.name.starts_with(&format!("{wire}{d}")))
+    });
+    if has_children {
+        return Err(format!(
+            "A pasta {} tem subpastas — exclua ou mova as subpastas primeiro.",
+            row.display_name
+        ));
+    }
+    if messages > 0 && !confirmed {
+        return Ok(DeleteDecision::NeedCount(messages));
+    }
+    if messages > 0 && confirmed && typed_name != Some(row.display_name.as_str()) {
+        return Ok(DeleteDecision::NeedTyped(row.display_name.clone()));
+    }
+    Ok(DeleteDecision::Proceed {
+        wire: wire.to_string(),
+        display: row.display_name.clone(),
+    })
+}
+
+/// Outcome of a successful `rename_folder` call: old + new RAW wire names
+/// (so the UI migrates selection atomically) plus the refreshed tree.
+/// `warning` carries the post-rename UIDVALIDITY-bump notice when the
+/// server did not preserve it (treated like an epoch change).
+#[derive(Debug, Clone, Serialize)]
+pub struct RenameFolderResult {
+    pub old: String,
+    pub new: String,
+    pub warning: Option<String>,
+    pub mailboxes: Vec<queries::MailboxRow>,
+}
+
+/// Rename one folder: guards → RENAME → cache migrate → re-LIST (FOLD-05).
+///
+/// `old` is the RAW wire name, `new_leaf` the raw user-typed leaf (same
+/// delimiter rules as create; encoded backend-side). UIDs are preserved —
+/// the cache row keeps its `mailbox_id`/`uid_validity`, only the name (and
+/// subtree prefixes) change. Online-only with the loud offline copy.
+#[tauri::command]
+pub async fn rename_folder(
+    state: State<'_, crate::AppState>,
+    old: String,
+    new_leaf: String,
+) -> Result<RenameFolderResult, String> {
+    let account_cfg: AccountConfig = load_account_config(state.clone()).await?;
+    let manager = manager_for(&state, &account_cfg);
+    let store = state.store.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        async_std::task::block_on(async {
+            // 1. Snapshot the cached tree (brief lock, never across `.await`).
+            let cached = {
+                let guard = store.lock().unwrap();
+                queries::list_mailboxes(guard.conn()).map_err(|e| format!("store: {e}"))?
+            };
+            // 2. Pure guards (no verb has fired on Err).
+            let (old_wire, new_wire) = guard_rename(&cached, &old, &new_leaf)?;
+            let delimiter = cached
+                .iter()
+                .find(|r| r.name == old_wire)
+                .map(|r| r.delimiter.clone())
+                .unwrap_or_default();
+            // 3. Wire RENAME; a UIDVALIDITY bump becomes a warning, not a
+            // silent accept — the new name stands (epoch-change rule).
+            let mut warning: Option<String> = None;
+            if let Err(e) = manager.rename_mailbox_in(&old_wire, &new_wire).await {
+                if matches!(e, SyncError::State(_)) {
+                    warning = Some(
+                        "A pasta foi renomeada, mas o servidor atualizou os dados da pasta — sincronize para conferir as mensagens.".to_string(),
+                    );
+                } else {
+                    let display = cached
+                        .iter()
+                        .find(|r| r.name == old_wire)
+                        .map(|r| r.display_name.clone())
+                        .unwrap_or_else(|| decode_modified_utf7(&old_wire));
+                    return Err(map_folder_error(&e, "rename", &display));
+                }
+            }
+            // 4. Migrate the cache row + subtree (same lock section).
+            {
+                let guard = store.lock().unwrap();
+                queries::rename_mailbox_cache(guard.conn(), &old_wire, &new_wire, &delimiter)
+                    .map_err(|e| format!("store: {e}"))?;
+            }
+            // 5. Re-LIST refresh (shared body) + return old/new for atomic
+            // selection migration.
+            let mailboxes = refresh_mailbox_tree(&manager, &store).await?;
+            Ok(RenameFolderResult {
+                old: old_wire,
+                new: new_wire,
+                warning,
+                mailboxes,
+            })
+        })
+    })
+    .await
+    .map_err(|e| format!("internal error: rename folder task failed ({e})"))?
+}
+
+/// Outcome of a successful `delete_folder` call: the deleted RAW wire name,
+/// the refreshed tree, and the INBOX fallback hint for selection.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeleteFolderResult {
+    pub deleted: String,
+    pub mailboxes: Vec<queries::MailboxRow>,
+    pub fallback: String,
+}
+
+/// Delete one folder: guards → DELETE → cache cascade → re-LIST (FOLD-06).
+///
+/// `confirmed` + `typed_name` drive the non-empty double gate: without
+/// confirmation a non-empty folder returns `need_delete_confirm:{count}`
+/// (no wire call); with confirmation but a mismatched typed name returns
+/// `need_typed_confirm:{display}` (no wire call). Empty-then-delete is
+/// never automated — refuse loudly instead. Online-only, INBOX/`\Noselect`
+/// never reach the wire, selection falls back to INBOX.
+#[tauri::command]
+pub async fn delete_folder(
+    state: State<'_, crate::AppState>,
+    name: String,
+    confirmed: bool,
+    typed_name: Option<String>,
+) -> Result<DeleteFolderResult, String> {
+    let account_cfg: AccountConfig = load_account_config(state.clone()).await?;
+    let manager = manager_for(&state, &account_cfg);
+    let store = state.store.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        async_std::task::block_on(async {
+            // 1. INBOX fast refusal before any I/O (guard_delete repeats it
+            // as the authority — same copy).
+            if name.eq_ignore_ascii_case("inbox") {
+                return Err("A INBOX não pode ser excluída — ela é fixa do servidor.".to_string());
+            }
+            // 2. Fresh LIST doubles as the online probe and the `\Noselect`
+            // guard (cached rows carry no attributes until M8 in 11-03).
+            let discovered = manager
+                .list_mailboxes()
+                .await
+                .map_err(|e| map_folder_error(&e, "probe", &decode_modified_utf7(&name)))?;
+            if let Some(mb) = discovered.iter().find(|m| m.name == name) {
+                if has_noselect_attr(&mb.attributes) {
+                    return Err(format!(
+                        "A pasta {} é um marcador do servidor e não pode ser excluída.",
+                        decode_modified_utf7(&name)
+                    ));
+                }
+            }
+            // 3. Snapshot the cached tree (brief lock, never across `.await`).
+            let cached = {
+                let guard = store.lock().unwrap();
+                queries::list_mailboxes(guard.conn()).map_err(|e| format!("store: {e}"))?
+            };
+            let display = cached
+                .iter()
+                .find(|r| r.name == name)
+                .map(|r| r.display_name.clone())
+                .unwrap_or_else(|| decode_modified_utf7(&name));
+            // 4. Fresh STATUS feeds the non-empty guard.
+            let messages = manager
+                .mailbox_status(&name)
+                .await
+                .map_err(|e| map_folder_error(&e, "probe", &display))?
+                .messages;
+            // 5. Pure guards — every refusal returns before any verb call.
+            // The decision carries the canonical (wire, display) pair used
+            // below, so no second lookup can drift.
+            let (target, display) = match guard_delete(
+                &cached,
+                &name,
+                messages,
+                confirmed,
+                typed_name.as_deref(),
+            )? {
+                DeleteDecision::NeedCount(n) => {
+                    return Err(format!("need_delete_confirm:{n}"));
+                }
+                DeleteDecision::NeedTyped(d) => {
+                    return Err(format!("need_typed_confirm:{d}"));
+                }
+                DeleteDecision::Proceed { wire, display } => (wire, display),
+            };
+            // 6. Wire DELETE, then cascade the cache in the same lock section.
+            if let Err(e) = manager.delete_mailbox_in(&target).await {
+                return Err(map_folder_error(&e, "delete", &display));
+            }
+            {
+                let guard = store.lock().unwrap();
+                queries::delete_mailbox_cache(guard.conn(), &target)
+                    .map_err(|e| format!("store: {e}"))?;
+            }
+            // 7. Re-LIST refresh (shared body); selection falls back to INBOX.
+            let mailboxes = refresh_mailbox_tree(&manager, &store).await?;
+            Ok(DeleteFolderResult {
+                deleted: target,
+                mailboxes,
+                fallback: "INBOX".to_string(),
+            })
+        })
+    })
+    .await
+    .map_err(|e| format!("internal error: delete folder task failed ({e})"))?
 }
 
 /// Sync status returned to the frontend.
@@ -1293,7 +1635,11 @@ mod tests {
     use crate::store::queries;
     use crate::store::Store;
 
-    use super::{is_connectivity_error, map_create_error, pending_depth, prepare_create_wire};
+    use super::{
+        guard_delete, guard_rename, has_noselect_attr, is_connectivity_error,
+        map_create_error, map_folder_error, pending_depth, prepare_create_wire,
+        DeleteDecision,
+    };
 
     /// Verify the list_messages + search_messages query path against an
     /// in-memory store (same pattern as queries.rs tests but exercising
@@ -1403,6 +1749,27 @@ mod tests {
         ]
     }
 
+    /// Richer cached tree for the rename/delete guards: INBOX, a parent
+    /// with one child, a lookalike (`Pai2`), and a system Trash by name.
+    fn folder_tree_full() -> Vec<queries::MailboxRow> {
+        let mut tree = folder_tree();
+        let row = |id: u64, name: &str, delimiter: &str| queries::MailboxRow {
+            id,
+            name: name.to_string(),
+            display_name: name.to_string(),
+            delimiter: delimiter.to_string(),
+            uid_validity: 100,
+            uid_next: 1,
+            last_sync_at: None,
+            unread_count: 0,
+            unseen_count: 0,
+        };
+        tree.push(row(3, "Pai/Sub", "/"));
+        tree.push(row(4, "Pai2", ""));
+        tree.push(row(5, "Lixeira", ""));
+        tree
+    }
+
     /// The create pre-wire guard returns UI-SPEC copy for every refusal —
     /// and because it is pure, every `Err` here provably returns before
     /// any verb call (T-11-02/T-11-03).
@@ -1483,6 +1850,153 @@ mod tests {
             map_create_error(&other).starts_with("Não foi possível criar a pasta:"),
             "unexpected: {}",
             map_create_error(&other)
+        );
+    }
+
+    /// The rename guard refuses INBOX / system roles / unknown / bad leaves /
+    /// existing targets before any verb call — and joins + encodes on success.
+    #[test]
+    fn guard_rename_refusals_and_happy_paths() {
+        let tree = folder_tree_full();
+        // INBOX (any case) never reaches the wire.
+        for inbox in ["INBOX", "inbox"] {
+            assert_eq!(
+                guard_rename(&tree, inbox, "Nova"),
+                Err("A INBOX não pode ser renomeada — ela é fixa do servidor.".to_string())
+            );
+        }
+        // System Trash by name is double-guarded here (UI disables upstream).
+        assert_eq!(
+            guard_rename(&tree, "Lixeira", "Outra"),
+            Err("Lixeira do sistema — o nome é fixo.".to_string())
+        );
+        // Unknown folder: refuse, do not invent a server round-trip.
+        assert_eq!(
+            guard_rename(&tree, "Fantasma", "Nova"),
+            Err("Essa pasta não existe mais na lista — atualize a lista e tente de novo.".to_string())
+        );
+        // New-leaf validation mirrors create (same delimiter rules).
+        assert_eq!(
+            guard_rename(&tree, "Pai", "A/B"),
+            Err("O nome não pode conter '/' — ele separa pastas. Crie uma pasta por vez.".to_string())
+        );
+        assert_eq!(
+            guard_rename(&tree, "Pai", "inbox"),
+            Err("INBOX é uma pasta reservada do servidor — escolha outro nome.".to_string())
+        );
+        // Target exists (including renaming onto itself).
+        assert_eq!(
+            guard_rename(&tree, "Pai/Sub", "Sub"),
+            Err("Já existe uma pasta com esse nome.".to_string())
+        );
+        assert_eq!(
+            guard_rename(&tree, "Pai2", "Pai2"),
+            Err("Já existe uma pasta com esse nome.".to_string())
+        );
+        // Happy paths: top-level stays top-level, nested keeps its parent
+        // prefix, encoding happens backend-side.
+        assert_eq!(
+            guard_rename(&tree, "Pai", "Novo"),
+            Ok(("Pai".to_string(), "Novo".to_string()))
+        );
+        assert_eq!(
+            guard_rename(&tree, "Pai/Sub", "Novo"),
+            Ok(("Pai/Sub".to_string(), "Pai/Novo".to_string()))
+        );
+        assert_eq!(
+            guard_rename(&tree, "Pai2", "Novo2"),
+            Ok(("Pai2".to_string(), "Novo2".to_string()))
+        );
+        assert_eq!(
+            guard_rename(&tree, "Pai/Sub", "Café"),
+            Ok(("Pai/Sub".to_string(), "Pai/Caf&AOk-".to_string()))
+        );
+    }
+
+    /// The delete guard refuses INBOX / unknown / parents before any verb
+    /// call, and gates non-empty folders behind the two confirm steps.
+    #[test]
+    fn guard_delete_refusals_and_confirm_gates() {
+        let tree = folder_tree_full();
+        assert_eq!(
+            guard_delete(&tree, "INBOX", 0, false, None),
+            Err("A INBOX não pode ser excluída — ela é fixa do servidor.".to_string())
+        );
+        assert_eq!(
+            guard_delete(&tree, "Fantasma", 0, false, None),
+            Err("Essa pasta não existe mais na lista — atualize a lista e tente de novo.".to_string())
+        );
+        // Parent with a child refuses loudly (move-out guidance, T-11-06).
+        assert_eq!(
+            guard_delete(&tree, "Pai", 0, false, None),
+            Err("A pasta Pai tem subpastas — exclua ou mova as subpastas primeiro.".to_string())
+        );
+        // Lookalike `Pai2` is not a child of `Pai` — proceeds.
+        assert_eq!(
+            guard_delete(&tree, "Pai2", 0, false, None),
+            Ok(DeleteDecision::Proceed {
+                wire: "Pai2".to_string(),
+                display: "Pai2".to_string(),
+            })
+        );
+        // Non-empty without confirmation: count gate, zero verbs.
+        assert_eq!(
+            guard_delete(&tree, "Pai2", 5, false, None),
+            Ok(DeleteDecision::NeedCount(5))
+        );
+        // Confirmed but typed name mismatches: typed gate, zero verbs.
+        assert_eq!(
+            guard_delete(&tree, "Pai2", 5, true, Some("outra")),
+            Ok(DeleteDecision::NeedTyped("Pai2".to_string()))
+        );
+        assert_eq!(
+            guard_delete(&tree, "Pai2", 5, true, None),
+            Ok(DeleteDecision::NeedTyped("Pai2".to_string()))
+        );
+        // Confirmed with the exact display name: proceeds.
+        assert_eq!(
+            guard_delete(&tree, "Pai2", 5, true, Some("Pai2")),
+            Ok(DeleteDecision::Proceed {
+                wire: "Pai2".to_string(),
+                display: "Pai2".to_string(),
+            })
+        );
+    }
+
+    /// `\Noselect` detection is spelling-agnostic (one- and two-backslash).
+    #[test]
+    fn noselect_attr_spellings() {
+        assert!(has_noselect_attr(&["\\NoSelect".to_string()]));
+        assert!(has_noselect_attr(&["\\\\NoSelect".to_string()]));
+        assert!(!has_noselect_attr(&["\\HasNoChildren".to_string()]));
+        assert!(!has_noselect_attr(&[]));
+    }
+
+    /// Folder error mapping per op: offline loud, exists repeated, DELETE
+    /// and probe copies exact.
+    #[test]
+    fn map_folder_error_copies_per_op() {
+        let offline = SyncError::Protocol("SessionManager reconnect: reset".to_string());
+        assert_eq!(
+            map_folder_error(&offline, "delete", "X"),
+            "Sem conexão — pastas só podem ser alteradas online. Tente de novo ao reconectar.".to_string()
+        );
+        let exists = SyncError::Protocol("RENAME a -> b: NO already exists".to_string());
+        assert_eq!(
+            map_folder_error(&exists, "rename", "a"),
+            "Já existe uma pasta com esse nome.".to_string()
+        );
+        let denied = SyncError::Protocol("DELETE Velha: NO cannot delete".to_string());
+        assert_eq!(
+            map_folder_error(&denied, "delete", "Velha"),
+            "O servidor não permitiu excluir Velha: IMAP protocol error: DELETE Velha: NO cannot delete.".to_string()
+        );
+        let probe = SyncError::Protocol("LIST failed: boom".to_string());
+        assert!(
+            map_folder_error(&probe, "probe", "X").starts_with("Não foi possível ler as pastas do servidor:")
+        );
+        assert!(
+            map_folder_error(&probe, "rename", "X").starts_with("Não foi possível renomear a pasta:")
         );
     }
 }

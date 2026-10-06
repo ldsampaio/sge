@@ -194,6 +194,8 @@ mod tests {
                     uid_validity: 100,
                     uid_next: Some(1),
                     unseen: 0,
+                    // Body-fetch fixture: no MESSAGES datum needed.
+                    messages: 0,
                 })
             })
         }
@@ -246,6 +248,14 @@ mod tests {
         }
 
         fn create_mailbox(&mut self, _name: &str) -> PinBox<'_, Result<(), SyncError>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn rename_mailbox(&mut self, _old: &str, _new: &str) -> PinBox<'_, Result<(), SyncError>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn delete_mailbox(&mut self, _name: &str) -> PinBox<'_, Result<(), SyncError>> {
             Box::pin(async move { Ok(()) })
         }
 

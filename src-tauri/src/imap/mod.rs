@@ -346,15 +346,30 @@ pub trait SyncSession: Unpin + Send {
     /// `CREATE <name>` — create one mailbox (Phase 10: Trash fallback only).
     fn create_mailbox(&mut self, name: &str) -> PinBox<'_, Result<(), SyncError>>;
 
+    /// `RENAME <old> <new>` — rename one mailbox, subtree included
+    /// (Plan 11-02). Name-only verb: no UID args, no streams to drain.
+    /// Raw wire names in, never display names.
+    fn rename_mailbox(&mut self, old: &str, new: &str) -> PinBox<'_, Result<(), SyncError>>;
+
+    /// `DELETE <name>` — delete one (empty, childless) mailbox
+    /// (Plan 11-02). Name-only verb: no UID args, no streams to drain.
+    /// Raw wire name in, never display_name.
+    fn delete_mailbox(&mut self, name: &str) -> PinBox<'_, Result<(), SyncError>>;
+
     /// `LIST "" "*"` — discover all mailboxes on the server (FOLD-01).
     /// Returns raw LIST results with name, delimiter, and attributes.
     fn list_mailboxes(&mut self) -> PinBox<'_, Result<Vec<MailboxInfo>, SyncError>>;
 
-    /// `STATUS <mailbox> (UIDVALIDITY UIDNEXT UNSEEN)` — read-only triage
-    /// signals for one folder without SELECTing it (FOLD-02).
+    /// `STATUS <mailbox> (UIDVALIDITY UIDNEXT UNSEEN MESSAGES)` — read-only
+    /// triage signals for one folder without SELECTing it (FOLD-02).
     ///
     /// `unseen` is the count of messages without `\Seen` (STATUS UNSEEN
     /// datum), NOT the SELECT "first unseen sequence number" semantic.
+    /// `messages` is the STATUS MESSAGES datum (total messages in the
+    /// folder) — feeds the non-empty delete guard (Plan 11-02). Vendored
+    /// mapping note: async-imap 0.11.3 has no dedicated `messages` field —
+    /// `parse_status` folds `StatusAttribute::Messages` into
+    /// `Mailbox.exists`, so `messages` reads from `.exists` here.
     fn mailbox_status(&mut self, name: &str) -> PinBox<'_, Result<MailboxStatus, SyncError>>;
 
     /// Graceful `LOGOUT`.  Idempotent on error.
@@ -367,6 +382,10 @@ pub struct MailboxStatus {
     pub uid_validity: u32,
     pub uid_next: Option<u32>,
     pub unseen: u32,
+    /// STATUS MESSAGES datum: total messages in the folder (Plan 11-02
+    /// non-empty delete guard). Sourced from the vendored `Mailbox.exists`
+    /// field — see the `mailbox_status` trait doc for the mapping.
+    pub messages: u32,
 }
 
 /// The UID STORE argument for a Seen toggle, in canonical form.
@@ -669,6 +688,29 @@ impl SyncSession for BoxedSession {
         })
     }
 
+    fn rename_mailbox(&mut self, old: &str, new: &str) -> PinBox<'_, Result<(), SyncError>> {
+        let (old_owned, new_owned) = (old.to_string(), new.to_string());
+        Box::pin(async move {
+            // Vendored async-imap 0.11.3 names confirmed via `cargo fetch`
+            // source inspection (Plan 11-02 compile gate): `rename(from, to)`
+            // and `delete(mailbox_name)` — no delta.
+            self.rename(&old_owned, &new_owned)
+                .await
+                .map_err(|e| SyncError::Protocol(format!("RENAME {old_owned} -> {new_owned}: {e}")))?;
+            Ok(())
+        })
+    }
+
+    fn delete_mailbox(&mut self, name: &str) -> PinBox<'_, Result<(), SyncError>> {
+        let name_owned = name.to_string();
+        Box::pin(async move {
+            self.delete(&name_owned)
+                .await
+                .map_err(|e| SyncError::Protocol(format!("DELETE {name_owned}: {e}")))?;
+            Ok(())
+        })
+    }
+
     fn logout(&mut self) -> PinBox<'_, Result<(), SyncError>> {
         Box::pin(async move {
             self.logout()
@@ -709,7 +751,7 @@ impl SyncSession for BoxedSession {
         let mailbox_name = name.to_string();
         Box::pin(async move {
             let mailbox = self
-                .status(&mailbox_name, "(UIDVALIDITY UIDNEXT UNSEEN)")
+                .status(&mailbox_name, "(UIDVALIDITY UIDNEXT UNSEEN MESSAGES)")
                 .await
                 .map_err(|e| SyncError::Protocol(format!("STATUS {mailbox_name}: {e}")))?;
             Ok(MailboxStatus {
@@ -721,6 +763,10 @@ impl SyncSession for BoxedSession {
                 uid_next: mailbox.uid_next,
                 // STATUS UNSEEN datum = count of messages without \Seen.
                 unseen: mailbox.unseen.unwrap_or(0),
+                // Vendored mapping: async-imap 0.11.3 folds the MESSAGES
+                // datum into `Mailbox.exists` (parse_status) — there is no
+                // dedicated field (Plan 11-02 compile-gate delta).
+                messages: mailbox.exists,
             })
         })
     }

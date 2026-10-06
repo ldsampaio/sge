@@ -258,6 +258,59 @@ impl SessionManager {
         }
     }
 
+    /// `RENAME <old> -> <new>` through the owned session with one
+    /// transparent reconnect + retry (Plan 11-02). The lease SELECTs `old`
+    /// first (keeps SELECT state sane); a [`SyncError::Refused`] is
+    /// deterministic and never retried. Ends with a `mailbox_status(new)`
+    /// UIDVALIDITY check against the pre-rename value (read by the caller
+    /// of this method): a bump surfaces [`SyncError::State`] — the command
+    /// layer treats it like an epoch change, never a silent accept.
+    ///
+    /// Locking: the rename lease is dropped before the post-rename STATUS
+    /// (same async mutex — holding it would deadlock).
+    pub async fn rename_mailbox_in(&self, old: &str, new: &str) -> Result<(), SyncError> {
+        let pre = self.mailbox_status(old).await?.uid_validity;
+        {
+            let mut lease = self.lease_for(old).await?;
+            match lease.session().rename_mailbox(old, new).await {
+                Ok(()) => {}
+                Err(refused @ SyncError::Refused(_)) => return Err(refused),
+                Err(first) => {
+                    eprintln!("[SGE imap] RENAME {old} -> {new} failed ({first}) — reconnecting once");
+                    drop(lease);
+                    self.reconnect().await?;
+                    let mut lease = self.lease_for(old).await?;
+                    lease.session().rename_mailbox(old, new).await?;
+                }
+            }
+        }
+        let post = self.mailbox_status(new).await?.uid_validity;
+        if post != pre {
+            return Err(SyncError::State(format!(
+                "RENAME {old} -> {new}: UIDVALIDITY changed {pre} -> {post} — treated like an epoch change"
+            )));
+        }
+        Ok(())
+    }
+
+    /// `DELETE <name>` through the owned session with one transparent
+    /// reconnect + retry (Plan 11-02). The lease SELECTs `name` first (keeps
+    /// SELECT state sane); a [`SyncError::Refused`] is deterministic and
+    /// never retried.
+    pub async fn delete_mailbox_in(&self, name: &str) -> Result<(), SyncError> {
+        let mut lease = self.lease_for(name).await?;
+        match lease.session().delete_mailbox(name).await {
+            Ok(()) => Ok(()),
+            Err(refused @ SyncError::Refused(_)) => Err(refused),
+            Err(first) => {
+                eprintln!("[SGE imap] DELETE {name} failed ({first}) — reconnecting once");
+                drop(lease);
+                self.reconnect().await?;
+                let mut lease = self.lease_for(name).await?;
+                lease.session().delete_mailbox(name).await
+            }
+        }
+    }
     /// Move `uid_set` (comma-joined `"1,2,3"`) from `src` to `dest` (raw
     /// wire names) under ONE held lease, with reconnect-retry and
     /// capability-gated fallback orchestration (Plan 10-02, MOVE-01 slice).
@@ -318,9 +371,10 @@ impl SessionManager {
         lease.session().list_mailboxes().await
     }
 
-    /// `STATUS <mailbox> (UIDVALIDITY UIDNEXT UNSEEN)` through the owned
-    /// session (FOLD-02 triage signals). Does not disturb the lease's
-    /// SELECTed folder — STATUS works on any mailbox.
+    /// `STATUS <mailbox> (UIDVALIDITY UIDNEXT UNSEEN MESSAGES)` through the
+    /// owned session (FOLD-02 triage signals + Plan 11-02 message count).
+    /// Does not disturb the lease's SELECTed folder — STATUS works on any
+    /// mailbox.
     pub async fn mailbox_status(
         &self,
         mailbox: &str,
@@ -542,6 +596,24 @@ mod tests {
         /// When true, `create_mailbox` fails with `Refused` (validation
         /// refusal — must never be retried).
         fail_create_refused: bool,
+        /// Recorded `(old, new)` pairs from `rename_mailbox` (Plan 11-02).
+        renamed_calls: Vec<(String, String)>,
+        /// Mailbox names passed to `delete_mailbox` (Plan 11-02).
+        deleted_mailboxes: Vec<String>,
+        /// When true, `rename_mailbox` / `delete_mailbox` fail with a
+        /// `Protocol` error (drives the reconnect-retry path).
+        fail_rename: bool,
+        fail_delete: bool,
+        /// When true, the RENAME/DELETE verbs fail with `Refused`
+        /// (deterministic — must never be retried).
+        fail_rename_refused: bool,
+        fail_delete_refused: bool,
+        /// Canned STATUS MESSAGES datum (Plan 11-02 non-empty guard).
+        status_messages: u32,
+        /// When true, every `mailbox_status` call bumps the returned
+        /// UIDVALIDITY by one first — drives the post-RENAME epoch check.
+        bump_status_validity: bool,
+        status_calls: usize,
         fail_store_deleted: bool,
         fail_expunge: bool,
         fail_copy: bool,
@@ -595,6 +667,15 @@ mod tests {
                 set_seen_calls: Vec::new(),
                 fail_create: false,
                 fail_create_refused: false,
+                renamed_calls: Vec::new(),
+                deleted_mailboxes: Vec::new(),
+                fail_rename: false,
+                fail_delete: false,
+                fail_rename_refused: false,
+                fail_delete_refused: false,
+                status_messages: 0,
+                bump_status_validity: false,
+                status_calls: 0,
                 fail_store_deleted: false,
                 fail_expunge: false,
                 fail_copy: false,
@@ -822,14 +903,54 @@ mod tests {
             Box::pin(async move { Ok(vec![]) })
         }
 
+        fn rename_mailbox(&mut self, old: &str, new: &str) -> PinBox<'_, Result<(), SyncError>> {
+            let (fail_protocol, fail_refused) = {
+                let mut f = self.0.lock().unwrap();
+                f.renamed_calls.push((old.to_string(), new.to_string()));
+                (f.fail_rename, f.fail_rename_refused)
+            };
+            Box::pin(async move {
+                if fail_refused {
+                    Err(SyncError::Refused("fake rename refused".to_string()))
+                } else if fail_protocol {
+                    Err(SyncError::Protocol("fake rename failure".to_string()))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        fn delete_mailbox(&mut self, name: &str) -> PinBox<'_, Result<(), SyncError>> {
+            let (fail_protocol, fail_refused) = {
+                let mut f = self.0.lock().unwrap();
+                f.deleted_mailboxes.push(name.to_string());
+                (f.fail_delete, f.fail_delete_refused)
+            };
+            Box::pin(async move {
+                if fail_refused {
+                    Err(SyncError::Refused("fake delete refused".to_string()))
+                } else if fail_protocol {
+                    Err(SyncError::Protocol("fake delete failure".to_string()))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
         fn mailbox_status(
             &mut self,
             _name: &str,
         ) -> PinBox<'_, Result<super::super::MailboxStatus, SyncError>> {
-            let status = super::super::MailboxStatus {
-                uid_validity: 100,
-                uid_next: None,
-                unseen: 0,
+            let status = {
+                let mut f = self.0.lock().unwrap();
+                f.status_calls += 1;
+                let validity = if f.bump_status_validity { 100 + f.status_calls as u32 } else { 100 };
+                super::super::MailboxStatus {
+                    uid_validity: validity,
+                    uid_next: None,
+                    unseen: 0,
+                    messages: f.status_messages,
+                }
             };
             Box::pin(async move { Ok(status) })
         }
@@ -990,6 +1111,126 @@ mod tests {
             assert_eq!(f.created_mailboxes, vec!["Pai".to_string()]);
         });
     }
+
+    #[test]
+    fn rename_and_delete_pass_wire_names_byte_identical() {
+        run(async {
+            let fake = FakeHandle::new(&["IMAP4rev1"], &[]);
+            let probe = fake.0.clone();
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            manager.rename_mailbox_in("Pai", "Novo").await.unwrap();
+            manager.delete_mailbox_in("Velha").await.unwrap();
+            let f = probe.lock().unwrap();
+            assert_eq!(
+                f.renamed_calls,
+                vec![("Pai".to_string(), "Novo".to_string())]
+            );
+            assert_eq!(f.deleted_mailboxes, vec!["Velha".to_string()]);
+            // RENAME leases the old name, DELETE the target name.
+            assert_eq!(f.select_calls, vec!["Pai".to_string(), "Velha".to_string()]);
+        });
+    }
+
+    #[test]
+    fn rename_and_delete_never_retry_refused() {
+        run(async {
+            let fake = FakeHandle::new(&["IMAP4rev1"], &[]);
+            let probe = fake.0.clone();
+            {
+                let mut f = probe.lock().unwrap();
+                f.fail_rename_refused = true;
+                f.fail_delete_refused = true;
+            }
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            let err = manager
+                .rename_mailbox_in("Pai", "Novo")
+                .await
+                .expect_err("refused RENAME must surface");
+            assert!(matches!(err, super::super::SyncError::Refused(_)));
+            let err = manager
+                .delete_mailbox_in("Velha")
+                .await
+                .expect_err("refused DELETE must surface");
+            assert!(matches!(err, super::super::SyncError::Refused(_)));
+            // No new lease attempts: exactly one verb call each, no retry.
+            let f = probe.lock().unwrap();
+            assert_eq!(f.renamed_calls.len(), 1);
+            assert_eq!(f.deleted_mailboxes.len(), 1);
+        });
+    }
+
+    #[test]
+    fn rename_and_delete_retry_goes_through_reconnect() {
+        run(async {
+            let fake = FakeHandle::new(&["IMAP4rev1"], &[]);
+            let probe = fake.0.clone();
+            {
+                let mut f = probe.lock().unwrap();
+                f.fail_rename = true;
+                f.fail_delete = true;
+            }
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            // Offline the reconnect cannot succeed: the retry path surfaces
+            // the reconnect error with exactly one verb call each.
+            for err in [
+                manager.rename_mailbox_in("Pai", "Novo").await.expect_err("offline"),
+                manager.delete_mailbox_in("Velha").await.expect_err("offline"),
+            ] {
+                let msg = err.to_string().to_lowercase();
+                assert!(
+                    msg.contains("reconnect") || msg.contains("connect"),
+                    "expected a reconnect/connect error, got: {err}"
+                );
+            }
+            let f = probe.lock().unwrap();
+            assert_eq!(f.renamed_calls.len(), 1);
+            assert_eq!(f.deleted_mailboxes.len(), 1);
+        });
+    }
+
+    #[test]
+    fn rename_rejects_uidvalidity_bump_as_state_error() {
+        run(async {
+            let fake = FakeHandle::new(&["IMAP4rev1"], &[]);
+            let probe = fake.0.clone();
+            {
+                probe.lock().unwrap().bump_status_validity = true;
+            }
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            // Pre-rename STATUS returns 101, post-rename 102 — a bump the
+            // caller must never silently accept (epoch rule).
+            let err = manager
+                .rename_mailbox_in("Pai", "Novo")
+                .await
+                .expect_err("UIDVALIDITY bump must surface");
+            let msg = err.to_string();
+            assert!(
+                matches!(err, super::super::SyncError::State(_)) && msg.contains("UIDVALIDITY"),
+                "expected a State UIDVALIDITY error, got: {err}"
+            );
+            let f = probe.lock().unwrap();
+            assert_eq!(f.renamed_calls.len(), 1, "bump detected after the verb, not instead of it");
+        });
+    }
+
+    #[test]
+    fn mailbox_status_carries_canned_message_count() {
+        run(async {
+            let fake = FakeHandle::new(&["IMAP4rev1"], &[]);
+            let probe = fake.0.clone();
+            {
+                probe.lock().unwrap().status_messages = 7;
+            }
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            // The MESSAGES datum flows from the session stub through the
+            // manager untouched — the delete guard reads it here.
+            let status = manager.mailbox_status("INBOX").await.unwrap();
+            assert_eq!(status.messages, 7);
+        });
+    }
+
+    #[test]
+    fn move_fallback_prefers_uid_move() {
         run(async {
             let fake = FakeHandle::new(&["IMAP4rev1", "UIDPLUS", "MOVE"], &[1, 2]);
             let probe = fake.0.clone();
