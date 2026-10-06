@@ -8,13 +8,14 @@ SGE is a Linux desktop email client built with Rust + Tauri v2 + React + SQLite.
 
 Connect to an IMAP server on Linux and read your mail locally in a fast Gmail-like UI — if this doesn't work, nothing else matters.
 
-## Current Milestone: v1.1 Triage & Folders — **Shipped ✅**
+## Current Milestone: v1.2 Compose & Organize
 
-**Status:** All 4 phases (6–9) executed autonomously. Lifecycle: audit → complete → cleanup. Milestone archived to `.planning/milestones/v1.1-phases/`.
+**Goal:** Usuário cria, organiza e envia e-mail pelo SGE (fim da era read-only).
 
-**Last activity:** 2026-10-04 — Milestone v1.1 shipped and PR merged.
-
-**Next milestone:** v1.2 — To be defined after review of completed work.
+**Target features:**
+- Apagar mensagens com expunge + mover entre pastas + rascunhos (salvar/editar)
+- Pastas: criar/renomear/apagar via IMAP (CREATE/RENAME/DELETE)
+- Compose + responder/encaminhar com anexos via SMTP (smtp.utfpr.edu.br:587/STARTTLS)
 
 ## Requirements
 
@@ -34,9 +35,12 @@ Connect to an IMAP server on Linux and read your mail locally in a fast Gmail-li
 - ✓ App refreshes on 5-min poll plus manual refresh through one guarded code path — Phase 8 (single-flight tested; live arrival deferred)
 - ✓ App backfills UIDs missed between syncs with no silent gaps — Phase 9 (7/7 verified: range-diff, tombstoning, convergence)
 
-### Active (v1.2 — to be defined by /gsd-new-milestone)
+### Active (v1.2)
 
-- [ ] Next goals emerge from v1.2 scoping (candidates: SMTP compose/send, IDLE push, CONDSTORE fast path, delete/move)
+- [ ] User can delete messages (expunge) and move them between folders
+- [ ] User can save/edit drafts
+- [ ] User can create/rename/delete folders via IMAP
+- [ ] User can compose + reply/forward with attachments via SMTP
 
 ### Shipped (v1.1 — 2026-10-05)
 

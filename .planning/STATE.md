@@ -1,20 +1,16 @@
 ---
 gsd_state_version: "1.0"
-milestone: v1.1
-milestone_name: Triage & Folders
-status: Shipped — v1.1 Triage & Folders complete (audit: tech_debt, 6 live items deferred)
-stopped_at: Milestone archived + tagged v1.1
-last_updated: "2026-10-05T16:15:00.000Z"
-last_activity: "2026-10-05"
-last_activity_desc: v1.1 shipped for real — 4 phases verified, audit tech_debt, archived
-state_head: ""
+milestone: v1.2
+milestone_name: Compose & Organize
+status: planning
+last_updated: "2026-10-06T13:46:51.679Z"
+last_activity: 2026-10-06
 progress:
-  total_phases: 4
-  completed_phases: 4
-  total_plans: 8
-  completed_plans: 8
-current_phase: 9
-current_phase_name: UID Backfill
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # Project State
@@ -28,11 +24,10 @@ See: .planning/PROJECT.md (updated 2026-10-05)
 
 ## Current Position
 
-Phase: Milestone v1.1 complete
+Phase: Not started (defining requirements)
 Plan: —
-Status: Shipped ✅ — 4 phases (6–9), 8 plans, 102 backend tests green, tsc + build clean. Audit: tech_debt (6 live-validation items deferred). Archives: `.planning/milestones/v1.1-ROADMAP.md`, `.planning/milestones/v1.1-REQUIREMENTS.md`, `.planning/v1.1-MILESTONE-AUDIT.md`. Tag: v1.1.
-
-Last activity: 2026-10-05 — milestone shipped.
+Status: Defining requirements
+Last activity: 2026-10-06 — Milestone v1.2 started
 
 ## Performance Metrics
 
