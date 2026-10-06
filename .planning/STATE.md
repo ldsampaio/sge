@@ -2,15 +2,19 @@
 gsd_state_version: "1.0"
 milestone: v1.2
 milestone_name: Compose & Organize
+current_phase: 11
+current_phase_name: folder-crud
 status: executing
-last_updated: "2026-10-06T14:30:00.000Z"
+stopped_at: Phase 10 complete — MoveMenu, ExpungeModal, undo toast, row/reader delete+move actions implemented; all 156 backend tests + frontend build green
+last_updated: "2026-10-06T23:25:38.613Z"
 last_activity: 2026-10-06
+last_activity_desc: Plan 10-04 executed (MoveMenu, ExpungeModal, undo toast, row/reader actions)
+state_head: f03bf6fde78cb3aa9b1542299dd539f44cffc841
 progress:
   total_phases: 5
   completed_phases: 1
-  total_plans: 4
+  total_plans: 7
   completed_plans: 4
-  percent: 20
 ---
 
 # Project State
@@ -24,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-10-05)
 
 ## Current Position
 
-Phase: 10 (Delete + Move) — COMPLETE (4/4 plans)
+Phase: 11 (folder-crud) — READY TO EXECUTE
 Plan: 10-04 executed 2026-10-06
 Status: All Phase 10 success criteria satisfied; ready for live validation gates (L1-L4)
 Last activity: 2026-10-06 — Plan 10-04 executed (MoveMenu, ExpungeModal, undo toast, row/reader actions)
