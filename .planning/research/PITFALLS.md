@@ -1,248 +1,474 @@
-# Pitfalls Research: v1.1 Triage & Folders (adding writes, folders, polling, backfill to a read-only IMAP client)
+# PITFALLS — Adding SMTP Send + Folder/Message CRUD to SGE (v1.2)
 
-**Domain:** IMAP email client — incremental v1.1 capabilities on an existing read-only single-session client
-**Researched:** 2026-10-04
-**Confidence:** HIGH (RFC 3501/4549/4551/7162/4315/2177 semantics + Dovecot/Evolution implementation history)
+> Research for the **v1.2 Compose & Organize** milestone. SGE already has a working
+> read/triage client (headers-first sync, per-folder sync, `flag_outbox`, single-flight
+> `SessionManager`, SQLite + FTS5, 993/SSL live-verified). This doc lists **common
+> mistakes when ADDING send + CRUD to that existing system** — not how to build a
+> client from scratch. Each pitfall: what goes wrong → warning signs → prevention →
+> which v1.2 phase should own it.
 
-## Critical Pitfalls
+**Suggested v1.2 phase split** (referenced as P1–P4 below):
 
-### Pitfall 1: Treating \Seen toggle as "just a STORE" without a same-source-of-truth flag-reconcile pass
+| Phase | Scope | Why this order |
+|-------|-------|----------------|
+| **P1 — SMTP transport** | Auth + STARTTLS + send-one-mail path, no queue, no threading | Unblocks everything; smallest live-testable slice against `smtp.utfpr.edu.br:587` |
+| **P2 — Compose safety** | Offline send queue, exactly-once, reply/forward threading headers, attachments | Hardest correctness surface; builds on P1 transport |
+| **P3 — Folder CRUD** | CREATE / RENAME / DELETE with delimiter, `\Noselect`, special-use | Independent of send; touches folder-discovery + sidebar tree |
+| **P4 — Delete / Move** | `\Deleted` + EXPUNGE/UID EXPUNGE, MOVE (= COPY + STORE), UIDVALIDITY-gated local deletes | Most destructive; must come after sync/backfill semantics are solid (they are — Phases 6–9) |
 
-**What goes wrong:**
-User taps read/unread, app fires `UID STORE +FLAGS \Seen`, updates local DB optimistically — but the next header sync overwrites the local flag with stale server data (or vice versa), so the toggle visibly flaps: read → unread → read. Worse, if the FETCH during sync uses non-UID sequence numbers, an intervening EXPUNGE shifts sequence numbers and the flag lands on the wrong message.
-
-**Why it happens:**
-M1 was read-only, so the sync path was designed as "server is truth, overwrite local." The first write feature breaks that assumption, but developers bolt STORE onto the side without changing sync to reconcile (compare-and-merge) instead of overwrite. Sync also commonly fetches flags by sequence number rather than UID, which is only safe inside a single SELECT with no expunge in between.
-
-**How to avoid:**
-- Always address flag writes by UID (`UID STORE <uid> ±FLAGS (\Seen)`), never by sequence number.
-- Sync must FETCH `UID + FLAGS` together and merge: apply server flags except for UIDs with a locally-pending (unacked) toggle; once STORE returns OK, clear pending and accept server state.
-- Never use plain `FETCH BODY[]`/`FETCH FLAGS` (implicit `\Seen` side effect on some servers for BODY[] — use BODY.PEEK discipline from M1; for flags-only FETCH there is no Seen side effect, but keep the habit of explicit `.SILENT` or UID STORE to suppress noisy untagged FETCH storms).
-- If server advertises CONDSTORE (RFC 7162), prefer `UID STORE … UNCHANGEDSINCE <modseq>` for toggles so a concurrent change from another client/phone returns `MODIFIED` instead of silently clobbering; on MODIFIED, re-fetch flags and re-apply user intent or surface conflict.
-
-**Warning signs:**
-- Flag state visibly flaps after toggle + sync.
-- "Wrong message marked read" bug reports (sequence-number addressing + expunge shift).
-- STORE issued with sequence numbers anywhere in the codebase.
-
-**Phase to address:**
-Flag-sync phase (first v1.1 phase) — reconcile logic must land in the same phase as the first STORE, not "later."
+Rule of thumb: **P1 before P2, P3 and P4 in either order, never P4 before a live UIDVALIDITY test.**
 
 ---
 
-### Pitfall 2: Single global UIDVALIDITY / UIDNEXT / high-water-mark applied to all folders
+## 1. SMTP SEND — Auth, STARTTLS, Queue, Duplicates, Threading
 
-**What goes wrong:**
-App stores one `uidvalidity` / `last_uid` in SQLite, then adds Sent/Drafts/custom folders reusing the same row. Opening a second folder either (a) compares the wrong UIDVALIDITY and needlessly wipes/re-downloads, or (b) misses a real UIDVALIDITY change and shows stale/wrong messages matched to recycled UIDs. Folder rename on another client looks like "folder vanished + unknown folder appeared" and orphans local rows.
+### 1.1 Reusing the IMAP credential path blindly for SMTP
 
-**Why it happens:**
-M1 only knew INBOX, so per-mailbox state got modeled as global app state. RFC 3501/9051 UIDVALIDITY is per-mailbox, and UIDNEXT/high-water-mark are meaningless across mailboxes. Developers also forget that LIST must be re-queried: folder set is dynamic.
+SMTP auth on port 587 is a *different* handshake (EHLO → STARTTLS → EHLO → AUTH)
+against a *different* host (`smtp.utfpr.edu.br`), and servers commonly advertise a
+different auth mechanism set (PLAIN vs LOGIN) or require the full address as username
+where IMAP accepts the short login. Copy-pasting the IMAP `connect_sync` config
+produces "auth works for reading, fails for sending" bugs that look like password
+problems.
 
-**How to avoid:**
-- Schema rule: every piece of sync state is keyed by folder — `(mailbox_name, uidvalidity, uidnext, highest_uid_seen)` at minimum; messages table gets a `folder` column (or folder id FK) in the same migration that adds folder browsing.
-- On every SELECT: compare returned UIDVALIDITY to stored per-folder value; on mismatch, purge only that folder's cached messages + drop its queued flag actions (RFC 4549 §3-d-1), then full re-fetch that folder.
-- Re-run LIST on each sync/poll cycle (cheap) and handle: renamed folder = delete-old-rows + fresh sync under new name; deleted folder = purge local rows (or tombstone) rather than showing a ghost folder forever.
-- Remember the existing stack constraint: imap-proto 0.16 cannot parse NAMESPACE — keep profiling folders from CAPABILITY + LIST-EXTENDED responses only; never branch on NAMESPACE data.
+- **Warning signs:** login succeeds, send fails with `535` / `530 Authentication required`;
+  works on one provider, fails on UTFPR; LOGIN-vs-PLAIN confusion in logs.
+- **Prevention:**
+  - Separate `SmtpConfig { host, port, username, password, security }` struct — never
+    reuse `AccountConfig` verbatim. Reuse only the *keyring lookup*, not the connection
+    parameters.
+  - Prefer a dedicated SMTP crate (`lettre` is the Rust standard) over hand-rolling
+    SMTP on a raw TLS stream — it already handles EHLO capability parsing + mechanism
+    fallback.
+  - Log the server's EHLO capability list + chosen mechanism (never the secret) at send
+    time; this turns "auth failed" into a 30-second diagnosis.
+  - Live-test P1 against the real UTFPR 587 endpoint early; STARTTLS is currently
+    unit-tested only (known residual risk from M1).
+- **Phase:** **P1** (blocks all send work).
 
-**Warning signs:**
-- Switching folders shows INBOX messages, or unread counts leak across folders.
-- One `sync_state` row without a folder column in code review.
-- Folder list is fetched once at login and never refreshed.
+### 1.2 STARTTLS downgrade / cert-validation gaps
 
-**Phase to address:**
-Folder-browsing phase — the per-folder sync-state migration is a prerequisite task in that phase, before any multi-folder FETCH.
+Two classic failures: (a) silently falling back to plaintext when STARTTLS fails
+(credential leak on port 587), (b) accepting any certificate to "make it work in dev"
+and shipping that. Both are invisible until a network attacker or a cert rotation
+exposes them.
+
+- **Warning signs:** a `TLS optional / opportunistic` flag anywhere; `danger_accept_invalid_certs`
+  or equivalent in non-test code; no test that asserts plaintext refusal.
+- **Prevention:**
+  - Enforce **required** STARTTLS on 587 (fail closed, surface a clear error).
+    Only 465/SMTPS uses implicit TLS — don't conflate the two code paths.
+  - Keep the existing configurable-security pattern from IMAP (SSL-TLS vs STARTTLS
+    per-account) but default SMTP to `STARTTLS-required`.
+  - Pin a negative test: connection to a non-TLS fake server must fail, not downgrade.
+  - Reuse the IMAP redaction discipline (`Debug` redacts secrets, no password in logs —
+    see `manager.rs` password discipline) for the SMTP path.
+- **Phase:** **P1**.
+
+### 1.3 Duplicate sends on retry (the most user-visible send bug)
+
+SMTP has no idempotency key. If the client times out *after* the server accepted the
+message (or after DATA but before the `250 OK` is read), a naive retry sends the mail
+twice. Users forgive a slow send; they do not forgive double-sending a job application.
+
+- **Warning signs:** retry loop around the whole `send()` call; no `Message-ID` generated
+  client-side; timeout values copied from IMAP FETCH (too short for large attachments
+  on DATA); "user clicked Send twice" reports.
+- **Prevention:**
+  - Generate `Message-ID` client-side (UUID + domain) and **persist the queued message
+    with that ID before first attempt**; dedupe the outbox on `Message-ID`.
+  - Retry only on transport errors *before* DATA acceptance is ambiguous; after a
+    timeout during/after DATA, mark `state=uncertain` and **reconcile instead of
+    blind-resending**: check Sent (via IMAP APPEND-confirm or server Sent copy) for
+    the `Message-ID` before re-queueing.
+  - Disable the Send button + single-flight the send command (same pattern as
+    `SessionManager` single-flight) so double-click ≠ double-send.
+  - Generous DATA-phase timeout (attachments upload slowly on 587); short EHLO/AUTH
+    timeouts are fine, DATA timeout must scale with size.
+- **Phase:** **P2** (queue design), with the single-flight guard in **P1**.
+
+### 1.4 Offline send queue that diverges from the `flag_outbox` pattern
+
+v1.1 already solved durable offline replay for flags (`flag_outbox`: UNIQUE collapse,
+attempts/last_error, UIDVALIDITY-gated drops). The mistake is building the send queue
+as a second, inconsistent mechanism (in-memory Vec, different retry/drop rules),
+so offline-send behaves differently from offline-flag and the two can deadlock or
+double-apply after reconnect.
+
+- **Warning signs:** new queue table without `attempts`/`last_error`/`created_at`;
+  no drop rule defined; queue survives app restart but flags don't (or vice versa);
+  sync worker and send worker both opening write transactions independently.
+- **Prevention:**
+  - Model `send_queue` explicitly on the `flag_outbox` schema shape
+    (`id, message_id UNIQUE, state queued|sending|sent|failed|uncertain, attempts,
+    last_error, created_at`) and reuse the same replay-engine conventions.
+  - One writer at a time: route send-queue flush through the same single-writer
+    discipline as the store (`Arc<Mutex<Store>>` — never hold across `.await`).
+  - Cap attempts with backoff, then park as `failed` with a user-visible retry —
+    never infinite-loop a 587 outage (same lesson as `fetch_tombstones` strikes
+    in Phase 9).
+  - Migration as M7 (forward-only, preserving rows — follow the M2→M6 pattern, with a
+    test like `m2_upgrades_v1_database_forward_preserving_rows`).
+- **Phase:** **P2**.
+
+### 1.5 Broken reply threading (`In-Reply-To` / `References` / `Subject` Re:)
+
+Replies that start a new thread (missing/wrong headers) or nest 10-deep quote pyramids
+are the #1 "send works but looks broken" complaint, and Gmail-style threading makes it
+worse because the UI groups by these headers.
+
+- **Warning signs:** composing replies by concatenating strings instead of building
+  headers from the original message record; `References` truncated to one ID;
+  `Subject` gaining multiple `Re:` prefixes; forwarded attachments duplicated inline.
+- **Prevention:**
+  - Build replies from the **local DB record** (which has the parse-verified headers
+    from `mail-parser`): `In-Reply-To = original Message-ID`; `References =
+    original.References + original.Message-ID` (cap length, keep first + last N);
+    `Subject = Re: <orig>` only if not already prefixed (case-insensitive, single `Re:`).
+  - For forwards: new `Message-ID`, no `In-Reply-To`, `Subject = Fwd:`, attachments
+    re-attached from the attachment store path (`attachments/<uid_validity>/<uid>/`),
+    not re-downloaded.
+  - Round-trip test: reply → parse the emitted MIME with `mail-parser` → assert headers
+    thread under the original. Add a UI test that a reply appears in the same thread.
+- **Phase:** **P2**.
+
+### 1.6 Sent-mail split brain (SMTP send vs IMAP Sent folder)
+
+Sending via SMTP does not put a copy in Sent — the client must APPEND it (or rely on
+the server's auto-save, which UTFPR may or may not do). Doing both creates duplicates;
+doing neither creates "I sent it but it's gone" panic. This is an *integration*
+pitfall: P1 transport works, but the read-side Sent folder (Phase 7) disagrees.
+
+- **Warning signs:** Sent folder empty after sending; or exactly two copies per send;
+  per-folder `uid_next` for Sent jumping unexpectedly; STATUS UNSEEN badge wrong on Sent.
+- **Prevention:**
+  - Decide one strategy and feature-detect: probe whether the server auto-saves
+    (send a test mail, SEARCH Sent for the `Message-ID`); if yes, skip APPEND; if no,
+    APPEND with the same `Message-ID` so a later sync dedupes rather than duplicates.
+  - APPEND **after** SMTP `250 OK`, with the sent bytes verbatim (preserves threading
+    headers + attachments); on APPEND failure, keep the queued record as
+    `sent-unfiled` and retry APPEND separately — never re-SMTP-send to fix a filing
+    failure (see 1.3).
+  - Update the local Sent mailbox optimistically but mark it `pending-append` so the
+    next per-folder sync reconciles instead of duplicating.
+- **Phase:** **P2** (needs P1 transport + Phase 7 Sent sync).
+
+### 1.7 Attachment encoding regressions on the send path
+
+The read path uses `mail-parser 0.11 + full_encoding` for *decoding*. The send path
+needs correct *encoding* (MIME multipart/mixed, base64, RFC 2231 filenames with
+accents — the codebase already handles accented folder names, expect accented
+filenames too). Wrong `Content-Transfer-Encoding` or a missing boundary corrupts
+attachments only for the recipient, so the sender never sees the bug.
+
+- **Warning signs:** attachments hand-built with string templates; non-ASCII filenames
+  untested; no size guard before DATA (587 servers often cap at 10–25 MB).
+- **Prevention:**
+  - Use a MIME builder crate (e.g. `lettre::message` / `mail-builder`), not format!.
+  - Pre-send size check with a clear error ("attachment exceeds ~X MB"); stream large
+    files, don't buffer whole attachments in memory (read side already caps body cache
+    at 256 KiB — apply the same memory discipline).
+  - Test matrix: ASCII + accented filename, small + multi-MB, reply-with-attachments
+    vs forward-with-attachments; verify by parsing the emitted bytes.
+- **Phase:** **P2**.
+
+---
+
+## 2. IMAP FOLDER CRUD — CREATE / RENAME / DELETE
+
+### 2.1 Hardcoding the hierarchy delimiter
+
+The codebase already stores `delimiter` per mailbox (M6) — the pitfall is ignoring it
+on the write path: `CREATE "Archive/2024"` breaks on servers using `.` (Courier,
+UTFPR may use `.`), and splitting display names on `/` corrupts the sidebar tree for
+those servers.
+
+- **Warning signs:** literal `"/"` or `"."` in CREATE/RENAME arguments; client-side
+  `name.split('/')` for nesting; tests only covering one delimiter.
+- **Prevention:**
+  - Always read the delimiter from LIST response / local `mailboxes.delimiter` for the
+    *parent*; never assume. Empty delimiter = flat, no nesting UI.
+  - Encode folder names: MUTF-7 encode segments (the codebase has `imap/mutf7.rs` —
+    reuse it for CREATE/RENAME args, not just display), join with the real delimiter.
+  - Parametrize folder-CRUD tests over at least `/` and `.` delimiters.
+- **Phase:** **P3** (first folder-write work).
+
+### 2.2 Creating / renaming under `\Noselect` parents (or deleting one)
+
+`\Noselect` mailboxes are hierarchy placeholders — you can't SELECT or APPEND them,
+but you *can* create children under them. Clients fail two ways: refusing to create
+anything under a `\Noselect` node (missing feature), or trying to SELECT/APPEND/move
+mail *into* it (server `NO`s, confusing error). Deleting a `\Noselect` parent with
+children has server-dependent semantics (some refuse while children exist).
+
+- **Warning signs:** folder tree treats every LIST entry as selectable; no `\Noselect`
+  flag stored locally; CREATE failures surfaced as raw `NO` without explanation.
+- **Prevention:**
+  - Store `attributes` (`\Noselect`, `\HasChildren`, `\HasNoChildren`) alongside the
+    delimiter at discovery time (extend the M6 column family — new migration).
+  - UI: `\Noselect` nodes render as expand-only (greyed, no message list, no "move
+    here" target); CREATE-child allowed; DELETE on a node with children requires
+    explicit confirmation + pre-check via LIST.
+  - Handle both LIST dialects: classic `\Noselect` and LIST-EXTENDED `CHILDREN`
+    (`\HasChildren`) — UTFPR capability matrix is still unverified (see STATE.md
+    blockers), so probe at runtime and degrade gracefully.
+- **Phase:** **P3**.
+
+### 2.3 Special-use folders (Sent/Drafts/Trash/Junk) treated as ordinary folders
+
+RFC 6154 `\Sent \Drafts \Trash \Junk` folders have client-visible roles: deleting the
+folder mapped as Trash orphans the delete flow; renaming `Sent` breaks the Sent-append
+logic (1.6); creating a second `Trash` confuses automated filing. Servers may also
+refuse to delete special-use mailboxes outright.
+
+- **Warning signs:** folder DELETE enabled uniformly with no role check; no
+  SPECIAL-USE detection at LIST time; Sent/Drafts mapping hardcoded to English names.
+- **Prevention:**
+  - Detect via `LIST ... RETURN (SPECIAL-USE)` when advertised, fall back to
+    well-known-name heuristics *recorded as heuristic* (re-check each discovery).
+  - Protect mapped roles in UI: DELETE/RENAME on a special-use folder requires
+    explicit role-remap (or refusal with explanation); never silently orphan.
+  - The v1.1 Sent/Drafts browsing work (Phase 7) must gain a `role` column — plan the
+    migration in P3, not as an afterthought in P4.
+- **Phase:** **P3**.
+
+### 2.4 RENAME races and stale-selection writes
+
+RENAME is effectively atomic server-side, but the client's *other* state isn't: an
+in-flight sync lease SELECTed on the old name, a pending `flag_outbox` row keyed by
+old `mailbox_id`/name, or a poll tick can write flags, APPEND, or sync against a
+mailbox that no longer exists under that name. async-imap's single session + SGE's
+single-flight lease serializes commands, but a RENAME issued from webmail (or a second
+client) bypasses the lease entirely.
+
+- **Warning signs:** RENAME implemented as a bare command with no local invalidation;
+  `selected_mailbox` cache not cleared after RENAME; outbox rows surviving a rename;
+  sync worker 404ing (`NO Mailbox does not exist`) in a loop after rename.
+- **Prevention:**
+  - After local RENAME: drop the `SessionManager` selection cache (same as `reconnect()`),
+    update the local `mailboxes` row atomically with any `flag_outbox` rows
+    (single SQLite transaction), re-run LIST + STATUS to confirm.
+  - Handle remote renames: treat persistent `NO` on a previously-good mailbox as
+    "re-discover folders" signal (LIST diff → match by UIDVALIDITY, not name), not
+    as a fatal sync error. Never auto-CREATE a replacement — that resurrects deleted
+    folders.
+  - Serialize RENAME against sync: take the same single-flight discipline (no sync pass
+    mid-rename); hold the Store mutex only for the DB transaction, never across `.await`.
+- **Phase:** **P3**, with the remote-rename detector owned jointly with **P4** sync.
+
+### 2.5 Case-sensitivity and INBOX special-casing
+
+`INBOX` is case-insensitive and special (CREATE must not recreate it; some servers
+treat `INBOX.Children` differently). Custom folders are typically case-preserving.
+Bugs: offering "Delete INBOX", creating `inbox` as a separate folder, or RENAMEing
+`INBOX` (servers refuse, but the local tree may already have optimistically renamed it).
+
+- **Warning signs:** INBOX appears in the DELETE/RENAME menu; optimistic rename applied
+  before server OK; duplicate `INBOX` + `inbox` rows in local DB.
+- **Prevention:** hard-guard INBOX in UI + command layer (no RENAME/DELETE, ever);
+  compare case-insensitively for INBOX only; roll back optimistic folder-tree changes
+  on server `NO`.
+- **Phase:** **P3**.
 
 ---
 
-### Pitfall 3: Overlapping syncs on one connection — poll timer fires while a sync (or STORE) is still in flight
+## 3. EXPUNGE SEMANTICS — `\Deleted`, EXPUNGE vs UID EXPUNGE, UIDVALIDITY
 
-**What goes wrong:**
-Poll interval elapses mid-sync; app issues a second SELECT/FETCH on the same single `async-imap` session (or sends a command while IDLE is active without DONE). Responses interleave, untagged FETCH/EXPUNGE lines get attributed to the wrong operation, UI shows duplicates or drops messages. With `async-imap 0.11`'s single-session SyncEngine there is exactly one command pipeline — concurrent use is a data race even if it compiles (requires `&mut` juggling or panics/deadlocks on a shared session).
+### 3.1 Treating `\Deleted` + EXPUNGE as one step (deleting other clients' mail)
 
-**Why it happens:**
-Polling looks trivially easy (`tokio::time::interval` + `sync()`), so it gets added without a sync mutex/queue. Developers also mix IDLE-style expectations with poll code, or forget RFC 2177's rule that nothing may be sent while the server waits for DONE.
+Plain `EXPUNGE` permanently removes **all** messages with `\Deleted` in the selected
+mailbox — including ones flagged by another client or webmail session. The naive
+delete flow (STORE `\Deleted` → EXPUNGE) can nuke mail the user never touched.
 
-**How to avoid:**
-- Single-flight guard: one async Mutex (or command queue / actor) around the entire SyncEngine session; poll tick that finds sync-in-progress either skips (and records "dirty → sync again after") or coalesces — never runs concurrently.
-- Decide poll vs IDLE explicitly: v1.1 scope is poll + manual refresh (NOOP/SELECT-based). If IDLE is ever added, it needs its own dedicated connection; the poll timer must DONE/close IDLE before issuing any command.
-- Manual refresh button must go through the same single-flight gate as the timer (shared `request_sync()` entry point).
-- Re-issue logic: RFC 2177 advises re-issuing IDLE ≥ every 29 min; for poll, pick a conservative default (e.g. 60–120 s, user-configurable) and add jitter so reconnect storms don't hammer the server.
+- **Warning signs:** `expunge()` with no UID set; delete flow tested only single-client;
+  no UID EXPUNGE capability check.
+- **Prevention:**
+  - Prefer `UID EXPUNGE <uidset>` (RFC 4315) when advertised: removes only the UIDs
+    this client flagged. Capability-probe at connect; fall back to COPY-to-Trash +
+    STORE + EXPUNGE only with explicit user confirmation that other `\Deleted` mail
+    may also vanish (or better: move-to-Trash as the default delete, expunge Trash
+    only on "empty trash").
+  - Default delete UX = **move to Trash** (P4 MOVE), with expunge reserved for
+    explicit empty-trash / permanent-delete actions.
+- **Phase:** **P4**.
 
-**Warning signs:**
-- Two tasks holding the IMAP session handle; `select`/`fetch` called from timer callback directly.
-- Intermittent duplicate or missing messages that only reproduce under slow networks (long sync overlapping next tick).
-- IDLE `DONE` never sent before next command (protocol error / server BYE).
+### 3.2 Expunging without a UIDVALIDITY gate (deleting the wrong mail)
 
-**Phase to address:**
-Poll-refresh phase — single-flight + shared entry point are acceptance criteria of that phase.
+UIDs are valid only within a UIDVALIDITY epoch. If UIDVALIDITY changed (mailbox
+recreated) between sync and delete, the stored UID may now point at a *different*
+message. STORE + EXPUNGE without re-validating UIDVALIDITY deletes a stranger's mail
+and the local DB happily reports success.
 
----
+- **Warning signs:** delete command taking only `(mailbox, uid)` with no validity
+  check; SELECT summary's `uid_validity` ignored; Phase 9 backfill/tombstone logic
+  bypassed on the write path.
+- **Prevention:**
+  - Gate every destructive op: SELECT → compare `uid_validity` against local
+    `mailboxes.uid_validity` → on mismatch, **abort the op, resync the mailbox, and
+    tell the user** (same drop-and-resync rule as the `flag_outbox` replay engine:
+    whole-mailbox queue drops on UIDVALIDITY bump — extend that rule to delete/move).
+  - Carry `uid_validity` in the delete/move outbox rows (like `flag_outbox` already
+    does for flags) and validate at flush time, not just enqueue time.
+  - Unit-test the mismatch path: validity bump between enqueue and flush must drop,
+    never execute.
+- **Phase:** **P4** (builds directly on the Phase 6/9 validity infrastructure).
 
-### Pitfall 4: Treating every UID gap as "missing, fetch it" — confusing expunged UIDs with never-seen UIDs, and racing UIDNEXT
+### 3.3 `\Deleted` visibility confusion (user deletes, mail "comes back")
 
-**What goes wrong:**
-Backfill logic computes `missing = (max_seen+1..UIDNEXT) − present` naively and FETCHes each gap UID. For UIDs that were expunged (deleted elsewhere) the server returns nothing, so the gap is "still missing" next cycle → app re-requests forever (sync never converges, log spam, battery drain). Conversely, sampling UIDNEXT, then FETCHing, then assuming contiguity misses arrivals between the two commands (UIDNEXT race) — new mail silently skipped until next full poll.
+Until EXPUNGE, `\Deleted` messages still exist: a re-sync that doesn't filter them
+re-displays "deleted" mail, and the FTS index keeps returning it in search. Users read
+this as data loss / broken delete. Conversely, hiding `\Deleted` locally before server
+confirmation makes a failed STORE look like a successful delete.
 
-**Why it happens:**
-UIDs are dense-in-practice so gaps feel like errors; developers forget expunge creates permanent holes (RFC 3501: UIDs are never reused within a UIDVALIDITY epoch, holes are normal). UIDNEXT is a prediction, not a snapshot — it can advance between any two commands.
+- **Warning signs:** sync upsert unconditionally reviving locally-hidden rows; FTS
+  results including pending-delete messages; no `pending_delete` / tombstone state
+  in the local model.
+- **Prevention:**
+  - Optimistic UI: mark `pending_delete` locally, hide from list/search immediately,
+    but keep the row until server confirms; on STORE/EXPUNGE failure, un-hide with an
+    error (same optimistic-with-rollback pattern as Phase 6 Seen flags).
+  - Sync filter: exclude locally-pending-delete UIDs from list/search results even if
+    the server still returns them; reconcile on next sync (server EXPUNGE → drop row +
+    FTS entry; server still has it + op failed → un-hide).
+  - Purge FTS entries on confirmed expunge (the `msg_ad` trigger path) — test that
+    expunged subjects no longer match search.
+- **Phase:** **P4**.
 
-**How to avoid:**
-- Backfill protocol per folder: `SELECT` → record `UIDNEXT_u1` → `UID FETCH known_range` (or `UID SEARCH ALL`) to learn the true present-set → missing = expected_range − present − known_expunged; fetch only those; then re-check UIDNEXT (`u2`); if `u2 > u1`, fetch `u1..u2` arrivals explicitly. Never loop forever on a UID the server repeatedly returns nothing for — after N (e.g. 2) empty results, record it as expunged/tombstoned in SQLite and stop asking.
-- Distinguish three states per UID in local store: `present`, `expunged` (server confirmed gone or repeatedly empty), `unknown` (never observed). Backfill only targets `unknown`.
-- Do NOT use `1:*` sequence FETCH to "fill gaps" — sequence numbers shift under expunge; always UID-addressed FETCH.
-- Cap backfill range size per cycle (e.g. fetch in chunks of 50–100) so a huge gap after offline weeks doesn't block the UI or OOM the session parser.
+### 3.4 Attachment orphans and FTS ghosts after expunge
 
-**Warning signs:**
-- Sync loop never reports "up to date"; same UIDs re-fetched every poll.
-- New mail intermittently missed right after backfill runs (UIDNEXT sampled too early).
-- `FETCH 1:*` or sequence-range FETCH in backfill code.
+Bodies live in SQLite, attachment bytes on disk
+(`attachments/<uid_validity>/<uid>/`). A delete that removes the DB row but not the
+disk directory leaks storage silently; a delete that removes the row but leaves FTS
+entries returns phantom search hits.
 
-**Phase to address:**
-UID-backfill phase — convergence test (poll twice, second poll issues zero FETCHes) belongs in that phase's success criteria.
-
----
-
-### Pitfall 5: Offline flag toggle lost or double-applied — no durable outbox for writes made while disconnected
-
-**What goes wrong:**
-User toggles read/unread with no connection (or session expired mid-STORE). App either drops the intent (toggle silently reverts on next sync — user thinks app is broken) or retries blindly on reconnect and double-applies / applies to a stale UID after a UIDVALIDITY change (flag lands on a different message or errors confusingly).
-
-**Why it happens:**
-M1 never needed a write queue — everything was a read. First-write feature inherits "fire and forget STORE; on error, show toast." RFC 4549 §5 explicitly calls out playback error recovery as the trickiest part: operations on no-longer-existing messages, and pending actions invalidated by UIDVALIDITY change.
-
-**How to avoid:**
-- Durable pending-ops table in SQLite: `(folder, uid, op=±Seen, created_at, attempts)` written before the optimistic UI update; a replay worker drains it on reconnect in order.
-- Playback rules (RFC 4549 §5.1): on per-op failure because message no longer exists → silently drop that op (not abort whole queue); on UIDVALIDITY mismatch for the folder → drop all queued ops for that folder (they reference dead UIDs) and notify once; cap retries with backoff, then surface "N changes couldn't sync" with a retry button.
-- Optimistic UI must mark toggled rows as "pending" (subtle indicator) until STORE ACK clears the queue entry — so revert-on-failure reads as honest state, not a glitch.
-
-**Warning signs:**
-- No table/queue for pending writes; STORE errors only toasted.
-- Toggle-while-offline silently does nothing (no outbox row).
-- After UIDVALIDITY regeneration, queued STOREs applied to recycled UIDs.
-
-**Phase to address:**
-Flag-sync phase (outbox + replay designed alongside first STORE); poll phase adds "drain outbox on reconnect" trigger.
-
----
-
-### Pitfall 6: Session expiry treated as fatal / login replayed from plaintext instead of keyring + clean re-SELECT
-
-**What goes wrong:**
-Server closes idle connection (common: 30-min inactivity timeout; explicitly noted in RFC 2177 for IDLE, and aggressive on some providers). App shows "disconnected" permanently, or crashes on use-after-close, or — worst — caches the password in memory/plaintext to "reconnect quickly," violating the keyring-only constraint. After reconnect, app resumes FETCHing with pre-disconnect sequence numbers or cached UIDNEXT, missing everything that arrived during the gap.
-
-**Why it happens:**
-M1's happy path keeps one long-lived session from login; expiry paths were never exercised. Reconnect feels like an edge case until polling keeps a client connected for hours.
-
-**How to avoid:**
-- Health-check each poll tick: cheap `NOOP` (RFC 3501 §6.1.2 — explicitly designed as periodic poll/keepalive) before sync; on failure, full reconnect: re-auth using keyring credentials (never cached plaintext), re-SELECT folder, re-read UIDVALIDITY + UIDNEXT, then incremental sync — not resume-mid-stream.
-- Session wrapper: `ensure_connected()` that every sync/poll/STORE path calls; exponential backoff on repeated failures; surface "reconnecting…" state in UI rather than error toast per tick.
-- Clear in-memory auth material on disconnect; re-read from keyring per reconnect (keeps the M1 keyring decision intact).
-
-**Warning signs:**
-- Password held in a global/static for reconnect; any plaintext credential file.
-- Sync-after-reconnect uses stale sequence numbers or skips UIDVALIDITY check.
-- First manual "leave app open 1 hour" test never performed.
-
-**Phase to address:**
-Poll-refresh phase (reconnect + NOOP health check are core poll-phase tasks).
+- **Warning signs:** no cleanup step for attachment dirs on expunge; FTS delete path
+  untested; `VACUUM`/WAL growth unmonitored.
+- **Prevention:** confirmed-expunge = one transaction deleting message + body +
+  attachment-part rows, then filesystem removal of the UID dir (scoped by
+  uid_validity, so a validity-recycled UID can never delete a new message's files),
+  then FTS verification query. Test with a message that has attachments.
+- **Phase:** **P4**.
 
 ---
 
-## Technical Debt Patterns
+## 4. MOVE — COPY + STORE + EXPUNGE "Atomicity" (There Is None by Default)
 
-| Shortcut | Immediate Benefit | Long-term Cost | When Acceptable |
-|----------|-------------------|----------------|-----------------|
-| Poll only INBOX, backfill/folders reuse INBOX code path with a folder-name parameter but shared sync-state row | Folders "work" fast | Cross-folder state corruption (Pitfall 2) | Never — per-folder state from the start |
-| Optimistic flag toggle with no pending-ops table ("add queue later") | Flag sync ships in days | Silent loss of offline toggles; no conflict story (Pitfalls 1, 5) | Never for writes — queue is part of the write feature |
-| Fire-and-forget STORE without checking MODIFIED / re-fetch | Simpler toggle code | Lost updates when phone + desktop both flag (Pitfall 1) | Only if CONDSTORE absent AND single-client assumption documented; revisit when multi-client reports appear |
-| `FETCH 1:*` full re-download as "backfill" | No gap logic to write | Bandwidth/CPU blowup on large UTFPR mailboxes; UI jank | Only as a manual "repair" button, never the automatic path |
-| Fixed 10 s poll interval for "real-time feel" | Feels instant in demo | Server throttling/BYE, battery drain, hammering on metered links | Never as default; 60–120 s default + manual refresh; sub-30 s only user-opt-in |
-| Single global "last sync" timestamp instead of per-folder UIDNEXT/modseq | Less schema churn | Cannot resume per folder; one slow folder stalls all | Never — schema cost is one migration |
+### 4.1 Assuming MOVE is atomic (message loss and duplication)
 
-## Integration Gotchas
+Without the MOVE extension (RFC 6851), "move" is three separate commands —
+`UID COPY → UID STORE +FLAGS \Deleted → UID EXPUNGE` — with a crash/reconnect window
+between each. Crash after COPY = duplicate (in both folders); crash after STORE but
+before EXPUNGE = ghost in source; retry of a half-completed move compounds both.
 
-| Integration | Common Mistake | Correct Approach |
-|-------------|---------------|------------------|
-| Dovecot / generic IMAP server (flag writes) | Assuming STORE +FLAGS always succeeds; ignoring `MODIFIED` / `NO` responses | Check tagged response; handle MODIFIED by re-fetching flags; treat `NO [UIDNOTSTICKY]`/read-only SELECT as "flags not persisted" (re-open read-write or warn) |
-| Server without CONDSTORE/QRESYNC (e.g. minimal/older servers) | Requiring HIGHESTMODSEQ/CHANGEDSINCE unconditionally → sync breaks on capable-poor servers | Capability-gate: use CONDSTORE fast path when advertised, fall back to UID+FLAGS full-range FETCH diff otherwise |
-| async-imap 0.11 session | Sharing `&mut Session` across timer + UI tasks; sending while IDLE active | Single owner + async Mutex/actor; commands only when no IDLE outstanding (DONE first); dedicated connection if IDLE ever adopted |
-| imap-proto 0.16 parser | Parsing NAMESPACE / exotic LIST-EXTENDED responses; unhandled untagged responses crash sync loop | Keep CAPABILITY+LIST profiling (existing M1 decision); tolerate-and-ignore unknown untagged data; keep regression tripwire test |
-| OS keyring (reconnect auth) | Caching password in memory indefinitely for fast reconnect | Re-read from keyring on each reconnect; zero in-memory copies after disconnect |
-| SQLite store | One `sync_state` row; messages without folder FK; no pending-ops table | Migrate: `folders(name PK, uidvalidity, uidnext, highest_seen)` + `messages(folder, uid, …, UNIQUE(folder,uid))` + `pending_ops(id, folder, uid, op, attempts)` |
+- **Warning signs:** move implemented as fire-and-forget command trio; no persisted
+  move intent; retry re-issues COPY unconditionally.
+- **Prevention:**
+  - Prefer server `MOVE` (UID MOVE) when advertised — single command, no window.
+    Probe capabilities; use MOVE path vs emulated path explicitly and log which.
+  - Emulated path must be a **state machine persisted in SQLite**
+    (`move_outbox`: `copied → flagged → expunged`, with source/target
+    mailbox+uid+validity), so a restart resumes instead of restarting. Idempotent
+    steps: before COPY, UID SEARCH target for a message with the same `Message-ID`
+    (COPY succeeded pre-crash → skip to flag step).
+  - Order matters: COPY first, verify present at destination, *then* flag+expunge
+    source. Never flag source before confirming the copy.
+- **Phase:** **P4**.
 
-## Performance Traps
+### 4.2 MOVE breaking threading, flags, and local identity
 
-| Trap | Symptoms | Prevention | When It Breaks |
-|------|----------|------------|----------------|
-| Full-folder UID+FLAGS FETCH every poll | Poll latency grows linearly; UI stalls on big INBOX | Incremental: `UID FETCH last_seen:UIDNEXT` + flag-diff only for known range; full FETCH only on UIDVALIDITY change | Breaks at ~5–10k messages per folder on poll cadence |
-| Unbounded backfill range in one FETCH | Multi-second hangs, large allocations in imap-proto parse | Chunk backfill (50–100 UIDs/command), yield to UI between chunks | Breaks after offline weeks / first sync of huge Sent folder |
-| Poll + backfill + flag-replay all firing on reconnect | Thundering-herd: 3 full syncs back-to-back | Single `request_sync(reason)` coalescing entry; reconnect = one ordered pass: connect → per-folder incremental → drain outbox → backfill | Breaks on every laptop-wake/reconnect |
-| Re-LIST + re-SELECT every folder every tick | N folders × round trips per poll; slow on high-latency links | LIST refresh at slower cadence (e.g. every N polls or on manual refresh); per-tick only sync visible/selected folder + INBOX | Breaks with 20+ folders on slow links |
+COPY preserves the message (new UID in target) but the local DB row is keyed by
+(source mailbox, UID). Naive moves lose `\Seen`, lose the body/attachment linkage,
+break reply threading (draft replies reference the old UID), and confuse the
+backfiller (source UID vanishes → tombstone strikes? target UID appears → re-fetch?).
 
-## Security Mistakes
+- **Warning signs:** move deletes the local row and re-fetches full body from server;
+  flags reset to unread after move; drafts/replies pointing at moved messages break;
+  Phase 9 sweeper treating move-target arrivals as gaps.
+- **Prevention:**
+  - Preserve on move: carry over flags (`\Seen` at minimum), reuse the cached body
+    bytes (don't re-FETCH what you already have — bodies are mailbox-independent),
+    retarget attachment dir references or move the directory to the new
+    `(validity, new_uid)` path only after confirming the new UID.
+  - Keep a `moved_from (old_mailbox, old_uid)` trace until the next successful sync
+    of both folders converges; resolve pending draft references by `Message-ID`,
+    not by UID.
+  - Backfill awareness: source-folder disappearance after a confirmed move is
+    expected, not a gap — exempt in-flight move UIDs from tombstone strikes.
+- **Phase:** **P4**.
 
-| Mistake | Risk | Prevention |
-|---------|------|------------|
-| Storing password outside keyring for reconnect convenience | Credential theft from disk/memory dump | Keyring-only (M1 constraint restated); re-read per reconnect; no plaintext fallback |
-| Using sequence-number FETCH/STORE after reconnect | Flags/bodies attributed to wrong messages (integrity, not just cosmetic — could mark wrong mail read in a shared mailbox) | UID-only addressing for all post-connect operations |
-| Applying queued STOREs after UIDVALIDITY change | Mutating wrong messages on recycled UIDs | Drop folder's queue on UIDVALIDITY mismatch (RFC 4549) + user-visible notice |
+### 4.3 MOVE into `\Noselect` / special-use / wrong-delimiter targets
 
-## UX Pitfalls
+The move destination picker reuses the folder tree — inheriting every P3 bug (2.1,
+2.2): moves into `\Noselect` fail opaquely, moves into Trash vs permanent-delete
+semantics confuse, cross-delimiter names corrupt.
 
-| Pitfall | User Impact | Better Approach |
-|---------|-------------|-----------------|
-| Toggle with no pending indicator; silent revert on failure | "App ignores me / is broken" | Optimistic toggle + subtle pending dot; honest revert + inline retry on failure |
-| Full-folder spinner on every poll | App feels frozen every minute | Background incremental sync; only badge/list-update, no modal spinner; spinner only on manual refresh |
-| Ghost folders after server-side rename/delete | Confusion, taps into empty dead folder | Refresh LIST regularly; remove/rename local folder rows with a one-time notice |
-| Backfill progress invisible on huge gaps | "Is it stuck?" after offline weeks | Determinate progress ("Syncing 1,200 of 3,400") with cancel; backfill yields to interaction |
-| Poll failure toasts every 60 s on bad network | Notification spam | Quiet reconnecting state; toast only after sustained failure (e.g. 3+ failed polls) |
+- **Warning signs:** destination list = raw LIST output with no filtering; no
+  Trash-vs-expunge policy; move-to-Sent allowed.
+- **Prevention:** destination picker excludes `\Noselect`, INBOX-except, and Sent
+  (unless explicitly refiling); default delete = MOVE to Trash role folder (from P3
+  special-use mapping); validate target delimiter before issuing COPY/MOVE.
+- **Phase:** **P4** (depends on P3 folder metadata).
 
-## "Looks Done But Isn't" Checklist
+### 4.4 Single-session lease vs concurrent move + sync + send
 
-- [ ] **Flag sync:** Often missing reconcile-on-sync — verify toggle → poll → flag stays; toggle on phone → poll → desktop reflects it
-- [ ] **Flag sync:** Often missing expunged-during-STORE handling — verify toggle on a message deleted elsewhere fails silently without breaking the queue
-- [ ] **Folders:** Often missing per-folder UIDVALIDITY check — verify change UIDVALIDITY for one folder (or simulate) purges only that folder
-- [ ] **Folders:** Often missing LIST refresh — verify server-side create/rename/delete appears/disappears locally after poll
-- [ ] **Poll:** Often missing single-flight — verify poll firing mid-sync coalesces instead of overlapping (instrument or slow-network test)
-- [ ] **Poll:** Often missing reconnect path — verify kill connection / wait out timeout → next poll reconnects via keyring with no user action
-- [ ] **Backfill:** Often missing convergence — verify two consecutive polls after backfill issue zero FETCHes
-- [ ] **Backfill:** Often missing expunged-vs-missing distinction — verify deleted-elsewhere UID is tombstoned, not re-requested forever
-- [ ] **Offline writes:** Often missing durable outbox — verify toggle offline → kill app → relaunch online → toggle replays
+SGE's `SessionManager` serializes everything through one session/lease — moves,
+flag writes, sync passes, and folder ops all contend. A long MOVE (large mailbox,
+slow server) can starve the 5-min poll or block the UI-perceived send; worse, adding a
+*second* IMAP connection for moves (to "fix" the blocking) breaks the single-flight
+invariant and interleaves SELECT/EXPUNGE across connections (the exact bug the manager
+was built to prevent).
 
-## Recovery Strategies
-
-| Pitfall | Recovery Cost | Recovery Steps |
-|---------|---------------|----------------|
-| Flag flap / wrong-message flags | MEDIUM | Stop sequence-addressed STOREs; add UID addressing + reconcile pass; one-time full flag re-FETCH per folder to heal |
-| Global sync state corruption across folders | MEDIUM | Migrate schema to per-folder state; wipe + full resync all folders once (bounded, user-warned) |
-| UIDVALIDITY miss (stale cache shown) | LOW | Add per-SELECT UIDVALIDITY compare; purge affected folder; re-fetch |
-| Runaway backfill (infinite re-FETCH) | LOW | Add tombstone marking + empty-result counter; clear runaway loop; backfill converges next poll |
-| Lost offline toggles | HIGH (data already lost) | Ship outbox; cannot recover past intents — apologize via release note; going forward all intents durable |
-| Plaintext credential cache added for reconnect | MEDIUM | Remove cache; re-read keyring; rotate password if written to disk; add test asserting no credential file exists |
-
-## Pitfall-to-Phase Mapping
-
-| Pitfall | Prevention Phase | Verification |
-|---------|------------------|--------------|
-| 1 — Flag reconcile / UID STORE / CONDSTORE conflict | Flag-sync phase (ships with first STORE) | Toggle stays across poll; cross-client (phone) change reflected; no sequence-number STORE in review |
-| 5 — Offline outbox + playback rules | Flag-sync phase (same phase as first write) | Offline toggle → restart → replay; UIDVALIDITY-change drops queue with notice |
-| 2 — Per-folder sync state + LIST refresh + rename/delete | Folder-browsing phase (prerequisite migration) | Per-folder rows in schema; folder rename/delete handled; imap-proto NAMESPACE still untouched |
-| 3 — Single-flight sync + shared entry for timer/manual | Poll-refresh phase | Overlapping-tick test coalesces; manual + timer share gate |
-| 6 — NOOP health check + keyring reconnect + re-SELECT | Poll-refresh phase | Kill-connection test self-heals; no credential outside keyring |
-| 4 — Backfill gap semantics + UIDNEXT race + convergence | UID-backfill phase | Double-poll zero-FETCH; expunged tombstoned; chunked FETCH |
-
-Suggested phase order from these pitfalls: **flags (with outbox) → folders (with per-folder state) → poll (with single-flight + reconnect) → backfill (with convergence)**. Backfill last because it depends on per-folder high-water marks (folders phase) and must not fight the poll loop (poll phase).
-
-## Sources
-
-- RFC 3501 / RFC 9051 §2.3.1 — UIDs, UIDVALIDITY, UIDNEXT semantics (HIGH)
-- RFC 4549 (Synchronization Operations for Disconnected IMAP4 Clients) §§3–5 — sync algorithm, UIDVALIDITY-mismatch purge, playback error recovery (HIGH)
-- RFC 4551 / RFC 7162 (CONDSTORE/QRESYNC) — UNCHANGEDSINCE, MODIFIED response, mod-sequences (HIGH)
-- RFC 4315 (UIDPLUS) — UID EXPUNGE semantics for disconnected clients (HIGH)
-- RFC 2177 (IDLE) — DONE-before-command rule, 29-minute re-issue, server inactivity timeout (HIGH)
-- Dovecot docs + Nylas UIDVALIDITY troubleshooting — signed-32-bit UID bugs, resync-stop on UIDVALIDITY flapping (MEDIUM)
-- Evolution/camel-imapx history — NOOP-race crashes, IDLE-cancel SELECT races, DONE-timeout reconnect (MEDIUM)
+- **Warning signs:** proposals for a second IMAP connection; move command holding the
+  lease across large data transfer; poll timer firing mid-move and queueing a sync
+  that SELECTs another folder halfway through the COPY→EXPUNGE sequence.
+- **Prevention:**
+  - Keep the single-session invariant. Route MOVE through `lease_for()` like
+    `set_seen_in` (reconnect + retry once, re-SELECT target mailbox).
+  - Chunk multi-message moves (bounded UID sets per command) so the poll/single-flight
+    queue stays responsive; surface move progress in UI rather than blocking.
+  - Never hold the Store mutex across `.await` (existing invariant) — stage move
+    state transitions as short transactions between network steps.
+- **Phase:** **P4** (integration hardening after basic move works).
 
 ---
-*Pitfalls research for: SGE v1.1 Triage & Folders*
-*Researched: 2026-10-04*
+
+## 5. Cross-Cutting Integration Pitfalls (New Features vs Existing System)
+
+| # | Pitfall | Warning sign | Prevention | Phase |
+|---|---------|--------------|------------|-------|
+| 5.1 | **Sync resurrection**: next poll re-fetches moved/expunged mail as "new" | `UIDNEXT`/exists jumps after move; deleted mail reappears | Update local sync state (`uid_next`, tombstones) in the same transaction as the confirmed move/expunge; exempt in-flight op UIDs from backfill | P4 |
+| 5.2 | **Poll-vs-send race**: 5-min poll SELECTs mid-send-append | Sent APPEND lands but sync misses it / duplicates it | Single-flight all IMAP through the manager; dedupe Sent arrivals by `Message-ID` | P2 + P4 |
+| 5.3 | **Schema migration pile-up**: M7+ breaking forward-only chain | New tables added without M-test; downgrade attempted | One migration per feature table (M7 send_queue, M8 move_outbox, M9 folder attrs/roles), each with a preserve-rows test following the M2–M6 pattern | P2, P3, P4 each |
+| 5.4 | **Keyring scope creep**: SMTP password stored as second secret, logout leaves one | Two keyring entries, only one cleared on logout/account-switch | Store one secret per account, reuse for both protocols; account-switch replaces the cached `SessionManager` *and* SMTP transport together | P1 |
+| 5.5 | **Error-message leakage**: raw SMTP/IMAP `NO` surfaced to users | "NO [ALREADYEXISTS]" dialogs; passwords in error strings | Map server errors to plain-language messages (follow the `__TAURI_INTERNALS__` guard precedent); assert no secret material in any error path | Each phase |
+| 5.6 | **Live-vs-unit drift**: send/folder/delete verified only against mocks | All-green suite, first real UTFPR run fails | Each phase needs at least one live gate against `mail.utfpr.edu.br` (587 SMTP, folder CRUD on a scratch prefix like `SGE-TEST-*`, move/expunge round-trip); keep the Phase 6–9 pattern of documenting deferred live items explicitly | P1–P4 |
+| 5.7 | **Drafts as second-class moves**: save/edit draft re-implements APPEND+DELETE badly | Draft edits creating duplicate drafts; offline draft edits lost | Treat draft-save as APPEND-new + (UIDVALIDITY-gated) delete-old — i.e. reuse the P4 move machinery, not a bespoke path; drafts queue offline like send_queue | P2 (design), P4 (reuse) |
+
+---
+
+## 6. Suggested Minimum Test/Live Gates per Phase
+
+- **P1:** EHLO capability log redacted; STARTTLS-required negative test; one live mail
+  delivered to self via UTFPR 587; double-click Send test (single delivery).
+- **P2:** `Message-ID` dedupe test; timeout-during-DATA → `uncertain` → reconcile test
+  (no auto-duplicate); reply/forward header round-trip through `mail-parser`;
+  offline-compose → restart → flush test; Sent APPEND-or-autosave probe documented.
+- **P3:** delimiter-parametrized CREATE/RENAME/DELETE tests (`/`, `.`); `\Noselect`
+  render + create-child-only test; special-use protection test; INBOX guard test;
+  live scratch-folder CRUD + rename-while-sync race test; post-rename LIST re-discovery.
+- **P4:** UID EXPUNGE-vs-EXPUNGE capability test; UIDVALIDITY-bump-aborts-delete test;
+  `\Deleted`-hidden-but-recoverable test; FTS + attachment-dir cleanup test;
+  crash-between-COPY-and-EXPUNGE resume test (emulated path); multi-client `\Deleted`
+  test (other client's flag survives my delete).
+
+---
+
+*Sources: RFC 3501 (IMAP4rev1) § CREATE/RENAME/DELETE/EXPUNGE/COPY/UID EXPUNGE notes,
+RFC 4315 (UIDPLUS/UID EXPUNGE), RFC 6154 (SPECIAL-USE), RFC 6851 (MOVE), RFC 5322
+§ In-Reply-To/References threading, RFC 3207 (STARTTLS); SGE codebase facts:
+`SessionManager` single-flight (`imap/manager.rs`), `flag_outbox` replay rules +
+`M2_FLAG_OUTBOX_SQL`, per-folder sync + delimiter M6 + STATUS/SYNC timestamp split
+M5 (`store/mod.rs`), attachment dir layout, tombstone sweeper (Phase 9). UTFPR server
+capabilities (CONDSTORE, SPECIAL-USE/LIST-EXTENDED, UIDPLUS/MOVE advertisement,
+587 auth mechanisms) remain unverified — probe live in P1/P3 before committing to
+code paths that assume them.*
