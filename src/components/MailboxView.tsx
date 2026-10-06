@@ -1,11 +1,12 @@
 import { useState, useCallback, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import Sidebar from "./Sidebar";
+import FolderDialog from "./FolderDialog";
 import MessageList, { type ListState } from "./MessageList";
 import ReadingPane from "./ReadingPane";
 import SyncStatus from "./SyncStatus";
 import SearchBar from "./SearchBar";
-import type { MessageRow, MailboxRow } from "../types";
+import type { MessageRow, MailboxRow, FolderTreeResult } from "../types";
 import { IconCap } from "./icons";
 import "./MailboxView.css";
 
@@ -24,6 +25,11 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
     message: "",
   });
   const [refreshKey, setRefreshKey] = useState(0);
+  // FOLD-04: create-folder dialog state (owned here so CREATE can re-LIST
+  // and select the new folder in the same handler tick).
+  const [folderDialogOpen, setFolderDialogOpen] = useState(false);
+  const [folderPending, setFolderPending] = useState(false);
+  const [folderError, setFolderError] = useState<string | null>(null);
 
   // FOLD-01: fetch mailbox list from the local store on mount.
   useEffect(() => {
@@ -72,6 +78,34 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
     })();
   }, []);
 
+  /** CREATE round-trip: invoke → re-LIST tree → select the new folder. */
+  async function handleCreateFolder(wireParent: string, leaf: string) {
+    setFolderPending(true);
+    setFolderError(null);
+    try {
+      const res = await invoke<FolderTreeResult>("create_folder", {
+        leaf,
+        parent: wireParent === "" ? null : wireParent,
+      });
+      setMailboxes(res.mailboxes ?? []);
+      setSelectedMailbox(res.created);
+      setSelectedMessage(null);
+      setRefreshKey((k) => k + 1);
+      setFolderDialogOpen(false);
+    } catch (e) {
+      // Invoke reject carries the backend UI-SPEC copy — inline, no toast.
+      setFolderError(
+        typeof e === "string"
+          ? e
+          : e instanceof Error
+            ? e.message
+            : "Não foi possível criar a pasta.",
+      );
+    } finally {
+      setFolderPending(false);
+    }
+  }
+
   return (
     <div className="mailbox-layout">
       <header className="mailbox-header">
@@ -93,6 +127,10 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
           selectedMailbox={selectedMailbox}
           mailboxes={mailboxes}
           onMailboxSelect={handleMailboxSelect}
+          onCreateFolder={() => {
+            setFolderError(null);
+            setFolderDialogOpen(true);
+          }}
         />
         <main className="message-panel" aria-label="Fila de leitura">
           <div className="message-list-header">
@@ -120,6 +158,17 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
         </main>
         <ReadingPane key={selectedMailbox} selectedMessage={selectedMessage} mailbox={selectedMailbox} mailboxes={mailboxes} />
       </div>
+      <FolderDialog
+        mode="create"
+        delimiter={mailboxes.find((m) => m.name === selectedMailbox)?.delimiter ?? ""}
+        parents={mailboxes}
+        existingNames={mailboxes.map((m) => m.name)}
+        onConfirm={handleCreateFolder}
+        onCancel={() => setFolderDialogOpen(false)}
+        isOpen={folderDialogOpen}
+        serverError={folderError}
+        pending={folderPending}
+      />
     </div>
   );
 }

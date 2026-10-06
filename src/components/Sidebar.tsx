@@ -1,12 +1,14 @@
 import type { ReactNode } from "react";
 import "./MailboxView.css";
-import { IconInbox } from "./icons";
+import { IconFolderPlus, IconInbox } from "./icons";
 import type { MailboxRow } from "../types";
 
 interface SidebarProps {
   selectedMailbox: string;
   mailboxes: MailboxRow[];
   onMailboxSelect: (mailbox: string) => void;
+  /** Opens the create-folder dialog (owned by MailboxView). */
+  onCreateFolder: () => void;
 }
 
 /**
@@ -30,20 +32,20 @@ function systemRank(rawName: string): number | null {
   return null;
 }
 
-interface TreeNode {
+export interface TreeNode {
   mailbox: MailboxRow;
   /** Último segmento do nome para exibição (o caminho completo vai no title). */
   shortLabel: string;
   children: TreeNode[];
 }
 
-interface FolderTree {
+export interface FolderTree {
   system: MailboxRow[];
   roots: TreeNode[];
 }
 
 /** Monta a árvore a partir da lista plana: sistema primeiro, resto aninhado. */
-function buildTree(mailboxes: MailboxRow[]): FolderTree {
+export function buildTree(mailboxes: MailboxRow[]): FolderTree {
   const system = mailboxes
     .filter((mb) => systemRank(mb.name) !== null)
     .sort(
@@ -98,6 +100,7 @@ export default function Sidebar({
   selectedMailbox,
   mailboxes = [],
   onMailboxSelect,
+  onCreateFolder,
 }: SidebarProps) {
   const showMailboxItems = mailboxes.length > 0;
   const tree = buildTree(mailboxes);
@@ -179,6 +182,17 @@ export default function Sidebar({
         )}
       </ul>
       <div className="sidebar-foot">
+        <button
+          type="button"
+          className="sidebar-newfolder"
+          onClick={onCreateFolder}
+          aria-label="Criar nova pasta"
+        >
+          <span className="sidebar-newfolder-icon" aria-hidden="true">
+            <IconFolderPlus size={17} />
+          </span>
+          <span>Nova pasta</span>
+        </button>
         <strong>Tudo em dia</strong>
         <p>
           Nenhuma mensagem nova pendente. Sincronize para buscar avisos recentes.

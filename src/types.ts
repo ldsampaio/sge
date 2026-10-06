@@ -50,6 +50,16 @@ export interface MailboxRow {
   unseen_count: number;
 }
 
+/**
+ * Outcome of the `create_folder` Tauri command (Phase 11 backend).
+ * The created folder's RAW wire name (for selection) plus the refreshed
+ * tree the sidebar re-renders.
+ */
+export interface FolderTreeResult {
+  created: string;
+  mailboxes: MailboxRow[];
+}
+
 export interface SyncStatusInfo {
   mailbox: string;
   last_sync_at: string;

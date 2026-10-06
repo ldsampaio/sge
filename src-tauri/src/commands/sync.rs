@@ -21,6 +21,7 @@ use crate::sync::{SyncEvent, SyncCallback};
 use crate::creds::{CredentialStore, KeyringStore, SavedCredentials, ServerConfig};
 use crate::imap::trash::{detect_trash, TrashResolution};
 use crate::imap::{AccountConfig, SecurityMode, SyncError};
+use crate::imap::mutf7::{encode_modified_utf7, validate_leaf, FolderNameError};
 use crate::imap::manager::SessionManager;
 use crate::imap::session::connect_sync;
 use crate::imap::SyncSession;
@@ -808,8 +809,9 @@ pub async fn cancel_sync(state: State<'_, crate::AppState>) -> Result<(), String
 
 /// Discover server folders and return cached per-folder triage rows (FOLD-01/02).
 ///
-/// `LIST "" "*"` via the SessionManager, then `STATUS (UIDVALIDITY UIDNEXT
-/// UNSEEN)` per selectable folder, cached with `set_mailbox_status`.
+/// Thin wrapper over [`refresh_mailbox_tree`]: `LIST "" "*"` via the
+/// SessionManager, then `STATUS (UIDVALIDITY UIDNEXT UNSEEN)` per selectable
+/// folder, cached with `set_mailbox_status`.
 /// `\Noselect` entries (hierarchy placeholders) are skipped — they cannot
 /// be SELECTed or STATUSed. Returns the locally cached rows (same shape the
 /// sidebar renders), so the tree works offline after the first discovery:
@@ -823,58 +825,210 @@ pub async fn list_mailboxes(
     let manager = manager_for(&state, &account_cfg);
     let store = state.store.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        async_std::task::block_on(async {
-            let discovered = match manager.list_mailboxes().await {
-                Ok(folders) => folders,
-                Err(e) => {
-                    // Offline fallback: serve the cached tree.
-                    let guard = store.lock().unwrap();
-                    let cached =
-                        queries::list_mailboxes(guard.conn()).map_err(|e| format!("store: {e}"))?;
-                    if cached.is_empty() {
-                        return Err(format!("LIST failed and no folders cached: {e}"));
-                    }
-                    eprintln!("[SGE sync] LIST failed ({e}) — serving {n} cached folders", n = cached.len());
-                    return Ok(cached);
-                }
-            };
-            {
-                let guard = store.lock().unwrap();
-                let conn = guard.conn();
-                for folder in &discovered {
-                    if folder
-                        .attributes
-                        .iter()
-                        .any(|a| a.contains("NoSelect"))
-                    {
-                        continue;
-                    }
-                    match manager.mailbox_status(&folder.name).await {
-                        Ok(status) => {
-                            let _ = queries::set_mailbox_status(
-                                conn,
-                                &folder.name,
-                                status.uid_validity,
-                                status.uid_next.unwrap_or(0),
-                                status.unseen,
-                            );
-                        }
-                        Err(e) => eprintln!(
-                            "[SGE sync] STATUS {} failed ({e}) — folder cached without unseen",
-                            folder.name
-                        ),
-                    }
-                    let _ = queries::ensure_mailbox(conn, &folder.name);
-                    // Hierarchy delimiter for tree rendering (M6).
-                    let _ = queries::set_mailbox_delimiter(conn, &folder.name, &folder.delimiter);
-                }
-            }
-            let guard = store.lock().unwrap();
-            queries::list_mailboxes(guard.conn()).map_err(|e| format!("store: {e}"))
-        })
+        async_std::task::block_on(refresh_mailbox_tree(&manager, &store))
     })
     .await
     .map_err(|e| format!("internal error: list mailboxes task failed ({e})"))?
+}
+
+/// Shared LIST + STATUS refresh body, reused verbatim by every folder
+/// command after its verb succeeds (Plan 11-01): folder ops return the
+/// fresh tree so the sidebar re-renders from one code path.
+///
+/// Caller runs this inside `spawn_blocking` + `block_on` (same as the
+/// folder commands); the store lock sections are brief and sync-only.
+async fn refresh_mailbox_tree(
+    manager: &Arc<SessionManager>,
+    store: &Arc<std::sync::Mutex<crate::store::Store>>,
+) -> Result<Vec<crate::store::queries::MailboxRow>, String> {
+    let discovered = match manager.list_mailboxes().await {
+        Ok(folders) => folders,
+        Err(e) => {
+            // Offline fallback: serve the cached tree.
+            let guard = store.lock().unwrap();
+            let cached =
+                queries::list_mailboxes(guard.conn()).map_err(|e| format!("store: {e}"))?;
+            if cached.is_empty() {
+                return Err(format!("LIST failed and no folders cached: {e}"));
+            }
+            eprintln!("[SGE sync] LIST failed ({e}) — serving {n} cached folders", n = cached.len());
+            return Ok(cached);
+        }
+    };
+    {
+        let guard = store.lock().unwrap();
+        let conn = guard.conn();
+        for folder in &discovered {
+            if folder
+                .attributes
+                .iter()
+                .any(|a| a.contains("NoSelect"))
+            {
+                continue;
+            }
+            match manager.mailbox_status(&folder.name).await {
+                Ok(status) => {
+                    let _ = queries::set_mailbox_status(
+                        conn,
+                        &folder.name,
+                        status.uid_validity,
+                        status.uid_next.unwrap_or(0),
+                        status.unseen,
+                    );
+                }
+                Err(e) => eprintln!(
+                    "[SGE sync] STATUS {} failed ({e}) — folder cached without unseen",
+                    folder.name
+                ),
+            }
+            let _ = queries::ensure_mailbox(conn, &folder.name);
+            // Hierarchy delimiter for tree rendering (M6).
+            let _ = queries::set_mailbox_delimiter(conn, &folder.name, &folder.delimiter);
+        }
+    }
+    let guard = store.lock().unwrap();
+    queries::list_mailboxes(guard.conn()).map_err(|e| format!("store: {e}"))
+}
+
+/// True when an IMAP-layer error smells like lost connectivity (as opposed
+/// to a server refusal): folder ops are online-only, so these map to the
+/// loud offline copy instead of being queued (no folder-op queue exists).
+fn is_connectivity_error(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    [
+        "connect",
+        "reconnect",
+        "timeout",
+        "timed out",
+        "dns",
+        "network",
+        "unreachable",
+        "no route",
+        "broken pipe",
+        "connection reset",
+        "connection refused",
+        "i/o error",
+        "io error",
+    ]
+    .iter()
+    .any(|s| m.contains(s))
+}
+
+/// Outcome of a successful `create_folder` call: the created folder's RAW
+/// wire name (so the UI selects/highlights it) plus the refreshed tree.
+#[derive(Debug, Clone, Serialize)]
+pub struct FolderTreeResult {
+    pub created: String,
+    pub mailboxes: Vec<queries::MailboxRow>,
+}
+
+/// Create one folder: validate → CREATE → re-LIST (FOLD-04, Plan 11-01).
+///
+/// `leaf` is the raw user-typed name, `parent` the RAW wire name of the
+/// parent folder (`None`/empty = top level). The delimiter comes from the
+/// parent's cached LIST row; the name is joined as
+/// `parent + delimiter + leaf` in raw modified-UTF-7 wire form and encoded
+/// backend-side (the UI never encodes — T-11-01). After CREATE the sidebar
+/// tree refreshes through the shared [`refresh_mailbox_tree`] body.
+///
+/// Online-only: on connectivity failure returns the loud offline copy — NO
+/// outbox enqueue (no folder-op queue exists). Validation and exists
+/// pre-checks return before any verb call.
+#[tauri::command]
+pub async fn create_folder(
+    state: State<'_, crate::AppState>,
+    leaf: String,
+    parent: Option<String>,
+) -> Result<FolderTreeResult, String> {
+    let account_cfg: AccountConfig = load_account_config(state.clone()).await?;
+    let manager = manager_for(&state, &account_cfg);
+    let store = state.store.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        async_std::task::block_on(async {
+            // 1. Snapshot the cached tree (brief lock, never across `.await`).
+            let cached = {
+                let guard = store.lock().unwrap();
+                queries::list_mailboxes(guard.conn()).map_err(|e| format!("store: {e}"))?
+            };
+            // 2. Resolve the delimiter from the parent's cached row;
+            // top-level creates join nothing.
+            let parent_wire = parent.filter(|p| !p.is_empty());
+            let delimiter = match &parent_wire {
+                Some(p) => cached
+                    .iter()
+                    .find(|r| r.name == *p)
+                    .map(|r| r.delimiter.clone())
+                    .unwrap_or_default(),
+                None => String::new(),
+            };
+            // 3. Validate + join + encode + exists pre-check (pure — no
+            // verb has fired if this returns Err).
+            let wire =
+                prepare_create_wire(&cached, parent_wire.as_deref(), &leaf, &delimiter)?;
+            // 4. Wire CREATE; online-only, no queue.
+            if let Err(e) = manager.create_mailbox_in(&wire).await {
+                return Err(map_create_error(&e));
+            }
+            // 5. Re-LIST refresh (shared body) + return the fresh tree.
+            let mailboxes = refresh_mailbox_tree(&manager, &store).await?;
+            Ok(FolderTreeResult {
+                created: wire,
+                mailboxes,
+            })
+        })
+    })
+    .await
+    .map_err(|e| format!("internal error: create folder task failed ({e})"))?
+}
+
+/// Pure pre-wire guard for `create_folder` (Plan 11-01): validate, then
+/// join `parent + delimiter + leaf`, encode, then exists pre-check against
+/// the cached tree. Returns the RAW wire name or the exact pt-BR UI-SPEC
+/// copy. Never touches the network — every `Err` here returns before any
+/// verb call (T-11-02 hierarchy escape, T-11-03 INBOX variant).
+fn prepare_create_wire(
+    cached: &[queries::MailboxRow],
+    parent: Option<&str>,
+    leaf: &str,
+    delimiter: &str,
+) -> Result<String, String> {
+    let leaf = leaf.trim();
+    if let Err(e) = validate_leaf(leaf, delimiter) {
+        return Err(match e {
+            FolderNameError::Empty => "Dê um nome para a pasta.".to_string(),
+            FolderNameError::ContainsDelimiter(d) => format!(
+                "O nome não pode conter '{d}' — ele separa pastas. Crie uma pasta por vez."
+            ),
+            FolderNameError::ReservedInbox => {
+                "INBOX é uma pasta reservada do servidor — escolha outro nome.".to_string()
+            }
+        });
+    }
+    let joined = match parent {
+        Some(p) => format!("{p}{delimiter}{leaf}"),
+        None => leaf.to_string(),
+    };
+    let wire = encode_modified_utf7(&joined);
+    if cached.iter().any(|r| r.name == wire) {
+        return Err("Já existe uma pasta com esse nome.".to_string());
+    }
+    Ok(wire)
+}
+
+/// Map a failed CREATE to plain language (Plan 11-01): offline is loud
+/// (no queue exists), already-exists repeats the exists copy, anything
+/// else surfaces the server detail instead of a bare NO.
+fn map_create_error(e: &SyncError) -> String {
+    let msg = e.to_string();
+    if is_connectivity_error(&msg) {
+        return "Sem conexão — pastas só podem ser alteradas online. Tente de novo ao reconectar."
+            .to_string();
+    }
+    let lower = msg.to_lowercase();
+    if lower.contains("already exist") || lower.contains("mailbox exists") {
+        return "Já existe uma pasta com esse nome.".to_string();
+    }
+    format!("Não foi possível criar a pasta: {msg}")
 }
 
 /// Sync status returned to the frontend.
@@ -1135,10 +1289,11 @@ pub async fn save_attachment(
 
 #[cfg(test)]
 mod tests {
+    use crate::imap::SyncError;
     use crate::store::queries;
     use crate::store::Store;
 
-    use super::pending_depth;
+    use super::{is_connectivity_error, map_create_error, pending_depth, prepare_create_wire};
 
     /// Verify the list_messages + search_messages query path against an
     /// in-memory store (same pattern as queries.rs tests but exercising
@@ -1217,5 +1372,117 @@ mod tests {
         // Other mailboxes are isolated.
         let other = queries::ensure_mailbox(conn, "Sent").unwrap();
         assert_eq!(pending_depth(conn, other), 0);
+    }
+
+    /// Cached-tree fixture for the folder guards: INBOX plus one
+    /// hierarchical parent (delimiter `/`).
+    fn folder_tree() -> Vec<queries::MailboxRow> {
+        vec![
+            queries::MailboxRow {
+                id: 1,
+                name: "INBOX".to_string(),
+                display_name: "INBOX".to_string(),
+                delimiter: "".to_string(),
+                uid_validity: 100,
+                uid_next: 1,
+                last_sync_at: None,
+                unread_count: 0,
+                unseen_count: 0,
+            },
+            queries::MailboxRow {
+                id: 2,
+                name: "Pai".to_string(),
+                display_name: "Pai".to_string(),
+                delimiter: "/".to_string(),
+                uid_validity: 100,
+                uid_next: 1,
+                last_sync_at: None,
+                unread_count: 0,
+                unseen_count: 0,
+            },
+        ]
+    }
+
+    /// The create pre-wire guard returns UI-SPEC copy for every refusal —
+    /// and because it is pure, every `Err` here provably returns before
+    /// any verb call (T-11-02/T-11-03).
+    #[test]
+    fn prepare_create_wire_refusals_use_ui_spec_copy() {
+        let tree = folder_tree();
+        // Empty / whitespace-only.
+        assert_eq!(
+            prepare_create_wire(&tree, None, "", ""),
+            Err("Dê um nome para a pasta.".to_string())
+        );
+        assert_eq!(
+            prepare_create_wire(&tree, None, "   ", ""),
+            Err("Dê um nome para a pasta.".to_string())
+        );
+        // Delimiter in leaf (hierarchy escape refused client-side).
+        assert_eq!(
+            prepare_create_wire(&tree, Some("Pai"), "A/B", "/"),
+            Err("O nome não pode conter '/' — ele separa pastas. Crie uma pasta por vez.".to_string())
+        );
+        // INBOX variants reserved on any delimiter.
+        for inbox in ["inbox", "INBOX", "Inbox"] {
+            assert_eq!(
+                prepare_create_wire(&tree, None, inbox, ""),
+                Err("INBOX é uma pasta reservada do servidor — escolha outro nome.".to_string()),
+                "{inbox:?} must be reserved"
+            );
+        }
+        // Existing name short-circuits (raw wire comparison).
+        assert_eq!(
+            prepare_create_wire(&tree, None, "Pai", ""),
+            Err("Já existe uma pasta com esse nome.".to_string())
+        );
+    }
+
+    /// Happy paths join `parent + delimiter + leaf` and encode backend-side.
+    #[test]
+    fn prepare_create_wire_joins_and_encodes() {
+        let tree = folder_tree();
+        assert_eq!(
+            prepare_create_wire(&tree, None, "Projetos", ""),
+            Ok("Projetos".to_string())
+        );
+        assert_eq!(
+            prepare_create_wire(&tree, Some("Pai"), "Filho", "/"),
+            Ok("Pai/Filho".to_string())
+        );
+        // Non-ASCII leaf is encoded; the UI never does this (T-11-01).
+        assert_eq!(
+            prepare_create_wire(&tree, Some("Pai"), "Café", "/"),
+            Ok("Pai/Caf&AOk-".to_string())
+        );
+        // Surrounding whitespace trims before join.
+        assert_eq!(
+            prepare_create_wire(&tree, None, "  Projetos  ", ""),
+            Ok("Projetos".to_string())
+        );
+    }
+
+    /// CREATE error mapping: offline is loud, already-exists repeats the
+    /// exists copy, other NOs surface the server detail.
+    #[test]
+    fn map_create_error_copies() {
+        let offline = SyncError::Protocol("SessionManager connect: dial failed".to_string());
+        assert!(is_connectivity_error(&offline.to_string()));
+        assert_eq!(
+            map_create_error(&offline),
+            "Sem conexão — pastas só podem ser alteradas online. Tente de novo ao reconectar.".to_string()
+        );
+        let exists =
+            SyncError::Protocol("CREATE Pai: NO Mailbox already exists".to_string());
+        assert_eq!(
+            map_create_error(&exists),
+            "Já existe uma pasta com esse nome.".to_string()
+        );
+        let other = SyncError::Protocol("CREATE x: NO bad separator".to_string());
+        assert!(
+            map_create_error(&other).starts_with("Não foi possível criar a pasta:"),
+            "unexpected: {}",
+            map_create_error(&other)
+        );
     }
 }

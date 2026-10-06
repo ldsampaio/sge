@@ -218,6 +218,28 @@ impl SessionManager {
         }
     }
 
+    /// `CREATE <wire>` through the owned session with one transparent
+    /// reconnect + retry (Plan 11-01 folder CREATE; same shape as
+    /// [`create_trash`](Self::create_trash)). `CREATE` needs no particular
+    /// folder selected, so the stable `INBOX` lease suffices. Takes the RAW
+    /// wire name (already modified-UTF-7 encoded by the caller) — never
+    /// encodes inside. A [`SyncError::Refused`] is deterministic and is
+    /// never retried (same rule as [`move_message_in`](Self::move_message_in)).
+    pub async fn create_mailbox_in(&self, wire: &str) -> Result<(), SyncError> {
+        let wire_owned = wire.to_string();
+        let mut lease = self.lease_for("INBOX").await?;
+        match lease.session().create_mailbox(&wire_owned).await {
+            Ok(()) => Ok(()),
+            Err(refused @ SyncError::Refused(_)) => Err(refused),
+            Err(first) => {
+                eprintln!("[SGE imap] CREATE {wire_owned} failed ({first}) — reconnecting once");
+                drop(lease);
+                self.reconnect().await?;
+                let mut lease = self.lease_for("INBOX").await?;
+                lease.session().create_mailbox(&wire_owned).await
+            }
+        }
+    }
     /// `CREATE Trash` through the owned session with one transparent
     /// reconnect + retry (Plan 10-02 Trash fallback). `CREATE` needs no
     /// particular folder selected, so the stable `INBOX` lease suffices.
@@ -514,6 +536,12 @@ mod tests {
         plain_expunge_calls: usize,
         created_mailboxes: Vec<String>,
         set_seen_calls: Vec<(u32, bool)>,
+        /// When true, `create_mailbox` fails with a `Protocol` error
+        /// (drives the reconnect-retry path of `create_mailbox_in`).
+        fail_create: bool,
+        /// When true, `create_mailbox` fails with `Refused` (validation
+        /// refusal — must never be retried).
+        fail_create_refused: bool,
         fail_store_deleted: bool,
         fail_expunge: bool,
         fail_copy: bool,
@@ -565,6 +593,8 @@ mod tests {
                 plain_expunge_calls: 0,
                 created_mailboxes: Vec::new(),
                 set_seen_calls: Vec::new(),
+                fail_create: false,
+                fail_create_refused: false,
                 fail_store_deleted: false,
                 fail_expunge: false,
                 fail_copy: false,
@@ -770,12 +800,20 @@ mod tests {
         }
 
         fn create_mailbox(&mut self, name: &str) -> PinBox<'_, Result<(), SyncError>> {
-            self.0
-                .lock()
-                .unwrap()
-                .created_mailboxes
-                .push(name.to_string());
-            Box::pin(async move { Ok(()) })
+            let (fail_protocol, fail_refused) = {
+                let mut f = self.0.lock().unwrap();
+                f.created_mailboxes.push(name.to_string());
+                (f.fail_create, f.fail_create_refused)
+            };
+            Box::pin(async move {
+                if fail_refused {
+                    Err(SyncError::Refused("fake create refused".to_string()))
+                } else if fail_protocol {
+                    Err(SyncError::Protocol("fake create failure".to_string()))
+                } else {
+                    Ok(())
+                }
+            })
         }
 
         fn list_mailboxes(
@@ -885,7 +923,73 @@ mod tests {
     }
 
     #[test]
-    fn move_fallback_prefers_uid_move() {
+    fn create_mailbox_in_passes_wire_name_byte_identical() {
+        run(async {
+            let fake = FakeHandle::new(&["IMAP4rev1"], &[]);
+            let probe = fake.0.clone();
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            // Raw ASCII hierarchy passes through untouched.
+            manager.create_mailbox_in("Pai/Filho").await.unwrap();
+            // Non-ASCII leaf arrives already encoded by the caller —
+            // the manager never encodes inside (T-11-01 wire-name rule).
+            let wire = super::super::mutf7::encode_modified_utf7("Lixeira & Cia");
+            manager.create_mailbox_in(&wire).await.unwrap();
+            let f = probe.lock().unwrap();
+            assert_eq!(f.created_mailboxes, vec!["Pai/Filho".to_string(), wire]);
+            // CREATE reuses the stable INBOX lease — one SELECT total.
+            assert_eq!(f.select_calls, vec!["INBOX".to_string()]);
+        });
+    }
+
+    #[test]
+    fn create_mailbox_in_never_retries_refused() {
+        run(async {
+            let fake = FakeHandle::new(&["IMAP4rev1"], &[]);
+            let probe = fake.0.clone();
+            {
+                probe.lock().unwrap().fail_create_refused = true;
+            }
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            let err = manager
+                .create_mailbox_in("Pai")
+                .await
+                .expect_err("refused CREATE must surface");
+            assert!(
+                matches!(err, super::super::SyncError::Refused(_)),
+                "expected Refused, got: {err}"
+            );
+            // No new lease attempt: exactly one verb call, no retry.
+            let f = probe.lock().unwrap();
+            assert_eq!(f.created_mailboxes.len(), 1);
+        });
+    }
+
+    #[test]
+    fn create_mailbox_in_retry_goes_through_reconnect() {
+        run(async {
+            let fake = FakeHandle::new(&["IMAP4rev1"], &[]);
+            let probe = fake.0.clone();
+            {
+                probe.lock().unwrap().fail_create = true;
+            }
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            // Offline the reconnect cannot succeed (test.invalid dials
+            // nothing): the retry path surfaces the reconnect error, and
+            // crucially the verb fired exactly once — the second CREATE
+            // only runs after a successful reconnect.
+            let err = manager
+                .create_mailbox_in("Pai")
+                .await
+                .expect_err("offline retry must surface the reconnect error");
+            let msg = err.to_string().to_lowercase();
+            assert!(
+                msg.contains("reconnect") || msg.contains("connect"),
+                "expected a reconnect/connect error, got: {err}"
+            );
+            let f = probe.lock().unwrap();
+            assert_eq!(f.created_mailboxes, vec!["Pai".to_string()]);
+        });
+    }
         run(async {
             let fake = FakeHandle::new(&["IMAP4rev1", "UIDPLUS", "MOVE"], &[1, 2]);
             let probe = fake.0.clone();

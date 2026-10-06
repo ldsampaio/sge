@@ -1336,3 +1336,130 @@
   place-items: center;
   color: var(--color-destructive);
 }
+
+/* ── Folder CRUD (Phase 11): Nova pasta button + FolderDialog ── */
+.sidebar-newfolder {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: center;
+  width: 100%;
+  padding: 9px 14px;
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 14px;
+  color: var(--color-primary);
+  background: #fff;
+  border: 2.5px solid var(--color-primary);
+  border-radius: var(--primitive-radius-pill);
+  cursor: pointer;
+  box-shadow: var(--primitive-shadow-clay);
+}
+
+.sidebar-newfolder:hover {
+  background: var(--color-primary);
+  color: #fff;
+}
+
+.sidebar-newfolder:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 4px rgba(79, 70, 229, 0.16);
+}
+
+.sidebar-newfolder-icon {
+  display: inline-flex;
+}
+
+.folder-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: rgba(30, 27, 75, 0.45);
+}
+
+.folder-dialog {
+  background: var(--card-bg);
+  border: 3px solid var(--card-border);
+  border-radius: var(--primitive-radius-lg);
+  box-shadow: var(--card-shadow), 0 20px 48px rgba(30, 27, 75, 0.25);
+  padding: 20px;
+  max-width: 420px;
+  width: 100%;
+  animation: modal-pop-in 180ms var(--primitive-ease) forwards;
+  font-family: var(--font-body);
+  display: grid;
+  gap: 8px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .folder-dialog {
+    animation: none;
+  }
+}
+
+.folder-dialog-title {
+  font-family: var(--font-display);
+  font-size: 20px;
+  font-weight: 700;
+  margin: 0 0 4px;
+}
+
+.folder-dialog-label {
+  font-size: 14px;
+  font-weight: 700;
+  font-family: var(--font-display);
+}
+
+.folder-dialog-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 9px 12px;
+  font-size: 14px;
+  font-family: var(--font-body);
+  color: var(--color-foreground);
+  background: #fff;
+  border: 2px solid var(--color-border);
+  border-radius: var(--primitive-radius-md);
+  outline: none;
+}
+
+.folder-dialog-input:focus {
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 4px rgba(79, 70, 229, 0.16);
+}
+
+.folder-dialog-error {
+  margin: 0;
+  font-size: 13.5px;
+  color: var(--color-destructive);
+}
+
+.folder-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.folder-dialog-actions .btn {
+  min-width: 120px;
+  padding: 10px 18px;
+  font-size: 13.5px;
+  font-weight: 700;
+  font-family: var(--font-display);
+}
+
+.folder-dialog-actions .btn-outline {
+  background: transparent;
+  color: var(--color-foreground);
+  border: 2.5px solid var(--color-border);
+  border-radius: var(--primitive-radius-pill);
+}
+
+.folder-dialog-actions .btn-outline:hover {
+  background: var(--primitive-slate-100);
+  border-color: var(--color-border-strong);
+}

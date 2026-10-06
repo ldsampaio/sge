@@ -276,6 +276,7 @@ pub fn run() {
             commands::sync::sync_status,
             commands::sync::set_seen,
             commands::sync::delete_message,
+            commands::sync::create_folder,
             commands::sync::move_message,
             commands::sync::expunge_messages,
             commands::sync::undo_queued_op,
