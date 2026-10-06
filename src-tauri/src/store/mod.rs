@@ -16,7 +16,7 @@ pub mod queries;
 pub const BODY_CACHE_CAP_BYTES: usize = 262144;
 
 /// Schema version managed by rusqlite_migration.
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 // v1 = full schema.sql (canonical DDL from ARCHITECTURE.md)
 // M2 = flag_outbox durable queue (Phase 6, Plan 06-01). The schema.sql v1
@@ -86,6 +86,7 @@ impl Store {
             M::up(M4_BACKFILL_SQL),
             M::up(M5_STATUS_TS_SQL),
             M::up(M6_DELIMITER_SQL),
+            M::up(M7_IMAP_OUTBOX_SQL),
         ]);
         migrations.to_latest(conn)?;
         Ok(())
@@ -181,6 +182,38 @@ const M5_STATUS_TS_SQL: &str =
 const M6_DELIMITER_SQL: &str =
     "ALTER TABLE mailboxes ADD COLUMN delimiter TEXT NOT NULL DEFAULT '';";
 
+/// M7 forward migration: durable delete/move queue + optimistic hidden state
+/// (Phase 10, Plan 10-03).
+///
+/// `imap_outbox` queues offline deletes/moves for pre-sweep replay with
+/// RFC 4549 drop rules (whole-mailbox drop on UIDVALIDITY bump, single-op
+/// drop when the UID is absent server-side). `UNIQUE(mailbox_id, uid)`
+/// collapses rapid re-tries to latest-wins. `flag_outbox` (Phase 6
+/// contract) is untouched — enqueueing a delete/move drops the same-key
+/// flag row instead (a flag write to a soon-moved message is moot).
+///
+/// `messages.pending_delete` is the optimistic hidden flag: delete/move
+/// sets it (row filtered from list/search, undo restores), the next sweep's
+/// expunge-diff removes the row once the server confirms the move. Adding
+/// a column leaves the `msg_ai`/`msg_ad` FTS triggers intact.
+const M7_IMAP_OUTBOX_SQL: &str = concat!(
+    "CREATE TABLE imap_outbox (",
+    "  id            INTEGER PRIMARY KEY,",
+    "  mailbox_id    INTEGER NOT NULL REFERENCES mailboxes(id) ON DELETE CASCADE,",
+    "  uid           INTEGER NOT NULL,",
+    "  op            TEXT NOT NULL CHECK (op IN ('delete','move')),",
+    "  dest_mailbox  TEXT,",
+    "  seen_intent   INTEGER,",
+    "  uid_validity  INTEGER NOT NULL,",
+    "  created_at    TEXT NOT NULL DEFAULT (datetime('now')),",
+    "  attempts      INTEGER NOT NULL DEFAULT 0,",
+    "  last_error    TEXT,",
+    "  UNIQUE (mailbox_id, uid)",
+    ");",
+    "CREATE INDEX idx_imap_outbox_mailbox ON imap_outbox(mailbox_id);",
+    "ALTER TABLE messages ADD COLUMN pending_delete INTEGER NOT NULL DEFAULT 0;",
+);
+
 /// Returns the app-data attachment directory for a given mailbox UID.
 ///
 /// Files live under `<app_data>/attachments/<uid_validity>/<uid>/` —
@@ -269,8 +302,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_6_with_delimiter() {
-        assert_eq!(SCHEMA_VERSION, 6);
+    fn schema_version_is_7_with_imap_outbox() {
+        assert_eq!(SCHEMA_VERSION, 7);
         let store = Store::open_in_memory().expect("migration should succeed");
         let conn = store.conn();
         let count: i64 = conn
@@ -465,6 +498,92 @@ mod tests {
             )
             .expect("unseen_count should default to 0 for pre-M3 rows");
         assert_eq!(unseen, 0);
+    }
+
+    #[test]
+    fn m7_adds_imap_outbox_and_pending_delete_preserving_rows() {
+        // Simulate a v6 database (through M6, as shipped after Plan 10-02).
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        Migrations::new(vec![
+            M::up(include_str!("schema.sql")),
+            M::up(M2_FLAG_OUTBOX_SQL),
+            M::up(M3_UNSEEN_COUNT_SQL),
+            M::up(M4_BACKFILL_SQL),
+            M::up(M5_STATUS_TS_SQL),
+            M::up(M6_DELIMITER_SQL),
+        ])
+        .to_latest(&mut conn)
+        .unwrap();
+        // Seed rows under v6: a cached message + a queued flag toggle.
+        conn.execute(
+            "INSERT INTO mailboxes (name, uid_validity, uid_next) VALUES ('INBOX', 100, 4)",
+            [],
+        )
+        .unwrap();
+        let mb: i64 = conn
+            .query_row("SELECT id FROM mailboxes WHERE name = 'INBOX'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO messages (mailbox_id, uid, subject, from_addr, date_utc, flags, preview) \
+             VALUES (?1, 1, 'Old', 'a@x.com', '2024-01-01T00:00:00Z', '[]', 'p')",
+            rusqlite::params![mb],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO flag_outbox (mailbox_id, uid, seen, uid_validity) \
+             VALUES (?1, 1, 1, 100)",
+            rusqlite::params![mb],
+        )
+        .unwrap();
+
+        // Forward-upgrade with the production set — only M7 applies.
+        Store::apply_migrations(&mut conn).unwrap();
+
+        // v6 rows survive the upgrade.
+        let msgs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(msgs, 1, "forward migration must preserve cached rows");
+        let ops: i64 = conn
+            .query_row("SELECT COUNT(*) FROM flag_outbox", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ops, 1, "forward migration must preserve flag_outbox rows");
+        // M7 surface exists.
+        for (kind, name) in [
+            ("table", "imap_outbox"),
+            ("index", "idx_imap_outbox_mailbox"),
+        ] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = ?1 AND name = ?2",
+                    rusqlite::params![kind, name],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{kind} {name} should exist at schema v7");
+        }
+        // Pre-M7 rows read as not-pending (hidden flag defaults to 0).
+        let pending: i64 = conn
+            .query_row(
+                "SELECT pending_delete FROM messages WHERE mailbox_id = ?1 AND uid = 1",
+                rusqlite::params![mb],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 0);
+        // flag_outbox contract untouched: no op/dest columns.
+        let extra: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('flag_outbox') \
+                 WHERE name IN ('op', 'dest_mailbox', 'seen_intent')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(extra, 0, "flag_outbox schema must stay untouched");
     }
 
     #[test]

@@ -509,12 +509,30 @@ pub fn delete_missing_uids(
     live_uids: &[u32],
 ) -> StoreResult<usize> {
     if live_uids.is_empty() {
-        return conn
+        // Explicit dependent deletes: `PRAGMA foreign_keys` is off by
+        // default, so ON DELETE CASCADE cannot be relied on for
+        // message_bodies/attachment_parts — orphans would survive the wipe.
+        conn.execute(
+            "DELETE FROM attachment_parts WHERE message_id IN \
+             (SELECT id FROM messages WHERE mailbox_id = ?1)",
+            rusqlite::params![mailbox_id],
+        )?;
+        conn.execute(
+            "DELETE FROM message_bodies WHERE message_id IN \
+             (SELECT id FROM messages WHERE mailbox_id = ?1)",
+            rusqlite::params![mailbox_id],
+        )?;
+        let n = conn
             .execute(
                 "DELETE FROM messages WHERE mailbox_id = ?1",
                 rusqlite::params![mailbox_id],
             )
-            .map_err(StoreError::from);
+            .map_err(StoreError::from)?;
+        // Wipe path (UIDVALIDITY bump): queued delete/move UIDs belong to
+        // the dead generation — replaying them would move the wrong
+        // messages (RFC 4549, same rule as the flag queue).
+        drop_imap_outbox_for_mailbox(conn, mailbox_id)?;
+        return Ok(n);
     }
 
     conn.execute_batch(
@@ -529,6 +547,18 @@ pub fn delete_missing_uids(
             }
         }
     }
+    conn.execute(
+        "DELETE FROM attachment_parts WHERE message_id IN \
+         (SELECT m.id FROM messages m WHERE m.mailbox_id = ?1 \
+          AND m.uid NOT IN (SELECT uid FROM sge_live_uids))",
+        rusqlite::params![mailbox_id],
+    )?;
+    conn.execute(
+        "DELETE FROM message_bodies WHERE message_id IN \
+         (SELECT m.id FROM messages m WHERE m.mailbox_id = ?1 \
+          AND m.uid NOT IN (SELECT uid FROM sge_live_uids))",
+        rusqlite::params![mailbox_id],
+    )?;
     conn.execute(
         "DELETE FROM messages WHERE mailbox_id = ?1 AND uid NOT IN (SELECT uid FROM sge_live_uids)",
         rusqlite::params![mailbox_id],
@@ -679,7 +709,7 @@ pub fn list_messages(
         "m.date_utc, m.flags, m.has_attachments, m.preview, mb.name ",
         "FROM messages m ",
         "JOIN mailboxes mb ON m.mailbox_id = mb.id ",
-        "WHERE mb.name = ?1 ",
+        "WHERE mb.name = ?1 AND m.pending_delete = 0 ",
         "ORDER BY m.date_utc DESC, m.uid DESC ",
         "LIMIT ?2 OFFSET ?3",
     );
@@ -713,6 +743,7 @@ pub fn fts_search(
         "JOIN mailboxes mb ON m.mailbox_id = mb.id ",
         "WHERE messages_fts MATCH ?1 ",
         "AND (?2 IS NULL OR mb.name = ?2) ",
+        "AND m.pending_delete = 0 ",
         "ORDER BY rank",
     );
     let mut stmt = conn.prepare(sql)?;
@@ -918,6 +949,301 @@ pub fn outbox_count(conn: &Connection, mailbox_id: u64) -> StoreResult<i64> {
         |row| row.get(0),
     )
     .map_err(StoreError::from)
+}
+
+// ── imap outbox (durable offline delete/move queue, Phase 10) ──────
+
+/// Queued delete/move operation kinds stored in `imap_outbox.op`.
+pub const IMAP_OP_DELETE: &str = "delete";
+pub const IMAP_OP_MOVE: &str = "move";
+
+/// One queued delete/move awaiting server acknowledgement (pre-sweep replay).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImapOutboxOp {
+    pub id: u64,
+    pub mailbox_id: u64,
+    pub uid: u32,
+    /// `'delete'` (move-to-Trash) or `'move'` (move to `dest_mailbox`).
+    pub op: String,
+    /// Target raw wire name. Always set: the resolved Trash for `delete`,
+    /// the picker wire name for `move`.
+    pub dest_mailbox: Option<String>,
+    /// Pending Seen state captured from a dropped `flag_outbox` row at
+    /// move-enqueue time; applied at the destination UID on replay.
+    /// `None` for `delete` (MOVE/COPY preserve flags server-side).
+    pub seen_intent: Option<bool>,
+    pub uid_validity: u32,
+    pub attempts: i64,
+    pub last_error: Option<String>,
+}
+
+/// Enqueue (or collapse) a delete/move for `mailbox_id` + `uid`.
+///
+/// Latest-wins per `(mailbox_id, uid)` like the flag outbox. As part of the
+/// same store-lock section the caller must hold, the same-key `flag_outbox`
+/// row is consumed: a flag write to a soon-moved message is moot, and a
+/// `move` carries its pending Seen state along as `seen_intent` for
+/// dest-side apply at replay (a `delete` needs none — MOVE/COPY preserve
+/// flags server-side). Re-enqueue refreshes epoch + dest and resets retry
+/// counters.
+pub fn enqueue_imap_outbox(
+    conn: &Connection,
+    mailbox_id: u64,
+    uid: u32,
+    op: &str,
+    dest_mailbox: Option<&str>,
+    uid_validity: u32,
+) -> StoreResult<()> {
+    let pending_seen: Option<bool> = match conn.query_row(
+        "SELECT seen FROM flag_outbox WHERE mailbox_id = ?1 AND uid = ?2",
+        rusqlite::params![mailbox_id, uid],
+        |row| row.get::<_, bool>(0),
+    ) {
+        Ok(seen) => Some(seen),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => return Err(StoreError::Sql(e)),
+    };
+    conn.execute(
+        "DELETE FROM flag_outbox WHERE mailbox_id = ?1 AND uid = ?2",
+        rusqlite::params![mailbox_id, uid],
+    )?;
+    let seen_intent: Option<bool> = if op == IMAP_OP_MOVE {
+        pending_seen
+    } else {
+        None
+    };
+    conn.execute(
+        "INSERT INTO imap_outbox (mailbox_id, uid, op, dest_mailbox, seen_intent, uid_validity)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+          ON CONFLICT(mailbox_id, uid) DO UPDATE SET
+            op           = excluded.op,
+            dest_mailbox = excluded.dest_mailbox,
+            seen_intent  = excluded.seen_intent,
+            uid_validity = excluded.uid_validity,
+            attempts     = 0,
+            last_error   = NULL",
+        rusqlite::params![mailbox_id, uid, op, dest_mailbox, seen_intent, uid_validity],
+    )?;
+    Ok(())
+}
+
+/// UIDs with a queued delete/move for `mailbox_id`.
+///
+/// Joins the convergence gate alongside [`pending_uids`]: a queued delete
+/// must never read as "converged".
+pub fn pending_imap_uids(conn: &Connection, mailbox_id: u64) -> StoreResult<Vec<u32>> {
+    let mut stmt =
+        conn.prepare("SELECT uid FROM imap_outbox WHERE mailbox_id = ?1 ORDER BY uid")?;
+    let rows = stmt
+        .query_map(rusqlite::params![mailbox_id], |row| {
+            row.get::<_, u32>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// All queued delete/move ops for `mailbox_id` in creation order.
+pub fn list_imap_outbox(conn: &Connection, mailbox_id: u64) -> StoreResult<Vec<ImapOutboxOp>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, mailbox_id, uid, op, dest_mailbox, seen_intent, uid_validity, attempts, last_error
+          FROM imap_outbox WHERE mailbox_id = ?1 ORDER BY id",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![mailbox_id], |row| {
+            Ok(ImapOutboxOp {
+                id: row.get::<_, u64>(0)?,
+                mailbox_id: row.get::<_, u64>(1)?,
+                uid: row.get::<_, u32>(2)?,
+                op: row.get::<_, String>(3)?,
+                dest_mailbox: row.get::<_, Option<String>>(4)?,
+                seen_intent: row.get::<_, Option<bool>>(5)?,
+                uid_validity: row.get::<_, u32>(6)?,
+                attempts: row.get::<_, i64>(7)?,
+                last_error: row.get::<_, Option<String>>(8)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Delete the queued delete/move for `mailbox_id` + `uid` (acknowledged or
+/// undone). Returns the number of rows deleted.
+pub fn delete_imap_outbox_op(
+    conn: &Connection,
+    mailbox_id: u64,
+    uid: u32,
+) -> StoreResult<usize> {
+    conn.execute(
+        "DELETE FROM imap_outbox WHERE mailbox_id = ?1 AND uid = ?2",
+        rusqlite::params![mailbox_id, uid],
+    )
+    .map_err(StoreError::from)
+}
+
+/// Drop the whole mailbox delete/move queue (UIDVALIDITY-bump path, RFC 4549).
+/// Returns the number of rows deleted.
+pub fn drop_imap_outbox_for_mailbox(
+    conn: &Connection,
+    mailbox_id: u64,
+) -> StoreResult<usize> {
+    conn.execute(
+        "DELETE FROM imap_outbox WHERE mailbox_id = ?1",
+        rusqlite::params![mailbox_id],
+    )
+    .map_err(StoreError::from)
+}
+
+/// Record a failed replay attempt (bumps `attempts`, stores the error text).
+pub fn record_imap_outbox_error(
+    conn: &Connection,
+    mailbox_id: u64,
+    uid: u32,
+    err: &str,
+) -> StoreResult<()> {
+    conn.execute(
+        "UPDATE imap_outbox
+          SET attempts = attempts + 1, last_error = ?1
+          WHERE mailbox_id = ?2 AND uid = ?3",
+        rusqlite::params![err, mailbox_id, uid],
+    )?;
+    Ok(())
+}
+
+/// Number of queued delete/move ops for `mailbox_id`.
+/// Added to the flag-outbox depth in `sync_status` for the pending indicator.
+pub fn imap_outbox_count(conn: &Connection, mailbox_id: u64) -> StoreResult<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM imap_outbox WHERE mailbox_id = ?1",
+        rusqlite::params![mailbox_id],
+        |row| row.get(0),
+    )
+    .map_err(StoreError::from)
+}
+
+// ── optimistic delete/move hidden state ────────────────────────────
+
+/// Set or clear the `pending_delete` hidden flag for a message row.
+///
+/// Delete/move sets it (row stays for undo, filtered from list/search);
+/// undo clears it; ack leaves it set until the sweep's expunge-diff removes
+/// the row. Missing rows are a no-op (expunged between tap and write).
+pub fn set_pending_delete(
+    conn: &Connection,
+    mailbox_id: u64,
+    uid: u32,
+    pending: bool,
+) -> StoreResult<()> {
+    conn.execute(
+        "UPDATE messages SET pending_delete = ?1 WHERE mailbox_id = ?2 AND uid = ?3",
+        rusqlite::params![pending, mailbox_id, uid],
+    )?;
+    Ok(())
+}
+
+/// `true` when the row carries the optimistic hidden flag (or the row is
+/// gone — callers treat missing as not-pending).
+pub fn is_pending_delete(
+    conn: &Connection,
+    mailbox_id: u64,
+    uid: u32,
+) -> StoreResult<bool> {
+    match conn.query_row(
+        "SELECT pending_delete FROM messages WHERE mailbox_id = ?1 AND uid = ?2",
+        rusqlite::params![mailbox_id, uid],
+        |row| row.get::<_, bool>(0),
+    ) {
+        Ok(pending) => Ok(pending),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+        Err(e) => Err(StoreError::Sql(e)),
+    }
+}
+
+/// Undo a still-queued delete/move: clear the hidden flag and drop the
+/// outbox row. Valid only while the op is still queued (until next sync);
+/// returns `true` when an op was pending and the row was restored.
+pub fn undo_pending_op(
+    conn: &Connection,
+    mailbox_id: u64,
+    uid: u32,
+) -> StoreResult<bool> {
+    let had_op: bool = conn.query_row(
+        "SELECT COUNT(*) FROM imap_outbox WHERE mailbox_id = ?1 AND uid = ?2",
+        rusqlite::params![mailbox_id, uid],
+        |row| row.get::<_, i64>(0),
+    )? > 0;
+    if !had_op {
+        return Ok(false);
+    }
+    set_pending_delete(conn, mailbox_id, uid, false)?;
+    delete_imap_outbox_op(conn, mailbox_id, uid)?;
+    Ok(true)
+}
+
+/// Delete local rows for exactly `uids` (confirmed expunge path).
+///
+/// Removes dependent `attachment_parts`/`message_bodies` rows explicitly —
+/// `PRAGMA foreign_keys` is off by default in this codebase, so FK cascade
+/// cannot be relied on — and drops any queued flag/imap ops for the UIDs.
+/// The FTS `msg_ad` trigger cleans the index automatically. Returns the
+/// UIDs actually removed (for attachment-dir cleanup by the caller).
+pub fn expunge_uids_local(
+    conn: &Connection,
+    mailbox_id: u64,
+    uids: &[u32],
+) -> StoreResult<Vec<u32>> {
+    if uids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = "?,".repeat(uids.len());
+    let in_clause = &placeholders[..placeholders.len() - 1];
+    let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(uids.len() + 1);
+    params.push(&mailbox_id);
+    for uid in uids {
+        params.push(uid);
+    }
+    let existing: Vec<u32> = {
+        let sql = format!(
+            "SELECT uid FROM messages WHERE mailbox_id = ?1 AND uid IN ({in_clause})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params.as_slice(), |row| row.get::<_, u32>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+    if existing.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Rebuild the IN clause from the rows actually present (placeholder
+    // count must match the bound params exactly).
+    let placeholders = "?,".repeat(existing.len());
+    let in_clause = &placeholders[..placeholders.len() - 1];
+    let mut rm_params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(existing.len() + 1);
+    rm_params.push(&mailbox_id);
+    for uid in &existing {
+        rm_params.push(uid);
+    }
+    let rm_sql = |table: &str, id_col: &str| {
+        format!(
+            "DELETE FROM {table} WHERE {id_col} IN \
+             (SELECT m.id FROM messages m WHERE m.mailbox_id = ?1 AND m.uid IN ({in_clause}))"
+        )
+    };
+    conn.execute(&rm_sql("attachment_parts", "message_id"), rm_params.as_slice())?;
+    conn.execute(&rm_sql("message_bodies", "message_id"), rm_params.as_slice())?;
+    let del_sql = format!(
+        "DELETE FROM messages WHERE mailbox_id = ?1 AND uid IN ({in_clause})"
+    );
+    conn.execute(&del_sql, rm_params.as_slice())?;
+    let op_sql = format!(
+        "DELETE FROM flag_outbox WHERE mailbox_id = ?1 AND uid IN ({in_clause})"
+    );
+    conn.execute(&op_sql, rm_params.as_slice())?;
+    let imap_sql = format!(
+        "DELETE FROM imap_outbox WHERE mailbox_id = ?1 AND uid IN ({in_clause})"
+    );
+    conn.execute(&imap_sql, rm_params.as_slice())?;
+    Ok(existing)
 }
 
 // ── local Seen write (optimistic UI) ───────────────────────────────
@@ -1417,5 +1743,188 @@ mod tests {
         // Pure helper round-trips.
         assert_eq!(set_seen_flag("not-json{{{", true), r#"["\\Seen"]"#);
         assert_eq!(set_seen_flag("[]", false), "[]");
+    }
+
+    // ── Phase 10 Plan 10-03 Wave 1: imap_outbox + pending_delete ──
+
+    #[test]
+    fn imap_outbox_enqueue_latest_wins() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let mb_id = ensure_mailbox(conn, "INBOX").unwrap();
+
+        enqueue_imap_outbox(conn, mb_id, 7, IMAP_OP_DELETE, Some("Trash"), 100).unwrap();
+        // Re-enqueue as move: latest op wins, one row, counters reset.
+        record_imap_outbox_error(conn, mb_id, 7, "boom").unwrap();
+        enqueue_imap_outbox(conn, mb_id, 7, IMAP_OP_MOVE, Some("Archive"), 100).unwrap();
+
+        let ops = list_imap_outbox(conn, mb_id).unwrap();
+        assert_eq!(ops.len(), 1, "re-enqueue must collapse to a single op");
+        assert_eq!(ops[0].uid, 7);
+        assert_eq!(ops[0].op, IMAP_OP_MOVE);
+        assert_eq!(ops[0].dest_mailbox.as_deref(), Some("Archive"));
+        assert_eq!(ops[0].attempts, 0, "re-enqueue resets retry counters");
+        assert_eq!(ops[0].last_error, None);
+        assert_eq!(imap_outbox_count(conn, mb_id).unwrap(), 1);
+        assert_eq!(pending_imap_uids(conn, mb_id).unwrap(), vec![7]);
+    }
+
+    #[test]
+    fn imap_enqueue_consumes_flag_op_capturing_seen_for_move() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let mb_id = ensure_mailbox(conn, "INBOX").unwrap();
+
+        // Queued Seen toggle for uid 5 (read), plain message for uid 6.
+        enqueue_outbox(conn, mb_id, 5, true, 100).unwrap();
+        enqueue_outbox(conn, mb_id, 6, false, 100).unwrap();
+
+        // Move uid 5: flag row consumed, Seen intent captured.
+        enqueue_imap_outbox(conn, mb_id, 5, IMAP_OP_MOVE, Some("Archive"), 100).unwrap();
+        assert!(
+            pending_uids(conn, mb_id).unwrap().contains(&6)
+                && !pending_uids(conn, mb_id).unwrap().contains(&5),
+            "same-key flag op must be gone after move enqueue"
+        );
+        let ops = list_imap_outbox(conn, mb_id).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].seen_intent, Some(true));
+
+        // Delete uid 6: flag row consumed, no Seen intent stored
+        // (MOVE/COPY preserve flags server-side).
+        enqueue_imap_outbox(conn, mb_id, 6, IMAP_OP_DELETE, Some("Trash"), 100).unwrap();
+        assert!(pending_uids(conn, mb_id).unwrap().is_empty());
+        let ops = list_imap_outbox(conn, mb_id).unwrap();
+        let del = ops.iter().find(|o| o.uid == 6).unwrap();
+        assert_eq!(del.seen_intent, None);
+    }
+
+    #[test]
+    fn imap_outbox_single_op_delete_and_mailbox_drop() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let mb_id = ensure_mailbox(conn, "INBOX").unwrap();
+
+        enqueue_imap_outbox(conn, mb_id, 3, IMAP_OP_DELETE, Some("Trash"), 100).unwrap();
+        enqueue_imap_outbox(conn, mb_id, 9, IMAP_OP_MOVE, Some("Archive"), 100).unwrap();
+
+        let deleted = delete_imap_outbox_op(conn, mb_id, 3).unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(pending_imap_uids(conn, mb_id).unwrap(), vec![9]);
+        assert_eq!(delete_imap_outbox_op(conn, mb_id, 3).unwrap(), 0);
+
+        // UIDVALIDITY bump → whole mailbox queue drops (RFC 4549).
+        let dropped = drop_imap_outbox_for_mailbox(conn, mb_id).unwrap();
+        assert_eq!(dropped, 1);
+        assert_eq!(imap_outbox_count(conn, mb_id).unwrap(), 0);
+    }
+
+    #[test]
+    fn pending_delete_hidden_from_list_and_fts_until_undo() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let mb_id = ensure_mailbox(conn, "INBOX").unwrap();
+        insert_msg(conn, mb_id, 1, "Visible", "a@x.com", "[]");
+        insert_msg(conn, mb_id, 2, "Hidden", "b@x.com", "[]");
+
+        set_pending_delete(conn, mb_id, 2, true).unwrap();
+        assert!(is_pending_delete(conn, mb_id, 2).unwrap());
+        assert!(!is_pending_delete(conn, mb_id, 1).unwrap());
+
+        let rows = list_messages(conn, "INBOX", 100, 0).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].uid, 1);
+        let hits = fts_search(conn, Some("INBOX"), "Hidden").unwrap();
+        assert!(hits.is_empty(), "pending rows must not surface in FTS");
+
+        // Ack path leaves the flag set (sweep expunge-diff removes the row).
+        enqueue_imap_outbox(conn, mb_id, 2, IMAP_OP_DELETE, Some("Trash"), 100).unwrap();
+        // Undo while still queued restores the row to list + FTS.
+        assert!(undo_pending_op(conn, mb_id, 2).unwrap());
+        assert!(!is_pending_delete(conn, mb_id, 2).unwrap());
+        assert!(pending_imap_uids(conn, mb_id).unwrap().is_empty());
+        let rows = list_messages(conn, "INBOX", 100, 0).unwrap();
+        assert_eq!(rows.len(), 2);
+        let hits = fts_search(conn, Some("INBOX"), "Hidden").unwrap();
+        assert_eq!(hits.len(), 1);
+
+        // Undo with nothing queued is a no-op false.
+        assert!(!undo_pending_op(conn, mb_id, 1).unwrap());
+        // Missing rows are a no-op, not an error.
+        set_pending_delete(conn, mb_id, 999, true).unwrap();
+        assert!(!is_pending_delete(conn, mb_id, 999).unwrap());
+    }
+
+    #[test]
+    fn expunge_removes_fts_bodies_and_parts() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let mb_id = ensure_mailbox(conn, "INBOX").unwrap();
+        insert_msg(conn, mb_id, 1, "GoneSoon", "a@x.com", "[]");
+        insert_msg(conn, mb_id, 2, "StaysHere", "b@x.com", "[]");
+        let msg_id: u64 = conn
+            .query_row(
+                "SELECT id FROM messages WHERE mailbox_id = ?1 AND uid = 1",
+                rusqlite::params![mb_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        insert_body(conn, msg_id, Some("text"), Some("<p>html</p>")).unwrap();
+        insert_attachment_meta(conn, msg_id, "2", "f.pdf", "application/pdf", 10).unwrap();
+        enqueue_outbox(conn, mb_id, 1, true, 100).unwrap();
+        enqueue_imap_outbox(conn, mb_id, 1, IMAP_OP_DELETE, Some("Trash"), 100).unwrap();
+
+        let removed = expunge_uids_local(conn, mb_id, &[1, 999]).unwrap();
+        assert_eq!(removed, vec![1], "only present UIDs report removed");
+        assert!(fts_search(conn, Some("INBOX"), "GoneSoon").unwrap().is_empty());
+        let bodies: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM message_bodies WHERE message_id = ?1",
+                rusqlite::params![msg_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bodies, 0, "explicit body delete (FK pragma is off)");
+        let parts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM attachment_parts WHERE message_id = ?1",
+                rusqlite::params![msg_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(parts, 0, "explicit parts delete (FK pragma is off)");
+        // Queued ops for the expunged UID drop with it.
+        assert!(pending_imap_uids(conn, mb_id).unwrap().is_empty());
+        // Survivor untouched.
+        assert_eq!(fts_search(conn, Some("INBOX"), "StaysHere").unwrap().len(), 1);
+        assert!(expunge_uids_local(conn, mb_id, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn expunge_diff_wipe_clears_dependents_and_imap_queue() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let mb_id = ensure_mailbox(conn, "INBOX").unwrap();
+        insert_msg(conn, mb_id, 1, "Old", "a@x.com", "[]");
+        let msg_id: u64 = conn
+            .query_row(
+                "SELECT id FROM messages WHERE mailbox_id = ?1 AND uid = 1",
+                rusqlite::params![mb_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        insert_body(conn, msg_id, Some("t"), None).unwrap();
+        insert_attachment_meta(conn, msg_id, "2", "f.pdf", "application/pdf", 5).unwrap();
+        enqueue_imap_outbox(conn, mb_id, 1, IMAP_OP_MOVE, Some("Archive"), 100).unwrap();
+
+        // Wipe path (UIDVALIDITY bump): rows + dependents + imap queue go.
+        delete_missing_uids(conn, mb_id, &[]).unwrap();
+        for table in ["messages", "message_bodies", "attachment_parts", "imap_outbox"] {
+            let n: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 0, "{table} must be empty after wipe");
+        }
+        assert!(fts_search(conn, Some("INBOX"), "Old").unwrap().is_empty());
     }
 }
