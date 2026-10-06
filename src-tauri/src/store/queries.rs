@@ -134,7 +134,7 @@ pub fn sync_status(
     mailbox: &str,
 ) -> StoreResult<Option<(String, u32, u32, i64)>> {
     match conn.query_row(
-        "SELECT last_sync_at, uid_validity, uid_next,
+        "SELECT IFNULL(last_sync_at, ''), uid_validity, uid_next,
                 (SELECT COUNT(*) FROM messages m WHERE m.mailbox_id = mailboxes.id)
          FROM mailboxes WHERE name = ?1",
         rusqlite::params![mailbox],
@@ -154,9 +154,11 @@ pub fn sync_status(
 }
 
 /// Cache a folder's `STATUS` datum after a successful sweep (FOLD-02).
-/// Creates the row when missing; stamps `last_sync_at` with the current
-/// UTC time. The sidebar badge shows the dynamic local unread count once
-/// synced and falls back to this server datum for never-synced folders.
+/// Creates the row when missing; stamps `status_synced_at` (NOT
+/// `last_sync_at` — that stays reserved for message syncs so the sidebar
+/// badge fallback keeps working). The sidebar badge shows the dynamic
+/// local unread count once synced and falls back to this server datum for
+/// never-synced folders.
 pub fn set_mailbox_status(
     conn: &Connection,
     mailbox: &str,
@@ -165,13 +167,13 @@ pub fn set_mailbox_status(
     unseen: u32,
 ) -> StoreResult<()> {
     conn.execute(
-        "INSERT INTO mailboxes (name, uid_validity, uid_next, unseen_count, last_sync_at)
+        "INSERT INTO mailboxes (name, uid_validity, uid_next, unseen_count, status_synced_at)
          VALUES (?1, ?2, ?3, ?4, datetime('now'))
          ON CONFLICT(name) DO UPDATE SET
-           uid_validity = excluded.uid_validity,
-           uid_next     = excluded.uid_next,
-           unseen_count = excluded.unseen_count,
-           last_sync_at = excluded.last_sync_at",
+           uid_validity     = excluded.uid_validity,
+           uid_next         = excluded.uid_next,
+           unseen_count     = excluded.unseen_count,
+           status_synced_at = excluded.status_synced_at",
         rusqlite::params![mailbox, uid_validity, uid_next, unseen],
     )?;
     Ok(())

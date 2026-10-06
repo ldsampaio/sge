@@ -32,11 +32,16 @@ use store::Store;
 /// `sync_gate` is the Phase 8 single-flight guard: at most one `start_sync`
 /// pass runs at a time, so a poll tick firing mid-sync skips instead of
 /// overlapping.
+///
+/// `sync_cancel` is the cooperative cancel flag: `cancel_sync` sets it,
+/// `start_sync` clears it when a pass begins, and the worker checks it
+/// between sweep batches.
 pub struct AppState {
     pub store: Arc<Mutex<Store>>,
     pub active_account: Mutex<Option<ActiveAccount>>,
     pub session_manager: Mutex<Option<Arc<imap::manager::SessionManager>>>,
     pub sync_gate: Arc<sync::SyncGate>,
+    pub sync_cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// In-memory credentials + server config for the connected session.
@@ -237,6 +242,7 @@ pub fn run() {
         active_account: Mutex::new(None),
         session_manager: Mutex::new(None),
         sync_gate: Arc::new(sync::SyncGate::default()),
+        sync_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())

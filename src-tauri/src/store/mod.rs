@@ -16,7 +16,7 @@ pub mod queries;
 pub const BODY_CACHE_CAP_BYTES: usize = 262144;
 
 /// Schema version managed by rusqlite_migration.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 // v1 = full schema.sql (canonical DDL from ARCHITECTURE.md)
 // M2 = flag_outbox durable queue (Phase 6, Plan 06-01). The schema.sql v1
@@ -84,6 +84,7 @@ impl Store {
             M::up(M2_FLAG_OUTBOX_SQL),
             M::up(M3_UNSEEN_COUNT_SQL),
             M::up(M4_BACKFILL_SQL),
+            M::up(M5_STATUS_TS_SQL),
         ]);
         migrations.to_latest(conn)?;
         Ok(())
@@ -159,6 +160,17 @@ const M4_BACKFILL_SQL: &str = concat!(
     "CREATE INDEX idx_tombstone_mailbox ON fetch_tombstones(mailbox_id);",
     "ALTER TABLE mailboxes ADD COLUMN sweeps_since_full INTEGER NOT NULL DEFAULT 0;",
 );
+
+/// M5 forward migration: separate STATUS timestamp (Phase 7 audit fix).
+///
+/// `set_mailbox_status` (STATUS discovery) used to stamp `last_sync_at`,
+/// which defeated the sidebar badge fallback: a discovered-but-never-
+/// message-synced folder looked "synced" with local unread 0 instead of
+/// showing the server UNSEEN datum. `status_synced_at` records STATUS
+/// freshness; `last_sync_at` is now stamped only by message syncs
+/// (`set_sync_state`), and the badge gates on it.
+const M5_STATUS_TS_SQL: &str =
+    "ALTER TABLE mailboxes ADD COLUMN status_synced_at TEXT;";
 
 /// Returns the app-data attachment directory for a given mailbox UID.
 ///
@@ -248,8 +260,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_4_with_backfill_tables() {
-        assert_eq!(SCHEMA_VERSION, 4);
+    fn schema_version_is_5_with_status_ts() {
+        assert_eq!(SCHEMA_VERSION, 5);
         let store = Store::open_in_memory().expect("migration should succeed");
         let conn = store.conn();
         let count: i64 = conn
@@ -259,7 +271,7 @@ mod tests {
                 |r| r.get(0),
             )
             .expect("query should succeed");
-        assert_eq!(count, 1, "flag_outbox table should exist at schema v4");
+        assert_eq!(count, 1, "flag_outbox table should exist at schema v5");
         let idx: i64 = conn
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE type='index' AND name = 'idx_outbox_mailbox'",
@@ -275,7 +287,7 @@ mod tests {
                 |r| r.get(0),
             )
             .expect("query should succeed");
-        assert_eq!(unseen_cols, 1, "mailboxes.unseen_count should exist at schema v4");
+        assert_eq!(unseen_cols, 1, "mailboxes.unseen_count should exist at schema v5");
     }
 
     #[test]
@@ -310,7 +322,7 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(n, 1, "{kind} {name} should exist at schema v4");
+            assert_eq!(n, 1, "{kind} {name} should exist at schema v5");
         }
         let cols: i64 = conn
             .query_row(
@@ -319,7 +331,48 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(cols, 1, "mailboxes.sweeps_since_full should exist at schema v4");
+        assert_eq!(cols, 1, "mailboxes.sweeps_since_full should exist at schema v5");
+    }
+
+    #[test]
+    fn m5_adds_status_synced_at() {
+        // Simulate a v4 database (through M4, as shipped after Phase 9).
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        Migrations::new(vec![
+            M::up(include_str!("schema.sql")),
+            M::up(M2_FLAG_OUTBOX_SQL),
+            M::up(M3_UNSEEN_COUNT_SQL),
+            M::up(M4_BACKFILL_SQL),
+        ])
+        .to_latest(&mut conn)
+        .unwrap();
+        Migrations::new(vec![
+            M::up(include_str!("schema.sql")),
+            M::up(M2_FLAG_OUTBOX_SQL),
+            M::up(M3_UNSEEN_COUNT_SQL),
+            M::up(M4_BACKFILL_SQL),
+            M::up(M5_STATUS_TS_SQL),
+        ])
+        .to_latest(&mut conn)
+        .unwrap();
+        // STATUS discovery must NOT stamp last_sync_at (badge fallback).
+        conn.execute(
+            "INSERT INTO mailboxes (name, uid_validity, uid_next) VALUES ('Sent', 10, 2)",
+            [],
+        )
+        .unwrap();
+        crate::store::queries::set_mailbox_status(&conn, "Sent", 10, 2, 4).unwrap();
+        let (last, status_ts, unseen): (Option<String>, Option<String>, i64) = conn
+            .query_row(
+                "SELECT last_sync_at, status_synced_at, unseen_count FROM mailboxes WHERE name = 'Sent'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(last, None, "STATUS must not stamp last_sync_at");
+        assert!(status_ts.is_some(), "STATUS stamps status_synced_at");
+        assert_eq!(unseen, 4);
     }
 
     #[test]

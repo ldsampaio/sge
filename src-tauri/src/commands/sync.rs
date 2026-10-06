@@ -113,6 +113,7 @@ pub async fn start_sync(
     // Run sync on a dedicated blocking thread.
     let store = state.store.clone();
     let gate = state.sync_gate.clone();
+    let cancel_flag = state.sync_cancel.clone();
     tauri::async_runtime::spawn_blocking(move || {
         async_std::task::block_on(async {
             // Single-flight (Phase 8): a poll tick or second refresh that
@@ -125,10 +126,12 @@ pub async fn start_sync(
                     return Ok(Default::default());
                 }
             };
+            // A new pass clears any pending cancel (stale "Pausar" press).
+            cancel_flag.store(false, std::sync::atomic::Ordering::SeqCst);
             let session = connect_sync(&account_cfg).await
                 .map_err(|e| format!("IMAP connection: {e}"))?;
             eprintln!("[SGE sync] Connected -- starting worker...");
-            let worker = SyncWorker::new(store);
+            let worker = SyncWorker::with_cancel(store, cancel_flag);
             let cb: SyncCallback = Arc::new(move |event| {
                 let _ = on_event.send(event);
             });
@@ -357,13 +360,14 @@ pub async fn search_messages(
 
 /// Cancel the currently running sync pass.
 ///
-/// Sets the cancellation flag; the worker checks it between batches
-/// and aborts cleanly (writes no partial sync_state).
+/// Sets the cooperative flag; the worker checks it between sweep batches
+/// and aborts cleanly (writes no partial sync_state, notifies the UI).
 #[tauri::command]
-pub async fn cancel_sync() -> Result<(), String> {
-    // Cancellation flag lives in AppState -- set it there.
-    // For now, no-op: the worker has no long-running batch to interrupt.
-    // Phase 3 / poll timer will wire this properly.
+pub async fn cancel_sync(state: State<'_, crate::AppState>) -> Result<(), String> {
+    state
+        .sync_cancel
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    eprintln!("[SGE sync] cancel requested");
     Ok(())
 }
 
@@ -373,7 +377,9 @@ pub async fn cancel_sync() -> Result<(), String> {
 /// UNSEEN)` per selectable folder, cached with `set_mailbox_status`.
 /// `\Noselect` entries (hierarchy placeholders) are skipped — they cannot
 /// be SELECTed or STATUSed. Returns the locally cached rows (same shape the
-/// sidebar renders), so the tree works offline after the first discovery.
+/// sidebar renders), so the tree works offline after the first discovery:
+/// when LIST/STATUS fails, the cached rows are served instead of an error
+/// (error only when nothing was ever cached).
 #[tauri::command]
 pub async fn list_mailboxes(
     state: State<'_, crate::AppState>,
@@ -383,10 +389,20 @@ pub async fn list_mailboxes(
     let store = state.store.clone();
     tauri::async_runtime::spawn_blocking(move || {
         async_std::task::block_on(async {
-            let discovered = manager
-                .list_mailboxes()
-                .await
-                .map_err(|e| format!("LIST failed: {e}"))?;
+            let discovered = match manager.list_mailboxes().await {
+                Ok(folders) => folders,
+                Err(e) => {
+                    // Offline fallback: serve the cached tree.
+                    let guard = store.lock().unwrap();
+                    let cached =
+                        queries::list_mailboxes(guard.conn()).map_err(|e| format!("store: {e}"))?;
+                    if cached.is_empty() {
+                        return Err(format!("LIST failed and no folders cached: {e}"));
+                    }
+                    eprintln!("[SGE sync] LIST failed ({e}) — serving {n} cached folders", n = cached.len());
+                    return Ok(cached);
+                }
+            };
             {
                 let guard = store.lock().unwrap();
                 let conn = guard.conn();
@@ -605,7 +621,10 @@ pub async fn save_attachment(
     uid: u32,
     part_number: String,
     file_path: String,
+    mailbox: Option<String>,
 ) -> Result<String, String> {
+    // Optional: older frontends omit it; default preserves the INBOX contract.
+    let mailbox = mailbox.unwrap_or_else(|| "INBOX".to_string());
     let acc = state.active_account.lock().unwrap().clone();
     tauri::async_runtime::spawn_blocking(move || {
         async_std::task::block_on(async {
@@ -644,7 +663,7 @@ pub async fn save_attachment(
             let mut session = connect_sync(&account_cfg)
                 .await
                 .map_err(|e| format!("IMAP connection failed: {e}"))?;
-            let _ = session.select_inbox().await
+            let _ = session.select_mailbox(&mailbox).await
                 .map_err(|e| format!("IMAP SELECT failed: {e}"))?;
             let raw = session.fetch_body(uid).await
                 .map_err(|e| format!("IMAP fetch failed: {e}"))?;

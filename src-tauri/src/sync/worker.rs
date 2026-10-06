@@ -35,6 +35,9 @@ const BATCH_SIZE: u32 = 200;
 /// connect/logout and test fixtures are trivial.
 pub struct SyncWorker {
     store: Arc<std::sync::Mutex<Store>>,
+    /// Cooperative cancellation: `cancel_sync` sets it; the sweep checks
+    /// it between batches and aborts cleanly (writes no partial state).
+    cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Aggregate result of one outbox replay pass.
@@ -50,7 +53,24 @@ pub struct ReplaySummary {
 
 impl SyncWorker {
     pub fn new(store: Arc<std::sync::Mutex<Store>>) -> Self {
-        Self { store }
+        Self {
+            store,
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Share an externally owned cancellation flag (the `AppState` slot
+    /// the `cancel_sync` command sets).
+    pub fn with_cancel(
+        store: Arc<std::sync::Mutex<Store>>,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self { store, cancel }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Replay queued Seen toggles for `mailbox_id` through `session`.
@@ -347,6 +367,16 @@ impl SyncWorker {
         let total_messages = sweep_uids.len() as u32;
 
         for chunk in sweep_uids.chunks(BATCH_SIZE as usize) {
+            // Cooperative cancel: abort cleanly between batches — no
+            // partial sync_state write, session logged out, UI notified.
+            if self.cancelled() {
+                eprintln!("[SGE sync] cancelled mid-sweep — aborting without state write");
+                session.logout().await?;
+                cb(SyncEvent::SyncError {
+                    detail: "sync cancelled".to_string(),
+                });
+                return Ok(result);
+            }
             let range_str = chunk
                 .iter()
                 .map(|u| u.to_string())
@@ -476,7 +506,24 @@ impl SyncWorker {
                     let _ = queries::clear_tombstone(conn, mailbox_id, uid);
 
                     if existing_set.contains(&uid) {
-                        result.updated += 1;
+                        // Unchanged vs updated: a stored row whose flags
+                        // already match the server sweep is unchanged (flags
+                        // are the convergence signal; envelope bytes are not
+                        // retained). Pending-wins rows always count as
+                        // updated — the local optimistic write goes through.
+                        if pending.contains(&uid) {
+                            result.updated += 1;
+                        } else {
+                            let stored = queries::message_flags(conn, mailbox_id, uid)
+                                .map_err(|e| {
+                                    SyncError::Protocol(format!("stored flags uid {uid}: {e}"))
+                                })?;
+                            if stored.as_deref() == Some(header.flags.as_str()) {
+                                result.unchanged += 1;
+                            } else {
+                                result.updated += 1;
+                            }
+                        }
                         cb(SyncEvent::MessageSynced {
                             uid,
                             flag: SyncFlag::Updated,
@@ -801,7 +848,8 @@ mod tests {
 
         assert!(!result3.converged);
         assert_eq!(result3.new, 0);
-        assert_eq!(result3.updated, 3);
+        assert_eq!(result3.unchanged, 3);
+        assert_eq!(result3.updated, 0);
         assert_eq!(result3.deleted, 0);
     }
 
@@ -1674,5 +1722,45 @@ mod tests {
         let mb = queries::mailbox_id(guard.conn(), "INBOX").unwrap().unwrap();
         let remaining = queries::tombstoned_uids(guard.conn(), mb).unwrap();
         assert!(remaining.is_empty(), "expunged uid's tombstone must prune");
+    }
+
+    /// A set cancel flag aborts the sweep before any fetch: no messages
+    /// cached, no sync state stamped.
+    #[test]
+    fn cancel_sync_aborts_without_state_write() {
+        use std::sync::atomic::AtomicBool;
+        let store = inbox(gap_summary(100, 3));
+        let flag = Arc::new(AtomicBool::new(true)); // cancelled before start
+        let worker = SyncWorker::with_cancel(store.clone(), flag);
+
+        let session = mock(gap_summary(100, 3), vec![mkhdr(1), mkhdr(2), mkhdr(3)]);
+        let result = async_std::task::block_on(async {
+            worker.sync_with_session(Box::new(session), "INBOX", cb()).await
+        })
+        .unwrap();
+
+        assert_eq!(result.new, 0, "aborted pass caches nothing");
+        assert!(!result.converged);
+        let guard = worker.store.lock().unwrap();
+        // STATUS caching (step 2b) legitimately records the epoch, but the
+        // message sync must stamp nothing and cache nothing.
+        let last: Option<String> = guard
+            .conn()
+            .query_row(
+                "SELECT last_sync_at FROM mailboxes WHERE name = 'INBOX'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(last, None, "aborted pass must not stamp last_sync_at");
+        let count: i64 = guard
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM messages m JOIN mailboxes mb ON m.mailbox_id = mb.id WHERE mb.name = 'INBOX'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "aborted pass caches no messages");
     }
 }
