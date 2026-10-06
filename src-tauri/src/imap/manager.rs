@@ -15,8 +15,12 @@
 //! the password) is only cloned into `connect_sync`. No log line in this
 //! module formats the config, the password, or credentials.
 
-use super::{AccountConfig, SyncError, SyncSession};
+use super::{
+    choose_expunge_path, choose_move_path, chunk_uid_set, AccountConfig, ExpungePath,
+    MovePath, SyncError, SyncSession,
+};
 use crate::imap::session::connect_sync;
+use std::collections::HashSet;
 
 /// Owns one authenticated IMAP session for the active account.
 ///
@@ -232,6 +236,56 @@ impl SessionManager {
         }
     }
 
+    /// Move `uid_set` (comma-joined `"1,2,3"`) from `src` to `dest` (raw
+    /// wire names) under ONE held lease, with reconnect-retry and
+    /// capability-gated fallback orchestration (Plan 10-02, MOVE-01 slice).
+    ///
+    /// MOVE advertised → one-verb `UID MOVE` per ~200-UID chunk. Otherwise
+    /// COPY → STORE `+Deleted` (per UID) → scoped removal: `UID EXPUNGE`
+    /// with UIDPLUS, else the unmark-others dance behind a bare `EXPUNGE`
+    /// (loud refusal when the unmark cannot be verified — never a blind
+    /// expunge). On first failure the lease drops, the session reconnects
+    /// (capabilities re-read), and the whole sequence retries exactly once.
+    pub async fn move_message_in(
+        &self,
+        src: &str,
+        uid_set: &str,
+        dest: &str,
+    ) -> Result<MoveOutcome, SyncError> {
+        match self.move_once(src, uid_set, dest).await {
+            Ok(outcome) => Ok(outcome),
+            Err(first) => {
+                eprintln!(
+                    "[SGE imap] move {src} -> {dest} set {uid_set} failed ({first}) — reconnecting once"
+                );
+                self.reconnect().await?;
+                self.move_once(src, uid_set, dest).await
+            }
+        }
+    }
+
+    /// One attempt of the move. Holds a SINGLE `lease_for(src)` guard for
+    /// the whole COPY/STORE/EXPUNGE sequence so no intermediate SELECT can
+    /// drift the expunge to the wrong folder. Never calls `self.lease_for`
+    /// re-entrantly while holding the lease (async mutex → deadlock) —
+    /// verbs run on `lease.session()` directly.
+    async fn move_once(
+        &self,
+        src: &str,
+        uid_set: &str,
+        dest: &str,
+    ) -> Result<MoveOutcome, SyncError> {
+        let uids = parse_uid_set(uid_set)?;
+        let mut lease = self.lease_for(src).await?;
+        let caps = match lease.cached_capabilities() {
+            Some(caps) => caps,
+            // Defensive only: `lease_for` fills the cache, so this runs
+            // solely when a future lease path skips the fill.
+            None => lease.session().capabilities().await?,
+        };
+        run_move_sequence(lease.session(), &uids, dest, &caps).await
+    }
+
     /// `LIST "" "*"` through the owned session (FOLD-01 folder discovery).
     pub async fn list_mailboxes(&self) -> Result<Vec<super::MailboxInfo>, SyncError> {
         let mut lease = self.lease_for("INBOX").await?;
@@ -248,6 +302,137 @@ impl SessionManager {
         let mut lease = self.lease_for("INBOX").await?;
         lease.session().mailbox_status(mailbox).await
     }
+}
+
+/// Outcome of [`SessionManager::move_message_in`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoveOutcome {
+    /// True when the server lacked MOVE and the COPY + STORE + EXPUNGE
+    /// fallback sequence ran instead of one-verb `UID MOVE`.
+    pub used_fallback: bool,
+}
+
+/// Parse a comma-joined UID set (`"1,2,3"`) into UIDs. Fail-closed on any
+/// malformed segment — a bad set must never reach the wire.
+fn parse_uid_set(uid_set: &str) -> Result<Vec<u32>, SyncError> {
+    uid_set
+        .split(',')
+        .map(|s| {
+            s.trim().parse::<u32>().map_err(|_| {
+                SyncError::State(format!(
+                    "invalid UID set {uid_set:?} — expected comma-joined UIDs"
+                ))
+            })
+        })
+        .collect()
+}
+
+/// True when a stored flags value carries `\Deleted`.
+///
+/// Flags travel as the JSON array `format_flags` writes
+/// (`["\\Seen","\\Deleted"]`); parse it exactly, falling back to a
+/// substring probe for foreign shapes rather than missing a mark. A clean
+/// parse with no exact atom is trusted (a custom keyword merely
+/// containing "deleted" must not trigger an unmark/restore cycle).
+fn flags_carry_deleted(flags: &str) -> bool {
+    if let Ok(names) = serde_json::from_str::<Vec<String>>(flags) {
+        return names.iter().any(|n| n == "\\Deleted");
+    }
+    flags.contains("Deleted")
+}
+
+/// Capability-gated move body: runs on the caller's already-leased session
+/// (SELECT stable) and issues NO `select_mailbox` itself — the single-lease
+/// rule. Chunked at [`chunk_uid_set`] width so multi-message ops stay
+/// poll-responsive.
+async fn run_move_sequence(
+    session: &mut dyn SyncSession,
+    uids: &[u32],
+    dest: &str,
+    caps: &[String],
+) -> Result<MoveOutcome, SyncError> {
+    if uids.is_empty() {
+        return Ok(MoveOutcome {
+            used_fallback: false,
+        });
+    }
+    if choose_move_path(caps) == MovePath::UidMove {
+        for chunk in chunk_uid_set(uids) {
+            session.uid_move_to(&chunk, dest).await?;
+        }
+        return Ok(MoveOutcome {
+            used_fallback: false,
+        });
+    }
+    // Fallback without MOVE: COPY, then mark, then scoped removal.
+    for chunk in chunk_uid_set(uids) {
+        session.uid_copy_to(&chunk, dest).await?;
+    }
+    for uid in uids {
+        session.store_deleted(*uid, true).await?;
+    }
+    if choose_expunge_path(caps) == ExpungePath::UidExpunge {
+        for chunk in chunk_uid_set(uids) {
+            session.uid_expunge(&chunk).await?;
+        }
+    } else {
+        unmark_dance_expunge(session, uids).await?;
+    }
+    Ok(MoveOutcome {
+        used_fallback: true,
+    })
+}
+
+/// UIDPLUS-absent expunge: protect other clients' `\Deleted` marks across a
+/// bare `EXPUNGE` that would otherwise nuke every marked message in the
+/// folder.
+///
+/// 1. Sweep flags (read-only, no SELECT) for live `\Deleted` UIDs outside
+///    our set (foreign marks). 2. `-FLAGS` them. 3. Re-read and VERIFY the
+///    unmark landed — any surviving mark aborts with a loud,
+///    plain-language refusal (nothing expunged yet). 4. Bare `EXPUNGE`
+///    (removes exactly our marked set, barring a concurrent foreign mark
+///    in the gap — residual risk inherent to servers without UIDPLUS).
+/// 5. Restore the foreign marks.
+async fn unmark_dance_expunge(
+    session: &mut dyn SyncSession,
+    ours: &[u32],
+) -> Result<(), SyncError> {
+    let ours_set: HashSet<u32> = ours.iter().copied().collect();
+    let live = session.search_uids().await?;
+    let mut foreign: Vec<u32> = Vec::new();
+    for chunk in chunk_uid_set(&live) {
+        for header in session.fetch_envelopes(&chunk).await? {
+            if !ours_set.contains(&header.uid) && flags_carry_deleted(&header.flags) {
+                foreign.push(header.uid);
+            }
+        }
+    }
+    for uid in &foreign {
+        session.store_deleted(*uid, false).await?;
+    }
+    if !foreign.is_empty() {
+        let check = foreign
+            .iter()
+            .map(|u| u.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        for header in session.fetch_envelopes(&check).await? {
+            if flags_carry_deleted(&header.flags) {
+                return Err(SyncError::Protocol(
+                    "servidor não suporta UID EXPUNGE e a proteção de mensagens \
+                     de outros clientes não pôde ser verificada — nenhuma mensagem \
+                     foi apagada"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    session.expunge().await?;
+    for uid in &foreign {
+        session.store_deleted(*uid, true).await?;
+    }
+    Ok(())
 }
 
 /// Exclusive, mailbox-selected access to the manager's session.
@@ -675,6 +860,137 @@ mod tests {
             assert_eq!(f.created_mailboxes, vec!["Trash".to_string()]);
             // CREATE reuses the INBOX selection from the expunge lease.
             assert_eq!(f.select_calls, vec!["INBOX".to_string()]);
+        });
+    }
+
+    #[test]
+    fn move_fallback_prefers_uid_move() {
+        run(async {
+            let fake = FakeHandle::new(&["IMAP4rev1", "UIDPLUS", "MOVE"], &[1, 2]);
+            let probe = fake.0.clone();
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            let outcome = manager.move_message_in("INBOX", "1,2", "Trash").await.unwrap();
+            assert_eq!(outcome, MoveOutcome { used_fallback: false });
+            let f = probe.lock().unwrap();
+            assert_eq!(f.moved_calls, vec![("1,2".to_string(), "Trash".to_string())]);
+            assert!(f.copied_calls.is_empty());
+            assert!(f.deleted_calls.is_empty());
+            assert!(f.expunged_sets.is_empty());
+            assert_eq!(f.plain_expunge_calls, 0);
+            // One SELECT for the whole op.
+            assert_eq!(f.select_calls, vec!["INBOX".to_string()]);
+        });
+    }
+
+    #[test]
+    fn move_fallback_copy_store_uid_expunge() {
+        run(async {
+            // UIDPLUS without MOVE: COPY + STORE + scoped UID EXPUNGE.
+            let fake = FakeHandle::new(&["IMAP4rev1", "UIDPLUS"], &[1, 2, 9]);
+            let probe = fake.0.clone();
+            {
+                // UID 9 carries another client's `\Deleted` — it must survive
+                // our scoped expunge.
+                probe.lock().unwrap().deleted.insert(9, true);
+            }
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            let outcome = manager.move_message_in("INBOX", "1,2", "Archive").await.unwrap();
+            assert_eq!(outcome, MoveOutcome { used_fallback: true });
+            let f = probe.lock().unwrap();
+            assert_eq!(f.moved_calls.len(), 0);
+            assert_eq!(f.copied_calls, vec![("1,2".to_string(), "Archive".to_string())]);
+            assert_eq!(f.deleted_calls, vec![(1, true), (2, true)]);
+            assert_eq!(f.expunged_sets, vec!["1,2".to_string()]);
+            assert_eq!(f.plain_expunge_calls, 0, "no bare EXPUNGE with UIDPLUS");
+            assert_eq!(f.select_calls, vec!["INBOX".to_string()]);
+            assert_eq!(f.removed, vec![1, 2], "only our UIDs removed");
+            assert_eq!(f.deleted.get(&9), Some(&true), "foreign mark survives");
+        });
+    }
+
+    #[test]
+    fn move_fallback_neither_runs_unmark_dance() {
+        run(async {
+            // Neither MOVE nor UIDPLUS: COPY + STORE + unmark dance + EXPUNGE.
+            let fake = FakeHandle::new(&["IMAP4rev1"], &[1, 2, 4]);
+            let probe = fake.0.clone();
+            {
+                probe.lock().unwrap().deleted.insert(4, true);
+            }
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            let outcome = manager.move_message_in("INBOX", "1,2", "Trash").await.unwrap();
+            assert_eq!(outcome, MoveOutcome { used_fallback: true });
+            let f = probe.lock().unwrap();
+            assert_eq!(f.copied_calls, vec![("1,2".to_string(), "Trash".to_string())]);
+            // Ours marked; foreign 4 unmarked then restored.
+            assert!(f.deleted_calls.contains(&(1, true)));
+            assert!(f.deleted_calls.contains(&(2, true)));
+            assert!(f.deleted_calls.contains(&(4, false)), "foreign unmarked: {:?}", f.deleted_calls);
+            assert!(f.deleted_calls.contains(&(4, true)), "foreign restored: {:?}", f.deleted_calls);
+            assert_eq!(f.plain_expunge_calls, 1);
+            assert!(f.expunged_sets.is_empty(), "no UID EXPUNGE without UIDPLUS");
+            assert_eq!(f.select_calls, vec!["INBOX".to_string()], "single SELECT held");
+            assert_eq!(f.removed, vec![1, 2], "foreign UID 4 survives the dance");
+            assert_eq!(f.deleted.get(&4), Some(&true), "foreign mark restored");
+        });
+    }
+
+    #[test]
+    fn move_fallback_move_without_uidplus_skips_dance() {
+        run(async {
+            // MOVE without UIDPLUS still moves in one verb — no expunge path.
+            let fake = FakeHandle::new(&["IMAP4rev1", "MOVE"], &[1, 2]);
+            let probe = fake.0.clone();
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            let outcome = manager.move_message_in("INBOX", "1,2", "Trash").await.unwrap();
+            assert_eq!(outcome, MoveOutcome { used_fallback: false });
+            let f = probe.lock().unwrap();
+            assert_eq!(f.moved_calls.len(), 1);
+            assert_eq!(f.plain_expunge_calls, 0);
+            assert!(f.expunged_sets.is_empty());
+        });
+    }
+
+    #[test]
+    fn move_fallback_chunks_large_sets() {
+        run(async {
+            let uids: Vec<u32> = (1..=450).collect();
+            let set = uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+            // MOVE path: 200 + 200 + 50.
+            let fake = FakeHandle::new(&["IMAP4rev1", "UIDPLUS", "MOVE"], &uids);
+            let probe = fake.0.clone();
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            manager.move_message_in("INBOX", &set, "Trash").await.unwrap();
+            {
+                let f = probe.lock().unwrap();
+                assert_eq!(f.moved_calls.len(), 3);
+                assert_eq!(f.moved_calls[0].0.split(',').count(), 200);
+                assert_eq!(f.moved_calls[2].0.split(',').count(), 50);
+            }
+            // Fallback COPY path chunks identically.
+            let fake2 = FakeHandle::new(&["IMAP4rev1", "UIDPLUS"], &uids);
+            let probe2 = fake2.0.clone();
+            let manager2 = SessionManager::for_test_session(Box::new(fake2));
+            manager2.move_message_in("INBOX", &set, "Trash").await.unwrap();
+            let f2 = probe2.lock().unwrap();
+            assert_eq!(f2.copied_calls.len(), 3);
+            assert_eq!(f2.expunged_sets.len(), 3);
+            assert_eq!(f2.deleted_calls.len(), 450);
+        });
+    }
+
+    #[test]
+    fn move_fallback_rejects_malformed_uid_set() {
+        run(async {
+            let fake = FakeHandle::new(&["IMAP4rev1", "UIDPLUS", "MOVE"], &[1]);
+            let probe = fake.0.clone();
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            assert!(manager.move_message_in("INBOX", "", "Trash").await.is_err());
+            assert!(manager.move_message_in("INBOX", "1,,2", "Trash").await.is_err());
+            // Fail-closed: nothing reached the wire.
+            let f = probe.lock().unwrap();
+            assert!(f.moved_calls.is_empty());
+            assert!(f.copied_calls.is_empty());
         });
     }
 }
