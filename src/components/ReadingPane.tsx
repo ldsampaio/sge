@@ -129,6 +129,7 @@ export default function ReadingPane({ selectedMessage, mailbox = "INBOX" }: Read
           uid: selectedMessage?.uid,
           partNumber: part_number,
           filePath: chosen,
+          mailbox,
         });
       }
     } catch {

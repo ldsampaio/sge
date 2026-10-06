@@ -197,7 +197,7 @@ export default function MessageList({
         reportState({ kind: "error", message: msg });
       }
     },
-    [reportState],
+    [mailbox, reportState],
   );
 
   // Keep rows in sync with toggles made from the reader pane (and re-apply

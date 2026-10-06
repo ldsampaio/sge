@@ -80,7 +80,7 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
             </p>
           </div>
         </div>
-        <SyncStatus mailbox={selectedMailbox} onSyncComplete={handleSyncComplete} />
+        <SyncStatus key={selectedMailbox} mailbox={selectedMailbox} onSyncComplete={handleSyncComplete} />
       </header>
       <div className="mailbox-panes">
         <Sidebar
@@ -101,6 +101,7 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
             )}
           </div>
           <MessageList
+            key={selectedMailbox}
             mailbox={selectedMailbox}
             searchQuery={searchQuery}
             refreshKey={refreshKey}
@@ -110,7 +111,7 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
             onMessageCount={setMessageCount}
           />
         </main>
-        <ReadingPane selectedMessage={selectedMessage} mailbox={selectedMailbox} />
+        <ReadingPane key={selectedMailbox} selectedMessage={selectedMessage} mailbox={selectedMailbox} />
       </div>
     </div>
   );
