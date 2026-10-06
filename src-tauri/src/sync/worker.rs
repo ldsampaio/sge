@@ -163,14 +163,32 @@ impl SyncWorker {
         Ok(summary)
     }
 
-    /// Execute a full INBOX sync pass against an injected [`SyncSession`].
+    /// Execute a full sync pass against an injected [`SyncSession`].
     ///
     /// The session is consumed (boxed trait object) — the caller
     /// owns connection lifecycle.  The worker emits progress via
-    /// `cb` and returns an aggregate [`SyncSummary`].
+    /// `cb` and returns an aggregate [`SyncSummary`]. Delegates to
+    /// [`sync_with_borrowed`](Self::sync_with_borrowed).
     pub async fn sync_with_session(
         &self,
         mut session: Box<dyn SyncSession>,
+        mailbox_name: &str,
+        cb: SyncCallback,
+    ) -> Result<SyncSummary, SyncError> {
+        self.sync_with_borrowed(&mut *session, mailbox_name, cb)
+            .await
+    }
+
+    /// Execute a full sync pass against a borrowed [`SyncSession`].
+    ///
+    /// Plan 10-02 precondition entry: `start_sync` holds a manager
+    /// [`MailboxLease`](crate::imap::manager::MailboxLease) across the pass
+    /// and passes `lease.session()` here, so the sweep SELECTs through the
+    /// single owned connection instead of opening a fresh session per pass
+    /// that could race destructive leases. No second IMAP connection.
+    pub async fn sync_with_borrowed(
+        &self,
+        session: &mut dyn SyncSession,
         mailbox_name: &str,
         cb: SyncCallback,
     ) -> Result<SyncSummary, SyncError> {
@@ -900,6 +918,41 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 3);
+    }
+
+    /// Plan 10-02 precondition entry: the worker borrows a lease-held
+    /// session (`&mut dyn SyncSession`) instead of consuming a fresh
+    /// connection — the `start_sync`-under-lease path. Borrowed, not
+    /// consumed: the caller still owns the session afterwards.
+    #[test]
+    fn sync_with_borrowed_runs_full_pass_on_lease_session() {
+        let store = inbox(MailboxSummary {
+            selected_mailbox: "INBOX".to_string(),
+            uid_validity: 100,
+            uid_next: Some(4),
+            exists: 3,
+        });
+        let worker = SyncWorker::new(store);
+
+        let summary = MailboxSummary {
+            selected_mailbox: "INBOX".to_string(),
+            uid_validity: 100,
+            uid_next: Some(4),
+            exists: 3,
+        };
+        let mut session = mock(summary, vec![mkhdr(1), mkhdr(2), mkhdr(3)]);
+
+        let result = async_std::task::block_on(async {
+            worker.sync_with_borrowed(&mut session, "INBOX", cb()).await
+        })
+        .unwrap();
+
+        assert_eq!(result.new, 3);
+        assert_eq!(result.updated, 0);
+        assert_eq!(result.deleted, 0);
+        // The borrowed session drove the whole pass (SELECT + sweep).
+        assert_eq!(session.select_calls, vec!["INBOX".to_string()]);
+        assert!(session.logout_called.load(Ordering::SeqCst));
     }
 
     /// Second run with same data → converged (no FETCH); the periodic full

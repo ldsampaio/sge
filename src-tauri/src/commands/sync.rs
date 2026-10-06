@@ -108,6 +108,11 @@ pub async fn start_sync(
     // Load credentials: prefer in-memory session, fall back to keyring.
     let account_cfg: AccountConfig = load_account_config(state.clone()).await?;
 
+    // Plan 10-02 precondition: the pass runs under the account's
+    // SessionManager lease — one owned connection shared with (and
+    // serialized against) destructive ops, never a fresh session per pass.
+    let manager = manager_for(&state, &account_cfg);
+
     eprintln!("[SGE sync] Connecting to {}:{}...", account_cfg.host, account_cfg.port);
 
     // Run sync on a dedicated blocking thread.
@@ -128,14 +133,17 @@ pub async fn start_sync(
             };
             // A new pass clears any pending cancel (stale "Pausar" press).
             cancel_flag.store(false, std::sync::atomic::Ordering::SeqCst);
-            let session = connect_sync(&account_cfg).await
-                .map_err(|e| format!("IMAP connection: {e}"))?;
-            eprintln!("[SGE sync] Connected -- starting worker...");
+            // Lease SELECTs `mailbox` on the owned session (connecting
+            // lazily on first use); the worker borrows it for the pass.
+            // `connect_sync` stays reserved for bootstrap/probe paths only.
+            let mut lease = manager.lease_for(&mailbox).await
+                .map_err(|e| format!("IMAP lease: {e}"))?;
+            eprintln!("[SGE sync] Leased session -- starting worker...");
             let worker = SyncWorker::with_cancel(store, cancel_flag);
             let cb: SyncCallback = Arc::new(move |event| {
                 let _ = on_event.send(event);
             });
-            let result = worker.sync_with_session(Box::new(session), &mailbox, cb).await
+            let result = worker.sync_with_borrowed(lease.session(), &mailbox, cb).await
                 .map_err(|e| e.to_string());
             match &result {
                 Ok(s) => eprintln!("[SGE sync] Done: new={} updated={} deleted={}", s.new, s.updated, s.deleted),

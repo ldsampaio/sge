@@ -1101,4 +1101,38 @@ mod tests {
             assert_eq!(f.plain_expunge_calls, 0);
         });
     }
+
+    #[test]
+    fn lease_and_destructive_op_serialize_on_one_session() {
+        run(async {
+            // Plan 10-02 single-flight contention: a sync-style lease held
+            // across a pass serializes a concurrent destructive op — no
+            // second connection, one shared session, one SELECT. (The
+            // `start_sync`-under-lease path holds exactly such a lease.)
+            let fake = FakeHandle::new(&["IMAP4rev1", "UIDPLUS"], &[1, 2]);
+            let probe = fake.0.clone();
+            let manager = Arc::new(SessionManager::for_test_session(Box::new(fake)));
+            let holder_mgr = manager.clone();
+            let holder = async move {
+                let _lease = holder_mgr.lease_for("INBOX").await.unwrap();
+                async_std::task::sleep(std::time::Duration::from_millis(300)).await;
+            };
+            let writer_mgr = manager.clone();
+            let writer = async move {
+                writer_mgr.mark_deleted_in("INBOX", 1, true).await.unwrap();
+            };
+            let start = std::time::Instant::now();
+            futures::join!(holder, writer);
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed >= std::time::Duration::from_millis(200),
+                "destructive op did not wait for the held lease: {elapsed:?}"
+            );
+            let f = probe.lock().unwrap();
+            // One session throughout: a single SELECT, a single CAPABILITY.
+            assert_eq!(f.select_calls, vec!["INBOX".to_string()]);
+            assert_eq!(f.caps_calls, 1);
+            assert_eq!(f.deleted_calls, vec![(1, true)]);
+        });
+    }
 }
