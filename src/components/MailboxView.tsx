@@ -1,14 +1,18 @@
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import Sidebar from "./Sidebar";
 import FolderDialog from "./FolderDialog";
 import FolderDeleteModal from "./FolderDeleteModal";
 import MessageList, { type ListState } from "./MessageList";
 import ReadingPane from "./ReadingPane";
+import DraftEditor from "./DraftEditor";
 import SyncStatus from "./SyncStatus";
 import SearchBar from "./SearchBar";
 import type {
   MessageRow,
+  MessageView,
+  DraftRow,
+  DraftSaveResult,
   MailboxRow,
   FolderTreeResult,
   RenameFolderResult,
@@ -17,6 +21,14 @@ import type {
 } from "../types";
 import { IconCap } from "./icons";
 import "./MailboxView.css";
+
+/** True when the raw wire name is the Drafts folder (role first, name fallback). */
+function isDraftsFolder(raw: string, mailboxes: MailboxRow[]): boolean {
+  const row = mailboxes.find((m) => m.name === raw);
+  if (row?.role === "drafts") return true;
+  const lower = raw.toLocaleLowerCase();
+  return lower === "drafts" || lower === "rascunhos";
+}
 
 interface MailboxViewProps {
   mailbox?: string;
@@ -47,6 +59,16 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
   } | null>(null);
   const [deletePending, setDeletePending] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  // DRAFT-01: open draft editor state. Null = reader mode; non-null renders
+  // DraftEditor in the reading pane with the compose session (null id = new).
+  const [draftEditor, setDraftEditor] = useState<{
+    draftId: string | null;
+    initial?: DraftRow | null;
+  } | null>(null);
+  const [draftLoading, setDraftLoading] = useState(false);
+  const [draftNotice, setDraftNotice] = useState<string | null>(null);
+  /** Server UIDs saved by this session → compose-session ids (row→session map). */
+  const sessionDraftsRef = useRef<Map<number, string>>(new Map());
 
   // FOLD-01: fetch mailbox list from the local store on mount.
   useEffect(() => {
@@ -68,7 +90,76 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
       setSelectedMailbox(msg.mailbox);
       setRefreshKey((k) => k + 1);
     }
+    const folder = msg.mailbox || selectedMailbox;
+    if (isDraftsFolder(folder, mailboxes)) {
+      void openDraftFromRow(msg, folder);
+      return;
+    }
     setSelectedMessage(msg);
+  }
+
+  /**
+   * Open a Drafts-folder row in the editor. List rows carry no compose-session
+   * id, so: rows saved by this session resolve via the session map straight
+   * to `get_draft`; any other row seeds a fresh session from its fetched
+   * content (plain-text only — HTML is never injected, T-12-06).
+   */
+  async function openDraftFromRow(msg: MessageRow, folder: string) {
+    setDraftNotice(null);
+    setSelectedMessage(null);
+    const knownId = sessionDraftsRef.current.get(msg.uid);
+    if (knownId !== undefined) {
+      setDraftLoading(true);
+      try {
+        const row = await invoke<DraftRow>("get_draft", { id: knownId });
+        setDraftEditor({ draftId: row.id, initial: row });
+      } catch (e) {
+        setDraftNotice(invokeErrorCopy(e));
+      } finally {
+        setDraftLoading(false);
+      }
+      return;
+    }
+    setDraftLoading(true);
+    try {
+      const view = await invoke<MessageView>("fetch_message", { uid: msg.uid, mailbox: folder });
+      const seed: DraftRow = {
+        id: "",
+        mailbox_id: 0,
+        message_id: "",
+        subject: view.subject ?? msg.subject ?? "",
+        body: view.text ?? "",
+        to: (view.to_addrs ?? []).join(", "),
+        cc: "",
+        bcc: "",
+        dirty: true,
+        server_uid: msg.uid,
+        attachments: "",
+        updated_at: "",
+      };
+      setDraftEditor({ draftId: null, initial: seed });
+    } catch (e) {
+      setDraftNotice(invokeErrorCopy(e));
+    } finally {
+      setDraftLoading(false);
+    }
+  }
+
+  /** A save lands in the list via the existing refresh path (no full sync). */
+  function handleDraftSaved(result: DraftSaveResult) {
+    if (result.server_uid !== null && result.server_uid !== undefined) {
+      sessionDraftsRef.current.set(result.server_uid, result.id);
+    }
+    setDraftEditor((ed) => (ed === null ? ed : { ...ed, draftId: result.id }));
+    setRefreshKey((k) => k + 1);
+  }
+
+  function handleDraftDiscarded(id: string) {
+    for (const [uid, known] of sessionDraftsRef.current) {
+      if (known === id) sessionDraftsRef.current.delete(uid);
+    }
+    setDraftEditor(null);
+    setRefreshKey((k) => k + 1);
   }
 
   const handleSearch = useCallback((query: string) => {
@@ -79,6 +170,8 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
   function handleMailboxSelect(m: string) {
     setSelectedMailbox(m);
     setSelectedMessage(null);
+    setDraftEditor(null);
+    setDraftNotice(null);
     setRefreshKey((k) => k + 1);
   }
 
@@ -221,6 +314,8 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
       ? (renameRow.display_name.split(renameDelim).pop() ?? renameRow.display_name)
       : (renameRow?.display_name ?? "");
 
+  const showingDrafts = isDraftsFolder(selectedMailbox, mailboxes);
+
   return (
     <div className="mailbox-layout">
       <header className="mailbox-header">
@@ -268,6 +363,25 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
               </span>
             )}
           </div>
+          {showingDrafts && (
+            <button
+              type="button"
+              className="btn draft-new-btn"
+              onClick={() => {
+                setSelectedMessage(null);
+                setDraftNotice(null);
+                setDraftEditor({ draftId: null });
+              }}
+              aria-label="Novo rascunho"
+            >
+              Novo rascunho
+            </button>
+          )}
+          {draftNotice && (
+            <p className="reading-error" role="alert">
+              {draftNotice}
+            </p>
+          )}
           <MessageList
             key={selectedMailbox}
             mailbox={selectedMailbox}
@@ -280,12 +394,22 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
             onMessageCount={setMessageCount}
           />
         </main>
-        <ReadingPane
-          key={selectedMailbox}
-          selectedMessage={selectedMessage}
-          mailbox={selectedMailbox}
-          mailboxes={mailboxes}
-        />
+        {draftEditor !== null || draftLoading ? (
+          <DraftEditorPane
+            draftEditor={draftEditor}
+            loading={draftLoading}
+            onSaved={handleDraftSaved}
+            onDiscarded={handleDraftDiscarded}
+            onClose={() => setDraftEditor(null)}
+          />
+        ) : (
+          <ReadingPane
+            key={selectedMailbox}
+            selectedMessage={selectedMessage}
+            mailbox={selectedMailbox}
+            mailboxes={mailboxes}
+          />
+        )}
       </div>
       {(() => {
         const isRename = renameTarget !== null;
@@ -321,5 +445,44 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
         isOpen={deleteTarget !== null}
       />
     </div>
+  );
+}
+
+/**
+ * Right-pane slot for draft editing: a loading placeholder while the seed
+ * loads, then the editor keyed by compose session so switching drafts
+ * remounts cleanly.
+ */
+function DraftEditorPane({
+  draftEditor,
+  loading,
+  onSaved,
+  onDiscarded,
+  onClose,
+}: {
+  draftEditor: { draftId: string | null; initial?: DraftRow | null } | null;
+  loading: boolean;
+  onSaved: (result: DraftSaveResult) => void;
+  onDiscarded: (id: string) => void;
+  onClose: () => void;
+}) {
+  if (draftEditor === null) {
+    return (
+      <aside className="reading-pane flex-center" aria-label="Editor de rascunho">
+        <p className="reading-placeholder" role="status">
+          {loading ? "Abrindo o rascunho…" : "Escolha um rascunho para editar"}
+        </p>
+      </aside>
+    );
+  }
+  return (
+    <DraftEditor
+      key={draftEditor.draftId ?? "new"}
+      draftId={draftEditor.draftId}
+      initial={draftEditor.initial}
+      onSaved={onSaved}
+      onDiscarded={onDiscarded}
+      onClose={onClose}
+    />
   );
 }
