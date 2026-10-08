@@ -16,7 +16,7 @@ pub mod queries;
 pub const BODY_CACHE_CAP_BYTES: usize = 262144;
 
 /// Schema version managed by rusqlite_migration.
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 10;
 
 // v1 = full schema.sql (canonical DDL from ARCHITECTURE.md)
 // M2 = flag_outbox durable queue (Phase 6, Plan 06-01). The schema.sql v1
@@ -89,6 +89,7 @@ impl Store {
             M::up(M7_IMAP_OUTBOX_SQL),
             M::up(M8_ROLES_SQL),
             M::up(M9_DRAFTS_SQL),
+            M::up(M10_SEND_QUEUE_SQL),
         ]);
         migrations.to_latest(conn)?;
         Ok(())
@@ -260,6 +261,39 @@ const M9_DRAFTS_SQL: &str = concat!(
     "CREATE INDEX idx_drafts_dirty ON drafts(dirty);",
 );
 
+/// M10 forward migration: durable send queue (Phase 13, Plan 13-01).
+///
+/// One row per outgoing mail (`id` = queue uuid). `message_id` is assigned
+/// once at enqueue and is `UNIQUE` — double-invoke dedupes on it, and
+/// retries resend the identical `.eml` bytes (never re-render). Envelope
+/// recipients ride as JSON (`to_addrs`/`cc_addrs`/`bcc_addrs`; BCC is
+/// envelope-only, never in headers). `eml_path` points at the immutable
+/// `<app_data>/outbox/<id>.eml` render. `state` is the flush machine
+/// (`queued|sending|sent|failed|uncertain`); `failed` is terminal-with-
+/// manual-retry, `uncertain` means reconcile-not-resend. `draft_id` links
+/// the DRAFT-03 send transaction (`NULL` = composed outside drafts).
+/// Crash recovery resets `sending` → `queued` at launch before any flush.
+const M10_SEND_QUEUE_SQL: &str = concat!(
+    "CREATE TABLE send_queue (",
+    "  id            TEXT PRIMARY KEY,",
+    "  message_id    TEXT NOT NULL UNIQUE,",
+    "  from_addr     TEXT NOT NULL DEFAULT '',",
+    "  to_addrs      TEXT NOT NULL DEFAULT '[]',",
+    "  cc_addrs      TEXT NOT NULL DEFAULT '[]',",
+    "  bcc_addrs     TEXT NOT NULL DEFAULT '[]',",
+    "  eml_path      TEXT NOT NULL DEFAULT '',",
+    "  state         TEXT NOT NULL DEFAULT 'queued'",
+    "    CHECK (state IN ('queued','sending','sent','failed','uncertain')),",
+    "  attempts      INTEGER NOT NULL DEFAULT 0,",
+    "  next_retry_at TEXT,",
+    "  last_error    TEXT,",
+    "  draft_id      TEXT,",
+    "  created_at    TEXT NOT NULL DEFAULT (datetime('now'))",
+    ");",
+    "CREATE INDEX idx_send_queue_state ON send_queue(state);",
+    "CREATE INDEX idx_send_queue_next_retry ON send_queue(next_retry_at);",
+);
+
 /// Returns the app-data attachment directory for a given mailbox UID.
 ///
 /// Files live under `<app_data>/attachments/<uid_validity>/<uid>/` —
@@ -348,8 +382,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_9_with_drafts() {
-        assert_eq!(SCHEMA_VERSION, 9);
+    fn schema_version_is_10_with_send_queue() {
+        assert_eq!(SCHEMA_VERSION, 10);
         let store = Store::open_in_memory().expect("migration should succeed");
         let conn = store.conn();
         let count: i64 = conn
@@ -777,6 +811,110 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM drafts", [], |r| r.get(0))
             .unwrap();
         assert_eq!(drafts, 0);
+    }
+
+    #[test]
+    fn m10_adds_send_queue_preserving_rows() {
+        // Simulate a v9 database (through M9, as shipped after Phase 12).
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        Migrations::new(vec![
+            M::up(include_str!("schema.sql")),
+            M::up(M2_FLAG_OUTBOX_SQL),
+            M::up(M3_UNSEEN_COUNT_SQL),
+            M::up(M4_BACKFILL_SQL),
+            M::up(M5_STATUS_TS_SQL),
+            M::up(M6_DELIMITER_SQL),
+            M::up(M7_IMAP_OUTBOX_SQL),
+            M::up(M8_ROLES_SQL),
+            M::up(M9_DRAFTS_SQL),
+        ])
+        .to_latest(&mut conn)
+        .unwrap();
+        // Seed v9 rows: mailbox + cached message + queued flag op + draft.
+        conn.execute(
+            "INSERT INTO mailboxes (name, uid_validity, uid_next, delimiter, role, attributes) \
+             VALUES ('INBOX', 100, 4, '', 'inbox', '')",
+            [],
+        )
+        .unwrap();
+        let mb: i64 = conn
+            .query_row("SELECT id FROM mailboxes WHERE name = 'INBOX'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO messages (mailbox_id, uid, subject, from_addr, date_utc, flags, preview) \
+             VALUES (?1, 1, 'Old', 'a@x.com', '2024-01-01T00:00:00Z', '[]', 'p')",
+            rusqlite::params![mb],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO flag_outbox (mailbox_id, uid, seen, uid_validity) \
+             VALUES (?1, 1, 1, 100)",
+            rusqlite::params![mb],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO drafts (id, mailbox_id, message_id, subject, body) \
+             VALUES ('draft-1', ?1, '<draft-1@sge.local>', 'Hi', 'hello')",
+            rusqlite::params![mb],
+        )
+        .unwrap();
+
+        // Forward-upgrade with the production set — only M10 applies.
+        Store::apply_migrations(&mut conn).unwrap();
+
+        // v9 rows survive the upgrade.
+        let msgs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(msgs, 1, "forward migration must preserve cached rows");
+        let ops: i64 = conn
+            .query_row("SELECT COUNT(*) FROM flag_outbox", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ops, 1, "forward migration must preserve flag_outbox rows");
+        let role: String = conn
+            .query_row("SELECT role FROM mailboxes WHERE name = 'INBOX'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(role, "inbox", "M8 role values survive the M10 upgrade");
+        let drafts: i64 = conn
+            .query_row("SELECT COUNT(*) FROM drafts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(drafts, 1, "forward migration must preserve draft rows");
+        // M10 surface exists with all 13 columns.
+        let cols: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('send_queue') WHERE name IN \
+                 ('id','message_id','from_addr','to_addrs','cc_addrs','bcc_addrs',\
+                  'eml_path','state','attempts','next_retry_at','last_error',\
+                  'draft_id','created_at')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cols, 13, "send_queue table must have all 13 columns");
+        for (kind, name) in [
+            ("table", "send_queue"),
+            ("index", "idx_send_queue_state"),
+            ("index", "idx_send_queue_next_retry"),
+        ] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = ?1 AND name = ?2",
+                    rusqlite::params![kind, name],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{kind} {name} should exist at schema v10");
+        }
+        // Fresh send_queue table starts empty.
+        let queued: i64 = conn
+            .query_row("SELECT COUNT(*) FROM send_queue", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(queued, 0);
     }
 
     #[test]

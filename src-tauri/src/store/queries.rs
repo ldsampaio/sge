@@ -1552,6 +1552,209 @@ pub fn dirty_draft_count_for(conn: &Connection, mailbox_id: u64) -> StoreResult<
     .map_err(StoreError::from)
 }
 
+// ── send queue (durable outbox, Phase 13) ──────────────────────────
+
+/// One queued outgoing mail: the exactly-once foundation (SEND-04).
+///
+/// `message_id` is assigned once at enqueue and is `UNIQUE` — double-invoke
+/// dedupes on it, retries resend the identical `.eml` bytes. `state` is one
+/// of `queued|sending|sent|failed|uncertain`; `failed` is terminal-with-
+/// manual-retry, `uncertain` means reconcile-not-resend (never blind retry).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SendRow {
+    pub id: String,
+    pub message_id: String,
+    pub from_addr: String,
+    pub to_addrs: String,
+    pub cc_addrs: String,
+    pub bcc_addrs: String,
+    pub eml_path: String,
+    pub state: String,
+    pub attempts: i64,
+    pub next_retry_at: Option<String>,
+    pub last_error: Option<String>,
+    pub draft_id: Option<String>,
+    pub created_at: String,
+}
+
+fn send_from_row(row: &Row<'_>) -> Result<SendRow, rusqlite::Error> {
+    Ok(SendRow {
+        id: row.get::<_, String>(0)?,
+        message_id: row.get::<_, String>(1)?,
+        from_addr: row.get::<_, String>(2)?,
+        to_addrs: row.get::<_, String>(3)?,
+        cc_addrs: row.get::<_, String>(4)?,
+        bcc_addrs: row.get::<_, String>(5)?,
+        eml_path: row.get::<_, String>(6)?,
+        state: row.get::<_, String>(7)?,
+        attempts: row.get::<_, i64>(8)?,
+        next_retry_at: row.get::<_, Option<String>>(9)?,
+        last_error: row.get::<_, Option<String>>(10)?,
+        draft_id: row.get::<_, Option<String>>(11)?,
+        created_at: row.get::<_, String>(12)?,
+    })
+}
+
+const SEND_COLUMNS: &str = "id, message_id, from_addr, to_addrs, cc_addrs, \
+     bcc_addrs, eml_path, state, attempts, next_retry_at, last_error, \
+     draft_id, created_at";
+
+/// Queue states stored in `send_queue.state`.
+pub const SEND_STATE_QUEUED: &str = "queued";
+pub const SEND_STATE_SENDING: &str = "sending";
+pub const SEND_STATE_SENT: &str = "sent";
+pub const SEND_STATE_FAILED: &str = "failed";
+pub const SEND_STATE_UNCERTAIN: &str = "uncertain";
+
+/// Insert one send row. Dedupe happens in `send_queue.rs` (check
+/// [`get_send_row_by_message_id`] first): a concurrent double-insert hits
+/// the `message_id` UNIQUE constraint and the caller reconciles to the
+/// existing row instead of failing the enqueue.
+#[allow(clippy::too_many_arguments)]
+pub fn enqueue_send_row(
+    conn: &Connection,
+    id: &str,
+    message_id: &str,
+    from_addr: &str,
+    to_addrs: &str,
+    cc_addrs: &str,
+    bcc_addrs: &str,
+    eml_path: &str,
+    draft_id: Option<&str>,
+) -> StoreResult<()> {
+    conn.execute(
+        "INSERT INTO send_queue (id, message_id, from_addr, to_addrs, cc_addrs, \
+           bcc_addrs, eml_path, state, draft_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', ?8)",
+        rusqlite::params![
+            id, message_id, from_addr, to_addrs, cc_addrs, bcc_addrs, eml_path, draft_id
+        ],
+    )?;
+    Ok(())
+}
+
+/// Load one queued mail by queue id. `None` when the id is unknown (the
+/// command layer maps this to `send-missing`).
+pub fn get_send_row(conn: &Connection, id: &str) -> StoreResult<Option<SendRow>> {
+    let sql = format!("SELECT {SEND_COLUMNS} FROM send_queue WHERE id = ?1");
+    let mut stmt = conn.prepare(&sql)?;
+    let row = stmt
+        .query_row(rusqlite::params![id], send_from_row)
+        .optional()?;
+    Ok(row)
+}
+
+/// Load one queued mail by Message-ID — the double-invoke dedupe key.
+pub fn get_send_row_by_message_id(
+    conn: &Connection,
+    message_id: &str,
+) -> StoreResult<Option<SendRow>> {
+    let sql = format!("SELECT {SEND_COLUMNS} FROM send_queue WHERE message_id = ?1");
+    let mut stmt = conn.prepare(&sql)?;
+    let row = stmt
+        .query_row(rusqlite::params![message_id], send_from_row)
+        .optional()?;
+    Ok(row)
+}
+
+/// Mails due for a flush pass: `queued` with no schedule or a schedule at
+/// or before `now` (`%Y-%m-%d %H:%M:%S` UTC, same shape as `datetime('now')`
+/// so lexicographic comparison is chronological). Oldest first.
+pub fn list_due_sends(conn: &Connection, now: &str) -> StoreResult<Vec<SendRow>> {
+    let sql = format!(
+        "SELECT {SEND_COLUMNS} FROM send_queue \
+         WHERE state = 'queued' AND (next_retry_at IS NULL OR next_retry_at <= ?1) \
+         ORDER BY created_at, id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(rusqlite::params![now], send_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Transition a row to a new state (`queued|sending|sent|failed|uncertain`).
+/// The CHECK constraint rejects anything else.
+pub fn set_send_state(conn: &Connection, id: &str, state: &str) -> StoreResult<()> {
+    conn.execute(
+        "UPDATE send_queue SET state = ?1 WHERE id = ?2",
+        rusqlite::params![state, id],
+    )?;
+    Ok(())
+}
+
+/// Record one failed attempt: `attempts + 1` with the next schedule and the
+/// plain-language error. `next_retry_at = None` leaves the row unscheduled
+/// (used when parking as terminal `failed` — never auto-retried).
+pub fn record_send_attempt(
+    conn: &Connection,
+    id: &str,
+    next_retry_at: Option<&str>,
+    last_error: Option<&str>,
+) -> StoreResult<()> {
+    conn.execute(
+        "UPDATE send_queue \
+         SET attempts = attempts + 1, next_retry_at = ?1, last_error = ?2 \
+         WHERE id = ?3",
+        rusqlite::params![next_retry_at, last_error, id],
+    )?;
+    Ok(())
+}
+
+/// Crash recovery: flip every `sending` row back to `queued` before any
+/// flush pass runs (a crash mid-send must re-send, never strand). `sent` /
+/// `failed` / `uncertain` are untouched — they already reached a verdict.
+/// Returns the number of rows flipped.
+pub fn reset_sending_to_queued(conn: &Connection) -> StoreResult<usize> {
+    conn.execute(
+        "UPDATE send_queue SET state = 'queued' WHERE state = 'sending'",
+        [],
+    )
+    .map_err(StoreError::from)
+}
+
+/// Per-state depths for `send_status` (`queued, sending, sent, failed,
+/// uncertain`) in a single scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub struct SendCounts {
+    pub queued: i64,
+    pub sending: i64,
+    pub sent: i64,
+    pub failed: i64,
+    pub uncertain: i64,
+}
+
+impl SendCounts {
+    /// Mails still needing transport (the outbox badge number).
+    pub fn pending(&self) -> i64 {
+        self.queued + self.sending
+    }
+}
+
+/// Count rows per state for the outbox badge + failed-retry surface.
+pub fn send_state_counts(conn: &Connection) -> StoreResult<SendCounts> {
+    let row = conn.query_row(
+        "SELECT \
+           SUM(CASE WHEN state = 'queued' THEN 1 ELSE 0 END), \
+           SUM(CASE WHEN state = 'sending' THEN 1 ELSE 0 END), \
+           SUM(CASE WHEN state = 'sent' THEN 1 ELSE 0 END), \
+           SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END), \
+           SUM(CASE WHEN state = 'uncertain' THEN 1 ELSE 0 END) \
+         FROM send_queue",
+        [],
+        |r| {
+            Ok(SendCounts {
+                queued: r.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                sending: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                sent: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                failed: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                uncertain: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+            })
+        },
+    )?;
+    Ok(row)
+}
+
 // ── tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]
