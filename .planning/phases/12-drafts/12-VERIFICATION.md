@@ -1,8 +1,9 @@
 ---
 phase: 12-drafts
 verified: 2026-10-08T00:00:00Z
-status: human_needed
-score: 3/3 must-haves verified (automated); 1 live gate pending human
+status: passed
+score: 3/3
+live_gates: deferred (need mail.utfpr.edu.br credentials — expected, non-blocking per precedent; follow-up /gsd-verify-work 12)
 human_verification:
   - test: "Live drafts round-trip against mail.utfpr.edu.br (UTFPR creds + network)"
     expected: "Create draft in Drafts folder, save twice, confirm exactly one server copy (APPEND-new + expunge-old); delete test drafts after. Verifies quoted HEADER SEARCH (MN-01) against a strict server."
