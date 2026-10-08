@@ -109,6 +109,11 @@ export default function DraftEditor({
   /** Live mirror so the autosave tick always sees current fields (no stale closure). */
   const liveRef = useRef({ to, cc, bcc, subject, body, dirty });
   liveRef.current = { to, cc, bcc, subject, body, dirty };
+  /** MN-06: the mount-once autosave tick captures the first render's
+   * `doSave`, so parent callbacks must not close over render state —
+   * mirror `onSaved` in a ref and call through it. */
+  const onSavedRef = useRef(onSaved);
+  onSavedRef.current = onSaved;
   const hasContent =
     dirty ||
     to.trim() !== "" ||
@@ -150,7 +155,7 @@ export default function DraftEditor({
       everSavedRef.current = true;
       retriedRef.current = false;
       setLastAcked(result.acked);
-      onSaved(result);
+      onSavedRef.current(result);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       if (message.startsWith("drafts-missing") && !retriedRef.current) {
@@ -238,8 +243,9 @@ export default function DraftEditor({
   // Dirty-only autosave tick (Task 3): clean ticks issue zero invokes;
   // dirty ticks run the same save path as the button. Single interval per
   // open editor (remount-per-session via parent key), cleared on unmount.
-  // `doSave` reads the live mirror, so the mount-once closure never goes
-  // stale; the in-flight guard blocks overlapping invokes (T-12-07).
+  // `doSave` reads the live mirror and `onSavedRef`, so the mount-once
+  // closure never goes stale (MN-06); the in-flight guard blocks
+  // overlapping invokes (T-12-07).
   useEffect(() => {
     const timer = window.setInterval(() => {
       if (liveRef.current.dirty && !inFlightRef.current) {
@@ -356,8 +362,9 @@ export default function DraftEditor({
           <button
             type="submit"
             className="btn"
-            disabled={phase === "saving"}
+            disabled={phase === "saving" || (!dirty && !everSavedRef.current)}
             aria-label="Guardar rascunho"
+            title={!dirty && !everSavedRef.current ? "Escreva algo antes de guardar" : undefined}
           >
             {phase === "saving" ? "Salvando…" : "Guardar"}
           </button>
