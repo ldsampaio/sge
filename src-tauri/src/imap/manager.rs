@@ -267,30 +267,42 @@ impl SessionManager {
     /// `RENAME <old> -> <new>` through the owned session with one
     /// transparent reconnect + retry (Plan 11-02). The lease SELECTs `old`
     /// first (keeps SELECT state sane); a [`SyncError::Refused`] is
-    /// deterministic and never retried. Ends with a `mailbox_status(new)`
-    /// UIDVALIDITY check against the pre-rename value (read by the caller
-    /// of this method): a bump surfaces [`SyncError::State`] — the command
-    /// layer treats it like an epoch change, never a silent accept.
+    /// deterministic and never retried. Ends with a UIDVALIDITY check of
+    /// `new` against the pre-rename value: a bump surfaces
+    /// [`SyncError::State`] — the command layer treats it like an epoch
+    /// change, never a silent accept.
     ///
-    /// Locking: the rename lease is dropped before the post-rename STATUS
-    /// (same async mutex — holding it would deadlock).
+    /// Both STATUS reads run on the rename lease itself: STATUS works on
+    /// any mailbox without disturbing the SELECTed folder, so no INBOX
+    /// bounce (exactly one SELECT per op). On the retry path `old` may
+    /// already be gone (a failed attempt can apply server-side), so the
+    /// retry re-leases INBOX and both the verb and the post-check run
+    /// there — STATUS(new) works from any selection.
+    ///
+    /// Locking: the rename lease is dropped before reconnect (same async
+    /// mutex — holding it would deadlock).
     pub async fn rename_mailbox_in(&self, old: &str, new: &str) -> Result<(), SyncError> {
-        let pre = self.mailbox_status(old).await?.uid_validity;
-        {
-            let mut lease = self.lease_for(old).await?;
-            match lease.session().rename_mailbox(old, new).await {
-                Ok(()) => {}
-                Err(refused @ SyncError::Refused(_)) => return Err(refused),
-                Err(first) => {
-                    eprintln!("[SGE imap] RENAME {old} -> {new} failed ({first}) — reconnecting once");
-                    drop(lease);
-                    self.reconnect().await?;
-                    let mut lease = self.lease_for(old).await?;
-                    lease.session().rename_mailbox(old, new).await?;
+        let mut lease = self.lease_for(old).await?;
+        let pre = lease.session().mailbox_status(old).await?.uid_validity;
+        match lease.session().rename_mailbox(old, new).await {
+            Ok(()) => {}
+            Err(refused @ SyncError::Refused(_)) => return Err(refused),
+            Err(first) => {
+                eprintln!("[SGE imap] RENAME {old} -> {new} failed ({first}) — reconnecting once");
+                drop(lease);
+                self.reconnect().await?;
+                let mut lease = self.lease_for("INBOX").await?;
+                lease.session().rename_mailbox(old, new).await?;
+                let post = lease.session().mailbox_status(new).await?.uid_validity;
+                if post != pre {
+                    return Err(SyncError::State(format!(
+                        "RENAME {old} -> {new}: UIDVALIDITY changed {pre} -> {post} — treated like an epoch change"
+                    )));
                 }
+                return Ok(());
             }
         }
-        let post = self.mailbox_status(new).await?.uid_validity;
+        let post = lease.session().mailbox_status(new).await?.uid_validity;
         if post != pre {
             return Err(SyncError::State(format!(
                 "RENAME {old} -> {new}: UIDVALIDITY changed {pre} -> {post} — treated like an epoch change"
@@ -331,7 +343,8 @@ impl SessionManager {
     /// to a dead generation and is dropped (`old_uid=None` path — the
     /// orphan is reaped by the next sweep's expunge-diff, Phase 9
     /// semantics). Reconcile rule: exactly one UID → it; zero → loud
-    /// `Protocol` error (keep `dirty=1`); multiple → max (newest wins).
+    /// `Refused` (keep `dirty=1`, never retried — a blind re-APPEND could
+    /// duplicate the server copy); multiple → max (newest wins).
     ///
     /// One reconnect-retry around the whole sequence (mirror
     /// [`move_message_in`](Self::move_message_in)); [`SyncError::Refused`]
@@ -531,10 +544,12 @@ pub async fn run_move_on_session(
 /// flush — one implementation, two callers).
 ///
 /// Issues no `select_mailbox` itself. Returns the reconciled new UID:
-/// exactly one SEARCH hit → it; zero → loud `Protocol` error (the server
-/// didn't persist the copy — the row stays `dirty=1`); multiple → max
-/// (a retried APPEND duet converges here; expunge-old still targets only
-/// the tracked `old_uid`, T-12-03). `old_uid == Some(new)` never
+/// exactly one SEARCH hit → it; zero → loud `Refused` error (the server
+/// didn't visibly persist the copy — and a blind re-APPEND could
+/// duplicate it, so like the unverifiable unmark dance this is
+/// deterministic and never retried; the row stays `dirty=1`); multiple →
+/// max (a retried APPEND duet converges here; expunge-old still targets
+/// only the tracked `old_uid`, T-12-03). `old_uid == Some(new)` never
 /// expunges (same copy — nothing superseded).
 pub async fn save_draft_on_session(
     session: &mut dyn SyncSession,
@@ -551,7 +566,7 @@ pub async fn save_draft_on_session(
     hits.sort_unstable();
     let new_uid = match hits.as_slice() {
         [] => {
-            return Err(SyncError::Protocol(format!(
+            return Err(SyncError::Refused(format!(
                 "APPEND draft {msg_id}: persisted copy not found"
             )))
         }
@@ -1446,10 +1461,14 @@ mod tests {
             .await
             .unwrap_err();
             assert!(err.to_string().contains("fake append failure"));
-            let f = probe.lock().unwrap();
-            assert_eq!(f.appended_calls.len(), 1);
-            assert!(f.deleted_calls.is_empty(), "no delete before append ack");
-            assert!(f.expunged_sets.is_empty());
+            // Scope the probe guard: it must drop before the re-lock below
+            // (same-thread re-lock of a std Mutex deadlocks).
+            {
+                let f = probe.lock().unwrap();
+                assert_eq!(f.appended_calls.len(), 1);
+                assert!(f.deleted_calls.is_empty(), "no delete before append ack");
+                assert!(f.expunged_sets.is_empty());
+            }
             // Toggle off — the next save succeeds (retry contract).
             probe.lock().unwrap().fail_append = false;
             let uid = super::save_draft_on_session(
