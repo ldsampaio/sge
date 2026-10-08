@@ -8,6 +8,7 @@ pub mod creds;
 pub mod drafts;
 pub mod imap;
 pub mod send_queue;
+pub mod smtp;
 pub mod store;
 pub mod sync;
 pub mod commands;
