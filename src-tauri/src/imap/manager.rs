@@ -348,7 +348,12 @@ impl SessionManager {
     ///
     /// One reconnect-retry around the whole sequence (mirror
     /// [`move_message_in`](Self::move_message_in)); [`SyncError::Refused`]
-    /// is deterministic and never retried. Never calls `self.*_in`
+    /// is deterministic and never retried. The retry RESUMES instead of
+    /// blindly re-APPENDing (MJ-03): when the first attempt's APPEND +
+    /// SEARCH landed but the expunge-old leg failed, a second APPEND would
+    /// orphan the first new copy — so the retry SEARCHes first and, when a
+    /// copy newer than `old_uid` already exists, skips APPEND and resumes
+    /// at the expunge-old leg. Never calls `self.*_in`
     /// re-entrantly while holding the lease (async mutex → deadlock) —
     /// verbs run on `lease.session()` directly.
     pub async fn save_draft_copy_in(
@@ -370,8 +375,26 @@ impl SessionManager {
                     "[SGE imap] save draft {drafts_wire} msg {msg_id} failed ({first}) — reconnecting once"
                 );
                 self.reconnect().await?;
-                self.save_once(drafts_wire, msg_id, bytes, old_uid, expected_validity)
-                    .await
+                // Resume probe: did the APPEND already land before the
+                // failure? A hit distinct from `old_uid` is the first
+                // attempt's new copy (same stable Message-ID) — skip the
+                // second APPEND and resume at expunge-old. No hit, a hit
+                // equal to `old_uid` (APPEND never ran), or a failed probe
+                // all fall through to the full sequence.
+                match self.search_draft_uid(drafts_wire, msg_id).await {
+                    Ok(Some(found)) if Some(found) != old_uid => {
+                        eprintln!(
+                            "[SGE imap] save draft {drafts_wire} msg {msg_id}: retry resumes at expunge-old (copy already at uid {found})"
+                        );
+                        self.expunge_old_only(drafts_wire, old_uid, found, expected_validity)
+                            .await?;
+                        Ok(found)
+                    }
+                    _ => {
+                        self.save_once(drafts_wire, msg_id, bytes, old_uid, expected_validity)
+                            .await
+                    }
+                }
             }
         }
     }
@@ -405,6 +428,59 @@ impl SessionManager {
             None => lease.session().capabilities().await?,
         };
         save_draft_on_session(lease.session(), drafts_wire, msg_id, bytes, effective_old, &caps).await
+    }
+
+    /// Retry-resume probe (MJ-03): SEARCH for the stable Message-ID without
+    /// APPENDing. Returns the newest hit, if any. Takes its own lease —
+    /// called only from the retry path, never while a lease is held.
+    async fn search_draft_uid(
+        &self,
+        drafts_wire: &str,
+        msg_id: &str,
+    ) -> Result<Option<u32>, SyncError> {
+        let mut lease = self.lease_for(drafts_wire).await?;
+        let mut hits = lease
+            .session()
+            .uid_search_header("Message-ID", msg_id)
+            .await?;
+        hits.sort_unstable();
+        Ok(hits.into_iter().max())
+    }
+
+    /// Retry-resume tail (MJ-03): the expunge-old leg only, for when the
+    /// first attempt's APPEND + reconcile already landed. Same
+    /// UIDVALIDITY stale-`old_uid` drop as [`save_once`](Self::save_once);
+    /// `old == new` never self-expunges.
+    async fn expunge_old_only(
+        &self,
+        drafts_wire: &str,
+        old_uid: Option<u32>,
+        new_uid: u32,
+        expected_validity: Option<u32>,
+    ) -> Result<(), SyncError> {
+        let mut lease = self.lease_for(drafts_wire).await?;
+        let mut effective_old = old_uid;
+        if let (Some(expected), Some(actual)) =
+            (expected_validity, lease.selected_validity())
+        {
+            if expected != actual {
+                eprintln!(
+                    "[SGE imap] resume expunge-old {drafts_wire}: UIDVALIDITY {expected} -> {actual} — tracked server_uid is stale, skipping"
+                );
+                effective_old = None;
+            }
+        }
+        if let Some(old) = effective_old {
+            if old != new_uid {
+                let caps = match lease.cached_capabilities() {
+                    Some(caps) => caps,
+                    None => lease.session().capabilities().await?,
+                };
+                lease.session().store_deleted(old, true).await?;
+                expunge_single_on_session(lease.session(), old, &caps).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Expunge one tracked draft copy (discard path) under ONE held lease:
@@ -1504,6 +1580,55 @@ mod tests {
             let f = probe.lock().unwrap();
             assert!(f.deleted_calls.is_empty(), "stale UID never touched");
             assert!(f.expunged_sets.is_empty(), "old_uid=None path");
+        });
+    }
+
+    #[test]
+    fn save_draft_resume_tail_expunges_old_without_reappend() {
+        run(async {
+            // MJ-03: the retry-resume tail removes the superseded copy and
+            // never APPENDs (Fake SELECT reports validity 100 = epoch).
+            let fake = FakeHandle::new(&["IMAP4rev1", "UIDPLUS"], &[7]);
+            let probe = fake.0.clone();
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            manager
+                .expunge_old_only("Drafts", Some(7), 9, Some(100))
+                .await
+                .unwrap();
+            let f = probe.lock().unwrap();
+            assert!(f.appended_calls.is_empty(), "resume never re-APPENDs");
+            assert!(f.deleted_calls.contains(&(7, true)));
+            assert_eq!(f.expunged_sets, vec!["7".to_string()]);
+        });
+    }
+
+    #[test]
+    fn save_draft_resume_tail_skips_stale_or_same_uid() {
+        run(async {
+            // Stale epoch (store 99 vs SELECT 100): the tracked UID belongs
+            // to a dead generation — resume must not touch it.
+            let fake = FakeHandle::new(&["IMAP4rev1", "UIDPLUS"], &[7]);
+            let probe = fake.0.clone();
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            manager
+                .expunge_old_only("Drafts", Some(7), 9, Some(99))
+                .await
+                .unwrap();
+            {
+                let f = probe.lock().unwrap();
+                assert!(f.deleted_calls.is_empty(), "stale UID never touched");
+                assert!(f.appended_calls.is_empty(), "resume never re-APPENDs");
+            }
+            // Same UID (nothing superseded): no self-expunge.
+            let fake = FakeHandle::new(&["IMAP4rev1", "UIDPLUS"], &[7]);
+            let probe = fake.0.clone();
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            manager
+                .expunge_old_only("Drafts", Some(7), 7, Some(100))
+                .await
+                .unwrap();
+            let f = probe.lock().unwrap();
+            assert!(f.deleted_calls.is_empty(), "old == new never expunges");
         });
     }
 
