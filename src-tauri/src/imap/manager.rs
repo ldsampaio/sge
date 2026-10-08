@@ -17,7 +17,7 @@
 
 use super::{
     choose_expunge_path, choose_move_path, chunk_uid_set, AccountConfig, ExpungePath,
-    MovePath, SyncError, SyncSession,
+    MovePath, SyncError, SyncSession, DRAFT_FLAGS,
 };
 use crate::imap::session::connect_sync;
 use std::collections::HashSet;
@@ -37,6 +37,10 @@ pub struct SessionManager {
 struct ManagerState {
     session: Option<Box<dyn SyncSession>>,
     selected_mailbox: Option<String>,
+    /// UIDVALIDITY from the last SELECT (Plan 12-02 draft stale-guard:
+    /// the save sequence compares it against the store epoch to detect a
+    /// generation change without a second round trip).
+    selected_validity: Option<u32>,
     /// `CAPABILITY` atoms queried once per fresh connection (the set is
     /// stable per session). Filled in [`SessionManager::lease_for`],
     /// invalidated by `reconnect()` — Plan 10-02 capability cache.
@@ -87,6 +91,7 @@ impl SessionManager {
                 summary.uid_validity, summary.exists
             );
             guard.selected_mailbox = Some(mailbox.to_string());
+            guard.selected_validity = Some(summary.uid_validity);
         }
         // Capability cache: the atom set is stable per connection, so one
         // `CAPABILITY` per fresh session serves every gated op until the
@@ -119,6 +124,7 @@ impl SessionManager {
         })?;
         guard.session = Some(Box::new(session));
         guard.selected_mailbox = None;
+        guard.selected_validity = None;
         // Capabilities belong to the old connection — the next lease
         // re-queries them (Plan 10-02 invalidation rule).
         guard.cached_capabilities = None;
@@ -311,6 +317,116 @@ impl SessionManager {
             }
         }
     }
+    /// Persist one draft copy under ONE held lease (Phase 12, DRAFT-02).
+    ///
+    /// Exactly-one-copy sequence: APPEND-new with `\Draft` (+`\Seen`)
+    /// flags, reconcile the new UID via `UID SEARCH HEADER Message-ID`
+    /// (async-imap swallows APPENDUID — RESEARCH §1, so there is no
+    /// capability branch for UID discovery), then scoped expunge-old of
+    /// the tracked `old_uid` (UIDPLUS `UID EXPUNGE`, else the single-UID
+    /// unmark dance — never a bare `expunge()`).
+    ///
+    /// `expected_validity` is the store epoch read before the save: when
+    /// the SELECT-time UIDVALIDITY differs, the tracked `old_uid` belongs
+    /// to a dead generation and is dropped (`old_uid=None` path — the
+    /// orphan is reaped by the next sweep's expunge-diff, Phase 9
+    /// semantics). Reconcile rule: exactly one UID → it; zero → loud
+    /// `Protocol` error (keep `dirty=1`); multiple → max (newest wins).
+    ///
+    /// One reconnect-retry around the whole sequence (mirror
+    /// [`move_message_in`](Self::move_message_in)); [`SyncError::Refused`]
+    /// is deterministic and never retried. Never calls `self.*_in`
+    /// re-entrantly while holding the lease (async mutex → deadlock) —
+    /// verbs run on `lease.session()` directly.
+    pub async fn save_draft_copy_in(
+        &self,
+        drafts_wire: &str,
+        msg_id: &str,
+        bytes: &[u8],
+        old_uid: Option<u32>,
+        expected_validity: Option<u32>,
+    ) -> Result<u32, SyncError> {
+        match self
+            .save_once(drafts_wire, msg_id, bytes, old_uid, expected_validity)
+            .await
+        {
+            Ok(uid) => Ok(uid),
+            Err(refused @ SyncError::Refused(_)) => Err(refused),
+            Err(first) => {
+                eprintln!(
+                    "[SGE imap] save draft {drafts_wire} msg {msg_id} failed ({first}) — reconnecting once"
+                );
+                self.reconnect().await?;
+                self.save_once(drafts_wire, msg_id, bytes, old_uid, expected_validity)
+                    .await
+            }
+        }
+    }
+
+    /// One attempt of the draft save. Holds a SINGLE
+    /// `lease_for(drafts_wire)` guard for the APPEND → SEARCH →
+    /// mark + scoped-expunge legs, so the expunge cannot drift to the
+    /// wrong folder (T-12-04).
+    async fn save_once(
+        &self,
+        drafts_wire: &str,
+        msg_id: &str,
+        bytes: &[u8],
+        old_uid: Option<u32>,
+        expected_validity: Option<u32>,
+    ) -> Result<u32, SyncError> {
+        let mut lease = self.lease_for(drafts_wire).await?;
+        let mut effective_old = old_uid;
+        if let (Some(expected), Some(actual)) =
+            (expected_validity, lease.selected_validity())
+        {
+            if expected != actual {
+                eprintln!(
+                    "[SGE imap] save draft {drafts_wire}: UIDVALIDITY {expected} -> {actual} — tracked server_uid is stale, appending fresh"
+                );
+                effective_old = None;
+            }
+        }
+        let caps = match lease.cached_capabilities() {
+            Some(caps) => caps,
+            None => lease.session().capabilities().await?,
+        };
+        save_draft_on_session(lease.session(), drafts_wire, msg_id, bytes, effective_old, &caps).await
+    }
+
+    /// Expunge one tracked draft copy (discard path) under ONE held lease:
+    /// mark `\Deleted` + scoped removal (UIDPLUS `UID EXPUNGE`, else the
+    /// single-UID unmark dance — never a bare `expunge()`, T-12-05).
+    /// One reconnect-retry; [`SyncError::Refused`] never retried.
+    pub async fn discard_server_copy_in(
+        &self,
+        drafts_wire: &str,
+        uid: u32,
+    ) -> Result<(), SyncError> {
+        let mut lease = self.lease_for(drafts_wire).await?;
+        let caps = match lease.cached_capabilities() {
+            Some(caps) => caps,
+            None => lease.session().capabilities().await?,
+        };
+        match discard_once(lease.session(), uid, &caps).await {
+            Ok(()) => Ok(()),
+            Err(refused @ SyncError::Refused(_)) => Err(refused),
+            Err(first) => {
+                eprintln!(
+                    "[SGE imap] discard draft {drafts_wire} uid {uid} failed ({first}) — reconnecting once"
+                );
+                drop(lease);
+                self.reconnect().await?;
+                let mut lease = self.lease_for(drafts_wire).await?;
+                let caps = match lease.cached_capabilities() {
+                    Some(caps) => caps,
+                    None => lease.session().capabilities().await?,
+                };
+                discard_once(lease.session(), uid, &caps).await
+            }
+        }
+    }
+
     /// Move `uid_set` (comma-joined `"1,2,3"`) from `src` to `dest` (raw
     /// wire names) under ONE held lease, with reconnect-retry and
     /// capability-gated fallback orchestration (Plan 10-02, MOVE-01 slice).
@@ -407,6 +523,77 @@ pub async fn run_move_on_session(
     caps: &[String],
 ) -> Result<MoveOutcome, SyncError> {
     run_move_sequence(session, uids, dest, caps).await
+}
+
+/// Draft APPEND-new + expunge-old on an already-selected session, without
+/// a manager lease (Phase 12: shared body behind
+/// [`SessionManager::save_draft_copy_in`] and the worker's reconnect
+/// flush — one implementation, two callers).
+///
+/// Issues no `select_mailbox` itself. Returns the reconciled new UID:
+/// exactly one SEARCH hit → it; zero → loud `Protocol` error (the server
+/// didn't persist the copy — the row stays `dirty=1`); multiple → max
+/// (a retried APPEND duet converges here; expunge-old still targets only
+/// the tracked `old_uid`, T-12-03). `old_uid == Some(new)` never
+/// expunges (same copy — nothing superseded).
+pub async fn save_draft_on_session(
+    session: &mut dyn SyncSession,
+    drafts_wire: &str,
+    msg_id: &str,
+    bytes: &[u8],
+    old_uid: Option<u32>,
+    caps: &[String],
+) -> Result<u32, SyncError> {
+    session
+        .append_message(drafts_wire, DRAFT_FLAGS, bytes)
+        .await?;
+    let mut hits = session.uid_search_header("Message-ID", msg_id).await?;
+    hits.sort_unstable();
+    let new_uid = match hits.as_slice() {
+        [] => {
+            return Err(SyncError::Protocol(format!(
+                "APPEND draft {msg_id}: persisted copy not found"
+            )))
+        }
+        [single] => *single,
+        multiple => *multiple.iter().max().expect("non-empty"),
+    };
+    if let Some(old) = old_uid {
+        if old != new_uid {
+            session.store_deleted(old, true).await?;
+            expunge_single_on_session(session, old, caps).await?;
+        }
+    }
+    Ok(new_uid)
+}
+
+/// Mark + scoped-expunge of one tracked draft copy on an
+/// already-selected session (discard leg shared by the manager and the
+/// worker — issues no `select_mailbox` itself).
+async fn discard_once(
+    session: &mut dyn SyncSession,
+    uid: u32,
+    caps: &[String],
+) -> Result<(), SyncError> {
+    session.store_deleted(uid, true).await?;
+    expunge_single_on_session(session, uid, caps).await
+}
+
+/// Scoped removal of exactly one UID: `UID EXPUNGE <uid>` with UIDPLUS,
+/// else the single-UID unmark dance (trivially scoped — one UID, no
+/// chunking). A bare `expunge()` is never issued on this path (T-12-05);
+/// an unverifiable dance surfaces [`SyncError::Refused`] (never retried).
+pub async fn expunge_single_on_session(
+    session: &mut dyn SyncSession,
+    uid: u32,
+    caps: &[String],
+) -> Result<(), SyncError> {
+    if choose_expunge_path(caps) == ExpungePath::UidExpunge {
+        session.uid_expunge(&uid.to_string()).await?;
+    } else {
+        unmark_dance_expunge(session, &[uid]).await?;
+    }
+    Ok(())
 }
 
 /// Parse a comma-joined UID set (`"1,2,3"`) into UIDs. Fail-closed on any
@@ -561,6 +748,13 @@ impl MailboxLease<'_> {
     pub fn cached_capabilities(&self) -> Option<Vec<String>> {
         self.guard.cached_capabilities.clone()
     }
+
+    /// UIDVALIDITY from the last SELECT of the leased mailbox (Plan 12-02
+    /// draft stale-guard). Always `Some` — `lease_for` SELECTs before
+    /// handing out the guard.
+    pub fn selected_validity(&self) -> Option<u32> {
+        self.guard.selected_validity
+    }
 }
 
 #[cfg(test)]
@@ -622,6 +816,14 @@ mod tests {
         /// server that won't honor the unmark — drives the loud-refusal
         /// path of the UIDPLUS-absent dance).
         sticky_deleted: HashSet<u32>,
+        /// Recorded `(mailbox, flags, bytes)` from `append_message`
+        /// (Plan 12-01 draft APPEND).
+        appended_calls: Vec<(String, String, Vec<u8>)>,
+        /// Canned `UID SEARCH HEADER` results (Plan 12-01 reconcile).
+        search_header_results: Vec<u32>,
+        /// When true, `append_message` fails with a `Protocol` error
+        /// (drives the draft save retry path).
+        fail_append: bool,
     }
 
     impl FakeSession {
@@ -681,6 +883,9 @@ mod tests {
                 fail_copy: false,
                 fail_move: false,
                 sticky_deleted: HashSet::new(),
+                appended_calls: Vec::new(),
+                search_header_results: Vec::new(),
+                fail_append: false,
             })))
         }
     }
@@ -955,6 +1160,40 @@ mod tests {
             Box::pin(async move { Ok(status) })
         }
 
+        fn append_message(
+            &mut self,
+            mailbox: &str,
+            flags: &str,
+            bytes: &[u8],
+        ) -> PinBox<'_, Result<(), SyncError>> {
+            let fail = {
+                let mut f = self.0.lock().unwrap();
+                f.appended_calls.push((
+                    mailbox.to_string(),
+                    flags.to_string(),
+                    bytes.to_vec(),
+                ));
+                f.fail_append
+            };
+            Box::pin(async move {
+                if fail {
+                    Err(SyncError::Protocol("fake append failure".to_string()))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        fn uid_search_header(
+            &mut self,
+            _field: &str,
+            _value: &str,
+        ) -> PinBox<'_, Result<Vec<u32>, SyncError>> {
+            let mut uids = self.0.lock().unwrap().search_header_results.clone();
+            uids.sort_unstable();
+            Box::pin(async move { Ok(uids) })
+        }
+
         fn logout(&mut self) -> PinBox<'_, Result<(), SyncError>> {
             Box::pin(async move { Ok(()) })
         }
@@ -978,6 +1217,7 @@ mod tests {
                 state: async_std::sync::Mutex::new(ManagerState {
                     session: Some(session),
                     selected_mailbox: None,
+                    selected_validity: None,
                     cached_capabilities: None,
                 }),
             }
@@ -1040,6 +1280,225 @@ mod tests {
             assert_eq!(f.created_mailboxes, vec!["Trash".to_string()]);
             // CREATE reuses the INBOX selection from the expunge lease.
             assert_eq!(f.select_calls, vec!["INBOX".to_string()]);
+        });
+    }
+
+    #[test]
+    fn save_draft_appends_new_and_expunges_old() {
+        run(async {
+            let fake = FakeHandle::new(&["IMAP4rev1", "UIDPLUS"], &[7]);
+            let probe = fake.0.clone();
+            {
+                probe.lock().unwrap().search_header_results = vec![9];
+            }
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            let bytes = b"From: a@x\r\n\r\nbody".to_vec();
+            let uid = manager
+                .save_draft_copy_in("Drafts", "<c1@sge.local>", &bytes, Some(7), Some(100))
+                .await
+                .unwrap();
+            assert_eq!(uid, 9);
+            let f = probe.lock().unwrap();
+            // APPEND carries mailbox + flags + byte-identical literal.
+            assert_eq!(f.appended_calls.len(), 1);
+            assert_eq!(f.appended_calls[0].0, "Drafts".to_string());
+            assert_eq!(
+                f.appended_calls[0].1,
+                super::super::DRAFT_FLAGS.to_string()
+            );
+            assert_eq!(f.appended_calls[0].2, bytes);
+            // Old copy marked + scoped-expunged; new copy never flagged.
+            assert!(f.deleted_calls.contains(&(7, true)));
+            assert!(!f.deleted_calls.iter().any(|(u, _)| *u == 9));
+            assert_eq!(f.expunged_sets, vec!["7".to_string()]);
+            assert_eq!(f.plain_expunge_calls, 0, "never a bare expunge");
+        });
+    }
+
+    #[test]
+    fn save_draft_first_save_issues_no_delete() {
+        run(async {
+            let fake = FakeHandle::new(&["IMAP4rev1", "UIDPLUS"], &[]);
+            let probe = fake.0.clone();
+            {
+                probe.lock().unwrap().search_header_results = vec![5];
+            }
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            let uid = manager
+                .save_draft_copy_in("Drafts", "<c2@sge.local>", b"bytes", None, Some(100))
+                .await
+                .unwrap();
+            assert_eq!(uid, 5);
+            let f = probe.lock().unwrap();
+            assert!(f.deleted_calls.is_empty());
+            assert!(f.expunged_sets.is_empty());
+        });
+    }
+
+    #[test]
+    fn save_draft_invisible_copy_is_loud_error_without_expunge() {
+        run(async {
+            let fake = FakeHandle::new(&["IMAP4rev1", "UIDPLUS"], &[]);
+            let probe = fake.0.clone();
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            let err = manager
+                .save_draft_copy_in("Drafts", "<c3@sge.local>", b"bytes", Some(7), Some(100))
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("persisted copy not found"),
+                "unexpected: {err}"
+            );
+            let f = probe.lock().unwrap();
+            assert!(f.expunged_sets.is_empty(), "no expunge on failed save");
+            assert!(f.deleted_calls.is_empty());
+        });
+    }
+
+    #[test]
+    fn save_draft_multi_hit_reconciles_to_max() {
+        run(async {
+            let fake = FakeHandle::new(&["IMAP4rev1", "UIDPLUS"], &[4, 9]);
+            let probe = fake.0.clone();
+            {
+                // Unsorted canned hits — the sequence sorts and takes max.
+                probe.lock().unwrap().search_header_results = vec![9, 4];
+            }
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            let uid = manager
+                .save_draft_copy_in("Drafts", "<c4@sge.local>", b"bytes", Some(4), Some(100))
+                .await
+                .unwrap();
+            assert_eq!(uid, 9, "newest wins");
+            let f = probe.lock().unwrap();
+            assert!(f.deleted_calls.contains(&(4, true)));
+        });
+    }
+
+    #[test]
+    fn save_draft_without_uidplus_uses_unmark_dance() {
+        run(async {
+            // No UIDPLUS → old UID removed via the single-UID unmark
+            // dance behind a bare EXPUNGE (never UID EXPUNGE).
+            let fake = FakeHandle::new(&["IMAP4rev1"], &[7]);
+            let probe = fake.0.clone();
+            {
+                probe.lock().unwrap().search_header_results = vec![9];
+            }
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            let uid = manager
+                .save_draft_copy_in("Drafts", "<c8@sge.local>", b"bytes", Some(7), Some(100))
+                .await
+                .unwrap();
+            assert_eq!(uid, 9);
+            let f = probe.lock().unwrap();
+            assert!(f.expunged_sets.is_empty(), "no UID EXPUNGE without UIDPLUS");
+            assert_eq!(f.plain_expunge_calls, 1);
+            assert!(f.removed.contains(&7), "old copy reaped by the dance");
+            assert!(!f.removed.contains(&9), "new copy survives");
+        });
+    }
+
+    #[test]
+    fn save_draft_same_uid_never_expunges_itself() {
+        run(async {
+            let fake = FakeHandle::new(&["IMAP4rev1", "UIDPLUS"], &[9]);
+            let probe = fake.0.clone();
+            {
+                probe.lock().unwrap().search_header_results = vec![9];
+            }
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            let uid = manager
+                .save_draft_copy_in("Drafts", "<c5@sge.local>", b"bytes", Some(9), Some(100))
+                .await
+                .unwrap();
+            assert_eq!(uid, 9);
+            let f = probe.lock().unwrap();
+            assert!(f.expunged_sets.is_empty());
+            assert!(f.deleted_calls.is_empty());
+        });
+    }
+
+    #[test]
+    fn save_draft_append_failure_errors_before_any_delete() {
+        run(async {
+            // `save_draft_on_session` is the lease-free body (no
+            // reconnect-retry — the retry wrapper mirrors `move_message_in`
+            // and would dial the network, so it stays offline-untested like
+            // the move retry path).
+            let fake = FakeHandle::new(&["IMAP4rev1", "UIDPLUS"], &[7]);
+            let probe = fake.0.clone();
+            {
+                let mut f = probe.lock().unwrap();
+                f.fail_append = true;
+                f.search_header_results = vec![9];
+            }
+            let mut session = fake;
+            let caps = vec!["IMAP4rev1".to_string(), "UIDPLUS".to_string()];
+            let err = super::save_draft_on_session(
+                &mut session,
+                "Drafts",
+                "<c7@sge.local>",
+                b"bytes",
+                Some(7),
+                &caps,
+            )
+            .await
+            .unwrap_err();
+            assert!(err.to_string().contains("fake append failure"));
+            let f = probe.lock().unwrap();
+            assert_eq!(f.appended_calls.len(), 1);
+            assert!(f.deleted_calls.is_empty(), "no delete before append ack");
+            assert!(f.expunged_sets.is_empty());
+            // Toggle off — the next save succeeds (retry contract).
+            probe.lock().unwrap().fail_append = false;
+            let uid = super::save_draft_on_session(
+                &mut session,
+                "Drafts",
+                "<c7@sge.local>",
+                b"bytes",
+                Some(7),
+                &caps,
+            )
+            .await
+            .unwrap();
+            assert_eq!(uid, 9);
+        });
+    }
+
+    #[test]
+    fn save_draft_uidvalidity_bump_drops_stale_old_uid() {
+        run(async {
+            // Fake SELECT reports validity 100; the store epoch says 99 —
+            // the tracked server_uid belongs to a dead generation.
+            let fake = FakeHandle::new(&["IMAP4rev1", "UIDPLUS"], &[7]);
+            let probe = fake.0.clone();
+            {
+                probe.lock().unwrap().search_header_results = vec![9];
+            }
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            let uid = manager
+                .save_draft_copy_in("Drafts", "<c6@sge.local>", b"bytes", Some(7), Some(99))
+                .await
+                .unwrap();
+            assert_eq!(uid, 9, "fresh copy still reconciled");
+            let f = probe.lock().unwrap();
+            assert!(f.deleted_calls.is_empty(), "stale UID never touched");
+            assert!(f.expunged_sets.is_empty(), "old_uid=None path");
+        });
+    }
+
+    #[test]
+    fn discard_server_copy_marks_and_scoped_expunges() {
+        run(async {
+            let fake = FakeHandle::new(&["IMAP4rev1", "UIDPLUS"], &[7]);
+            let probe = fake.0.clone();
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            manager.discard_server_copy_in("Drafts", 7).await.unwrap();
+            let f = probe.lock().unwrap();
+            assert!(f.deleted_calls.contains(&(7, true)));
+            assert_eq!(f.expunged_sets, vec!["7".to_string()]);
+            assert_eq!(f.plain_expunge_calls, 0, "never a bare expunge");
         });
     }
 

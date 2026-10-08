@@ -16,7 +16,7 @@ pub mod queries;
 pub const BODY_CACHE_CAP_BYTES: usize = 262144;
 
 /// Schema version managed by rusqlite_migration.
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 
 // v1 = full schema.sql (canonical DDL from ARCHITECTURE.md)
 // M2 = flag_outbox durable queue (Phase 6, Plan 06-01). The schema.sql v1
@@ -88,6 +88,7 @@ impl Store {
             M::up(M6_DELIMITER_SQL),
             M::up(M7_IMAP_OUTBOX_SQL),
             M::up(M8_ROLES_SQL),
+            M::up(M9_DRAFTS_SQL),
         ]);
         migrations.to_latest(conn)?;
         Ok(())
@@ -230,6 +231,35 @@ const M8_ROLES_SQL: &str = concat!(
     "ALTER TABLE mailboxes ADD COLUMN attributes TEXT NOT NULL DEFAULT '';",
 );
 
+/// M9 forward migration: local-first drafts backing store
+/// (Phase 12, Plan 12-01).
+///
+/// One row per compose session (`id` = UI uuid). `message_id` is stable
+/// per session and is the `UID SEARCH HEADER Message-ID` reconcile key
+/// (async-imap 0.11 swallows APPENDUID, so UID discovery always goes
+/// through SEARCH — see RESEARCH §1). `server_uid` is the last APPENDed
+/// copy's UID (`NULL` = never APPENDed); `dirty = 1` rows ARE the
+/// offline queue (no separate outbox — the reconnect pass flushes them).
+/// `attachments` holds staging refs only (picker UI is Phase 14).
+const M9_DRAFTS_SQL: &str = concat!(
+    "CREATE TABLE drafts (",
+    "  id            TEXT PRIMARY KEY,",
+    "  mailbox_id    INTEGER NOT NULL REFERENCES mailboxes(id) ON DELETE CASCADE,",
+    "  message_id    TEXT NOT NULL UNIQUE,",
+    "  subject       TEXT NOT NULL DEFAULT '',",
+    "  body          TEXT NOT NULL DEFAULT '',",
+    "  recipients_to TEXT NOT NULL DEFAULT '',",
+    "  recipients_cc TEXT NOT NULL DEFAULT '',",
+    "  recipients_bcc TEXT NOT NULL DEFAULT '',",
+    "  dirty         INTEGER NOT NULL DEFAULT 1,",
+    "  server_uid    INTEGER,",
+    "  attachments   TEXT NOT NULL DEFAULT '[]',",
+    "  updated_at    TEXT NOT NULL DEFAULT (datetime('now'))",
+    ");",
+    "CREATE INDEX idx_drafts_mailbox ON drafts(mailbox_id);",
+    "CREATE INDEX idx_drafts_dirty ON drafts(dirty);",
+);
+
 /// Returns the app-data attachment directory for a given mailbox UID.
 ///
 /// Files live under `<app_data>/attachments/<uid_validity>/<uid>/` —
@@ -318,8 +348,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_8_with_roles() {
-        assert_eq!(SCHEMA_VERSION, 8);
+    fn schema_version_is_9_with_drafts() {
+        assert_eq!(SCHEMA_VERSION, 9);
         let store = Store::open_in_memory().expect("migration should succeed");
         let conn = store.conn();
         let count: i64 = conn
@@ -664,6 +694,89 @@ mod tests {
         assert_eq!(delim, "/", "M6 delimiter values survive the M8 upgrade");
         assert_eq!(role, "", "role defaults empty (not-yet-resolved, never assumed)");
         assert_eq!(attrs, "");
+    }
+
+    #[test]
+    fn m9_adds_drafts_preserving_rows() {
+        // Simulate a v8 database (through M8, as shipped after Phase 11).
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        Migrations::new(vec![
+            M::up(include_str!("schema.sql")),
+            M::up(M2_FLAG_OUTBOX_SQL),
+            M::up(M3_UNSEEN_COUNT_SQL),
+            M::up(M4_BACKFILL_SQL),
+            M::up(M5_STATUS_TS_SQL),
+            M::up(M6_DELIMITER_SQL),
+            M::up(M7_IMAP_OUTBOX_SQL),
+            M::up(M8_ROLES_SQL),
+        ])
+        .to_latest(&mut conn)
+        .unwrap();
+        // Seed v8 rows: mailbox + cached message + role values.
+        conn.execute(
+            "INSERT INTO mailboxes (name, uid_validity, uid_next, delimiter, role, attributes) \
+             VALUES ('INBOX', 100, 4, '', 'inbox', '')",
+            [],
+        )
+        .unwrap();
+        let mb: i64 = conn
+            .query_row("SELECT id FROM mailboxes WHERE name = 'INBOX'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO messages (mailbox_id, uid, subject, from_addr, date_utc, flags, preview) \
+             VALUES (?1, 1, 'Old', 'a@x.com', '2024-01-01T00:00:00Z', '[]', 'p')",
+            rusqlite::params![mb],
+        )
+        .unwrap();
+
+        // Forward-upgrade with the production set — only M9 applies.
+        Store::apply_migrations(&mut conn).unwrap();
+
+        // v8 rows survive the upgrade.
+        let msgs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(msgs, 1, "forward migration must preserve cached rows");
+        let role: String = conn
+            .query_row("SELECT role FROM mailboxes WHERE name = 'INBOX'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(role, "inbox", "M8 role values survive the M9 upgrade");
+        // M9 surface exists with all 12 columns.
+        let cols: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('drafts') WHERE name IN \
+                 ('id','mailbox_id','message_id','subject','body','recipients_to',\
+                  'recipients_cc','recipients_bcc','dirty','server_uid',\
+                  'attachments','updated_at')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cols, 12, "drafts table must have all 12 columns");
+        for (kind, name) in [
+            ("table", "drafts"),
+            ("index", "idx_drafts_mailbox"),
+            ("index", "idx_drafts_dirty"),
+        ] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = ?1 AND name = ?2",
+                    rusqlite::params![kind, name],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{kind} {name} should exist at schema v9");
+        }
+        // Fresh drafts table starts empty.
+        let drafts: i64 = conn
+            .query_row("SELECT COUNT(*) FROM drafts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(drafts, 0);
     }
 
     #[test]

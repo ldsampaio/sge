@@ -290,12 +290,13 @@ pub async fn set_seen(
     .map_err(|e| format!("internal error: set_seen task failed ({e})"))?
 }
 
-/// Combined durable-queue depth (flag + delete/move) for `mailbox_id`.
-/// Surfaced in every delete/move/expunge result and `sync_status` as the
-/// pending indicator.
+/// Combined durable-queue depth (flag + delete/move + dirty drafts) for
+/// `mailbox_id`. Surfaced in every delete/move/expunge/draft result and
+/// `sync_status` as the pending indicator.
 fn pending_depth(conn: &rusqlite::Connection, mailbox_id: u64) -> i64 {
     queries::outbox_count(conn, mailbox_id).unwrap_or(0)
         + queries::imap_outbox_count(conn, mailbox_id).unwrap_or(0)
+        + queries::dirty_draft_count_for(conn, mailbox_id).unwrap_or(0)
 }
 
 /// Resolve the Trash wire name: per-account memory cache → LIST + detect.
@@ -711,12 +712,309 @@ pub async fn undo_queued_op(
     .map_err(|e| format!("internal error: undo task failed ({e})"))?
 }
 
+/// Outcome of a `save_draft` call returned to the frontend.
+///
+/// The save lands locally instantly (local-first, no network wait).
+/// `acked` tells the UI whether the server confirmed the copy or the row
+/// stays `dirty=1` for the reconnect flush; `server_uid` + `dirty` are the
+/// Phase 13 DRAFT-03 send-transaction handoff.
+#[derive(Debug, Clone, Serialize)]
+pub struct DraftSaveResult {
+    pub id: String,
+    pub dirty: bool,
+    pub server_uid: Option<u32>,
+    pub acked: bool,
+    pub pending_count: i64,
+}
+
+/// Outcome of a `discard_draft` call returned to the frontend.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiscardResult {
+    pub id: String,
+    pub discarded: bool,
+}
+
+/// Find the Drafts wire name in a LIST result via role resolution
+/// (Phase 11 roles: SPECIAL-USE `\Drafts` first, then known names).
+/// Pure helper — unit-tested without network.
+fn find_drafts_wire(mailboxes: &[MailboxInfo]) -> Option<String> {
+    resolve_roles(mailboxes)
+        .into_iter()
+        .find(|(_, role)| *role == Role::Drafts)
+        .map(|(wire, _)| wire)
+}
+
+/// Resolve the Drafts wire name: an explicit `mailbox` override wins
+/// (no network); otherwise LIST + role resolution. Missing → a
+/// `drafts-missing:` refusal so the UI can run the Phase 11
+/// create-confirm flow, then retry.
+async fn resolve_drafts_wire(
+    manager: &Arc<SessionManager>,
+    mailbox: Option<String>,
+) -> Result<String, String> {
+    if let Some(wire) = mailbox {
+        return Ok(wire);
+    }
+    let folders = manager
+        .list_mailboxes()
+        .await
+        .map_err(|e| e.to_string())?;
+    find_drafts_wire(&folders).ok_or_else(|| {
+        "drafts-missing: nenhuma pasta Rascunhos encontrada no servidor — confirme para criar".to_string()
+    })
+}
+
+/// Save a draft: local-first write, then APPEND-new + expunge-old.
+///
+/// Under one store lock the compose session upserts `dirty=1` (stable
+/// `message_id` per session — read from the existing row, generated once
+/// via `new_message_id`), so the call returns even offline. When online,
+/// the manager persists the copy and the row marks clean with the
+/// reconciled `server_uid`; on failure the row stays dirty with
+/// `acked=false` and a plain-language detail (no secret leakage). A
+/// UIDVALIDITY bump since the last sync drops the stale `server_uid`
+/// (`old_uid=None` path — the orphan is reaped by the sweep).
+///
+/// Last-writer-wins: a server copy edited elsewhere is overwritten by the
+/// next local save with no merge (documented, no conflict UI in MVP).
+#[tauri::command]
+pub async fn save_draft(
+    state: State<'_, crate::AppState>,
+    id: String,
+    subject: String,
+    body: String,
+    to: String,
+    cc: String,
+    bcc: String,
+    mailbox: Option<String>,
+) -> Result<DraftSaveResult, String> {
+    let account_cfg: AccountConfig = load_account_config(state.clone()).await?;
+    let from_addr = account_cfg.username.clone();
+    let manager = manager_for(&state, &account_cfg);
+    let wire = resolve_drafts_wire(&manager, mailbox).await?;
+    let store = state.store.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        async_std::task::block_on(async {
+            // 1. Local-first upsert under one lock (returns even offline).
+            // The Message-ID is stable per session: read from the existing
+            // row, generated once via `new_message_id` (T-12-03).
+            let (mailbox_id, message_id, old_uid, epoch) = {
+                let guard = store.lock().unwrap();
+                let conn = guard.conn();
+                let mb = queries::ensure_mailbox(conn, &wire)
+                    .map_err(|e| format!("store: {e}"))?;
+                let existing = queries::get_draft(conn, &id)
+                    .map_err(|e| format!("store: {e}"))?;
+                let (msg_id, prev_uid) = match existing {
+                    Some(row) => (row.message_id, row.server_uid),
+                    None => (crate::drafts::new_message_id(&id), None),
+                };
+                let epoch = queries::get_sync_state(conn, &wire)
+                    .map_err(|e| format!("store: {e}"))?
+                    .map(|(v, _)| v);
+                queries::upsert_draft(conn, &id, mb, &msg_id, &subject, &body, &to, &cc, &bcc)
+                    .map_err(|e| format!("store: {e}"))?;
+                (mb, msg_id, prev_uid, epoch)
+            };
+
+            // 2. Render + APPEND-new + expunge-old; failure stays dirty.
+            let date = chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S +0000").to_string();
+            let split = |s: &str| {
+                s.split(',')
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect::<Vec<_>>()
+            };
+            let fields = crate::drafts::DraftFields {
+                from: from_addr,
+                to: split(&to),
+                cc: split(&cc),
+                bcc: split(&bcc),
+                subject: subject.clone(),
+                body: body.clone(),
+                message_id: message_id.clone(),
+            };
+            let bytes = crate::drafts::render_draft_rfc5322(&fields, &date);
+            let (acked, server_uid) =
+                match manager.save_draft_copy_in(&wire, &message_id, &bytes, old_uid, epoch).await
+                {
+                    Ok(new_uid) => {
+                        let guard = store.lock().unwrap();
+                        let _ = queries::mark_draft_clean(guard.conn(), &id, new_uid);
+                        eprintln!("[SGE sync] save_draft {id} acknowledged as uid {new_uid}");
+                        (true, Some(new_uid))
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[SGE sync] save_draft {id} not acknowledged ({e}) — stays dirty"
+                        );
+                        (false, old_uid)
+                    }
+                };
+
+            let (dirty, pending_count) = {
+                let guard = store.lock().unwrap();
+                let dirty = queries::get_draft(guard.conn(), &id)
+                    .map_err(|e| format!("store: {e}"))?
+                    .map(|r| r.dirty)
+                    .unwrap_or(!acked);
+                (dirty, pending_depth(guard.conn(), mailbox_id))
+            };
+            Ok(DraftSaveResult {
+                id,
+                dirty,
+                server_uid,
+                acked,
+                pending_count,
+            })
+        })
+    })
+    .await
+    .map_err(|e| format!("internal error: save_draft task failed ({e})"))?
+}
+
+/// Load one draft for editing (local-first, no network wait).
+///
+/// Returns the local row including `server_uid` + `dirty` (the Phase 13
+/// DRAFT-03 handoff). When the local row is missing — a server-only copy
+/// with no local session — falls back to the server: the Message-ID is
+/// deterministic per compose session (`new_message_id`), so the copy
+/// reconciles via `UID SEARCH HEADER Message-ID` and the BODY.PEEK fetch
+/// never sets `\Seen`. The fallback row persists locally as clean so the
+/// next open is instant.
+#[tauri::command]
+pub async fn get_draft(
+    state: State<'_, crate::AppState>,
+    id: String,
+) -> Result<queries::DraftRow, String> {
+    let store = state.store.clone();
+    let local: Option<queries::DraftRow> = {
+        let guard = store.lock().unwrap();
+        queries::get_draft(guard.conn(), &id).map_err(|e| format!("store: {e}"))?
+    };
+    if let Some(row) = local {
+        return Ok(row);
+    }
+    // Rare server fallback (no local row).
+    let account_cfg: AccountConfig = load_account_config(state.clone()).await?;
+    let manager = manager_for(&state, &account_cfg);
+    let wire = resolve_drafts_wire(&manager, None).await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        async_std::task::block_on(async {
+            let mut lease = manager
+                .lease_for(&wire)
+                .await
+                .map_err(|e| e.to_string())?;
+            let msg_id = crate::drafts::new_message_id(&id);
+            let mut hits = lease
+                .session()
+                .uid_search_header("Message-ID", &msg_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            hits.sort_unstable();
+            let uid = hits.into_iter().max().ok_or_else(|| {
+                "Rascunho não encontrado — nem local nem no servidor".to_string()
+            })?;
+            // BODY.PEEK-only: the fallback never sets `\Seen`.
+            let raw = lease
+                .session()
+                .fetch_body(uid)
+                .await
+                .map_err(|e| e.to_string())?;
+            drop(lease);
+            let parsed = mail_parser::MessageParser::new()
+                .parse(&raw)
+                .ok_or_else(|| "Não foi possível ler o rascunho do servidor".to_string())?;
+            let addr_list = |a: Option<&mail_parser::Address<'_>>| {
+                a.map(|addr| {
+                    addr.iter()
+                        .filter_map(|e| e.address().map(|s| s.to_string()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default()
+            };
+            let (subject, body, to, cc, bcc) = (
+                parsed.subject().unwrap_or_default().to_string(),
+                parsed.body_text(0).map(|c| c.to_string()).unwrap_or_default(),
+                addr_list(parsed.to()),
+                addr_list(parsed.cc()),
+                addr_list(parsed.bcc()),
+            );
+            let from = parsed
+                .from()
+                .and_then(|a| a.first())
+                .and_then(|e| e.address().map(|s| s.to_string()))
+                .unwrap_or_default();
+            let _ = from;
+            let guard = store.lock().unwrap();
+            let conn = guard.conn();
+            let mb = queries::ensure_mailbox(conn, &wire)
+                .map_err(|e| format!("store: {e}"))?;
+            queries::upsert_draft(conn, &id, mb, &msg_id, &subject, &body, &to, &cc, &bcc)
+                .map_err(|e| format!("store: {e}"))?;
+            queries::mark_draft_clean(conn, &id, uid)
+                .map_err(|e| format!("store: {e}"))?;
+            queries::get_draft(conn, &id)
+                .map_err(|e| format!("store: {e}"))?
+                .ok_or_else(|| "Rascunho não encontrado após leitura do servidor".to_string())
+        })
+    })
+    .await
+    .map_err(|e| format!("internal error: get_draft task failed ({e})"))?
+}
+
+/// Discard a draft: delete the local row + expunge the tracked server copy.
+///
+/// The server leg is best-effort online: if the network fails (or the
+/// Drafts folder is missing), the local row is already gone and the orphan
+/// is reaped by the next sweep's expunge-diff. Always succeeds once the
+/// local row is deleted — the UI confirms only when dirty content exists
+/// (UI-side rule).
+#[tauri::command]
+pub async fn discard_draft(
+    state: State<'_, crate::AppState>,
+    id: String,
+) -> Result<DiscardResult, String> {
+    let store = state.store.clone();
+    let tracked: Option<(u64, u32)> = {
+        let guard = store.lock().unwrap();
+        let conn = guard.conn();
+        let row = queries::get_draft(conn, &id).map_err(|e| format!("store: {e}"))?;
+        let tracked = row.and_then(|r| r.server_uid.map(|u| (r.mailbox_id, u)));
+        queries::delete_draft(conn, &id).map_err(|e| format!("store: {e}"))?;
+        tracked
+    };
+    if let Some((_mailbox_id, uid)) = tracked {
+        // Best-effort server cleanup — failures only log (T-12-05: scoped
+        // single-UID expunge, never a bare `expunge()`).
+        let account_cfg: AccountConfig = load_account_config(state.clone()).await?;
+        let manager = manager_for(&state, &account_cfg);
+        match resolve_drafts_wire(&manager, None).await {
+            Ok(wire) => {
+                if let Err(e) = manager.discard_server_copy_in(&wire, uid).await {
+                    eprintln!(
+                        "[SGE sync] discard_draft {id} uid {uid} server cleanup failed ({e}) — orphan reaped by sweep"
+                    );
+                }
+            }
+            Err(e) => eprintln!(
+                "[SGE sync] discard_draft {id}: no Drafts folder ({e}) — local row already gone"
+            ),
+        }
+    }
+    Ok(DiscardResult {
+        id,
+        discarded: true,
+    })
+}
+
 /// Return the latest sync status from SQLite: last_sync_at + counts.
 ///
 /// Read-only -- no IMAP round-trip. Used by the frontend to show
 /// "Up-to-date <timestamp>" or "Offline -- last synced <timestamp>".
-/// `pending_count` sums BOTH durable-outbox depths (flag toggles +
-/// delete/move ops) for the pending indicator.
+/// `pending_count` sums durable-outbox depths (flag toggles +
+/// delete/move ops + dirty drafts) for the pending indicator.
 #[tauri::command]
 pub async fn sync_status(
     state: State<'_, crate::AppState>,

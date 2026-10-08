@@ -280,7 +280,8 @@ impl From<async_imap::error::Error> for SyncError {
 /// Reads are ENVELOPE sweeps, `BODY.PEEK[]` bodies, SELECT, LOGOUT.
 /// `LIST` discovers the folder tree. The single write verb is
 /// [`SyncSession::set_seen`] (UID STORE `\\Seen`, Phase 6 — ends the M1
-/// read-only era). `EXPUNGE` and `APPEND` are **never** exposed.
+/// read-only era). `EXPUNGE` and scoped `UID EXPUNGE` carry delete/move
+/// (Phase 10); `APPEND` persists draft copies (Phase 12, DRAFT-02).
 pub trait SyncSession: Unpin + Send {
     /// `SELECT <mailbox>` — selects any mailbox by name and returns
     /// UIDVALIDITY / UIDNEXT / exists counts.
@@ -357,6 +358,29 @@ pub trait SyncSession: Unpin + Send {
     /// Raw wire name in, never display_name.
     fn delete_mailbox(&mut self, name: &str) -> PinBox<'_, Result<(), SyncError>>;
 
+    /// `APPEND <mailbox> (<flags>) <literal>` — persist one draft copy on
+    /// the server (Phase 12, DRAFT-02). UID discovery is a separate
+    /// [`SyncSession::uid_search_header`] step: async-imap's `append`
+    /// returns `()` and swallows APPENDUID, so callers reconcile via
+    /// `UID SEARCH HEADER Message-ID` instead of parsing APPENDUID.
+    fn append_message(
+        &mut self,
+        mailbox: &str,
+        flags: &str,
+        bytes: &[u8],
+    ) -> PinBox<'_, Result<(), SyncError>>;
+
+    /// `UID SEARCH HEADER <field> <value>` — find server copies by header
+    /// (Phase 12: reconcile the APPENDed draft via its stable Message-ID).
+    /// Returns sorted UIDs: exactly one → the new copy; zero → the server
+    /// didn't persist it (loud error, keep `dirty=1`); multiple → take the
+    /// max (newest wins, the tracked old UID is still the expunge target).
+    fn uid_search_header(
+        &mut self,
+        field: &str,
+        value: &str,
+    ) -> PinBox<'_, Result<Vec<u32>, SyncError>>;
+
     /// `LIST "" "*"` — discover all mailboxes on the server (FOLD-01).
     /// Returns raw LIST results with name, delimiter, and attributes.
     fn list_mailboxes(&mut self) -> PinBox<'_, Result<Vec<MailboxInfo>, SyncError>>;
@@ -414,6 +438,10 @@ pub fn deleted_store_arg(deleted: bool) -> &'static str {
         "-FLAGS.SILENT (\\Deleted)"
     }
 }
+
+/// The APPEND flags literal for a draft copy: `\Draft` (+`\Seen`, per
+/// CONTEXT — the copy is the user's own text, already "read").
+pub const DRAFT_FLAGS: &str = "(\\Draft \\Seen)";
 
 /// Which server verb carries a move, given the advertised capabilities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -712,6 +740,43 @@ impl SyncSession for BoxedSession {
         })
     }
 
+    fn append_message(
+        &mut self,
+        mailbox: &str,
+        flags: &str,
+        bytes: &[u8],
+    ) -> PinBox<'_, Result<(), SyncError>> {
+        let (mailbox_owned, flags_owned, bytes_owned) =
+            (mailbox.to_string(), flags.to_string(), bytes.to_vec());
+        Box::pin(async move {
+            self.append(&mailbox_owned, Some(flags_owned.as_str()), None, &bytes_owned)
+                .await
+                .map_err(|e| {
+                    SyncError::Protocol(format!("APPEND {mailbox_owned}: {e}"))
+                })?;
+            Ok(())
+        })
+    }
+
+    fn uid_search_header(
+        &mut self,
+        field: &str,
+        value: &str,
+    ) -> PinBox<'_, Result<Vec<u32>, SyncError>> {
+        let (field_owned, value_owned) = (field.to_string(), value.to_string());
+        Box::pin(async move {
+            let query = format!("HEADER {field_owned} {value_owned}");
+            let uids_set = self.uid_search(&query).await.map_err(|e| {
+                SyncError::Protocol(format!(
+                    "UID SEARCH HEADER {field_owned} {value_owned}: {e}"
+                ))
+            })?;
+            let mut uids: Vec<u32> = uids_set.into_iter().collect();
+            uids.sort_unstable();
+            Ok(uids)
+        })
+    }
+
     fn logout(&mut self) -> PinBox<'_, Result<(), SyncError>> {
         Box::pin(async move {
             self.logout()
@@ -952,14 +1017,20 @@ mod tests {
     }
 
     #[test]
-    fn deleted_store_arg_never_sequence_addressed() {
-        // Same purity contract as `seen_store_arg`: no identifier in the
+    fn deleted_store_arg_never_sequence_addressed() {        // Same purity contract as `seen_store_arg`: no identifier in the
         // flag expression, canonical backslash-Deleted form.
         for deleted in [true, false] {
             let arg = deleted_store_arg(deleted);
             assert!(!arg.contains("UID"), "flag arg must not name identifiers: {arg}");
             assert!(arg.ends_with("(\\Deleted)"), "canonical backslash-Deleted form: {arg}");
         }
+    }
+
+    #[test]
+    fn draft_flags_spelling() {
+        // T-12: APPEND carries the exact (\Draft \Seen) literal — the
+        // wire spelling the fake-based draft tests assert against.
+        assert_eq!(DRAFT_FLAGS, "(\\Draft \\Seen)");
     }
 
     fn caps(names: &[&str]) -> Vec<String> {

@@ -1027,6 +1027,15 @@ mod tests {
         /// When true, `uid_move_to` refuses loudly (`SyncError::Refused`,
         /// the unmark-dance shape) — drives the replay refusal-cleanup test.
         pub fail_move_refused: bool,
+        /// Recorded `(mailbox, flags, bytes)` from `append_message`
+        /// (Plan 12-01 draft APPEND).
+        pub appended_calls: Vec<(String, String, Vec<u8>)>,
+        /// Canned `UID SEARCH HEADER` results (Plan 12-01 reconcile;
+        /// Plan 12-02 extends with per-Message-ID results for the
+        /// reconnect flush).
+        pub search_header_results: Vec<u32>,
+        /// When true, `append_message` fails — drives draft replay tests.
+        pub fail_append: bool,
     }
 
     impl SyncSession for MockSession {
@@ -1175,6 +1184,35 @@ mod tests {
             Box::pin(async move { Ok(()) })
         }
 
+        fn append_message(
+            &mut self,
+            mailbox: &str,
+            flags: &str,
+            bytes: &[u8],
+        ) -> PinBox<'_, Result<(), SyncError>> {
+            self.appended_calls.push((
+                mailbox.to_string(),
+                flags.to_string(),
+                bytes.to_vec(),
+            ));
+            if self.fail_append {
+                return Box::pin(async move {
+                    Err(SyncError::Protocol("mock append failure".to_string()))
+                });
+            }
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn uid_search_header(
+            &mut self,
+            _field: &str,
+            _value: &str,
+        ) -> PinBox<'_, Result<Vec<u32>, SyncError>> {
+            let mut uids = self.search_header_results.clone();
+            uids.sort_unstable();
+            Box::pin(async move { Ok(uids) })
+        }
+
         fn list_mailboxes(&mut self) -> PinBox<'_, Result<Vec<MailboxInfo>, SyncError>> {
             Box::pin(async move { Ok(vec![]) })
         }
@@ -1251,6 +1289,9 @@ mod tests {
             fail_rename: false,
             fail_delete: false,
             fail_move_refused: false,
+            appended_calls: Vec::new(),
+            search_header_results: Vec::new(),
+            fail_append: false,
         }
     }
 

@@ -1412,6 +1412,146 @@ pub fn set_local_seen(
     Ok(())
 }
 
+// ── drafts (local-first compose sessions, Phase 12) ─────────────────
+
+/// One compose session row: the editor backing store (DRAFT-01).
+///
+/// `server_uid` is the last APPENDed copy's UID (`None` = never
+/// persisted); `dirty` marks rows needing a server write (offline queue).
+/// Serialized over IPC by `get_draft` (Phase 13 DRAFT-03 consumes
+/// `server_uid` + `dirty` for the send transaction).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DraftRow {
+    pub id: String,
+    pub mailbox_id: u64,
+    pub message_id: String,
+    pub subject: String,
+    pub body: String,
+    pub to: String,
+    pub cc: String,
+    pub bcc: String,
+    pub dirty: bool,
+    pub server_uid: Option<u32>,
+    pub attachments: String,
+    pub updated_at: String,
+}
+
+fn draft_from_row(row: &Row<'_>) -> Result<DraftRow, rusqlite::Error> {
+    Ok(DraftRow {
+        id: row.get::<_, String>(0)?,
+        mailbox_id: row.get::<_, u64>(1)?,
+        message_id: row.get::<_, String>(2)?,
+        subject: row.get::<_, String>(3)?,
+        body: row.get::<_, String>(4)?,
+        to: row.get::<_, String>(5)?,
+        cc: row.get::<_, String>(6)?,
+        bcc: row.get::<_, String>(7)?,
+        dirty: row.get::<_, bool>(8)?,
+        server_uid: row.get::<_, Option<u32>>(9)?,
+        attachments: row.get::<_, String>(10)?,
+        updated_at: row.get::<_, String>(11)?,
+    })
+}
+
+const DRAFT_COLUMNS: &str = "id, mailbox_id, message_id, subject, body, \
+     recipients_to, recipients_cc, recipients_bcc, dirty, server_uid, \
+     attachments, updated_at";
+
+/// Insert or replace a compose session, marking it dirty (`dirty = 1`).
+///
+/// Local-first: called BEFORE any network attempt, so the row survives
+/// offline saves. `message_id` is stable per session (generated once at
+/// row creation) — never regenerated on re-save, or the SEARCH-reconcile
+/// would orphan the previous server copy (T-12-03).
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_draft(
+    conn: &Connection,
+    id: &str,
+    mailbox_id: u64,
+    message_id: &str,
+    subject: &str,
+    body: &str,
+    to: &str,
+    cc: &str,
+    bcc: &str,
+) -> StoreResult<()> {
+    conn.execute(
+        "INSERT INTO drafts (id, mailbox_id, message_id, subject, body, \
+          recipients_to, recipients_cc, recipients_bcc, dirty, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, datetime('now')) \
+         ON CONFLICT(id) DO UPDATE SET \
+           mailbox_id    = excluded.mailbox_id, \
+           subject       = excluded.subject, \
+           body          = excluded.body, \
+           recipients_to = excluded.recipients_to, \
+           recipients_cc = excluded.recipients_cc, \
+           recipients_bcc = excluded.recipients_bcc, \
+           dirty         = 1, \
+           updated_at    = datetime('now')",
+        rusqlite::params![id, mailbox_id, message_id, subject, body, to, cc, bcc],
+    )?;
+    Ok(())
+}
+
+/// Load one compose session by id. `None` when the row is missing (the
+/// command layer falls back to the rare server copy in that case).
+pub fn get_draft(conn: &Connection, id: &str) -> StoreResult<Option<DraftRow>> {
+    let sql = format!("SELECT {DRAFT_COLUMNS} FROM drafts WHERE id = ?1");
+    let mut stmt = conn.prepare(&sql)?;
+    let row = stmt
+        .query_row(rusqlite::params![id], draft_from_row)
+        .optional()?;
+    Ok(row)
+}
+
+/// Delete a compose session row (discard path). Returns rows deleted.
+pub fn delete_draft(conn: &Connection, id: &str) -> StoreResult<usize> {
+    conn.execute("DELETE FROM drafts WHERE id = ?1", rusqlite::params![id])
+        .map_err(StoreError::from)
+}
+
+/// All dirty rows in creation order (the reconnect flush queue).
+pub fn list_dirty_drafts(conn: &Connection) -> StoreResult<Vec<DraftRow>> {
+    let sql = format!("SELECT {DRAFT_COLUMNS} FROM drafts WHERE dirty = 1 ORDER BY updated_at, id");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map([], draft_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Mark a session clean after its server copy is confirmed: `dirty = 0`,
+/// `server_uid` updated to the reconciled UID.
+pub fn mark_draft_clean(
+    conn: &Connection,
+    id: &str,
+    server_uid: u32,
+) -> StoreResult<()> {
+    conn.execute(
+        "UPDATE drafts SET dirty = 0, server_uid = ?1 WHERE id = ?2",
+        rusqlite::params![server_uid, id],
+    )?;
+    Ok(())
+}
+
+/// Depth of the dirty-draft queue (added to `sync_status.pending_count`).
+pub fn dirty_draft_count(conn: &Connection) -> StoreResult<i64> {
+    conn.query_row("SELECT COUNT(*) FROM drafts WHERE dirty = 1", [], |row| {
+        row.get(0)
+    })
+    .map_err(StoreError::from)
+}
+
+/// Depth of the dirty-draft queue for one mailbox (per-folder pending).
+pub fn dirty_draft_count_for(conn: &Connection, mailbox_id: u64) -> StoreResult<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM drafts WHERE dirty = 1 AND mailbox_id = ?1",
+        rusqlite::params![mailbox_id],
+        |row| row.get(0),
+    )
+    .map_err(StoreError::from)
+}
+
 // ── tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]

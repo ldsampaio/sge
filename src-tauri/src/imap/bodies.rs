@@ -259,6 +259,23 @@ mod tests {
             Box::pin(async move { Ok(()) })
         }
 
+        fn append_message(
+            &mut self,
+            _mailbox: &str,
+            _flags: &str,
+            _bytes: &[u8],
+        ) -> PinBox<'_, Result<(), SyncError>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn uid_search_header(
+            &mut self,
+            _field: &str,
+            _value: &str,
+        ) -> PinBox<'_, Result<Vec<u32>, SyncError>> {
+            Box::pin(async move { Ok(vec![]) })
+        }
+
         fn logout(&mut self) -> PinBox<'_, Result<(), SyncError>> {
             Box::pin(async move { Ok(()) })
         }

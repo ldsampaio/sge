@@ -1,12 +1,83 @@
 {
   "contract": "1.0.0",
   "flavor": "core",
-  "milestone": "v1.2 — not yet planned (run `/gsd-new-milestone`)",
-  "phases": [],
+  "milestone": "v1.2 — Compose & Organize",
+  "phases": [
+    {
+      "number": "1",
+      "name": "Scaffold + Connection",
+      "status": "complete"
+    },
+    {
+      "number": "2",
+      "name": "Sync Engine + Local Store",
+      "status": "complete"
+    },
+    {
+      "number": "3",
+      "name": "Mailbox UI Shell + Search",
+      "status": "complete"
+    },
+    {
+      "number": "4",
+      "name": "Reader + Attachments",
+      "status": "complete"
+    },
+    {
+      "number": "5",
+      "name": "Keyring + Packaging",
+      "status": "complete"
+    },
+    {
+      "number": "6",
+      "name": "Flag Sync + Outbox",
+      "status": "complete"
+    },
+    {
+      "number": "7",
+      "name": "Folders + Per-Folder Sync",
+      "status": "complete"
+    },
+    {
+      "number": "8",
+      "name": "Poll + Manual Refresh",
+      "status": "complete"
+    },
+    {
+      "number": "9",
+      "name": "UID Backfill",
+      "status": "complete"
+    },
+    {
+      "number": "10",
+      "name": "Delete + Move",
+      "status": "complete"
+    },
+    {
+      "number": "11",
+      "name": "Folder CRUD",
+      "status": "complete"
+    },
+    {
+      "number": "12",
+      "name": "Drafts",
+      "status": "pending"
+    },
+    {
+      "number": "13",
+      "name": "Send Pipeline",
+      "status": "pending"
+    },
+    {
+      "number": "14",
+      "name": "Compose UI",
+      "status": "pending"
+    }
+  ],
   "next": {
-    "command": "/gsd:discuss-phase",
-    "label": "Discuss the first phase",
-    "reason": "Project initialized — plan your first phase"
+    "command": "/gsd:progress --next",
+    "label": "Advance to the next step",
+    "reason": "Phase 12 of 5 · executing"
   },
-  "updated_at": "2026-10-06T13:46:51.680Z"
+  "updated_at": "2026-10-07T00:07:08.445Z"
 }

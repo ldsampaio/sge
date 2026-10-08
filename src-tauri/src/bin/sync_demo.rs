@@ -133,6 +133,14 @@ impl SyncSession for MockSession {
         Box::pin(async move { Ok(()) })
     }
 
+    fn append_message(&mut self, _mailbox: &str, _flags: &str, _bytes: &[u8]) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SyncError>> + Send>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn uid_search_header(&mut self, _field: &str, _value: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u32>, SyncError>> + Send>> {
+        Box::pin(async move { Ok(vec![]) })
+    }
+
     fn logout(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SyncError>> + Send>> {
         Box::pin(async move { Ok(()) })
     }

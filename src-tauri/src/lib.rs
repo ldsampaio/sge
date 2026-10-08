@@ -5,6 +5,7 @@
 // delegates to `imap::probe` (filled in Plan 01-02, extended by later phases).
 
 pub mod creds;
+pub mod drafts;
 pub mod imap;
 pub mod store;
 pub mod sync;
