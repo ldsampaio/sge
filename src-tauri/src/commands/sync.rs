@@ -744,6 +744,27 @@ fn find_drafts_wire(mailboxes: &[MailboxInfo]) -> Option<String> {
         .map(|(wire, _)| wire)
 }
 
+/// Find the Drafts wire name in the LOCALLY CACHED folder tree (no network).
+///
+/// Role column first (`drafts`, written on every LIST refresh — Phase 11
+/// T-11-07); case-insensitive known-name fallback for trees synced before
+/// roles existed. Missing → `None` so the caller can fall back to a LIST
+/// refresh or refuse with the frozen `drafts-missing:` prefix (Phase 11
+/// create-confirm flow). Never gates on network by itself: the local-first
+/// upsert must survive offline (DRAFT-01, CR-01).
+fn find_drafts_wire_cached(conn: &rusqlite::Connection) -> Option<String> {
+    let rows = queries::list_mailboxes(conn).ok()?;
+    if let Some(hit) = rows.iter().find(|m| m.role == "drafts") {
+        return Some(hit.name.clone());
+    }
+    rows.iter()
+        .find(|m| {
+            let lower = m.name.to_lowercase();
+            lower == "drafts" || lower == "rascunhos" || lower == "[gmail]/drafts"
+        })
+        .map(|m| m.name.clone())
+}
+
 /// Resolve the Drafts wire name: an explicit `mailbox` override wins
 /// (no network); otherwise LIST + role resolution. Missing → a
 /// `drafts-missing:` refusal so the UI can run the Phase 11
@@ -768,7 +789,10 @@ async fn resolve_drafts_wire(
 ///
 /// Under one store lock the compose session upserts `dirty=1` (stable
 /// `message_id` per session — read from the existing row, generated once
-/// via `new_message_id`), so the call returns even offline. When online,
+/// via `new_message_id`), so the call returns even offline. The wire name
+/// resolves from the locally cached folder tree first (CR-01: a network
+/// LIST before the upsert would fail offline before persisting anything);
+/// a LIST refresh runs only on a cold cache. When online,
 /// the manager persists the copy and the row marks clean with the
 /// reconciled `server_uid`; on failure the row stays dirty with
 /// `acked=false` and a plain-language detail (no secret leakage). A
@@ -791,7 +815,23 @@ pub async fn save_draft(
     let account_cfg: AccountConfig = load_account_config(state.clone()).await?;
     let from_addr = account_cfg.username.clone();
     let manager = manager_for(&state, &account_cfg);
-    let wire = resolve_drafts_wire(&manager, mailbox).await?;
+    // CR-01 (local-first ordering): explicit override wins; otherwise the
+    // cached tree — never a network LIST ahead of the local write. A LIST
+    // refresh is only a cold-cache fallback; offline with a warm cache the
+    // upsert below still lands `dirty=1` with `acked=false`.
+    let wire: String = match mailbox {
+        Some(w) => w,
+        None => {
+            let cached = {
+                let guard = state.store.lock().unwrap();
+                find_drafts_wire_cached(guard.conn())
+            };
+            match cached {
+                Some(w) => w,
+                None => resolve_drafts_wire(&manager, None).await?,
+            }
+        }
+    };
     let store = state.store.clone();
     tauri::async_runtime::spawn_blocking(move || {
         async_std::task::block_on(async {
