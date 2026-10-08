@@ -765,7 +765,7 @@ impl SyncSession for BoxedSession {
     ) -> PinBox<'_, Result<Vec<u32>, SyncError>> {
         let (field_owned, value_owned) = (field.to_string(), value.to_string());
         Box::pin(async move {
-            let query = format!("HEADER {field_owned} {value_owned}");
+            let query = format!("HEADER {field_owned} \"{value_owned}\"");
             let uids_set = self.uid_search(&query).await.map_err(|e| {
                 SyncError::Protocol(format!(
                     "UID SEARCH HEADER {field_owned} {value_owned}: {e}"
