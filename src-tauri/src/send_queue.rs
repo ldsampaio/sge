@@ -522,4 +522,288 @@ mod tests {
         assert_eq!(n, 0, "refusal must leave no partial row");
         std::fs::remove_dir_all(&app_data).ok();
     }
+
+    fn seed_draft(conn: &Connection, draft_id: &str, message_id: &str) {
+        let mb = queries::ensure_mailbox(conn, "INBOX").unwrap();
+        queries::upsert_draft(
+            conn,
+            draft_id,
+            mb,
+            message_id,
+            "Assunto",
+            "corpo do rascunho",
+            "amigo@example.com",
+            "",
+            "",
+        )
+        .unwrap();
+    }
+
+    fn outbox_file_count(app_data: &Path) -> usize {
+        std::fs::read_dir(app_data.join("outbox"))
+            .map(|rd| rd.count())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn double_enqueue_same_message_id_returns_existing_row() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let app_data = test_dir("dedupe");
+        seed_draft(conn, "draft-dedupe", "<dedupe-1@sge.local>");
+
+        let with_draft = || EnqueueInput {
+            from: "eu@utfpr.edu.br".to_string(),
+            to: vec!["amigo@example.com".to_string()],
+            cc: vec![],
+            bcc: vec![],
+            subject: "Assunto".to_string(),
+            body: "corpo do rascunho".to_string(),
+            draft_id: Some("draft-dedupe".to_string()),
+        };
+        let first = enqueue_send(conn, &app_data, with_draft()).unwrap();
+        assert!(!first.deduped);
+        assert_eq!(first.message_id, "<dedupe-1@sge.local>");
+        let second = enqueue_send(conn, &app_data, with_draft()).unwrap();
+        assert!(second.deduped, "second invoke must dedupe");
+        assert_eq!(second.queue_id, first.queue_id);
+        assert_eq!(second.message_id, first.message_id);
+
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM send_queue", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "dedupe must leave exactly one row");
+        assert_eq!(
+            outbox_file_count(&app_data),
+            1,
+            "dedupe must not write a second .eml"
+        );
+        std::fs::remove_dir_all(&app_data).ok();
+    }
+
+    #[test]
+    fn crash_recovery_resets_only_sending() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let states = [
+            SEND_STATE_QUEUED,
+            SEND_STATE_SENDING,
+            SEND_STATE_SENDING,
+            SEND_STATE_SENT,
+            SEND_STATE_FAILED,
+            SEND_STATE_UNCERTAIN,
+        ];
+        for (i, state) in states.iter().enumerate() {
+            let id = format!("sq-crash-{i}");
+            queries::enqueue_send_row(
+                conn,
+                &id,
+                &format!("<crash-{i}@sge.local>"),
+                "eu@utfpr.edu.br",
+                "[\"a@x.com\"]",
+                "[]",
+                "[]",
+                &format!("/tmp/{id}.eml"),
+                None,
+            )
+            .unwrap();
+            if *state != SEND_STATE_QUEUED {
+                queries::set_send_state(conn, &id, state).unwrap();
+            }
+        }
+
+        let flipped = crash_recover(conn).unwrap();
+        assert_eq!(flipped, 2, "exactly the two sending rows flip");
+
+        let state_of = |i: usize| {
+            queries::get_send_row(conn, &format!("sq-crash-{i}"))
+                .unwrap()
+                .unwrap()
+                .state
+        };
+        assert_eq!(state_of(0), SEND_STATE_QUEUED);
+        assert_eq!(state_of(1), SEND_STATE_QUEUED);
+        assert_eq!(state_of(2), SEND_STATE_QUEUED);
+        assert_eq!(state_of(3), SEND_STATE_SENT, "sent untouched");
+        assert_eq!(state_of(4), SEND_STATE_FAILED, "failed untouched");
+        assert_eq!(state_of(5), SEND_STATE_UNCERTAIN, "uncertain untouched");
+    }
+
+    #[test]
+    fn backoff_stays_inside_jitter_bounds_and_caps() {
+        // Edge rolls pin the band; production rolls fall strictly inside.
+        for attempts in [0u32, 1, 2, 5, 8, 12] {
+            let (lo, hi) = backoff_bounds(attempts);
+            assert!(lo >= 1 && hi >= lo);
+            assert_eq!(backoff_delay_for_attempt(attempts, 0.0), lo);
+            assert_eq!(backoff_delay_for_attempt(attempts, 1.0), hi);
+            let mid = backoff_delay_for_attempt(attempts, 0.5);
+            assert!((lo..=hi).contains(&mid));
+        }
+        // Growth: 30s base doubling (attempts are post-increment failures).
+        assert_eq!(backoff_bounds(0), (24, 36));
+        assert_eq!(backoff_bounds(1), (48, 72));
+        // Cap: 15 min nominal, ±20 % jitter → never above 1080 s.
+        let (lo, hi) = backoff_bounds(100);
+        assert_eq!((lo, hi), (720, 1080));
+        for _ in 0..50 {
+            let d = backoff_delay_for_attempt(100, clock_roll());
+            assert!((720..=1080).contains(&d), "capped delay {d} out of band");
+        }
+    }
+
+    #[test]
+    fn oversize_render_refuses_with_plain_language_limit() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let app_data = test_dir("oversize");
+        let mut big = input("amigo@example.com");
+        big.body = "x".repeat(SEND_MAX_BYTES + 1);
+        let err = enqueue_send(conn, &app_data, big).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.starts_with("send-too-large"),
+            "unexpected prefix: {text}"
+        );
+        assert!(
+            text.contains("25 MB"),
+            "refusal must name the limit in plain language: {text}"
+        );
+        for secret in ["amigo@example.com", "Oi", "xxx"] {
+            assert!(
+                !text.contains(secret),
+                "refusal must not leak content: {text}"
+            );
+        }
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM send_queue", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "oversize refusal must leave no row");
+        assert_eq!(
+            outbox_file_count(&app_data),
+            0,
+            "oversize refusal must leave no file"
+        );
+        std::fs::remove_dir_all(&app_data).ok();
+    }
+
+    #[test]
+    fn bcc_envelope_only_never_in_headers() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let app_data = test_dir("bcc");
+        let mut with_bcc = input("amigo@example.com");
+        with_bcc.cc = vec!["copia@example.com".to_string()];
+        with_bcc.bcc = vec!["oculta@example.com".to_string()];
+        let out = enqueue_send(conn, &app_data, with_bcc).unwrap();
+        assert!(!out.deduped);
+
+        let row = queries::get_send_row(conn, &out.queue_id).unwrap().unwrap();
+        let envelope_bcc: Vec<String> = serde_json::from_str(&row.bcc_addrs).unwrap();
+        assert_eq!(envelope_bcc, vec!["oculta@example.com".to_string()]);
+
+        let raw = std::fs::read(Path::new(&row.eml_path)).unwrap();
+        let text = String::from_utf8_lossy(&raw);
+        assert!(
+            !text.lines().any(|l| l.to_ascii_lowercase().starts_with("bcc:")),
+            "rendered headers must never carry Bcc:\n{text}"
+        );
+        assert!(
+            text.contains("oculta@example.com") == false,
+            "BCC address must not appear anywhere in the bytes"
+        );
+        let msg = mail_parser::MessageParser::new()
+            .parse(&raw)
+            .expect("rendered bytes must parse");
+        assert_eq!(
+            msg.bcc().map(|a| a.iter().count()).unwrap_or(0),
+            0,
+            "parsed message must expose no BCC"
+        );
+        std::fs::remove_dir_all(&app_data).ok();
+    }
+
+    #[test]
+    fn header_injection_bcc_line_stripped() {
+        // T-13-02: a hostile subject must not smuggle a second header.
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let app_data = test_dir("injection");
+        let mut hostile = input("vitima@example.com");
+        hostile.subject = "Oi\r\nBcc: evil@example.com".to_string();
+        let out = enqueue_send(conn, &app_data, hostile).unwrap();
+        let row = queries::get_send_row(conn, &out.queue_id).unwrap().unwrap();
+        let raw = std::fs::read(Path::new(&row.eml_path)).unwrap();
+        let msg = mail_parser::MessageParser::new()
+            .parse(&raw)
+            .expect("rendered bytes must parse");
+        assert_eq!(
+            msg.bcc().map(|a| a.iter().count()).unwrap_or(0),
+            0,
+            "injected Bcc header must not survive"
+        );
+        assert_eq!(msg.subject(), Some("OiBcc: evil@example.com"));
+        std::fs::remove_dir_all(&app_data).ok();
+    }
+
+    #[test]
+    fn failure_attempt_schedules_inside_bounds_and_failed_is_terminal() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let app_data = test_dir("attempt");
+        let out = enqueue_send(conn, &app_data, input("amigo@example.com")).unwrap();
+
+        let before = Utc::now();
+        let attempts = record_send_failure(conn, &out.queue_id, "connection reset").unwrap();
+        let after = Utc::now();
+        assert_eq!(attempts, 1);
+        let row = queries::get_send_row(conn, &out.queue_id).unwrap().unwrap();
+        assert_eq!(row.attempts, 1);
+        assert_eq!(row.last_error.as_deref(), Some("connection reset"));
+        // attempts=1 → nominal 60 s ±20 % → next_retry_at in [before+48s, after+72s].
+        let scheduled = row.next_retry_at.clone().unwrap();
+        let lo = (before + chrono::Duration::seconds(48))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let hi = (after + chrono::Duration::seconds(72))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        assert!(
+            scheduled >= lo && scheduled <= hi,
+            "next_retry_at {scheduled} outside [{lo}, {hi}]"
+        );
+
+        // Terminal failed: kept schedule for display, never due-listed.
+        mark_send_failed(conn, &out.queue_id, "message rejected").unwrap();
+        let row = queries::get_send_row(conn, &out.queue_id).unwrap().unwrap();
+        assert_eq!(row.state, SEND_STATE_FAILED);
+        assert!(
+            row.next_retry_at.is_some(),
+            "terminal failed keeps its schedule (display only)"
+        );
+        assert!(
+            list_due(&out.queue_id, conn).is_empty(),
+            "failed must never appear in the due list"
+        );
+
+        // Manual retry re-queues due-immediately; non-failed retry is a no-op.
+        assert!(requeue_failed(conn, &out.queue_id).unwrap());
+        let row = queries::get_send_row(conn, &out.queue_id).unwrap().unwrap();
+        assert_eq!(row.state, SEND_STATE_QUEUED);
+        assert_eq!(row.next_retry_at, None);
+        assert_eq!(list_due(&out.queue_id, conn).len(), 1);
+        assert!(
+            !requeue_failed(conn, &out.queue_id).unwrap(),
+            "retry on a queued row must not yank it"
+        );
+        std::fs::remove_dir_all(&app_data).ok();
+    }
+
+    fn list_due(id: &str, conn: &Connection) -> Vec<SendRow> {
+        queries::list_due_sends(conn, "2999-01-01 00:00:00")
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.id == id)
+            .collect()
+    }
 }
