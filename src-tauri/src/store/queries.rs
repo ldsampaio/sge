@@ -1755,6 +1755,43 @@ pub fn send_state_counts(conn: &Connection) -> StoreResult<SendCounts> {
     Ok(row)
 }
 
+/// Ids currently `sending` — flush-entry triage (Plan 13-02): rows stranded
+/// by a crash between the SMTP accept and the local verdict. The flush pass
+/// resets them via [`reset_sending_to_queued`] and immediately parks them as
+/// `uncertain` (reconcile-not-resend) instead of blindly re-sending.
+pub fn list_sending_send_ids(conn: &Connection) -> StoreResult<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT id FROM send_queue WHERE state = 'sending'")?;
+    let ids = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ids)
+}
+
+/// Rows awaiting Sent reconcile (`uncertain` verdicts): Sent SEARCH by
+/// Message-ID decides sent vs. single re-send. Oldest first.
+pub fn list_uncertain_sends(conn: &Connection) -> StoreResult<Vec<SendRow>> {
+    let sql = format!(
+        "SELECT {SEND_COLUMNS} FROM send_queue \
+         WHERE state = 'uncertain' ORDER BY created_at, id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map([], send_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Park a row as `uncertain` with the reconcile reason. Attempts are
+/// untouched — the requeue after a reconcile miss counts the attempt, so a
+/// verdict here must not double-count.
+pub fn mark_send_uncertain(conn: &Connection, id: &str, reason: &str) -> StoreResult<()> {
+    conn.execute(
+        "UPDATE send_queue SET state = 'uncertain', last_error = ?1 WHERE id = ?2",
+        rusqlite::params![reason, id],
+    )?;
+    Ok(())
+}
+
 // ── tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]

@@ -447,9 +447,11 @@ pub fn crash_recover(conn: &Connection) -> StoreResult<usize> {
 /// Frozen command contract: `send_status()` returns `{queued, sending,
 /// failed, uncertain, sent_unfiled, pending_count}` verbatim — this struct
 /// serializes to exactly that shape. `sent_unfiled` (SMTP succeeded but the
-/// Sent APPEND did not) is filled by Plan 13-02, which owns the APPEND leg;
-/// until then it reads 0. `pending_count` (`queued + sending`) is the badge
-/// number and the `queue_send` fourth field.
+/// Sent APPEND did not) is defined as [`crate::sync::worker::FlushOutcome`]
+/// by Plan 13-02 but produced only by Plan 13-03's APPEND leg (with the
+/// `sent_unfiled` CHECK-extension migration, M11); until then it reads 0.
+/// `pending_count` (`queued + sending`) is the badge number and the
+/// `queue_send` fourth field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct SendStatusSnapshot {
     pub queued: i64,
@@ -468,7 +470,9 @@ pub fn send_status_snapshot(conn: &Connection) -> StoreResult<SendStatusSnapshot
         sending: c.sending,
         failed: c.failed,
         uncertain: c.uncertain,
-        // Plan 13-02 scope (APPEND leg): no writer exists yet, always 0.
+        // Plan 13-03 scope (APPEND leg + M11 CHECK migration): no writer
+        // exists yet, always 0. Plan 13-02 defines the SentUnfiled outcome
+        // the APPEND leg will produce.
         sent_unfiled: 0,
         pending_count: c.pending(),
     })
@@ -870,7 +874,7 @@ mod tests {
         assert_eq!(snap.sending, 0);
         assert_eq!(snap.failed, 1);
         assert_eq!(snap.uncertain, 0);
-        assert_eq!(snap.sent_unfiled, 0, "Plan 13-02 fills this");
+        assert_eq!(snap.sent_unfiled, 0, "Plan 13-03 fills this");
         assert_eq!(snap.pending_count, 1);
         // Serializes to exactly the frozen send_status() keys.
         let json = serde_json::to_value(&snap).unwrap();
