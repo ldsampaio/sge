@@ -150,6 +150,15 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
         updated_at: "",
       };
       setDraftEditor({ draftId: null, initial: seed, key: nextDraftKey() });
+      // MN-04: the fetch contract carries no Cc/Bcc and plain-text only —
+      // a seeded resume may silently drop recipients/HTML body on the next
+      // save, so say so up front (Phase 14 extends the contract).
+      if (
+        (view.html !== null && view.html !== "" && (view.text === null || view.text === "")) ||
+        view.has_attachments
+      ) {
+        setDraftNotice("Conteúdo parcial — Cc, anexos ou formatação podem não estar incluídos.");
+      }
     } catch (e) {
       setDraftNotice(invokeErrorCopy(e));
     } finally {
