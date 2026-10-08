@@ -2021,11 +2021,12 @@ pub async fn save_attachment(
 #[cfg(test)]
 mod tests {
     use crate::imap::SyncError;
+    use crate::imap::MailboxInfo;
     use crate::store::queries;
     use crate::store::Store;
 
     use super::{
-        guard_delete, guard_rename, has_noselect_attr, is_connectivity_error,
+        find_drafts_wire, guard_delete, guard_rename, has_noselect_attr, is_connectivity_error,
         map_create_error, map_folder_error, pending_depth, prepare_create_wire,
         DeleteDecision,
     };
@@ -2107,6 +2108,100 @@ mod tests {
         // Other mailboxes are isolated.
         let other = queries::ensure_mailbox(conn, "Sent").unwrap();
         assert_eq!(pending_depth(conn, other), 0);
+    }
+
+    /// Draft rows feed the same pending indicator: a dirty draft counts,
+    /// a clean (acknowledged) one does not. Drives the `save_draft`
+    /// `pending_count` contract (frozen UI shape: `DraftSaveResult`
+    /// carries the depth so the indicator updates on every save).
+    #[test]
+    fn pending_depth_counts_dirty_drafts() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let drafts_mb = queries::ensure_mailbox(conn, "Drafts").unwrap();
+        assert_eq!(pending_depth(conn, drafts_mb), 0);
+
+        queries::upsert_draft(
+            conn, "compose-1", drafts_mb, "<compose-1@sge.local>",
+            "Subject", "Body", "to@example.com", "", "",
+        )
+        .unwrap();
+        assert_eq!(pending_depth(conn, drafts_mb), 1);
+
+        // Acknowledged (server copy confirmed) → depth drains.
+        queries::mark_draft_clean(conn, "compose-1", 5).unwrap();
+        assert_eq!(pending_depth(conn, drafts_mb), 0);
+
+        // Drafts in another mailbox never leak into this folder's depth.
+        let other = queries::ensure_mailbox(conn, "INBOX").unwrap();
+        queries::upsert_draft(
+            conn, "compose-2", other, "<compose-2@sge.local>",
+            "Subject", "Body", "to@example.com", "", "",
+        )
+        .unwrap();
+        assert_eq!(pending_depth(conn, other), 1);
+        assert_eq!(pending_depth(conn, drafts_mb), 0);
+    }
+
+    /// `save_draft`/`get_draft` return the local row including `server_uid`
+    /// + `dirty` — the Phase 13 DRAFT-03 send-transaction handoff. A clean
+    /// row exposes the reconciled UID; a freshly upserted row is dirty
+    /// with no server copy yet.
+    #[test]
+    fn draft_row_exposes_server_uid_and_dirty() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let drafts_mb = queries::ensure_mailbox(conn, "Drafts").unwrap();
+
+        queries::upsert_draft(
+            conn, "compose-9", drafts_mb, "<compose-9@sge.local>",
+            "Subject", "Body", "to@example.com", "", "",
+        )
+        .unwrap();
+        let row = queries::get_draft(conn, "compose-9").unwrap().unwrap();
+        assert!(row.dirty);
+        assert_eq!(row.server_uid, None);
+
+        queries::mark_draft_clean(conn, "compose-9", 7).unwrap();
+        let row = queries::get_draft(conn, "compose-9").unwrap().unwrap();
+        assert!(!row.dirty);
+        assert_eq!(row.server_uid, Some(7));
+    }
+
+    fn fixture_mailbox(name: &str, attributes: &[&str]) -> MailboxInfo {
+        MailboxInfo {
+            name: name.to_string(),
+            display_name: name.to_string(),
+            delimiter: "/".to_string(),
+            attributes: attributes.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// Drafts wire resolution: SPECIAL-USE `\Drafts` wins (the
+    /// `resolve_drafts_wire` path `save_draft`/`discard_draft` take before
+    /// any APPEND/expunge verb runs).
+    #[test]
+    fn find_drafts_wire_resolves_special_use() {
+        let folders = vec![
+            fixture_mailbox("INBOX", &[]),
+            fixture_mailbox("Rascunhos", &["\\Drafts"]),
+        ];
+        assert_eq!(
+            find_drafts_wire(&folders),
+            Some("Rascunhos".to_string())
+        );
+    }
+
+    /// No Drafts role anywhere → `None`, and the command layer turns that
+    /// into the `drafts-missing:` refusal (UI runs the Phase 11
+    /// create-confirm flow, then retries) — before any verb call.
+    #[test]
+    fn find_drafts_wire_missing_returns_none() {
+        let folders = vec![
+            fixture_mailbox("INBOX", &[]),
+            fixture_mailbox("Archive", &[]),
+        ];
+        assert_eq!(find_drafts_wire(&folders), None);
     }
 
     /// Cached-tree fixture for the folder guards: INBOX plus one
