@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::imap::headers::MessageHeader;
-use crate::imap::manager::run_move_on_session;
+use crate::imap::manager::{run_move_on_session, save_draft_on_session};
 use crate::imap::{MailboxSummary, SyncError, SyncSession};
 use crate::store::queries;
 use crate::store::Store;
@@ -333,6 +333,122 @@ impl SyncWorker {
         Ok(summary)
     }
 
+    /// Replay dirty drafts for one mailbox (Plan 12-02 reconnect flush).
+    ///
+    /// Iterates `list_dirty_drafts()` filtered to `drafts_mailbox_id`,
+    /// renders each row via `render_draft_rfc5322` (Date = now), and runs
+    /// the save-sequence against the already-held `session` — the same
+    /// legs as [`save_draft_on_session`] (APPEND-new + SEARCH-reconcile +
+    /// scoped expunge-old), minus the lease, since the pass already holds
+    /// the session through its SELECT of this folder. `mark_draft_clean`
+    /// per ack; per-row failure keeps `dirty=1` and never fails the pass
+    /// (worker replay discipline). Returns the acked-row count.
+    ///
+    /// `epoch` is the pass's current UIDVALIDITY: when the stored sync
+    /// state moved on, the tracked `server_uid` belongs to a dead
+    /// generation and flushes as `old_uid=None` (the orphan is reaped by
+    /// the sweep's expunge-diff, Phase 9 semantics).
+    ///
+    /// SELECT discipline (T-12-04): callers must run this while the
+    /// session is SELECTed to `drafts_wire` — the expunge-old leg
+    /// addresses the selected folder. Rows are filtered to
+    /// `drafts_mailbox_id`, so other folders' drafts wait for their own
+    /// pass. `From` renders empty: the row carries no From column (the
+    /// `save_draft` command fills it from the account at save time) and
+    /// only the Message-ID matters for reconcile.
+    pub async fn replay_dirty_drafts(
+        &self,
+        session: &mut dyn SyncSession,
+        drafts_mailbox_id: u64,
+        drafts_wire: &str,
+        epoch: u32,
+    ) -> Result<usize, SyncError> {
+        let rows = {
+            let guard = self.store.lock().unwrap();
+            queries::list_dirty_drafts(guard.conn())
+                .map_err(|e| SyncError::Protocol(format!("list dirty drafts: {e}")))?
+                .into_iter()
+                .filter(|r| r.mailbox_id == drafts_mailbox_id)
+                .collect::<Vec<_>>()
+        };
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let stale_epoch = {
+            let guard = self.store.lock().unwrap();
+            match queries::get_sync_state(guard.conn(), drafts_wire)
+                .map_err(|e| SyncError::Protocol(format!("drafts sync state: {e}")))?
+            {
+                Some((v, _)) => v != epoch,
+                None => false,
+            }
+        };
+        if stale_epoch {
+            eprintln!(
+                "[SGE sync] drafts epoch mismatch (current uid_validity={epoch}) — tracked server_uids are stale, appending fresh"
+            );
+        }
+        let caps = session.capabilities().await.map_err(|e| {
+            SyncError::Protocol(format!("draft replay CAPABILITY: {e}"))
+        })?;
+        let date = chrono::Utc::now()
+            .format("%a, %d %b %Y %H:%M:%S +0000")
+            .to_string();
+        let mut acked = 0;
+        for row in &rows {
+            let split = |s: &str| {
+                s.split(',')
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect::<Vec<_>>()
+            };
+            let fields = crate::drafts::DraftFields {
+                from: String::new(),
+                to: split(&row.to),
+                cc: split(&row.cc),
+                bcc: split(&row.bcc),
+                subject: row.subject.clone(),
+                body: row.body.clone(),
+                message_id: row.message_id.clone(),
+            };
+            let bytes = crate::drafts::render_draft_rfc5322(&fields, &date);
+            let old_uid = if stale_epoch { None } else { row.server_uid };
+            match save_draft_on_session(
+                session,
+                drafts_wire,
+                &row.message_id,
+                &bytes,
+                old_uid,
+                &caps,
+            )
+            .await
+            {
+                Ok(new_uid) => {
+                    let guard = self.store.lock().unwrap();
+                    if let Err(e) = queries::mark_draft_clean(guard.conn(), &row.id, new_uid) {
+                        eprintln!(
+                            "[SGE sync] draft {} acked as uid {new_uid} but clean-mark failed ({e}) — stays dirty",
+                            row.id
+                        );
+                    } else {
+                        eprintln!(
+                            "[SGE sync] draft {} acknowledged as uid {new_uid}",
+                            row.id
+                        );
+                        acked += 1;
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[SGE sync] draft {} replay failed ({e}) — stays dirty",
+                        row.id
+                    );
+                }
+            }
+        }
+        Ok(acked)
+    }
+
     /// Best-effort Seen apply at a move destination (move-carries-toggle).
     ///
     /// The server assigns a new UID on move (no COPYUID parsing — the
@@ -608,6 +724,19 @@ impl SyncWorker {
                 imap_replay.acked, imap_replay.dropped, imap_replay.failed, imap_replay.moved
             );
             result.moved += imap_replay.moved;
+            // Drafts folder may be message-empty yet hold dirty rows —
+            // flush while SELECTed here (same SELECT discipline as below).
+            let draft_acked = self
+                .replay_dirty_drafts(
+                    &mut *session,
+                    mailbox_id,
+                    mailbox_name,
+                    summary.uid_validity,
+                )
+                .await?;
+            if draft_acked > 0 {
+                eprintln!("[SGE sync] draft replay on empty mailbox: acked={draft_acked}");
+            }
             session.logout().await?;
             cb(SyncEvent::SyncCompleted {
                 summary: result.clone(),
@@ -636,6 +765,24 @@ impl SyncWorker {
             imap_replay.acked, imap_replay.dropped, imap_replay.failed, imap_replay.moved
         );
         result.moved += imap_replay.moved;
+
+        // ── Step 4c: dirty-draft flush (Plan 12-02) ──
+        // The session is SELECTed to `mailbox_name`; only draft rows
+        // belonging to this folder flush (SELECT discipline, T-12-04 —
+        // the expunge-old leg addresses the selected folder). Draft
+        // APPENDs don't interact with the sweep's UID set, so pre-sweep
+        // placement next to the imap replay is safe.
+        let draft_acked = self
+            .replay_dirty_drafts(
+                &mut *session,
+                mailbox_id,
+                mailbox_name,
+                summary.uid_validity,
+            )
+            .await?;
+        if draft_acked > 0 {
+            eprintln!("[SGE sync] draft replay: acked={draft_acked}");
+        }
 
         // Pending-wins gate: UIDs with an unacknowledged optimistic toggle
         // (flag queue) or delete/move (imap queue) keep their local flags
@@ -968,6 +1115,7 @@ impl SyncWorker {
 mod tests {
     use super::*;
     use crate::imap::{MailboxInfo, MailboxStatus, PinBox};
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -1034,6 +1182,11 @@ mod tests {
         /// Plan 12-02 extends with per-Message-ID results for the
         /// reconnect flush).
         pub search_header_results: Vec<u32>,
+        /// Per-Message-ID canned SEARCH results, keyed by the searched
+        /// value: when non-empty for a value, wins over
+        /// `search_header_results` (multi-draft flush — each row
+        /// reconciles its own UID).
+        pub search_header_by_msgid: HashMap<String, Vec<u32>>,
         /// When true, `append_message` fails — drives draft replay tests.
         pub fail_append: bool,
     }
@@ -1206,9 +1359,13 @@ mod tests {
         fn uid_search_header(
             &mut self,
             _field: &str,
-            _value: &str,
+            value: &str,
         ) -> PinBox<'_, Result<Vec<u32>, SyncError>> {
-            let mut uids = self.search_header_results.clone();
+            let mut uids = self
+                .search_header_by_msgid
+                .get(value)
+                .cloned()
+                .unwrap_or_else(|| self.search_header_results.clone());
             uids.sort_unstable();
             Box::pin(async move { Ok(uids) })
         }
@@ -1291,6 +1448,7 @@ mod tests {
             fail_move_refused: false,
             appended_calls: Vec::new(),
             search_header_results: Vec::new(),
+            search_header_by_msgid: HashMap::new(),
             fail_append: false,
         }
     }
@@ -1299,6 +1457,255 @@ mod tests {
         Arc::new(std::sync::Mutex::new(
             Store::open_in_memory().expect("migration should succeed"),
         ))
+    }
+
+    /// Seed one dirty draft row in `mailbox`; returns its mailbox id.
+    fn draft_row(
+        store: &Arc<std::sync::Mutex<Store>>,
+        mailbox: &str,
+        id: &str,
+        msg_id: &str,
+    ) -> u64 {
+        let guard = store.lock().unwrap();
+        let mb = queries::ensure_mailbox(guard.conn(), mailbox).unwrap();
+        queries::upsert_draft(
+            guard.conn(),
+            id,
+            mb,
+            msg_id,
+            "Subject",
+            "Body",
+            "to@example.com",
+            "",
+            "",
+        )
+        .unwrap();
+        mb
+    }
+
+    fn drafts_summary() -> MailboxSummary {
+        MailboxSummary {
+            selected_mailbox: "Drafts".to_string(),
+            uid_validity: 100,
+            uid_next: Some(2),
+            exists: 0,
+        }
+    }
+
+    /// Plan 12-02 reconnect flush: dirty row + canned SEARCH `[5]` →
+    /// clean with `server_uid=5`. First save (no tracked UID) issues no
+    /// delete/expunge legs.
+    #[test]
+    fn replay_dirty_drafts_acks_and_cleans() {
+        let store = inbox(drafts_summary());
+        let drafts_mb = draft_row(&store, "Drafts", "compose-1", "<c1@sge.local>");
+        let worker = SyncWorker::new(store.clone());
+
+        let mut session = mock(drafts_summary(), vec![]);
+        session.search_header_results = vec![5];
+        let acked = async_std::task::block_on(async {
+            worker
+                .replay_dirty_drafts(&mut session, drafts_mb, "Drafts", 100)
+                .await
+        })
+        .unwrap();
+
+        assert_eq!(acked, 1);
+        assert_eq!(session.appended_calls.len(), 1);
+        assert_eq!(session.appended_calls[0].0, "Drafts");
+        assert!(session.deleted_calls.is_empty());
+        assert!(session.expunged_sets.is_empty());
+        let guard = store.lock().unwrap();
+        let row = queries::get_draft(guard.conn(), "compose-1")
+            .unwrap()
+            .unwrap();
+        assert!(!row.dirty);
+        assert_eq!(row.server_uid, Some(5));
+    }
+
+    /// Failing APPEND → row stays `dirty=1`, the pass itself still
+    /// returns Ok (worker replay discipline — never fails the sync).
+    #[test]
+    fn replay_dirty_drafts_append_failure_stays_dirty() {
+        let store = inbox(drafts_summary());
+        let drafts_mb = draft_row(&store, "Drafts", "compose-1", "<c1@sge.local>");
+        let worker = SyncWorker::new(store.clone());
+
+        let mut session = mock(drafts_summary(), vec![]);
+        session.fail_append = true;
+        let acked = async_std::task::block_on(async {
+            worker
+                .replay_dirty_drafts(&mut session, drafts_mb, "Drafts", 100)
+                .await
+        })
+        .unwrap();
+
+        assert_eq!(acked, 0);
+        let guard = store.lock().unwrap();
+        let row = queries::get_draft(guard.conn(), "compose-1")
+            .unwrap()
+            .unwrap();
+        assert!(row.dirty);
+        assert_eq!(row.server_uid, None);
+    }
+
+    /// SELECT discipline: rows belonging to another folder never flush
+    /// on this pass (the expunge-old leg addresses the selected folder,
+    /// T-12-04) — they wait for their own folder's pass.
+    #[test]
+    fn replay_dirty_drafts_skips_other_mailbox_rows() {
+        let store = inbox(drafts_summary());
+        draft_row(&store, "INBOX", "compose-9", "<c9@sge.local>");
+        let drafts_mb = {
+            let guard = store.lock().unwrap();
+            queries::ensure_mailbox(guard.conn(), "Drafts").unwrap()
+        };
+        let worker = SyncWorker::new(store.clone());
+
+        let mut session = mock(drafts_summary(), vec![]);
+        session.search_header_results = vec![5];
+        let acked = async_std::task::block_on(async {
+            worker
+                .replay_dirty_drafts(&mut session, drafts_mb, "Drafts", 100)
+                .await
+        })
+        .unwrap();
+
+        assert_eq!(acked, 0);
+        assert!(session.appended_calls.is_empty());
+        let guard = store.lock().unwrap();
+        let row = queries::get_draft(guard.conn(), "compose-9")
+            .unwrap()
+            .unwrap();
+        assert!(row.dirty);
+    }
+
+    /// Re-save with a tracked UID APPENDs-new and expunges the
+    /// superseded copy (exactly-one-copy invariant on the flush path).
+    #[test]
+    fn replay_dirty_drafts_expunges_superseded_copy() {
+        let store = inbox(drafts_summary());
+        let drafts_mb = draft_row(&store, "Drafts", "compose-1", "<c1@sge.local>");
+        {
+            let guard = store.lock().unwrap();
+            queries::mark_draft_clean(guard.conn(), "compose-1", 7).unwrap();
+            queries::upsert_draft(
+                guard.conn(),
+                "compose-1",
+                drafts_mb,
+                "<c1@sge.local>",
+                "Subject v2",
+                "Body v2",
+                "to@example.com",
+                "",
+                "",
+            )
+            .unwrap();
+            queries::set_sync_state(guard.conn(), "Drafts", 100, 8).unwrap();
+        }
+        let worker = SyncWorker::new(store.clone());
+
+        let mut session = mock(drafts_summary(), vec![]);
+        session.search_header_results = vec![9];
+        let acked = async_std::task::block_on(async {
+            worker
+                .replay_dirty_drafts(&mut session, drafts_mb, "Drafts", 100)
+                .await
+        })
+        .unwrap();
+
+        assert_eq!(acked, 1);
+        assert!(session.deleted_calls.contains(&(7, true)));
+        assert!(session.expunged_sets.contains(&"7".to_string()));
+        let guard = store.lock().unwrap();
+        let row = queries::get_draft(guard.conn(), "compose-1")
+            .unwrap()
+            .unwrap();
+        assert!(!row.dirty);
+        assert_eq!(row.server_uid, Some(9));
+    }
+
+    /// UIDVALIDITY bump since the last sync → the tracked `server_uid`
+    /// is stale (`old_uid=None` path): APPEND fresh, no expunge of the
+    /// dead-generation UID (the orphan is reaped by the sweep).
+    #[test]
+    fn replay_dirty_drafts_epoch_bump_drops_stale_old_uid() {
+        let store = inbox(drafts_summary());
+        let drafts_mb = draft_row(&store, "Drafts", "compose-1", "<c1@sge.local>");
+        {
+            let guard = store.lock().unwrap();
+            queries::mark_draft_clean(guard.conn(), "compose-1", 7).unwrap();
+            queries::upsert_draft(
+                guard.conn(),
+                "compose-1",
+                drafts_mb,
+                "<c1@sge.local>",
+                "Subject v2",
+                "Body v2",
+                "to@example.com",
+                "",
+                "",
+            )
+            .unwrap();
+            queries::set_sync_state(guard.conn(), "Drafts", 99, 8).unwrap();
+        }
+        let worker = SyncWorker::new(store.clone());
+
+        let mut session = mock(drafts_summary(), vec![]);
+        session.search_header_results = vec![9];
+        let acked = async_std::task::block_on(async {
+            worker
+                .replay_dirty_drafts(&mut session, drafts_mb, "Drafts", 100)
+                .await
+        })
+        .unwrap();
+
+        assert_eq!(acked, 1);
+        assert!(session.deleted_calls.is_empty());
+        assert!(session.expunged_sets.is_empty());
+        let guard = store.lock().unwrap();
+        let row = queries::get_draft(guard.conn(), "compose-1")
+            .unwrap()
+            .unwrap();
+        assert!(!row.dirty);
+        assert_eq!(row.server_uid, Some(9));
+    }
+
+    /// Multi-draft flush: per-Message-ID canned SEARCH results reconcile
+    /// each row to its own UID (the shared flat vec cannot express this).
+    #[test]
+    fn replay_dirty_drafts_reconciles_each_row_by_message_id() {
+        let store = inbox(drafts_summary());
+        let drafts_mb = draft_row(&store, "Drafts", "compose-1", "<c1@sge.local>");
+        draft_row(&store, "Drafts", "compose-2", "<c2@sge.local>");
+        let worker = SyncWorker::new(store.clone());
+
+        let mut session = mock(drafts_summary(), vec![]);
+        session
+            .search_header_by_msgid
+            .insert("<c1@sge.local>".to_string(), vec![5]);
+        session
+            .search_header_by_msgid
+            .insert("<c2@sge.local>".to_string(), vec![8]);
+        let acked = async_std::task::block_on(async {
+            worker
+                .replay_dirty_drafts(&mut session, drafts_mb, "Drafts", 100)
+                .await
+        })
+        .unwrap();
+
+        assert_eq!(acked, 2);
+        assert_eq!(session.appended_calls.len(), 2);
+        let guard = store.lock().unwrap();
+        let one = queries::get_draft(guard.conn(), "compose-1")
+            .unwrap()
+            .unwrap();
+        let two = queries::get_draft(guard.conn(), "compose-2")
+            .unwrap()
+            .unwrap();
+        assert_eq!(one.server_uid, Some(5));
+        assert_eq!(two.server_uid, Some(8));
+        assert!(!one.dirty && !two.dirty);
     }
 
     /// Three new messages → all appear as `new`.
