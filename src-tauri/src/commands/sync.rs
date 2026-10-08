@@ -1010,37 +1010,55 @@ pub async fn get_draft(
 /// Drafts folder is missing), the local row is already gone and the orphan
 /// is reaped by the next sweep's expunge-diff. Always succeeds once the
 /// local row is deleted — the UI confirms only when dirty content exists
-/// (UI-side rule).
+/// (UI-side rule). The tracked UID is epoch-gated like the save path
+/// (MJ-04): a UIDVALIDITY bump since the save skips the server leg instead
+/// of expunging a stranger's UID.
 #[tauri::command]
 pub async fn discard_draft(
     state: State<'_, crate::AppState>,
     id: String,
 ) -> Result<DiscardResult, String> {
     let store = state.store.clone();
-    let tracked: Option<(u64, u32)> = {
+    let (tracked, epoch): (Option<(u64, u32)>, Option<u32>) = {
         let guard = store.lock().unwrap();
         let conn = guard.conn();
         let row = queries::get_draft(conn, &id).map_err(|e| format!("store: {e}"))?;
         let tracked = row.and_then(|r| r.server_uid.map(|u| (r.mailbox_id, u)));
+        // MJ-04: capture the Drafts epoch alongside the tracked UID (same
+        // lock, same `get_sync_state` lookup `save_draft` uses). Cold cache
+        // → `None` (guard disabled, pre-guard behavior for that corner).
+        let epoch = find_drafts_wire_cached(conn)
+            .and_then(|wire| queries::get_sync_state(conn, &wire).ok().flatten())
+            .map(|(v, _)| v);
         queries::delete_draft(conn, &id).map_err(|e| format!("store: {e}"))?;
-        tracked
+        (tracked, epoch)
     };
     if let Some((_mailbox_id, uid)) = tracked {
         // Best-effort server cleanup — failures only log (T-12-05: scoped
-        // single-UID expunge, never a bare `expunge()`).
+        // single-UID expunge, never a bare `expunge()`). Cached wire first
+        // (no LIST round-trip for best-effort cleanup); LIST refresh only
+        // on a cold cache.
         let account_cfg: AccountConfig = load_account_config(state.clone()).await?;
         let manager = manager_for(&state, &account_cfg);
-        match resolve_drafts_wire(&manager, None).await {
-            Ok(wire) => {
-                if let Err(e) = manager.discard_server_copy_in(&wire, uid).await {
-                    eprintln!(
-                        "[SGE sync] discard_draft {id} uid {uid} server cleanup failed ({e}) — orphan reaped by sweep"
-                    );
-                }
+        let wire: Option<String> = {
+            let guard = store.lock().unwrap();
+            find_drafts_wire_cached(guard.conn())
+        };
+        let server_cleanup = |wire: &str| async {
+            if let Err(e) = manager.discard_server_copy_in(wire, uid, epoch).await {
+                eprintln!(
+                    "[SGE sync] discard_draft {id} uid {uid} server cleanup failed ({e}) — orphan reaped by sweep"
+                );
             }
-            Err(e) => eprintln!(
-                "[SGE sync] discard_draft {id}: no Drafts folder ({e}) — local row already gone"
-            ),
+        };
+        match wire {
+            Some(wire) => server_cleanup(&wire).await,
+            None => match resolve_drafts_wire(&manager, None).await {
+                Ok(wire) => server_cleanup(&wire).await,
+                Err(e) => eprintln!(
+                    "[SGE sync] discard_draft {id}: no Drafts folder ({e}) — local row already gone"
+                ),
+            },
         }
     }
     Ok(DiscardResult {

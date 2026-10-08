@@ -486,13 +486,25 @@ impl SessionManager {
     /// Expunge one tracked draft copy (discard path) under ONE held lease:
     /// mark `\Deleted` + scoped removal (UIDPLUS `UID EXPUNGE`, else the
     /// single-UID unmark dance — never a bare `expunge()`, T-12-05).
+    /// `expected_validity` is the store epoch read before the discard: when
+    /// the SELECT-time UIDVALIDITY differs, the tracked `uid` belongs to a
+    /// dead generation and the server leg is skipped (MJ-04 — the orphan is
+    /// reaped by the next sweep's expunge-diff, the already-documented
+    /// orphan posture). `None` disables the guard (epoch unknown).
     /// One reconnect-retry; [`SyncError::Refused`] never retried.
     pub async fn discard_server_copy_in(
         &self,
         drafts_wire: &str,
         uid: u32,
+        expected_validity: Option<u32>,
     ) -> Result<(), SyncError> {
         let mut lease = self.lease_for(drafts_wire).await?;
+        if uid_is_stale(expected_validity, lease.selected_validity()) {
+            eprintln!(
+                "[SGE imap] discard draft {drafts_wire} uid {uid}: UIDVALIDITY changed — tracked copy is stale, skipping server leg"
+            );
+            return Ok(());
+        }
         let caps = match lease.cached_capabilities() {
             Some(caps) => caps,
             None => lease.session().capabilities().await?,
@@ -507,6 +519,12 @@ impl SessionManager {
                 drop(lease);
                 self.reconnect().await?;
                 let mut lease = self.lease_for(drafts_wire).await?;
+                if uid_is_stale(expected_validity, lease.selected_validity()) {
+                    eprintln!(
+                        "[SGE imap] discard draft {drafts_wire} uid {uid}: UIDVALIDITY changed across reconnect — tracked copy is stale, skipping server leg"
+                    );
+                    return Ok(());
+                }
                 let caps = match lease.cached_capabilities() {
                     Some(caps) => caps,
                     None => lease.session().capabilities().await?,
@@ -656,6 +674,18 @@ pub async fn save_draft_on_session(
         }
     }
     Ok(new_uid)
+}
+
+/// True when a tracked UID belongs to a dead folder generation (MJ-04):
+/// both epochs known and disagree. `None` on either side disables the
+/// guard (fail-open would expunge a stranger's UID; fail-closed would skip
+/// legitimate cleanup — unknown means "proceed", matching pre-guard
+/// behavior, with the sweep as the orphan backstop).
+fn uid_is_stale(expected_validity: Option<u32>, selected_validity: Option<u32>) -> bool {
+    matches!(
+        (expected_validity, selected_validity),
+        (Some(expected), Some(actual)) if expected != actual
+    )
 }
 
 /// Mark + scoped-expunge of one tracked draft copy on an
@@ -1638,11 +1668,32 @@ mod tests {
             let fake = FakeHandle::new(&["IMAP4rev1", "UIDPLUS"], &[7]);
             let probe = fake.0.clone();
             let manager = SessionManager::for_test_session(Box::new(fake));
-            manager.discard_server_copy_in("Drafts", 7).await.unwrap();
+            manager
+                .discard_server_copy_in("Drafts", 7, None)
+                .await
+                .unwrap();
             let f = probe.lock().unwrap();
             assert!(f.deleted_calls.contains(&(7, true)));
             assert_eq!(f.expunged_sets, vec!["7".to_string()]);
             assert_eq!(f.plain_expunge_calls, 0, "never a bare expunge");
+        });
+    }
+
+    #[test]
+    fn discard_server_copy_skips_stale_uid_on_validity_bump() {
+        run(async {
+            // MJ-04: Fake SELECT reports validity 100; the store epoch says
+            // 99 — the tracked UID belongs to a dead generation.
+            let fake = FakeHandle::new(&["IMAP4rev1", "UIDPLUS"], &[7]);
+            let probe = fake.0.clone();
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            manager
+                .discard_server_copy_in("Drafts", 7, Some(99))
+                .await
+                .unwrap();
+            let f = probe.lock().unwrap();
+            assert!(f.deleted_calls.is_empty(), "stale UID never flagged");
+            assert!(f.expunged_sets.is_empty(), "stale UID never expunged");
         });
     }
 
