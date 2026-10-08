@@ -1040,17 +1040,22 @@ pub async fn discard_draft(
             let guard = store.lock().unwrap();
             find_drafts_wire_cached(guard.conn())
         };
-        let server_cleanup = |wire: &str| async {
-            if let Err(e) = manager.discard_server_copy_in(wire, uid, epoch).await {
-                eprintln!(
-                    "[SGE sync] discard_draft {id} uid {uid} server cleanup failed ({e}) — orphan reaped by sweep"
-                );
-            }
-        };
         match wire {
-            Some(wire) => server_cleanup(&wire).await,
+            Some(wire) => {
+                if let Err(e) = manager.discard_server_copy_in(&wire, uid, epoch).await {
+                    eprintln!(
+                        "[SGE sync] discard_draft {id} uid {uid} server cleanup failed ({e}) — orphan reaped by sweep"
+                    );
+                }
+            }
             None => match resolve_drafts_wire(&manager, None).await {
-                Ok(wire) => server_cleanup(&wire).await,
+                Ok(wire) => {
+                    if let Err(e) = manager.discard_server_copy_in(&wire, uid, epoch).await {
+                        eprintln!(
+                            "[SGE sync] discard_draft {id} uid {uid} server cleanup failed ({e}) — orphan reaped by sweep"
+                        );
+                    }
+                }
                 Err(e) => eprintln!(
                     "[SGE sync] discard_draft {id}: no Drafts folder ({e}) — local row already gone"
                 ),
