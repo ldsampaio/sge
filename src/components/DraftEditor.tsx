@@ -1,7 +1,14 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { DiscardResult, DraftRow, DraftSaveResult, FolderTreeResult } from "../types";
 import "./MailboxView.css";
+
+/**
+ * Autosave cadence (Phase 12 CONTEXT): owned by the open editor like the
+ * SyncStatus poll timer — dirty-gated, in-flight-guarded, one interval per
+ * open editor, cleared on unmount/editor-switch.
+ */
+export const DRAFT_AUTOSAVE_INTERVAL_MS = 30_000;
 
 export interface DraftEditorProps {
   /** Compose-session id, or null for a brand-new draft (uuid minted on first save). */
@@ -99,6 +106,9 @@ export default function DraftEditor({
     bcc !== savedRef.current.bcc ||
     subject !== savedRef.current.subject ||
     body !== savedRef.current.body;
+  /** Live mirror so the autosave tick always sees current fields (no stale closure). */
+  const liveRef = useRef({ to, cc, bcc, subject, body, dirty });
+  liveRef.current = { to, cc, bcc, subject, body, dirty };
   const hasContent =
     dirty ||
     to.trim() !== "" ||
@@ -113,6 +123,10 @@ export default function DraftEditor({
     inFlightRef.current = true;
     setPhase("saving");
     setErrorMsg("");
+    // Read through the live mirror: manual saves and autosave ticks share
+    // this exact path, so a tick can never persist a stale keystroke.
+    const { to: liveTo, cc: liveCc, bcc: liveBcc, subject: liveSubject, body: liveBody } =
+      liveRef.current;
     try {
       if (sessionIdRef.current === null) {
         sessionIdRef.current = newComposeId();
@@ -120,13 +134,19 @@ export default function DraftEditor({
       const id = sessionIdRef.current;
       const result = await invoke<DraftSaveResult>("save_draft", {
         id,
-        subject,
-        body,
-        to,
-        cc,
-        bcc,
+        subject: liveSubject,
+        body: liveBody,
+        to: liveTo,
+        cc: liveCc,
+        bcc: liveBcc,
       });
-      savedRef.current = { to, cc, bcc, subject, body };
+      savedRef.current = {
+        to: liveTo,
+        cc: liveCc,
+        bcc: liveBcc,
+        subject: liveSubject,
+        body: liveBody,
+      };
       everSavedRef.current = true;
       retriedRef.current = false;
       setLastAcked(result.acked);
@@ -214,6 +234,23 @@ export default function DraftEditor({
       setDiscardPending(false);
     }
   }
+
+  // Dirty-only autosave tick (Task 3): clean ticks issue zero invokes;
+  // dirty ticks run the same save path as the button. Single interval per
+  // open editor (remount-per-session via parent key), cleared on unmount.
+  // `doSave` reads the live mirror, so the mount-once closure never goes
+  // stale; the in-flight guard blocks overlapping invokes (T-12-07).
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (liveRef.current.dirty && !inFlightRef.current) {
+        void doSave();
+      }
+    }, DRAFT_AUTOSAVE_INTERVAL_MS);
+    return () => {
+      window.clearInterval(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Indicator copy follows the SyncStatus tone (CONTEXT agent's discretion).
   const indicator =
