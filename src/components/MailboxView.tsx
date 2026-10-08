@@ -61,14 +61,26 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
   const [deleteError, setDeleteError] = useState<string | null>(null);
   // DRAFT-01: open draft editor state. Null = reader mode; non-null renders
   // DraftEditor in the reading pane with the compose session (null id = new).
+  // `key` is a stable per-open session key (MJ-01/MJ-02): the editor remounts
+  // exactly when a *different* draft opens — never on the first save of a
+  // new draft (key flip "new"→uuid blanked the form) and always when two
+  // non-session server rows open back-to-back (shared "new" key showed
+  // stale content).
   const [draftEditor, setDraftEditor] = useState<{
     draftId: string | null;
     initial?: DraftRow | null;
+    key: string;
   } | null>(null);
   const [draftLoading, setDraftLoading] = useState(false);
   const [draftNotice, setDraftNotice] = useState<string | null>(null);
   /** Server UIDs saved by this session → compose-session ids (row→session map). */
   const sessionDraftsRef = useRef<Map<number, string>>(new Map());
+  /** Monotonic mint for per-open editor session keys (MJ-01/MJ-02). */
+  const draftSessionRef = useRef(0);
+  function nextDraftKey(): string {
+    draftSessionRef.current += 1;
+    return `draft-open-${draftSessionRef.current}`;
+  }
 
   // FOLD-01: fetch mailbox list from the local store on mount.
   useEffect(() => {
@@ -112,7 +124,7 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
       setDraftLoading(true);
       try {
         const row = await invoke<DraftRow>("get_draft", { id: knownId });
-        setDraftEditor({ draftId: row.id, initial: row });
+        setDraftEditor({ draftId: row.id, initial: row, key: nextDraftKey() });
       } catch (e) {
         setDraftNotice(invokeErrorCopy(e));
       } finally {
@@ -137,7 +149,7 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
         attachments: "",
         updated_at: "",
       };
-      setDraftEditor({ draftId: null, initial: seed });
+      setDraftEditor({ draftId: null, initial: seed, key: nextDraftKey() });
     } catch (e) {
       setDraftNotice(invokeErrorCopy(e));
     } finally {
@@ -145,7 +157,10 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
     }
   }
 
-  /** A save lands in the list via the existing refresh path (no full sync). */
+  /** A save lands in the list via the existing refresh path (no full sync).
+   * The per-open `key` is preserved (MJ-01): the first save of a new draft
+   * must NOT remount the editor — field state lives in the mounted
+   * instance and a key flip would reseed it from the stale `initial`. */
   function handleDraftSaved(result: DraftSaveResult) {
     if (result.server_uid !== null && result.server_uid !== undefined) {
       sessionDraftsRef.current.set(result.server_uid, result.id);
@@ -370,7 +385,7 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
               onClick={() => {
                 setSelectedMessage(null);
                 setDraftNotice(null);
-                setDraftEditor({ draftId: null });
+                setDraftEditor({ draftId: null, key: nextDraftKey() });
               }}
               aria-label="Novo rascunho"
             >
@@ -450,8 +465,8 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
 
 /**
  * Right-pane slot for draft editing: a loading placeholder while the seed
- * loads, then the editor keyed by compose session so switching drafts
- * remounts cleanly.
+ * loads, then the editor keyed by the per-open session key so switching
+ * drafts remounts cleanly (MJ-01/MJ-02 — never by post-save id).
  */
 function DraftEditorPane({
   draftEditor,
@@ -460,7 +475,7 @@ function DraftEditorPane({
   onDiscarded,
   onClose,
 }: {
-  draftEditor: { draftId: string | null; initial?: DraftRow | null } | null;
+  draftEditor: { draftId: string | null; initial?: DraftRow | null; key: string } | null;
   loading: boolean;
   onSaved: (result: DraftSaveResult) => void;
   onDiscarded: (id: string) => void;
@@ -477,7 +492,7 @@ function DraftEditorPane({
   }
   return (
     <DraftEditor
-      key={draftEditor.draftId ?? "new"}
+      key={draftEditor.key}
       draftId={draftEditor.draftId}
       initial={draftEditor.initial}
       onSaved={onSaved}
