@@ -981,12 +981,8 @@ pub async fn get_draft(
                 addr_list(parsed.cc()),
                 addr_list(parsed.bcc()),
             );
-            let from = parsed
-                .from()
-                .and_then(|a| a.first())
-                .and_then(|e| e.address().map(|s| s.to_string()))
-                .unwrap_or_default();
-            let _ = from;
+            // No From column by design (Phase 13 owns the sender identity):
+            // the sender address is intentionally not extracted here.
             let guard = store.lock().unwrap();
             let conn = guard.conn();
             let mb = queries::ensure_mailbox(conn, &wire)
