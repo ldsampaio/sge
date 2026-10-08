@@ -209,6 +209,13 @@ pub fn compute_next_retry_at(post_attempts: u32, now: &chrono::DateTime<Utc>) ->
 }
 
 /// Caller-supplied mail for one enqueue.
+///
+/// Frozen command contract (Plan 13-03 exposes verbatim): `queue_send`
+/// takes `{from, to[], cc[], bcc[], subject, body, draft_id?}` — exactly
+/// these fields — and returns `{queue_id, message_id, state, pending_count}`.
+/// Error strings keep their prefixes verbatim: `send-too-large`,
+/// `send-no-recipient`, `send-missing` (unknown `draft_id` at enqueue),
+/// matching the `drafts-missing` precedent from Phase 12.
 #[derive(Debug, Clone)]
 pub struct EnqueueInput {
     pub from: String,
@@ -225,6 +232,11 @@ pub struct EnqueueInput {
 
 /// Enqueue result. `deduped` is true when the Message-ID was already queued
 /// (double-invoke — no second row, no second `.eml` write).
+///
+/// Frozen command contract: `queue_send` returns `{queue_id, message_id,
+/// state, pending_count}` — the command layer builds `pending_count` from
+/// [`send_status_snapshot`] (`.pending_count`); `deduped` stays internal
+/// (the double-click case is indistinguishable from success by design).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EnqueueOutcome {
     pub queue_id: String,
@@ -405,6 +417,11 @@ pub fn mark_send_failed(conn: &Connection, id: &str, last_error: &str) -> StoreR
 /// Manual retry: `failed` → `queued` with a cleared schedule (due
 /// immediately). Any other state is a no-op `false` — retry never yanks a
 /// row out of `sending`/`uncertain` (those have a verdict or an owner).
+///
+/// Frozen command contract: `retry_send({queue_id})` returns `{queue_id,
+/// state}` and only transitions `failed` → `queued`; unknown `queue_id`
+/// surfaces `send-missing: unknown send '<id>' — it may already be sent`
+/// (never a raw SQL error).
 pub fn requeue_failed(conn: &Connection, id: &str) -> StoreResult<bool> {
     let row = queries::get_send_row(conn, id)?;
     match row {
@@ -423,6 +440,38 @@ pub fn requeue_failed(conn: &Connection, id: &str) -> StoreResult<bool> {
 /// Phase 10 outbox). Returns the flipped count for the launch log.
 pub fn crash_recover(conn: &Connection) -> StoreResult<usize> {
     queries::reset_sending_to_queued(conn)
+}
+
+/// Outbox status snapshot for the badge + failed-retry surface.
+///
+/// Frozen command contract: `send_status()` returns `{queued, sending,
+/// failed, uncertain, sent_unfiled, pending_count}` verbatim — this struct
+/// serializes to exactly that shape. `sent_unfiled` (SMTP succeeded but the
+/// Sent APPEND did not) is filled by Plan 13-02, which owns the APPEND leg;
+/// until then it reads 0. `pending_count` (`queued + sending`) is the badge
+/// number and the `queue_send` fourth field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SendStatusSnapshot {
+    pub queued: i64,
+    pub sending: i64,
+    pub failed: i64,
+    pub uncertain: i64,
+    pub sent_unfiled: i64,
+    pub pending_count: i64,
+}
+
+/// Read the current outbox depths in one scan (no network, no clock).
+pub fn send_status_snapshot(conn: &Connection) -> StoreResult<SendStatusSnapshot> {
+    let c = queries::send_state_counts(conn)?;
+    Ok(SendStatusSnapshot {
+        queued: c.queued,
+        sending: c.sending,
+        failed: c.failed,
+        uncertain: c.uncertain,
+        // Plan 13-02 scope (APPEND leg): no writer exists yet, always 0.
+        sent_unfiled: 0,
+        pending_count: c.pending(),
+    })
 }
 
 #[cfg(test)]
@@ -805,5 +854,37 @@ mod tests {
             .into_iter()
             .filter(|r| r.id == id)
             .collect()
+    }
+
+    #[test]
+    fn status_snapshot_reports_frozen_shape() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let app_data = test_dir("status");
+        let a = enqueue_send(conn, &app_data, input("a@example.com")).unwrap();
+        let b = enqueue_send(conn, &app_data, input("b@example.com")).unwrap();
+        mark_send_failed(conn, &b.queue_id, "refused").unwrap();
+
+        let snap = send_status_snapshot(conn).unwrap();
+        assert_eq!(snap.queued, 1);
+        assert_eq!(snap.sending, 0);
+        assert_eq!(snap.failed, 1);
+        assert_eq!(snap.uncertain, 0);
+        assert_eq!(snap.sent_unfiled, 0, "Plan 13-02 fills this");
+        assert_eq!(snap.pending_count, 1);
+        // Serializes to exactly the frozen send_status() keys.
+        let json = serde_json::to_value(&snap).unwrap();
+        for key in [
+            "queued",
+            "sending",
+            "failed",
+            "uncertain",
+            "sent_unfiled",
+            "pending_count",
+        ] {
+            assert!(json.get(key).is_some(), "missing key {key}");
+        }
+        let _ = a;
+        std::fs::remove_dir_all(&app_data).ok();
     }
 }
