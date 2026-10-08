@@ -31,7 +31,7 @@ Decimal phases appear between their surrounding integers in numeric order. v1.2 
 
 - [x] **Phase 10: Delete + Move** - Trash-semantics delete, permanent expunge, and move between folders with offline queue
 - [x] **Phase 11: Folder CRUD** - Create, rename, and delete folders via IMAP with sidebar tree (completed 2026-10-06)
-- [ ] **Phase 12: Drafts** - Local-first draft editing synced to the server via APPEND
+- [x] **Phase 12: Drafts** - Local-first draft editing synced to the server via APPEND (completed 2026-10-08)
 - [ ] **Phase 13: Send Pipeline** - Durable SMTP send queue with retry and Sent filing
 - [ ] **Phase 14: Compose UI** - Compose, reply/forward, and attachments over the proven pipelines
 
@@ -135,6 +135,6 @@ Phases execute in numeric order: 10 → 11 → 12 → 13 → 14
 | 9. UID Backfill | v1.1 | 1/1 | Complete | 2026-10-05 |
 | 10. Delete + Move | v1.2 | 4/4 | Complete | 2026-10-06 |
 | 11. Folder CRUD | v1.2 | 3/3 | Complete    | 2026-10-06 |
-| 12. Drafts | v1.2 | 0/TBD | Not started | - |
+| 12. Drafts | v1.2 | 3/3 | Complete | 2026-10-08 |
 | 13. Send Pipeline | v1.2 | 0/TBD | Not started | - |
 | 14. Compose UI | v1.2 | 0/TBD | Not started | - |
