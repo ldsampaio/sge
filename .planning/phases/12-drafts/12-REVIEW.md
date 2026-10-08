@@ -23,6 +23,9 @@ findings:
   minor: 6
   total: 11
 status: issues_found
+fix_status: all_fixed
+fixed_at: 2026-10-08T00:00:00Z
+fix_commits: 9
 ---
 
 # Phase 12 (Drafts): Code Review Report
@@ -254,3 +257,27 @@ call through it, or include `doSave` in deps with proper memoization.
 _Reviewed: 2026-10-08_
 _Reviewer: the agent (gsd-code-reviewer)_
 _Depth: standard_
+
+---
+
+## Fix notes (2026-10-08 — all 11 findings fixed, 0 deferred)
+
+**Verification:** `cargo test -p sge` → 226 passed, 0 failed, 1 ignored
+(run with `~/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo`;
+note: system `/usr/bin/cargo` rustc is broken — `librustc_driver` symbol
+lookup error — so the rustup stable 1.99.0 toolchain was used).
+`npx tsc --noEmit` → clean, no errors.
+
+| Finding | Disposition | Commit |
+|---------|-------------|--------|
+| CR-01 offline save gated on LIST | fixed: wire resolves from cached tree first (`find_drafts_wire_cached`: role column + known-name fallback); LIST refresh only on cold cache; frozen `drafts-missing:` prefix kept | `d6f10f7` |
+| MJ-01 blank after first save | fixed (with MJ-02, one change): per-open `key` minted at every editor open; pane keys by it, so saves never remount | `fc32e74` |
+| MJ-02 stale content across server drafts | fixed (same change): consecutive seeded opens mint distinct keys → clean remount with fresh `initial` | `fc32e74` |
+| MJ-03 retry re-APPENDs | fixed: retry SEARCHes first (`search_draft_uid`); hit ≠ `old_uid` resumes at expunge-old (`expunge_old_only`, with same UIDVALIDITY drop + no-self-expunge); else full retry. 2 new tests | `bd754c7` |
+| MJ-04 discard without epoch guard | fixed: `discard_draft` captures epoch pre-delete; `discard_server_copy_in(wire, uid, expected_validity)` skips stale server leg (incl. across reconnect). 1 new test; existing test updated. Follow-up: async-closure → inline blocks (lifetime) | `d2ad356` + `13819d8` |
+| MN-01 unquoted SEARCH value | fixed: `HEADER {field} "{value}"` | `23651d7` |
+| MN-02 `new_message_id` sanitization | fixed: allow `[A-Za-z0-9_.-]`, cap 128; empty → deterministic `<rejected-<hash>@sge.local>`. 2 new tests | `68fca05` |
+| MN-03 dead `let from` | fixed: extraction deleted, intent documented (no From column by design) | `c9d248f` |
+| MN-04 lossy fresh-seed resume | fixed (targeted variant): partial-content notice only when loss is detectable (HTML-only body or attachments); Cc/Bcc gap unknowable from `MessageView`, deferred to Phase 14 contract extension | `44d9773` |
+| MN-05 pristine-empty Save | fixed: `Guardar` disabled while `!dirty && !everSavedRef` (+ tooltip) | `8b40a52` |
+| MN-06 autosave stale closure | fixed (same commit): `onSaved` mirrored in `onSavedRef`, called through it | `8b40a52` |
