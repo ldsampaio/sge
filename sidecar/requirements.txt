@@ -1,0 +1,7 @@
+# Phase 15 pin record: the entire Python sidecar closure is THREE lines.
+# Everything else (torch CPU, uvicorn, tokenizers) resolves from laya's own
+# `serve` extra. CPU-only torch comes from the `--extra-index-url` in
+# build-sidecar.sh — never the CUDA default (single biggest size lever).
+laya[serve]==0.4.2
+pyinstaller~=6.0
+huggingface_hub>=0.23

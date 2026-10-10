@@ -1,568 +1,614 @@
-# ARCHITECTURE — v1.2 Compose & Organize (SMTP Send + IMAP CRUD)
+# Architecture Research: Laya Auto-Classify Integration (v1.3)
 
-> Research doc for the subsequent milestone. Answers: how SMTP send queue +
-> IMAP CREATE/DELETE/RENAME/EXPUNGE/MOVE integrate with the existing
-> single-session + outbox + sync architecture. New components vs modified,
-> data-flow changes, send-queue durability design, suggested build order.
->
-> Source of truth for existing behavior: repo at research time
-> (`src-tauri/src/imap/manager.rs`, `imap/mod.rs`, `imap/session.rs`,
-> `sync/worker.rs`, `sync/mod.rs`, `store/{mod,queries}.rs`,
-> `store/schema.sql`, `commands/sync.rs`, `lib.rs`, `Cargo.toml`).
-> PROJECT.md context: stack Rust + Tauri v2 + React + SQLite fixed;
-> servers `mail.utfpr.edu.br:993/SSL` + `smtp.utfpr.edu.br:587/STARTTLS`;
-> out-of-scope items from M1 (send, non-INBOX folders) are now the v1.2 Active set.
+**Domain:** On-device email classification inside an existing IMAP desktop client
+**Researched:** 2026-10-10
+**Confidence:** HIGH (existing SGE architecture — direct repo read); MEDIUM (Laya sidecar contract — official skill docs + docs.rs, verified against installed `laya 0.3.20`; Tauri sidecar mechanics — official Tauri v2 docs, cross-verified)
 
----
+## Standard Architecture
 
-## 1. Existing architecture (baseline, what we must not break)
+### System Overview
 
-### 1.1 Single-session ownership — `imap/manager.rs`
+v1.3 adds one new lane to the existing system. Nothing in the current
+lanes changes shape — the classifier **consumes** the Phase 10/11
+machinery (MOVE, CREATE) and the sync/store substrate, it does not
+rebuild any of it.
 
-- `SessionManager` owns **one** authenticated `BoxedSession` per account
-  (`account_key = host:port:username`; command layer caches one manager per
-  account in `AppState::session_manager`, replaces on account change).
-- Access is via **mailbox-scoped leases**: `lease_for(mailbox)` connects
-  lazily, (re-)SELECTs when fresh or folder changed, and holds the state
-  mutex for the lease lifetime → **single-flight serialization** of all IMAP
-  writes. At most one lease exists at a time.
-- Write path pattern (canonical — `set_seen_in`): lease → attempt →
-  on failure `reconnect()` + fresh lease + **retry exactly once**.
-- Read helpers that don't disturb SELECT: `list_mailboxes()` (LIST),
-  `mailbox_status()` (STATUS on any folder). Note both currently lease
-  INBOX first (`lease_for("INBOX")`) — STATUS works on any mailbox so the
-  SELECT is just a session-warmup.
-- Password discipline: `AccountConfig` Debug redacts; no log formats secrets.
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                          React UI (new surfaces)                  │
+│  ┌──────────────┐ ┌──────────────┐ ┌────────────┐ ┌────────────┐ │
+│  │ Suggestion   │ │ Taxonomy     │ │ Override   │ │ Batch      │ │
+│  │ chip +       │ │ editor +     │ │ (re-move + │ │ progress + │ │
+│  │ Confirm btn  │ │ JSON import  │ │ record)    │ │ report     │ │
+│  └──────┬───────┘ └──────┬───────┘ └─────┬──────┘ └─────┬──────┘ │
+└─────────┼────────────────┼───────────────┼──────────────┼────────┘
+          │ Tauri IPC (new commands, existing Channel event pattern)
+┌─────────┼────────────────┼───────────────┼──────────────┼────────┐
+│         ▼                ▼               ▼              ▼       │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │              NEW: classify/ module (Rust)                 │  │
+│  │  taxonomy.rs (load/validate) │ bridge.rs (sidecar HTTP)  │  │
+│  │  worker.rs (queue + ClassifyGate) │ suggest.rs (shape)   │  │
+│  └──────┬───────────────┬───────────────────────┬───────────┘  │
+│         │               │                       │              │
+│  ┌──────▼──────┐ ┌──────▼────────┐ ┌────────────▼──────────┐   │
+│  │  MODIFIED:  │ │ NEW: sidecar  │ │ MODIFIED: existing    │   │
+│  │  store/     │ │ laya serve    │ │ imap/manager +        │   │
+│  │  (M12:      │ │ 127.0.0.1     │ │ sync/worker (post-    │   │
+│  │  taxonomy + │ │ loopback HTTP │ │ sync hook, MOVE +     │   │
+│  │  labels)    │ │ multilingual  │ │ CREATE reuse)         │   │
+│  └─────────────┘ └───────────────┘ └───────────────────────┘   │
+└──────────────────────────────────────────────────────────────────┘
+```
 
-### 1.2 Transport trait — `imap/mod.rs` (`SyncSession`)
+### Component Responsibilities
 
-Object-safe trait, real impl on `BoxedSession` (async-imap 0.11), `MockSession`
-in tests. Current verbs:
+| Component | Responsibility | Typical Implementation |
+|-----------|----------------|------------------------|
+| Laya sidecar | Typed `choice`/`noul` answers over email state; zero text generation | `laya[serve]` (or `laya-rs2`) HTTP server on `127.0.0.1`, spawned via Tauri `externalBin` + `shell().sidecar().spawn()` |
+| `classify/bridge.rs` (NEW) | Loopback HTTP client: `POST /predict`, health probe, timeout/retry | `reqwest` (check fit) or `std::net` minimal client; single-flight requests (Laya serves one forward pass at a time) |
+| `classify/taxonomy.rs` (NEW) | Load/validate taxonomy JSON (5 top + children + fallback + rules), version it | `serde_json` + JSON-schema-ish validation in Rust; default UTFPR taxonomy as bundled `resources/` file |
+| `classify/worker.rs` (NEW) | Background classification queue drained under `ClassifyGate`; never blocks sync | `tauri::async_runtime::spawn` loop, same `try_begin`/skip shape as `SyncGate` |
+| `classify/suggest.rs` (NEW) | Shape sidecar answers into suggestions (primary + runner-up secondary + confidence + sensitive flag) | Pure function: Laya JSON → `Suggestion` struct; confidence gate → `A Classificar` |
+| Store M12 (MODIFIED) | `taxonomy` (versioned), `labels` (primary+secondary per message), `label_overrides`, `classify_queue`/`batch_runs` | Forward-only migration, all SQL in `queries.rs` (single-SQL-module invariant) |
+| SessionManager (MODIFIED, additive) | `ensure_auto_tree()` (CREATE missing `Auto/*` paths) + reuse of `move_message_in` | Same lease → attempt → reconnect-retry-once template; no new verbs needed |
+| sync/worker (MODIFIED, hook only) | After a pass commits new UIDs, enqueue classify jobs (fire-and-forget) | 3–5 line hook at pass end; sync never awaits classification |
+| Commands (MODIFIED `commands/sync.rs` or NEW `commands/classify.rs`) | `classify_message`, `confirm_suggestion` (= MOVE), `override_label`, `batch_classify`, `import_taxonomy` | Copy the `set_seen` optimistic+durable template |
 
-| Verb | Method | Notes |
-|---|---|---|
-| SELECT | `select_mailbox` / `select_inbox` | per-folder, returns UIDVALIDITY/UIDNEXT/exists |
-| SEARCH | `search_uids` | `UID SEARCH ALL` |
-| FETCH headers | `fetch_envelopes(range)` | 200-UID batches, `HEADERS::FETCH_ATTRS` |
-| FETCH body | `fetch_body(uid)` | **`BODY.PEEK[]` only — never sets \Seen** |
-| STORE Seen | `set_seen(uid, seen)` | UID-only, `±FLAGS.SILENT (\Seen)`; **the single write verb** |
-| LIST | `list_mailboxes` | FOLD-01 discovery |
-| STATUS | `mailbox_status` | FOLD-02 triage (UIDVALIDITY/UIDNEXT/UNSEEN) |
-| LOGOUT | `logout` | |
+## Recommended Project Structure
 
-Explicitly **never exposed**: EXPUNGE, APPEND, CREATE/RENAME/DELETE, MOVE/COPY
-(doc comment in `mod.rs` § SyncSession). v1.2 lifts exactly this ban.
+```
+src-tauri/
+├── binaries/                       # NEW: laya-sidecar-<target-triple> (externalBin)
+│   └── laya-sidecar-x86_64-unknown-linux-gnu
+├── resources/                      # NEW: default taxonomy (bundle resources)
+│   └── taxonomy-utfpr-ptbr.json
+├── src/
+│   ├── classify/                   # NEW module
+│   │   ├── mod.rs                  #   public surface: ClassifyError, Suggestion, ClassifyHandle
+│   │   ├── taxonomy.rs             #   load/validate/version taxonomy JSON
+│   │   ├── bridge.rs               #   sidecar lifecycle + POST /predict client
+│   │   ├── worker.rs               #   queue drain + ClassifyGate + batch runner
+│   │   └── suggest.rs              #   answer shaping, confidence gate, sensitive rule
+│   ├── commands/
+│   │   └── classify.rs             # NEW (or fold into sync.rs): 5 commands below
+│   ├── imap/manager.rs             # MODIFIED: +ensure_auto_tree (additive)
+│   ├── sync/worker.rs              # MODIFIED: +post-pass enqueue hook (additive)
+│   ├── store/                      # MODIFIED: M12 migration + queries
+│   ├── lib.rs                      # MODIFIED: AppState +classification state, setup() spawns sidecar
+│   └── capabilities/default.json   # MODIFIED: shell:allow-spawn for the sidecar
+src/
+├── components/
+│   ├── ClassifyChip.tsx            # NEW: suggestion + Confirm / Correct
+│   ├── TaxonomyEditor.tsx          # NEW: categories/keywords/rules + JSON import
+│   └── BatchProgress.tsx           # NEW: batch progress + report
+```
 
-Parser landmine (must respect): imap-proto 0.16 **cannot parse NAMESPACE**
-— any unparseable response permanently poisons the session read side.
-Tripwire test `namespace_response_is_unparseable`. New verbs must add
-same-style replay/mock coverage, and any new response type (e.g. APPENDUID,
-MOVE extended responses) must be verified parseable or handled via
-`run_command`-style raw paths that don't depend on the typed parser.
+### Structure Rationale
 
-### 1.3 Sync engine — `sync/worker.rs` + `sync/mod.rs`
+- **`classify/` mirrors `smtp/` and `imap/`:** one module per transport-ish
+  boundary. The sidecar is a third transport (loopback HTTP) next to IMAP
+  and SMTP — giving it its own module keeps the failure domains obvious
+  (sidecar down ≠ mail down).
+- **Commands in their own file:** `commands/sync.rs` already holds ~2000+
+  lines (sync + organize + drafts + send). A new `commands/classify.rs`
+  avoids further growth; registration in `lib.rs invoke_handler` is one line.
+- **Taxonomy as data, not code:** categories/keywords/rules ship as a
+  versioned JSON resource so the UI editor and the JSON import share one
+  format, and future taxonomy updates don't need a recompile.
 
-- `SyncWorker` holds `Arc<Mutex<Store>>`; session injected per call
-  (`sync_with_session(Box<dyn SyncSession>, mailbox_name, cb)`). 7-step pass:
-  1. ensure mailbox row + read sync state → 2. SELECT (+2b STATUS triage,
-  graceful) → 3. UIDVALIDITY guard (wipe + drop outbox on bump) →
-  4. `SEARCH ALL` + inconsistency guard (EXISTS>0 but empty SEARCH = hard
-  error, never wipe) + empty-mailbox shortcut → 5. header sweep in
-  200-UID batches with in-pass range-diff re-fetch + strike counting →
-  6. expunge diff (`delete_missing_uids` vs live∪tombstoned) →
-  7. write sync state + **post-sync outbox replay** + logout.
-- `replay_outbox` (RFC 4549): epoch check first (any op with stale
-  `uid_validity` → drop whole mailbox queue, zero STOREs); absent-UID drop
-  per op when `live_uids` known; per-op failure → `attempts`+`last_error`,
-  stays queued; store lock held only for brief sync sections, never across
-  awaits. Replay failure never fails the sync.
-- `pending_uids` gate ("pending-wins", FLAG-02): sweep upserts must not
-  clobber local optimistic flags for queued UIDs.
-- Convergence (Phase 9): skip sweep when server UID set == local, no epoch
-  bump, no pending ops; full sweep every `FULL_SWEEP_EVERY=5`; tombstones
-  after `TOMBSTONE_STRIKES=3` empty FETCHes; `sweeps_since_full` counter.
-- `SyncGate` single-flight (Phase 8): one pass at a time; late ticks skip.
-  Poll timer lives in the **UI layer**, backend only exposes the gate.
-  Cooperative cancel flag checked between batches.
-- `MockSession` is the test seam: deterministic envelopes, call counts,
-  `set_seen_calls`, gap/tombstone injection. Every new verb needs mock arms.
+## Architectural Patterns
 
-### 1.4 Store — `store/{mod.rs,queries.rs,schema.sql}`
+### Pattern 1: Laya sidecar over loopback HTTP (bundled, offline)
 
-- SQLite WAL, `rusqlite_migration`, `SCHEMA_VERSION = 6`
-  (v1 baseline + M2 flag_outbox + M3 unseen_count + M4 fetch_tombstones +
-  sweeps_since_full + M5 status_synced_at + M6 delimiter).
-- **Single-SQL-module invariant**: all SQL in `queries.rs`, no raw SQL
-  elsewhere. Tables: `mailboxes` (sync state folded in, one row/folder),
-  `messages` keyed `(mailbox_id, uid)`, `message_bodies` (sanitized only),
-  `attachment_parts` (metadata only, bytes on disk), `messages_fts` + 2 triggers.
-- `flag_outbox(mailbox_id, uid, seen, uid_validity, attempts, last_error,
-  UNIQUE(mailbox_id,uid))` — latest-wins collapse; helpers
-  `enqueue/list/pending/delete/drop/record_error/count`.
-- Lock discipline: `Arc<Mutex<Store>>`; **sync Store mutex never crosses
-  `.await`** (brief sync sections only). Async manager mutex *may* cross await.
-- `BODY_CACHE_CAP_BYTES = 256 KiB`; attachments under
-  `<app_data>/attachments/<uid_validity>/<uid>/`.
+**What:** Laya runs as a child process of the Tauri app (Tauri `externalBin`
+sidecar, `src-tauri/binaries/laya-sidecar-<triple>`), exposing `POST
+/predict` on `127.0.0.1`. The Rust backend is an HTTP client; the React
+frontend never talks to Laya directly. Spawned in `setup()`, killed on
+app exit (Tauri tracks sidecars; no orphan processes).
 
-### 1.5 Commands layer — `commands/sync.rs` + `lib.rs`
+**When to use:** This is the mandated shape — PROJECT.md pins "bundled
+offline sidecar", and the Laya integration skill prescribes exactly this
+for non-Python hosts ("Anything else: run Laya as a small local HTTP
+sidecar, bind 127.0.0.1"). Native-Rust inference crates (`laya-candle`,
+`laya-rs`) exist but are the wrong call here: CPU-only inference is
+~1 s+/prediction vs ~20–60 ms via the tuned sidecar, and they would add
+candle + weights (~400 MB) into the main binary's build graph.
 
-- `start_sync(mailbox, Channel<SyncEvent>)`: loads account (in-memory
-  `active_account` first, keyring fallback) → `SyncGate::try_begin` →
-  **`connect_sync` fresh session per pass** (does NOT use SessionManager) →
-  worker → progress events. ⚠️ architectural wrinkle for v1.2 (see §3.4).
-- `set_seen(uid, seen, mailbox?)`: the optimistic+durable template v1.2 must
-  copy — (1) local write + enqueue under one store lock, (2) immediate UID
-  STORE via manager lease, ack deletes op / failure records error, (3) drain
-  rest of queue opportunistically on open session; returns
-  `{acked, pending_count, detail}`.
-- `fetch_message` / `save_attachment`: direct `connect_sync` + SELECT +
-  `BODY.PEEK[]`, parse with mail-parser, sanitize (ammonia), cache
-  (bounded). Read-only invariant: never set \Seen.
-- `list_mailboxes`: LIST via manager → per-folder STATUS → cache
-  (`set_mailbox_status` + `ensure_mailbox` + `set_mailbox_delimiter`) →
-  serve cached rows; **offline fallback** serves cache when LIST fails.
-- `AppState`: `store`, `active_account` (memory-only), `session_manager`
-  cache, `sync_gate`, `sync_cancel`.
+**Trade-offs:** + offline (no mail leaves the machine — satisfies the
+security constraint); + typed answers, never generated text (the
+sensitive-data rule is structurally easier: there are no justifications
+to leak passwords into); + checkpoint preload once at startup (~25–35 s
+cold — must happen in background, see Pitfall 1); − new runtime dep to
+bundle (`tauri-plugin-shell` not yet in `Cargo.toml`; `externalBin`
+triple-suffixed binary; new capability entries); − first cold
+prediction after idle may stall on checkpoint reload (mitigate: preload
+`multilingual` at sidecar start, keep warm with the sync hook's steady
+traffic).
 
----
-
-## 2. v1.2 feature → integration-point map
-
-| # | v1.2 requirement (PROJECT.md Active) | IMAP verbs | SMTP | Integration points |
-|---|---|---|---|---|
-| 1 | Delete messages (expunge) | `UID STORE +FLAGS (\Deleted)` + `EXPUNGE` (or `UID EXPUNGE`) | — | SyncSession + manager + outbox (new op kind) + sync expunge-diff + UI |
-| 2 | Move between folders | `UID COPY` + `STORE \Deleted` + `EXPUNGE`, or `MOVE` (RFC 6851, if advertised) | — | Same as (1) + two-mailbox store bookkeeping + UIDVALIDITY epochs per folder |
-| 3 | Save/edit drafts | `APPEND` to Drafts (+ `STORE \Draft` / replace by delete+append) | — | SyncSession APPEND + local drafts table or flag + sync pickup |
-| 4 | Folders CREATE/RENAME/DELETE | `CREATE` / `RENAME` / `DELETE` (+ LIST refresh) | — | SyncSession + manager + `mailboxes` rows + tombstone/outbox cleanup on rename |
-| 5 | Compose + reply/forward with attachments via SMTP | `APPEND` to Sent (save copy) | **new: SMTP send** `smtp.utfpr.edu.br:587/STARTTLS` | **new `smtp/` module + `send_queue` table + send worker + compose commands + APPEND Sent** |
-
----
-
-## 3. Design
-
-### 3.1 New trait verbs on `SyncSession` (MODIFIED `imap/mod.rs`)
-
-Add, with real impls on `BoxedSession` + arms on `MockSession`:
-
+**Example:**
 ```rust
-// Folder lifecycle (req 4)
-fn create_mailbox(&mut self, name: &str) -> PinBox<'_, Result<(), SyncError>>;
-fn rename_mailbox(&mut self, from: &str, to: &str) -> PinBox<'_, Result<(), SyncError>>;
-fn delete_mailbox(&mut self, name: &str) -> PinBox<'_, Result<(), SyncError>>;
-// Message lifecycle (req 1–3)
-fn store_deleted(&mut self, uid: u32, deleted: bool) -> PinBox<'_, Result<(), SyncError>>;
-fn expunge(&mut self) -> PinBox<'_, Result<Vec<u32> /* or () */, SyncError>>;
-fn uid_expunge(&mut self, uids: &[u32]) -> PinBox<'_, Result<(), SyncError>>; // if UIDPLUS
-fn copy_message(&mut self, uid: u32, dest: &str) -> PinBox<'_, Result<Option<u32>> /* APPENDUID */, SyncError>>;
-fn move_message(&mut self, uid: u32, dest: &str) -> PinBox<'_, Result<(), SyncError>>; // MOVE or COPY+Deleted+EXPUNGE fallback
-fn append_message(&mut self, dest: &str, bytes: &[u8], flags: &[&str]) -> PinBox<'_, Result<Option<u32>, SyncError>>;
+// bridge.rs — single-flight client (Laya serves one forward pass at a time)
+pub struct LayaBridge {
+    client: reqwest::Client,   // or minimal http client
+    base_url: String,          // http://127.0.0.1:<port>
+    lock: tokio::sync::Mutex<()>,
+}
+impl LayaBridge {
+    pub async fn predict(&self, state: serde_json::Value, questions: serde_json::Value)
+        -> Result<LayaAnswers, ClassifyError>
+    {
+        let _guard = self.lock.lock().await;      // serialize forward passes
+        // POST {base_url}/predict {state, questions}, timeout ~10 s
+    }
+    pub async fn health(&self) -> bool { /* GET /health */ }
+}
 ```
 
-Notes:
+### Pattern 2: Single-pass multi-question predict (hierarchy without N+1)
 
-- **Capability gating**: probe `CAPABILITY` once per session for
-  `MOVE`, `UIDPLUS` (`UID EXPUNGE`), `APPENDUID`. `move_message` prefers
-  `MOVE` when advertised, else falls back to `COPY + STORE \Deleted +
-  EXPUNGE`. `uid_expunge` only when UIDPLUS; else plain `EXPUNGE`
-  (expunges all \Deleted in the selected mailbox — caller must ensure the
-  mailbox lease selected the right folder and no foreign \Deleted flags
-  are pending, or restrict to the UIDPLUS path).
-- **No sequence numbers**: all verbs take UIDs (extend the T-6-01 rule).
-- **Wire names are raw modified-UTF-7** (`mailbox.name`, never display_name);
-  quote/escape folder names (quoted-string or literal) — a folder named
-  `Foo "Bar"` must not break the command line. Add a unit test.
-- **Parser tripwire**: APPENDUID/MOVE extended responses go through
-  imap-proto 0.16 — extend the `namespace_response_is_unparseable`-style
-  tripwire: if the parser chokes, fall back to ignoring the extended data
-  (treat destination UID as unknown → next sync reconciles) rather than
-  poisoning the session.
+**What:** One `predict` call per email carrying **three questions**:
+`category` (`choice` over the 5 top-level + `A Classificar`, each option
+described with its children keywords folded into the description),
+`sensitive` (`noul`: "does this email contain passwords/codes/personal
+secrets?"), and optionally `priority` (`score`) if the UI wants it. All
+questions share one forward pass (~7–16 ms marginal cost each). The
+**secondary label is free**: it's the runner-up of the same `category`
+distribution (Laya returns per-option probabilities). The **child
+category is deterministic**: keyword match from the taxonomy within the
+winning top-level — no second model call.
 
-### 3.2 SessionManager additions (MODIFIED `imap/manager.rs`)
+**When to use:** Always for v1.3. Keeps per-mail cost to one forward pass
+(~50 ms GPU / ~150 ms CPU), which is what makes classify-on-sync viable
+for a 200-mail backfill (~10–30 s background, acceptable with progress).
 
-Follow the `set_seen_in` template exactly (lease → attempt → reconnect +
-fresh lease → retry once). New methods, all mailbox-scoped:
+**Trade-offs:** + no latency cascade; + secondary label can't contradict
+primary (same distribution); − child resolution is keyword-based, dumber
+than a model call (acceptable: child only refines the folder name under
+an already-chosen top-level; override path corrects mistakes); − option
+descriptions must stay information-dense (fold children keywords in, cap
+length). If the taxonomy ever exceeds ~20 leaf options flattened, use
+Laya's shortlist pattern — with 5 top-level options we are far below the
+20-option guardrail, no shortlist needed.
 
-- `mark_deleted_in(mailbox, uid, deleted)` — `STORE ±\Deleted`.
-- `expunge_in(mailbox)` / `uid_expunge_in(mailbox, uids)`.
-- `move_message_in(src, dest, uid)` — internally may SELECT twice (COPY from
-  src lease, EXPUNGE on src); holds the single-flight lock throughout so no
-  interleaved SELECT can redirect the EXPUNGE. **This is the most
-  lease-sensitive op**: plain EXPUNGE acts on the *selected* mailbox, so the
-  method must own the lease from SELECT(src) through EXPUNGE without
-  yielding it. Signature takes `&self` (not a lease) for this reason.
-- `append_to(dest, bytes, flags)` — APPEND needs no SELECT; still goes
-  through the manager (single-flight) so an APPEND can't interleave a
-  SELECT-sensitive sequence.
-- `create_mailbox / rename_mailbox / delete_mailbox` — no SELECT needed;
-  single-flight via a lease on INBOX (keeps the "at most one user of the
-  session" invariant without disturbing folder state).
+**Example:**
+```json
+{
+  "state": {
+    "from": "secretaria@utfpr.edu.br",
+    "subject": "Reunião do colegiado adiada",
+    "snippet": "Prezados, a reunião do colegiado...",
+    "lang_hint": "pt-BR"
+  },
+  "questions": {
+    "category": {
+      "type": "choice",
+      "instructions": "Qual categoria desta mensagem? Responda apenas com a etiqueta.",
+      "criteria": {
+        "Academico": "aulas, provas, colegiado, secretaria, disciplinas...",
+        "Administrativo": "rh, ponto, memorandos, portarias...",
+        "Financeiro": "pagamentos, bolsas, reembolsos...",
+        "Pessoal": "familiares, amigos, assuntos particulares...",
+        "Avisos": "informes gerais, eventos, comunicados...",
+        "A Classificar": "nada acima se aplica com clareza"
+      }
+    },
+    "sensitive": { "type": "noul", "instructions": "Contém senhas, códigos ou dados sigilosos?" }
+  }
+}
+```
 
-No change to the lease struct itself; no second session. SMTP never touches
-this manager (separate connection, §3.5).
+### Pattern 3: Classify-behind-sync (queue, never inline)
 
-### 3.3 Store: two new durable queues + folder bookkeeping (MODIFIED `store/`)
+**What:** The sync pass does **not** call Laya. At pass end it enqueues
+`(mailbox_id, uid)` jobs for newly-seen UIDs into a `classify_queue`
+table (or in-memory channel + durable table — see §Data Flow) and
+returns. A separate `classify` worker, gated by a `ClassifyGate`
+(single-flight clone of `SyncGate`), drains the queue: build state from
+cached headers + `preview` (never force a body FETCH), call sidecar,
+write `labels` row, emit `ClassificationReady` event. Manual classify
+and batch classify push into the **same** queue with different priority
+flags — one drain path, three entry points.
 
-**M7 migration** (`SCHEMA_VERSION 7`): new tables. Keep the single-SQL-module
-invariant — all SQL in `queries.rs`.
+**When to use:** This ordering is load-bearing: sync holds the IMAP lease
+and the store lock in brief sections; awaiting a 50–150 ms model call
+per message inside the pass would serialize the mailbox behind the GPU
+and break the poll cadence. Queue-behind also gives crash durability
+(survives restart) and natural batching for the whole-account flow.
 
-**A. Generalize or second table? — decision: SECOND table (`send_queue`),
-keep `flag_outbox` untouched.**
+**Trade-offs:** + sync latency unchanged; + offline classification works
+(queue drains when the sidecar is up — sidecar is local, so "offline"
+only means IMAP down, classification still runs); + batch mode is just
+"enqueue everything with bulk flag"; − suggestions arrive seconds after
+sync (UI must handle `unclassified → classifying → suggested` states);
+− queue table needs its own epoch hygiene (UIDVALIDITY bump drops queued
+jobs for that mailbox, same RFC 4549 rule as the other outboxes).
 
-Rationale: lifecycles differ fundamentally. `flag_outbox` rows are tiny
-(mailbox_id, uid, bit) with latest-wins collapse and RFC 4549 epoch-drop.
-Send ops carry a full MIME payload (KBs–MBs with attachments), need
-multi-state lifecycle (queued → sending → sent/failed), per-op retry with
-backoff, and must survive *SMTP* failures independently of IMAP epochs.
-Unifying them forces nullable payload columns + divergent state machines in
-one table. Shared pattern, separate tables.
+### Pattern 4: Confirm-then-MOVE through the proven outbox (no new IMAP verbs)
+
+**What:** Confirming a suggestion is **exactly** a Phase 10 move with a
+pre-step: `ensure_auto_tree()` CREATEs any missing `Auto/<Top>/<Child>`
+path (reusing `create_mailbox_in`), then the existing `move_message_in`
++ `imap_outbox` optimistic+durable flow runs unchanged. The classifier
+never touches IMAP directly. Override = confirm to a different folder +
+insert `label_overrides` row (records the correction; no fine-tuning in
+v1.3 per out-of-scope). Batch = loop over suggestions calling the same
+confirm path with `bulk_run_id`, no per-mail dialog, progress events +
+final report.
+
+**When to use:** Every physical move in v1.3. This is the single most
+important constraint in this document: **zero new SyncSession verbs**.
+MOVE/COPY-fallback, UIDPLUS-gated expunge, reconnect-retry, epoch
+gating, pre-sweep replay — all already proven. v1.3 inherits them for
+free and cannot regress them.
+
+**Trade-offs:** + smallest possible IMAP blast radius (additive
+`ensure_auto_tree` only); + offline confirm works via `imap_outbox`
+replay; + undo window comes free if confirm reuses the Trash-style
+reverse-MOVE pattern; − `Auto/` tree creation needs the Phase 11 guards
+(INBOX protection is irrelevant here, but `\Noselect` + delimiter +
+modified-UTF-7 leaf encoding rules all apply to `Auto/...` names).
+
+## Data Flow
+
+### Request Flow
+
+```
+Classify-on-sync (primary flow):
+  Sync pass commits new UIDs
+      ↓ (hook: enqueue, no await)
+  classify_queue ← (mailbox_id, uid, source='sync'|'manual'|'batch')
+      ↓ (ClassifyGate::try_begin; worker loop)
+  Worker: read cached subject/from/preview (store lock, brief)
+      ↓
+  LayaBridge::predict (loopback HTTP, serialized, ~50 ms)
+      ↓
+  suggest::shape (confidence gate → fallback; runner-up → secondary)
+      ↓
+  labels row write (primary, secondary, confidence, model_version)
+      ↓
+  Channel event ClassificationReady → UI chip appears
+
+Confirm flow (user accepts suggestion):
+  UI Confirm → confirm_suggestion(uid, dest=Auto/<Top>/<Child>)
+      ↓
+  ensure_auto_tree (CREATE missing levels, Phase 11 guards) → move_message_in
+      ↓ (existing Phase 10 path: optimistic local delete + imap_outbox enqueue
+          → lease attempt → ack/dequeue → next sync reconciles dest folder)
+  labels row: status=suggested → confirmed; UI moves mail to Auto/ folder
+
+Batch flow (whole account, unconfirmed):
+  batch_classify → enqueue ALL unclassified UIDs (bulk_run_id, progress total)
+      ↓ worker drains (same path) → auto-confirm each suggestion ≥ threshold,
+          below threshold stays `A Classificar`
+      ↓ BatchProgress events → final report (moved counts per category, review list)
+```
+
+### State Management
+
+```
+labels.status: pending → suggested → confirmed | overridden | dismissed
+  - pending:     enqueued, no answer yet (UI: subtle "classificando…" state)
+  - suggested:   sidecar answered, awaiting user (UI chip + Confirm/Correct)
+  - confirmed:   user accepted; MOVE issued through imap_outbox
+  - overridden:  user picked a different folder; correction recorded
+  - dismissed:   user rejected suggestion without moving (stays put)
+```
+
+### Key Data Flows
+
+1. **Sync → classify (fire-and-forget):** worker hook enqueues jobs; sync
+   never waits. Dedupe: `UNIQUE(mailbox_id, uid)` on the queue; re-sync
+   of an already-labeled message is a no-op (labels keyed
+   `(mailbox_id, uid)` upsert-once, never overwritten except by
+   re-classify command).
+2. **Classify → suggest → UI:** `labels` write + `ClassificationReady`
+   event (existing `Channel<SyncEvent>` pattern extended with
+   `ClassificationReady / ClassificationProgress / BatchReport`).
+3. **Confirm → MOVE:** identical to Phase 10 `move_message` command path,
+   dest constrained to `Auto/...` (single-email) or user-picked folder
+   (override). `\Seen` preservation, no body re-FETCH, pending indicator —
+   all inherited.
+4. **Taxonomy → questions:** UI editor / JSON import writes `taxonomy`
+   (version++); worker builds Laya `criteria` from the active version and
+   stamps `labels.taxonomy_version` so stale suggestions are identifiable
+   after a taxonomy edit (old labels kept, flagged `stale=1` — never
+   silently rewritten).
+
+## Scaling Considerations
+
+| Scale | Architecture Adjustments |
+|-------|--------------------------|
+| 1 mailbox, <1k msgs (target user) | As designed. Single-pass per mail, serial loopback calls. Backfill ~1–3 min CPU, seconds GPU. No change needed. |
+| 5k–20k msgs backfill | Drain in UID order with cooperative cancel (reuse `sync_cancel` pattern); batch progress UI mandatory; consider 4-mail mini-batches only if measured idle — do NOT parallelize forward passes (Laya serializes internally; concurrent calls interleave badly per skill guidance). |
+| 100k+ msgs | Out of scope for personal UTFPR use. If ever: cap snippet length harder, skip already-labeled, resumable `batch_runs` cursor (already in schema). |
+
+### Scaling Priorities
+
+1. **First bottleneck: cold checkpoint load (~25–35 s).** Sidecar preloads
+   `multilingual` at app start in background; `classify_status` reports
+   `warming` until `/health` is ready; queue simply waits. Never block
+   first sync on it.
+2. **Second bottleneck: CPU-only inference (~140 ms/mail).** Acceptable for
+   incremental sync (a dozen new mails ≈ 2 s background). Whole-account
+   batch on CPU needs the progress UI to be honest — it is, by design.
+
+## Anti-Patterns
+
+### Anti-Pattern 1: Calling Laya inline in the sync pass
+
+**What people do:** `fetch_envelopes` → `predict` → write label, all inside
+`sync_with_session`.
+**Why it's wrong:** Holds the IMAP lease across model latency; stalls
+poll cadence; a sidecar crash/hang fails the sync (violates
+"replay-failure-never-fails-sync" and its classify analogue).
+**Do this instead:** Post-pass enqueue + independent worker (Pattern 3).
+Classify degrades to `pending`; sync never notices.
+
+### Anti-Pattern 2: New IMAP verbs or a second IMAP session for Auto/ moves
+
+**What people do:** Add `MOVE_CLASSIFIED` verb / open a dedicated session
+for the classifier.
+**Why it's wrong:** Breaks the single-session invariant (§1.1 of the v1.2
+research: two sessions → EXPUNGE on wrong selection = data loss); forks
+the replay discipline that Phase 10 proved.
+**Do this instead:** `ensure_auto_tree` + existing `move_message_in` +
+`imap_outbox`. Zero new verbs (Pattern 4).
+
+### Anti-Pattern 3: Storing or logging email text in classification tables/logs
+
+**What people do:** Persist the snippet/state sent to Laya for
+"debuggability", or log suggestion justifications.
+**Why it's wrong:** Violates the sensitive-data rule (passwords/codes in
+SQLite/logs) and the no-secrets discipline. Laya returns no free text —
+log labels + confidence + timings only.
+**Do this instead:** Labels store `(mailbox_id, uid, primary, secondary,
+confidence, taxonomy_version, status)` — pointers to the message, never
+its content. Truncate state client-side (subject ≤ 200 chars, snippet ≤
+1000 chars) before POST.
+
+### Anti-Pattern 4: Frontend calling the sidecar directly
+
+**What people do:** React `fetch('http://127.0.0.1:PORT/predict')` to skip
+backend plumbing.
+**Why it's wrong:** Bypasses taxonomy versioning, confidence gating, the
+sensitive rule, and label persistence; two writers (UI + worker) race on
+`labels`; CSP/ports become UI concerns.
+**Do this instead:** All classification through Tauri commands; sidecar
+port never leaves Rust (bind 127.0.0.1, ephemeral port chosen by the
+backend, passed as sidecar argv).
+
+## Integration Points
+
+### New Tauri commands (all in NEW `commands/classify.rs`)
+
+| Command | Input | What it does | Reuses |
+|---------|-------|--------------|--------|
+| `classify_message` | `mailbox, uid` | Enqueue single job (priority manual), fast-path drain if gate free | classify worker |
+| `confirm_suggestion` | `mailbox, uid, dest` | `ensure_auto_tree` + Phase 10 move path; mark label `confirmed` | `move_message_in`, `imap_outbox`, Phase 11 CREATE |
+| `override_label` | `mailbox, uid, dest, corrected_primary` | Same as confirm to user folder + `label_overrides` insert | same + overrides table |
+| `batch_classify` | `mailbox? (none = all)` | Enqueue all unlabeled + `batch_runs` row; drain auto-confirms ≥ threshold | worker bulk mode |
+| `import_taxonomy` | `json` | Validate → `taxonomy` version++ → mark prior labels `stale` | taxonomy.rs |
+| `classify_status` | — | `{sidecar: warming\|ready\|down, queued, pending_count}` | bridge health + queue depth |
+
+New events on the existing `Channel` pattern: `ClassificationReady(uid,
+primary, confidence)`, `ClassificationProgress(done, total)`,
+`BatchReport(run_id, per_category_counts, review_list)`.
+
+### SQLite M12 (MODIFIED `store/`, forward-only, preserve-rows test)
 
 ```sql
--- M7-A: outbound SMTP queue (durability core of req 5)
-CREATE TABLE send_queue (
-  id            INTEGER PRIMARY KEY,
-  created_at    TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
-  state         TEXT NOT NULL DEFAULT 'queued',  -- queued|sending|sent|failed
-  -- RFC822 payload (fully rendered MIME at enqueue time — see §3.6)
-  mime_path     TEXT NOT NULL,                   -- file under <app_data>/outbox/<id>.eml, NOT a blob
-  mime_size     INTEGER NOT NULL DEFAULT 0,
-  -- envelope (for retry without re-parsing MIME)
-  smtp_host     TEXT NOT NULL DEFAULT '',
-  smtp_port     INTEGER NOT NULL DEFAULT 587,
-  from_addr     TEXT NOT NULL DEFAULT '',
-  to_addrs      TEXT NOT NULL DEFAULT '[]',      -- JSON
-  cc_addrs      TEXT NOT NULL DEFAULT '[]',
-  bcc_addrs     TEXT NOT NULL DEFAULT '[]',      -- envelope-only, never in MIME headers
-  subject       TEXT NOT NULL DEFAULT '',
-  in_reply_to   TEXT,                            -- threading for replies
-  references_hdr TEXT,
-  -- associated local draft / source message (nullable)
-  draft_id      INTEGER REFERENCES drafts(id) ON DELETE SET NULL,
-  -- retry bookkeeping (mirrors flag_outbox attempts/last_error)
-  attempts      INTEGER NOT NULL DEFAULT 0,
-  last_error    TEXT,
-  next_retry_at TEXT,                            -- backoff gate
-  sent_at       TEXT
+-- M12-A: versioned taxonomy (one active row; history kept)
+CREATE TABLE taxonomy (
+  version     INTEGER PRIMARY KEY,            -- monotonic, worker stamps labels
+  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  active      INTEGER NOT NULL DEFAULT 0,     -- exactly one row active=1
+  definition  TEXT NOT NULL                   -- canonical taxonomy JSON
 );
-CREATE INDEX idx_sendq_state ON send_queue(state, next_retry_at);
-
--- M7-B: local drafts (req 3 — save/edit without server round-trip)
-CREATE TABLE drafts (
-  id            INTEGER PRIMARY KEY,
-  created_at    TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
-  to_addrs      TEXT NOT NULL DEFAULT '[]',
-  cc_addrs      TEXT NOT NULL DEFAULT '[]',
-  bcc_addrs     TEXT NOT NULL DEFAULT '[]',
-  subject       TEXT NOT NULL DEFAULT '',
-  body_text     TEXT NOT NULL DEFAULT '',
-  in_reply_to   TEXT,                            -- reply/forward context
-  attachments   TEXT NOT NULL DEFAULT '[]',      -- JSON [{path,name,mime}] staged files
-  server_uid    INTEGER,                         -- UID in Drafts folder after APPEND (nullable until synced)
-  dirty         INTEGER NOT NULL DEFAULT 1       -- 1 = local edits newer than server copy
+-- M12-B: labels per message (pointers only — NEVER email content)
+CREATE TABLE labels (
+  mailbox_id       INTEGER NOT NULL REFERENCES mailboxes(id) ON DELETE CASCADE,
+  uid              INTEGER NOT NULL,
+  primary_label    TEXT NOT NULL DEFAULT 'A Classificar',
+  secondary_label  TEXT,
+  child_label      TEXT,                       -- keyword-resolved child (nullable)
+  confidence       REAL NOT NULL DEFAULT 0,
+  taxonomy_version INTEGER NOT NULL DEFAULT 1,
+  status           TEXT NOT NULL DEFAULT 'pending',  -- pending|suggested|confirmed|overridden|dismissed
+  stale            INTEGER NOT NULL DEFAULT 0,       -- taxonomy moved on
+  updated_at       TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (mailbox_id, uid)
+);
+CREATE INDEX idx_labels_status ON labels(status);
+-- M12-C: override corrections (learning signal for future, display now)
+CREATE TABLE label_overrides (
+  id           INTEGER PRIMARY KEY,
+  mailbox_id   INTEGER NOT NULL, uid INTEGER NOT NULL,
+  suggested    TEXT NOT NULL, corrected TEXT NOT NULL,
+  created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+-- M12-D: classification work queue (RFC 4549 epoch hygiene like its siblings)
+CREATE TABLE classify_queue (
+  id           INTEGER PRIMARY KEY,
+  mailbox_id   INTEGER NOT NULL REFERENCES mailboxes(id) ON DELETE CASCADE,
+  uid          INTEGER NOT NULL,
+  source       TEXT NOT NULL DEFAULT 'sync',  -- sync|manual|batch
+  bulk_run_id  INTEGER,                        -- NULL unless batch
+  uid_validity INTEGER NOT NULL,              -- epoch at enqueue; stale → drop
+  attempts     INTEGER NOT NULL DEFAULT 0,
+  last_error   TEXT,
+  UNIQUE (mailbox_id, uid)
+);
+-- M12-E: batch runs (progress + report)
+CREATE TABLE batch_runs (
+  id           INTEGER PRIMARY KEY,
+  started_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  finished_at  TEXT,
+  total        INTEGER NOT NULL DEFAULT 0,
+  done         INTEGER NOT NULL DEFAULT 0,
+  report       TEXT                           -- JSON per-category counts + review list
 );
 ```
 
-**B. Delete/move ops: extend the outbox pattern, not the table.**
+Why separate tables (not columns on `messages`): labels have their own
+lifecycle (stale flags, overrides, re-classify) and the queue needs
+epoch-gated replay semantics identical to `flag_outbox`/`imap_outbox` —
+the codebase's established pattern is one table per durable intent
+(§3.3 of the v1.2 research). `messages` stays the sync-owned source of
+truth; `labels` is keyed `(mailbox_id, uid)` alongside it and cascades
+on mailbox delete (same `drop_*_for_mailbox` helper shape).
 
-Two options; recommended: **new `imap_outbox` table** (successor to
-`flag_outbox`) rather than overloading it:
+### Internal Boundaries
 
-```sql
--- M7-C: durable IMAP mutation queue (req 1–2; Seen keeps its table)
-CREATE TABLE imap_outbox (
-  id            INTEGER PRIMARY KEY,
-  mailbox_id    INTEGER NOT NULL REFERENCES mailboxes(id) ON DELETE CASCADE,
-  uid           INTEGER NOT NULL,
-  op            TEXT NOT NULL,                   -- 'delete' | 'move'
-  dest_mailbox  TEXT,                            -- move target (raw wire name), NULL for delete
-  uid_validity  INTEGER NOT NULL,                -- epoch at enqueue (RFC 4549 same rule)
-  attempts      INTEGER NOT NULL DEFAULT 0,
-  last_error    TEXT,
-  created_at    TEXT NOT NULL DEFAULT (datetime('now')),
-  UNIQUE (mailbox_id, uid)                       -- latest-wins vs flag_outbox row for same uid
-);
-CREATE INDEX idx_imap_outbox_mb ON imap_outbox(mailbox_id);
-```
+| Boundary | Communication | Notes |
+|----------|---------------|-------|
+| sync worker → classify worker | `classify_queue` table (durable handoff) | Sync never awaits; worker polls/drains under `ClassifyGate` |
+| Rust backend → sidecar | Loopback HTTP `POST /predict`, `GET /health` | Serialized by bridge mutex; 10 s timeout → `attempts++`, stays queued |
+| classify worker → IMAP | **None directly** — only via `imap_outbox` + manager | Confirmed moves are Phase 10 moves; classifier holds no lease |
+| taxonomy → worker | Active `taxonomy` row read per drain batch | Questions rebuilt when `version` changes; labels stamped |
+| backend → UI | Tauri commands + `Classification*` channel events | Same Channel pattern as `SyncEvent`/`Send*` |
 
-Why a second table instead of adding `op` to `flag_outbox`: `flag_outbox`
-has a UNIQUE(mailbox_id,uid)+`seen` column with latest-wins on the Seen bit;
-a delete/move op for the same UID is a *different intent* that must not
-collapse into a Seen toggle (deleting a message with a pending Seen toggle
-must execute delete, not flip the bit). Interaction rule: when a
-delete/move enqueues for (mailbox,uid), delete the `flag_outbox` row for the
-same key (a flag write to a soon-dead message is moot); replay order is
-delete/move *after* any surviving flag ops for other UIDs. UIDVALIDITY
-epoch-drop and absent-UID-drop apply identically (share the helper logic,
-parameterize by table).
+### Sidecar packaging (Tauri v2, verified against official docs)
 
-Alternative (simpler, acceptable): keep three *separate* op columns in one
-new table. Do NOT add `op`/`dest` nullables to `flag_outbox` — it changes
-the Phase 6 contract under existing tests.
+- `tauri.conf.json`: `bundle.externalBin: ["binaries/laya-sidecar"]` +
+  triple-suffixed binary at
+  `src-tauri/binaries/laya-sidecar-x86_64-unknown-linux-gnu` (Linux-only
+  per project constraint — one triple needed).
+- `capabilities/default.json`: `shell:allow-spawn` (+ `allow-execute` if
+  one-shot health probes are used) with matching `name` + argv validators
+  (port, `--model multilingual`, `--device auto`).
+- Checkpoint weights (~322–421 M params): ship as `bundle.resources`
+  (resolved via `$RESOURCE`) OR sidecar self-contained with weights
+  adjacent (working dir = binary dir). Spike must decide — weights next
+  to the binary is simpler for offline-first; resources path needs
+  `fs:allow-resource-read-recursive`.
+- New deps: `tauri-plugin-shell` (spawn), HTTP client for bridge
+  (`reqwest` — verify async-std compat; else `surf`/`ureq` in
+  `spawn_blocking`, matching the lettre precedent of keeping the runtime
+  unmixed).
+- Dev fallback: if the sidecar binary is absent (`tauri dev` without
+  build), bridge connects to a locally-run `laya serve` on a documented
+  port — same code path, zero special-casing in the worker.
 
-**C. Folder lifecycle bookkeeping (req 4):**
-
-- No schema change needed for CREATE/DELETE: reuse `mailboxes` rows
-  (`ensure_mailbox` on CREATE discovery; `DELETE FROM mailboxes` + cascade
-  on DELETE). RENAME = `UPDATE mailboxes SET name=?` **plus** cascade-fix
-  any `imap_outbox.dest_mailbox` / queued ops referencing the old wire name,
-  and clear `fetch_tombstones` + reset `sweeps_since_full` for the renamed
-  row (UIDs are stable across RENAME per RFC 3501 §6.3.5, so message rows
-  survive — only the name changes; but strikes reference mailbox_id so they
-  survive automatically; still force a full sweep `sweeps_since_full =
-  FULL_SWEEP_EVERY` to re-verify flags post-rename).
-- `\Noselect` placeholders: never enqueue ops against them (command layer
-  validates via cached attributes or fresh LIST).
-
-### 3.4 Sync-worker changes (MODIFIED `sync/worker.rs`)
-
-The sweep itself isIDS read-mostly; mutations replay around it. Changes:
-
-1. **Pre-sweep: replay `imap_outbox` (delete/move) BEFORE the header sweep
-   for the mailbox** — a locally-deleted message must not be re-fetched and
-   resurrected in the same pass. Order per mailbox pass:
-   `SELECT → imap_outbox replay (delete/move) → flag replay (existing) →
-   sweep → expunge-diff → sync-state write`.
-   Move replay across two folders: COPY to dest (via manager, which handles
-   the cross-SELECT internally), on success APPEND-side needs no local write
-   (next dest-folder sync fetches it); on src, delete local row immediately
-   (optimistic) and drop op on ack.
-2. **Expunge-diff reconciliation**: server-side expunges (another client, or
-   our own EXPUNGE now visible) already flow through `delete_missing_uids`.
-   New: after our own delete-ack, also `clear_tombstone` + delete local row
-   (the sweep's Step-6 would do it anyway next pass; immediate delete keeps
-   UI snappy — optimistic delete at command time + confirm at sync).
-3. **Convergence interaction**: `skip_sweep` currently requires
-   `pending.is_empty()` where pending = flag_outbox only. Extend to
-   `imap_outbox` depth: any queued delete/move forces a full pass (the UID
-   set is about to change). `send_queue` depth does NOT gate the IMAP sweep
-   (SMTP and IMAP are independent transports) — except Sent/Drafts folder
-   syncs, which should run after a successful send+APPEND (see §3.6).
-4. **STATUS/UIDVALIDITY per folder unchanged**; folder DELETE locally drops
-   the mailbox row (cascade deletes messages + outbox rows — matches server
-   truth after DELETE).
-5. **`start_sync` wrinkle**: it currently opens a *fresh* `connect_sync`
-   session per pass instead of the `SessionManager`. With EXPUNGE/MOVE in
-   play this is a correctness hazard (two sessions: sync sweep SELECTs INBOX
-   while a manager lease EXPUNGEs it → `EXPUNGE` on wrong selection or
-   `UID EXPUNGE` mismatch). **Fix in v1.2**: route `start_sync` through
-   `manager_for().lease_for(mailbox)` (pass the `&mut dyn SyncSession` from
-   the lease into `sync_with_session`; logout becomes lease-drop, keep
-   explicit logout for server hygiene). This unifies all IMAP under
-   single-flight. Precondition for safe delete/move — do it first (§5, step 1).
-
-### 3.5 New: SMTP module — `src-tauri/src/smtp/` (NEW)
-
-New crate surface, parallel to `imap/`:
-
-- `smtp/mod.rs`: `SmtpConfig { host, port, security (STARTTLS/implicit/plain-loopback), username, password (Zeroizing) }`,
-  `SmtpError`, `send_raw(envelope, bytes)` via the **`lettre`** crate
-  (add `lettre = { version = "0.11", features = ["tokio1-native-tls", "builder"] }`
-  — check async-std compat; else drive lettre's sync transport inside
-  `spawn_blocking`, consistent with the existing blocking-thread discipline).
-- Reuse credential loading: same `load_account_config` shape; SMTP host
-  defaults `smtp.` for `mail.` host? No — user-configurable with sensible
-  default (`smtp.utfpr.edu.br:587/STARTTLS`), stored alongside IMAP server
-  config in keyring (extend `ServerConfig` with `smtp_host/smtp_port/
-  smtp_security`, defaulted for backward compat with saved configs).
-- Password discipline identical to IMAP (redacted Debug, Zeroizing).
-- `MockSmtp` test seam mirroring `MockSession` (record envelopes, inject
-  failures) so send-retry logic is unit-tested without a live 587.
-
-### 3.6 Send-queue durability design (NEW, core of req 5)
-
-State machine per `send_queue` row:
-
-```
-queued → sending → sent ✓ (terminal; APPEND Sent; delete MIME file)
-  │         │
-  │         └─→ queued (retryable SMTP/IO error; attempts++, backoff)
-  └─→ failed ✗ (terminal-after-N: 5xx permanent, or attempts > MAX_RETRIES=8)
-```
-
-Flow (compose → send):
-
-1. **Enqueue (command `queue_send`)**: render full MIME **once** at enqueue
-   (lettre `Message::builder`, attachments streamed from staged paths) →
-   write bytes to `<app_data>/outbox/<uuid>.eml` → insert `send_queue` row
-   (`state=queued`, envelope columns, `mime_path`). Return immediately —
-   UI shows "Queued ⏳". MIME-on-disk (not blob) keeps SQLite small and
-   lets retries re-read without re-rendering (attachment staging files may
-   move; the .eml is self-contained).
-2. **Dispatch (command `flush_send_queue` + opportunistic triggers)**:
-   - Trigger points: after enqueue, after `start_sync` success, manual
-     "Retry" button, app start (flush on launch — covers mail queued while
-     offline). Single-flight via the existing `SyncGate`? No — **separate
-     `SendGate`** (SMTP and IMAP are independent; an IMAP sweep must not
-     block an SMTP flush). Same try_begin/skip semantics.
-   - Worker loop: `SELECT ... WHERE state='queued' AND next_retry_at <= now
-     ORDER BY id` → mark `sending` → `smtp.send_raw` → on success: mark
-     `sent`, **APPEND copy to Sent** (via manager `append_to("Sent", mime,
-     ["\\Seen"])` — sent mail is read), delete .eml, emit event; on
-     retryable error: `attempts++`, `next_retry_at = now + min(2^attempts
-     min, 30 min)`, state back to `queued`; on permanent (5xx / auth):
-     `state=failed` with `last_error` surfaced in UI.
-   - Crash-safety: rows left in `sending` at startup (crash mid-SMTP) are
-     reset to `queued` on launch (`UPDATE send_queue SET state='queued'
-     WHERE state='sending'`) — at-least-once delivery; duplicates possible
-     if SMTP accepted but process died before marking sent. Mitigate with
-     `Message-ID` header rendered at enqueue (server-side dedup is
-     best-effort; document the at-least-once contract in UI copy
-     "may duplicate on crash during send").
-3. **Reply/forward**: `in_reply_to`/`references_hdr` set from the source
-   message; body quoted (text) at compose time in frontend; attachments
-   re-staged. No IMAP `ANSWERED` flag write required (optional follow-up:
-   `STORE +\Answered` on the source UID via the flag path — trivially fits
-   `flag_outbox` if desired, but keep out of v1.2 scope unless cheap).
-4. **Offline**: enqueue works with zero connectivity (pure local write);
-   flush fails fast with recorded error, backoff applies. `sync_status`
-   gains `send_pending_count` for the UI badge.
-5. **BCC correctness**: envelope recipients = to+cc+bcc; MIME headers contain
-   only to/cc. Worker sends from envelope columns, never re-parses MIME.
-   Unit test: bcc address receives but is absent from MIME bytes.
-
-### 3.7 Drafts flow (req 3)
-
-- Local-first: `drafts` table is the editor backing store (autosave =
-  UPDATE row, `dirty=1`). No IMAP traffic on keystroke.
-- **Server persistence**: on explicit "Save" (or autosave-debounced, TBD):
-  `append_to("Drafts", mime, ["\Draft"])` → store returned UID in
-  `drafts.server_uid`, `dirty=0`. Edit-after-save = APPEND new + DELETE old
-  server copy (IMAP has no in-place replace; `server_uid` retargets) +
-  local UPDATE. Sync sweep picks up Drafts like any folder (per-folder sync
-  already exists from Phase 7) — foreign draft edits converge naturally.
-- Deleting a draft: local DELETE + if `server_uid` present, enqueue
-  `imap_outbox` delete op for Drafts folder.
-
-### 3.8 Data-flow changes (before → after)
-
-**Before (v1.1)** — all flows read-only except Seen:
-UI → Tauri command → (optimistic local write + outbox enqueue) →
-manager lease → UID STORE → ack → dequeue; sync sweep reconciles.
-
-**After (v1.2)** — three durable lanes sharing the store, serialized per
-transport:
-
-```
-Compose UI ──queue_send──▶ send_queue + .eml file ──flush──▶ SMTP ──ok──▶ APPEND Sent ──▶ sync(Sent)
-Drafts UI ──save_draft──▶ drafts row ──save──▶ APPEND Drafts ──▶ sync(Drafts)
-List UI ──delete/move──▶ imap_outbox (+optimistic local delete) ──replay──▶ STORE+EXPUNGE/COPY ──▶ sync
-Folders UI ──create/rename/delete──▶ manager ──▶ LIST refresh ──▶ mailboxes cache ──▶ sidebar
-Sync pass ──manager lease (was: fresh connect)──▶ SELECT ──▶ imap_outbox replay ──▶ flag replay ──▶ sweep
-```
-
-New Tauri commands (all following the `set_seen` optimistic+durable template):
-`queue_send`, `flush_send_queue` (`send_status`), `save_draft`,
-`delete_draft`, `delete_messages`, `move_messages`, `create_folder`,
-`rename_folder`, `delete_folder`. New events on the existing Channel pattern:
-`SendQueued/SendProgress/SendCompleted/SendFailed`, `FolderTreeChanged`.
-
----
-
-## 4. New vs modified — explicit file list
+## New vs Modified — explicit file list
 
 ### NEW files
 
 | File | Purpose |
-|---|---|
-| `src-tauri/src/smtp/mod.rs` | SMTP transport (lettre), `SmtpConfig`, `send_raw`, `MockSmtp`, capability/auth errors |
-| `src-tauri/src/commands/send.rs` | `queue_send`, `flush_send_queue`, `send_status`, `retry_send` |
-| `src-tauri/src/commands/organize.rs` | `delete_messages`, `move_messages`, `create_folder`, `rename_folder`, `delete_folder`, `save_draft`, `delete_draft` |
-| Frontend `Compose*.tsx`, `Drafts*.tsx`, outbox badge, folder-tree context menu | Compose/reply/forward UI, queued/failed states, folder CRUD UI |
-| `.eml` files under `<app_data>/outbox/` | Durable MIME payloads (outside SQLite by design) |
+|------|---------|
+| `src-tauri/src/classify/{mod,taxonomy,bridge,worker,suggest}.rs` | Classification lane (see §Structure) |
+| `src-tauri/src/commands/classify.rs` | 6 commands above |
+| `src-tauri/binaries/laya-sidecar-<triple>` | Bundled sidecar binary |
+| `src-tauri/resources/taxonomy-utfpr-ptbr.json` | Default taxonomy (5 top + children + fallback + rules) |
+| `ClassifyChip.tsx`, `TaxonomyEditor.tsx`, `BatchProgress.tsx` | UI surfaces |
 
-New deps: `lettre` (SMTP). No new SQLite features (WAL + migrations cover it).
+New deps: `tauri-plugin-shell`, HTTP client. No new SQLite features.
 
 ### MODIFIED files
 
 | File | Change | Risk |
-|---|---|---|
-| `imap/mod.rs` | +7 trait verbs (§3.1), capability helpers, tripwire test for new response types | Medium — trait change touches MockSession + all impls |
-| `imap/manager.rs` | +8 lease methods w/ reconnect-retry (§3.2); MOVE holds lease across double-SELECT | Medium — lease-holding logic is the correctness core |
-| `sync/worker.rs` | imap_outbox pre-sweep replay, pending-gate extension, tombstone clear on self-delete | Medium — order matters; keep replay-failure-never-fails-sync |
-| `sync/mod.rs` | `SendGate` (clone of SyncGate) + send events | Low |
-| `commands/sync.rs` | `start_sync` via manager lease (§3.4); `sync_status` += `send_pending_count` + `imap_outbox` depth | Medium — the manager-lease cutover |
-| `store/mod.rs` | M7 (+ maybe M8) migrations, `SCHEMA_VERSION` 7, forward-upgrade tests | Low-Medium (follow M2–M6 pattern) |
-| `store/queries.rs` | send_queue + drafts + imap_outbox helpers (single-SQL-module invariant) | Medium — largest diff, but mechanical |
-| `lib.rs` | `smtp` module, `SendGate` state, new commands in `invoke_handler`, SMTP fields in `ServerConfig`/`ActiveAccount` | Low |
-| `creds.rs` | SMTP host/port/security in keyring server config (defaulted) | Low |
-| `Cargo.toml` | `lettre` pin | Low |
+|------|--------|------|
+| `imap/manager.rs` | +`ensure_auto_tree` (CREATE missing `Auto/` levels, Phase 11 guards) | Low — additive, existing verb |
+| `sync/worker.rs` | +post-pass enqueue hook (new UIDs → `classify_queue`) | Low — 3–5 lines, no await, failure never fails sync |
+| `sync/mod.rs` | +`ClassifyGate` (clone of `SyncGate`) | Low — proven shape |
+| `store/mod.rs` | M12 migration, `SCHEMA_VERSION` 11→12 | Low — follow M2–M11 pattern |
+| `store/queries.rs` | taxonomy/labels/queue/batch helpers (single-SQL invariant) | Medium — largest diff, mechanical |
+| `commands/sync.rs` or `mod.rs` | `sync_status` += queue depth (badge) | Low |
+| `lib.rs` | AppState +bridge/gate, `setup()` spawn, `invoke_handler` | Low-Medium (sidecar lifecycle) |
+| `tauri.conf.json`, `capabilities/default.json` | externalBin + resources + shell perms | Low — doc-driven |
+| `Cargo.toml` | `tauri-plugin-shell` + HTTP client pins | Low |
 
 ### UNTOUCHED (must stay invariant)
 
-- `BODY.PEEK[]` read path, ammonia sanitize, `BODY_CACHE_CAP_BYTES`.
-- `flag_outbox` schema + RFC 4549 replay semantics (extended by analogy, not edited).
-- Convergence/tombstone/sweep-counter logic (only the pending-gate input widens).
-- `SyncGate` semantics; transcript secret discipline; `normalize_host`/loopback/cert-refusal rules (SMTP reuses them).
+- `SyncSession` trait — **zero new verbs**. `BODY.PEEK[]` reads,
+  ammonia sanitize, `flag_outbox`/`imap_outbox`/`send_queue` schemas and
+  replay semantics, convergence/tombstone logic, `SyncGate` semantics,
+  keyring/secret discipline.
+
+## Suggested build order (dependency-ordered; Phase 10/11 machinery is the floor)
+
+1. **Sidecar packaging spike.** Bundle a hello-world sidecar via
+   `externalBin` + `shell:allow-spawn`, spawn in `setup()`, `/health`
+   green in dev **and** in a `bun run tauri build` Linux bundle. Resolves
+   the two unknowns up front: weights placement (resources vs adjacent)
+   and cold-start time on the user's machine. No UI, no schema.
+2. **Taxonomy + M12 store.** Default UTFPR JSON, `taxonomy.rs`
+   validation, M12 migration + queries + preserve-rows test. Headless —
+   testable with `cargo test` only.
+3. **Bridge + worker + labels (no moves).** `predict` client, single-pass
+   3-question shape, confidence gate, queue drain under `ClassifyGate`,
+   `labels` writes, `ClassificationReady` events, `classify_message` +
+   `classify_status` commands. Verify: sync a folder → labels appear with
+   sane pt-BR categories; sidecar down → `pending`, sync unaffected.
+4. **Confirm/override → MOVE (the Phase 10/11 payoff).**
+   `ensure_auto_tree` + `confirm_suggestion`/`override_label` through
+   `imap_outbox`; suggestion chip UI. Verify: confirm moves to
+   `Auto/<Top>/`; offline confirm replays; override records correction;
+   `A Classificar` never moves.
+5. **Taxonomy editor + JSON import.** UI over `import_taxonomy`; stale-flag
+   display. Verify: import bumps version, old labels flagged, worker uses
+   new criteria.
+6. **Batch classify.** `batch_runs`, bulk enqueue, auto-confirm ≥
+   threshold, progress + report UI. Verify on a test folder: counts add
+   up, below-threshold mail stays `A Classificar`, report lists reviews.
+7. **Polish + audit:** queue-depth badges, `classifying` list states, FTS
+   over labels (optional — `messages_fts` join, cheap if wanted),
+   full `cargo test` + live round-trip against `mail.utfpr.edu.br`.
+
+Why this order: packaging risk first (only true unknown — everything
+else is proven-pattern reuse); store before worker (can't write what has
+no table); suggestions before moves (trust gate — user sees labels work
+before anything moves); single confirmed moves before batch (batch is a
+loop over the confirm path; an unproven confirm at batch scale is how
+mail ends up in the wrong tree); UI editor after the engine it edits.
+
+## Risks & open questions
+
+1. **Cold start (~25–35 s checkpoint load)** blocks nothing by design
+   (background preload, `warming` status), but first-run UX must say so —
+   else "classificação não funciona" bug reports. Mitigate with honest
+   status copy.
+2. **CPU-only fallback latency** (~140 ms/mail): fine incremental, slow
+   whole-account. Batch progress UI is the mitigation; no architecture
+   change needed.
+3. **`Auto` root vs user folders:** reserve `Auto` (leaf-encoded,
+   delimiter-joined, Phase 11 rules); if the user already owns `Auto`,
+   confirm-then-nest (`Auto` reuse with confirmation) — decide in planning,
+   one dialog.
+4. **Snippet fidelity:** labels derive from cached headers + `preview`
+   (~200 chars) — no body FETCH forced (headers-first invariant holds).
+   If accuracy disappoints on evaluation, the escalation is
+   fetch-`body_text`-for-`pending`-only — a worker change, not an
+   architecture change.
+5. **Confidence threshold:** no universal value (Laya docs: "validate
+   thresholds on representative data"). Ship a default (e.g. 0.6) behind a
+   taxonomy-rule field, tunable in the editor; evaluation on real pt-BR
+   mail during Phase verification sets it.
+6. **Multilingual routing:** force `model: multilingual` (pt-BR traffic is
+   the known case; the English checkpoint is confidently wrong on
+   non-Latin scripts). Router auto-detect stays as fallback for mixed mail.
+
+## Sources
+
+- SGE repo at research time (`imap/manager.rs`, `sync/{mod,worker}.rs`,
+  `store/{mod,schema.sql,queries.rs}`, `commands/sync.rs`, `lib.rs`,
+  `Cargo.toml`) + `.planning/research/ARCHITECTURE.md` (v1.2 baseline §1)
+  + `PROJECT.md` v1.3 scoping — HIGH confidence (direct source read).
+- Laya `laya-integration` skill (`github.com/wdobry/laya-playground`,
+  skills/laya-integration/SKILL.md): sidecar pattern, single-pass
+  multi-question, one-forward-pass-at-a-time lock, 20-option shortlist
+  guardrail, latency figures — MEDIUM-HIGH (project's own integration
+  guidance + live `laya_status` confirming package `laya 0.3.20` present;
+  checkpoint names/flags should be re-verified at build time against the
+  pinned sidecar version).
+- `docs.rs/laya`, `docs.rs/laya-candle`, `laya-rs` family READMEs
+  (Rust-native options assessed and rejected) — MEDIUM.
+- Tauri v2 official docs (`v2.tauri.app/develop/sidecar`,
+  `v2.tauri.app/develop/resources`): `externalBin` + triple suffix +
+  `shell:allow-spawn` + resources mapping — MEDIUM (official docs,
+  cross-verified across docs repo + community write-ups; not yet
+  exercised in this repo).
 
 ---
-
-## 5. Suggested build order (dependency-ordered, each step shippable + tested)
-
-1. **Unify sync under SessionManager** (§3.4 fix). Precondition for every
-   destructive op. Tests: existing sweep suite green against lease-injected
-   session; single-flight contention test (sync vs flag-STORE overlap).
-2. **IMAP verbs + manager methods + mocks** (§3.1–3.2, no UI). Trait verbs,
-   BoxedSession impls, MockSession arms, reconnect-retry tests, folder-name
-   quoting test, parser tripwire. No store/commands yet — pure transport.
-3. **`imap_outbox` + worker replay + delete/move commands** (req 1–2 vertical
-   slice). M7-C migration, queries, pre-sweep replay order, optimistic local
-   delete, `delete_messages`/`move_messages` commands, list UI wiring.
-   Verify: offline delete → reconnect → server expunged; move lands in dest.
-4. **Folder CRUD** (req 4). CREATE/RENAME/DELETE verbs already exist from
-   step 2; add commands + `mailboxes` bookkeeping + LIST refresh + sidebar
-   tree UI. Verify: rename preserves messages (same UIDs), delete cascades.
-5. **Drafts local + APPEND** (req 3). M7-B, editor backed by `drafts`,
-   save→APPEND→`server_uid`, edit=resend+delete-old. Verify: draft survives
-   restart offline; server copy appears in Drafts.
-6. **SMTP module + send_queue + flush worker** (req 5 core). `lettre`
-   transport, M7-A, `queue_send`/`flush_send_queue`, backoff, crash-recovery
-   reset, APPEND-to-Sent on success. MockSmtp unit suite (retry, permanent
-   fail, bcc, crash-recovery). Live-verify against `smtp.utfpr.edu.br:587`.
-7. **Compose/reply/forward UI + attachments** (req 5 surface). MIME render,
-   staged attachments, threading headers, outbox badge, failed-retry UX.
-   End-to-end: compose offline → online flush → arrives + Sent copy.
-8. **Polish + audit**: `sync_status` pending counts, folder-tree optimistic
-   states, FTS over Sent/Drafts, migration forward-upgrade tests (v6→v7
-   preserving rows), full `cargo test` + live round-trip checklist.
-
-Why this order: transport before queue (can't replay what can't be spoken);
-unified session before destructive verbs (EXPUNGE on a stray session is data
-loss); delete/move before drafts/send (they exercise the outbox-replay
-machinery the send flow imitates); SMTP last among backends (independent
-transport, longest live-verify tail); UI last per layer (commands testable
-headless via store+mock).
-
----
-
-## 6. Risks & open questions
-
-1. **EXPUNGE blast radius**: plain `EXPUNGE` removes *all* \Deleted in the
-   mailbox, including flags set by other clients. Prefer `UID EXPUNGE`
-   when UIDPLUS advertised; else document "delete = expunge all deleted in
-   folder" and consider selecting with a guard (re-SEARCH \Deleted set first,
-   warn if foreign deleted UIDs exist). Decision needed before step 3.
-2. **MOVE support on `mail.utfpr.edu.br`**: unknown until CAPABILITY probed.
-   The COPY-fallback must be ready day one (assume no MOVE).
-3. **APPENDUID absence**: without UIDPLUS, dest UID after COPY/MOVE is
-   unknown until next dest-folder sync — UI must tolerate "moved (locating…)"
-   states. Tombstone/pending machinery already models this shape.
-4. **Lettre runtime fit**: project drives async-imap on async-std inside
-   `spawn_blocking`; lettre's async story is tokio-centric. Simplest fit:
-   lettre sync transport inside `spawn_blocking` (matches existing discipline,
-   no runtime mixing). Confirm during step 6 spike.
-5. **`start_sync` cutover regression**: lease-based sync changes logout
-   semantics (lease-drop vs explicit LOGOUT) and error paths. Keep explicit
-   `logout()` on the leased session at pass end; run the full Phase 9 suite.
-6. **At-least-once send**: crash between SMTP-accept and `sent` marking
-   duplicates. Message-ID-at-enqueue + UI copy noting the contract; no
-   two-phase commit available across SMTP+SQLite.
-7. **Attachment size**: .eml on disk unbounded by `BODY_CACHE_CAP_BYTES`
-   (that's the *download* cache cap). Add a *send* cap (e.g. 25 MB, matching
-   common server limits) with a friendly composer error — prevents
-   queueing mail the server will always 5xx-reject into `failed`.
-
----
-
-*Written 2026-10-06 from repo read (v1.1 shipped state, SCHEMA_VERSION 6).
-Next step: turn §5 into phased GSD plans for the v1.2 milestone.*
+*Architecture research for: v1.3 Auto-Classify (Laya) integration*
+*Researched: 2026-10-10*

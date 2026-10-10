@@ -17,7 +17,7 @@
 
 use super::{
     choose_expunge_path, choose_move_path, chunk_uid_set, AccountConfig, ExpungePath,
-    MovePath, SyncError, SyncSession, DRAFT_FLAGS,
+    MovePath, SyncError, SyncSession, DRAFT_FLAGS, SENT_FLAGS,
 };
 use crate::imap::session::connect_sync;
 use std::collections::HashSet;
@@ -70,39 +70,96 @@ impl SessionManager {
     /// Connects on first use, (re-)SELECTs `mailbox` whenever the session is
     /// fresh or a different folder is selected, and serializes concurrent
     /// callers through the state mutex (FOLD-03: per-folder leases).
+    ///
+    /// One transparent reconnect (same shape as the `set_seen_in` family):
+    /// a pooled session may have died idle (server-side timeout) — the
+    /// SELECT on it then fails with an EOF-style error. Only a *reused*
+    /// session earns the retry: a fresh connect that fails is a hard error
+    /// (server down, unknown folder) and surfaces immediately without a
+    /// second dial. The dead session is dropped before reconnecting so a
+    /// later lease can never reuse it.
     pub async fn lease_for(&self, mailbox: &str) -> Result<MailboxLease<'_>, SyncError> {
         let mut guard = self.state.lock().await;
-        if guard.session.is_none() {
-            let session = connect_sync(&self.config).await.map_err(|e| {
-                SyncError::Protocol(format!("SessionManager connect: {e}"))
-            })?;
-            guard.session = Some(Box::new(session));
-            guard.selected_mailbox = None;
-            guard.cached_capabilities = None;
-        }
-        let needs_select = guard.selected_mailbox.as_deref() != Some(mailbox);
-        if needs_select {
-            let session = guard.session.as_mut().expect("connected above");
-            let summary = session.select_mailbox(mailbox).await.map_err(|e| {
-                SyncError::Protocol(format!("SessionManager SELECT {mailbox}: {e}"))
-            })?;
-            eprintln!(
-                "[SGE imap] lease selected {mailbox}: uid_validity={} exists={}",
-                summary.uid_validity, summary.exists
-            );
-            guard.selected_mailbox = Some(mailbox.to_string());
-            guard.selected_validity = Some(summary.uid_validity);
-        }
-        // Capability cache: the atom set is stable per connection, so one
-        // `CAPABILITY` per fresh session serves every gated op until the
-        // next reconnect. Failing closed here surfaces a broken session
-        // immediately instead of misrouting MOVE/expunge fallbacks.
-        if guard.cached_capabilities.is_none() {
-            let session = guard.session.as_mut().expect("connected above");
-            let caps = session.capabilities().await.map_err(|e| {
-                SyncError::Protocol(format!("SessionManager CAPABILITY: {e}"))
-            })?;
-            guard.cached_capabilities = Some(caps);
+        let mut can_retry = guard.session.is_some();
+        let mut retried = false;
+        loop {
+            if guard.session.is_none() {
+                let session = connect_sync(&self.config).await.map_err(|e| {
+                    SyncError::Protocol(format!(
+                        "SessionManager {}: {e}",
+                        if retried { "reconnect" } else { "connect" }
+                    ))
+                })?;
+                guard.session = Some(Box::new(session));
+                guard.selected_mailbox = None;
+                guard.selected_validity = None;
+                guard.cached_capabilities = None;
+            }
+            if guard.selected_mailbox.as_deref() != Some(mailbox) {
+                let select_outcome = {
+                    let session = guard.session.as_mut().expect("connected above");
+                    session.select_mailbox(mailbox).await
+                };
+                match select_outcome {
+                    Ok(summary) => {
+                        eprintln!(
+                            "[SGE imap] lease selected {mailbox}: uid_validity={} exists={}",
+                            summary.uid_validity, summary.exists
+                        );
+                        guard.selected_mailbox = Some(mailbox.to_string());
+                        guard.selected_validity = Some(summary.uid_validity);
+                    }
+                    Err(e) => {
+                        let err = SyncError::Protocol(format!(
+                            "SessionManager SELECT {mailbox}: {e}"
+                        ));
+                        if can_retry {
+                            can_retry = false;
+                            retried = true;
+                            eprintln!(
+                                "[SGE imap] lease {mailbox} SELECT failed ({err}) — reconnecting once"
+                            );
+                            guard.session = None;
+                            guard.selected_mailbox = None;
+                            guard.selected_validity = None;
+                            guard.cached_capabilities = None;
+                            continue;
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+            // Capability cache: the atom set is stable per connection, so one
+            // `CAPABILITY` per fresh session serves every gated op until the
+            // next reconnect. Failing closed here surfaces a broken session
+            // immediately instead of misrouting MOVE/expunge fallbacks.
+            if guard.cached_capabilities.is_none() {
+                let caps_outcome = {
+                    let session = guard.session.as_mut().expect("connected above");
+                    session.capabilities().await
+                };
+                match caps_outcome {
+                    Ok(caps) => guard.cached_capabilities = Some(caps),
+                    Err(e) => {
+                        let err =
+                            SyncError::Protocol(format!("SessionManager CAPABILITY: {e}"));
+                        if can_retry {
+                            can_retry = false;
+                            retried = true;
+                            eprintln!(
+                                "[SGE imap] lease {mailbox} CAPABILITY failed ({err}) — reconnecting once"
+                            );
+                            guard.session = None;
+                            guard.selected_mailbox = None;
+                            guard.selected_validity = None;
+                            guard.cached_capabilities = None;
+                            continue;
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+            break;
         }
         Ok(MailboxLease { guard })
     }
@@ -267,30 +324,42 @@ impl SessionManager {
     /// `RENAME <old> -> <new>` through the owned session with one
     /// transparent reconnect + retry (Plan 11-02). The lease SELECTs `old`
     /// first (keeps SELECT state sane); a [`SyncError::Refused`] is
-    /// deterministic and never retried. Ends with a `mailbox_status(new)`
-    /// UIDVALIDITY check against the pre-rename value (read by the caller
-    /// of this method): a bump surfaces [`SyncError::State`] — the command
-    /// layer treats it like an epoch change, never a silent accept.
+    /// deterministic and never retried. Ends with a UIDVALIDITY check of
+    /// `new` against the pre-rename value: a bump surfaces
+    /// [`SyncError::State`] — the command layer treats it like an epoch
+    /// change, never a silent accept.
     ///
-    /// Locking: the rename lease is dropped before the post-rename STATUS
-    /// (same async mutex — holding it would deadlock).
+    /// Both STATUS reads run on the rename lease itself: STATUS works on
+    /// any mailbox without disturbing the SELECTed folder, so no INBOX
+    /// bounce (exactly one SELECT per op). On the retry path `old` may
+    /// already be gone (a failed attempt can apply server-side), so the
+    /// retry re-leases INBOX and both the verb and the post-check run
+    /// there — STATUS(new) works from any selection.
+    ///
+    /// Locking: the rename lease is dropped before reconnect (same async
+    /// mutex — holding it would deadlock).
     pub async fn rename_mailbox_in(&self, old: &str, new: &str) -> Result<(), SyncError> {
-        let pre = self.mailbox_status(old).await?.uid_validity;
-        {
-            let mut lease = self.lease_for(old).await?;
-            match lease.session().rename_mailbox(old, new).await {
-                Ok(()) => {}
-                Err(refused @ SyncError::Refused(_)) => return Err(refused),
-                Err(first) => {
-                    eprintln!("[SGE imap] RENAME {old} -> {new} failed ({first}) — reconnecting once");
-                    drop(lease);
-                    self.reconnect().await?;
-                    let mut lease = self.lease_for(old).await?;
-                    lease.session().rename_mailbox(old, new).await?;
+        let mut lease = self.lease_for(old).await?;
+        let pre = lease.session().mailbox_status(old).await?.uid_validity;
+        match lease.session().rename_mailbox(old, new).await {
+            Ok(()) => {}
+            Err(refused @ SyncError::Refused(_)) => return Err(refused),
+            Err(first) => {
+                eprintln!("[SGE imap] RENAME {old} -> {new} failed ({first}) — reconnecting once");
+                drop(lease);
+                self.reconnect().await?;
+                let mut lease = self.lease_for("INBOX").await?;
+                lease.session().rename_mailbox(old, new).await?;
+                let post = lease.session().mailbox_status(new).await?.uid_validity;
+                if post != pre {
+                    return Err(SyncError::State(format!(
+                        "RENAME {old} -> {new}: UIDVALIDITY changed {pre} -> {post} — treated like an epoch change"
+                    )));
                 }
+                return Ok(());
             }
         }
-        let post = self.mailbox_status(new).await?.uid_validity;
+        let post = lease.session().mailbox_status(new).await?.uid_validity;
         if post != pre {
             return Err(SyncError::State(format!(
                 "RENAME {old} -> {new}: UIDVALIDITY changed {pre} -> {post} — treated like an epoch change"
@@ -331,11 +400,17 @@ impl SessionManager {
     /// to a dead generation and is dropped (`old_uid=None` path — the
     /// orphan is reaped by the next sweep's expunge-diff, Phase 9
     /// semantics). Reconcile rule: exactly one UID → it; zero → loud
-    /// `Protocol` error (keep `dirty=1`); multiple → max (newest wins).
+    /// `Refused` (keep `dirty=1`, never retried — a blind re-APPEND could
+    /// duplicate the server copy); multiple → max (newest wins).
     ///
     /// One reconnect-retry around the whole sequence (mirror
     /// [`move_message_in`](Self::move_message_in)); [`SyncError::Refused`]
-    /// is deterministic and never retried. Never calls `self.*_in`
+    /// is deterministic and never retried. The retry RESUMES instead of
+    /// blindly re-APPENDing (MJ-03): when the first attempt's APPEND +
+    /// SEARCH landed but the expunge-old leg failed, a second APPEND would
+    /// orphan the first new copy — so the retry SEARCHes first and, when a
+    /// copy newer than `old_uid` already exists, skips APPEND and resumes
+    /// at the expunge-old leg. Never calls `self.*_in`
     /// re-entrantly while holding the lease (async mutex → deadlock) —
     /// verbs run on `lease.session()` directly.
     pub async fn save_draft_copy_in(
@@ -357,8 +432,26 @@ impl SessionManager {
                     "[SGE imap] save draft {drafts_wire} msg {msg_id} failed ({first}) — reconnecting once"
                 );
                 self.reconnect().await?;
-                self.save_once(drafts_wire, msg_id, bytes, old_uid, expected_validity)
-                    .await
+                // Resume probe: did the APPEND already land before the
+                // failure? A hit distinct from `old_uid` is the first
+                // attempt's new copy (same stable Message-ID) — skip the
+                // second APPEND and resume at expunge-old. No hit, a hit
+                // equal to `old_uid` (APPEND never ran), or a failed probe
+                // all fall through to the full sequence.
+                match self.search_draft_uid(drafts_wire, msg_id).await {
+                    Ok(Some(found)) if Some(found) != old_uid => {
+                        eprintln!(
+                            "[SGE imap] save draft {drafts_wire} msg {msg_id}: retry resumes at expunge-old (copy already at uid {found})"
+                        );
+                        self.expunge_old_only(drafts_wire, old_uid, found, expected_validity)
+                            .await?;
+                        Ok(found)
+                    }
+                    _ => {
+                        self.save_once(drafts_wire, msg_id, bytes, old_uid, expected_validity)
+                            .await
+                    }
+                }
             }
         }
     }
@@ -394,16 +487,81 @@ impl SessionManager {
         save_draft_on_session(lease.session(), drafts_wire, msg_id, bytes, effective_old, &caps).await
     }
 
+    /// Retry-resume probe (MJ-03): SEARCH for the stable Message-ID without
+    /// APPENDing. Returns the newest hit, if any. Takes its own lease —
+    /// called only from the retry path, never while a lease is held.
+    async fn search_draft_uid(
+        &self,
+        drafts_wire: &str,
+        msg_id: &str,
+    ) -> Result<Option<u32>, SyncError> {
+        let mut lease = self.lease_for(drafts_wire).await?;
+        let mut hits = lease
+            .session()
+            .uid_search_header("Message-ID", msg_id)
+            .await?;
+        hits.sort_unstable();
+        Ok(hits.into_iter().max())
+    }
+
+    /// Retry-resume tail (MJ-03): the expunge-old leg only, for when the
+    /// first attempt's APPEND + reconcile already landed. Same
+    /// UIDVALIDITY stale-`old_uid` drop as [`save_once`](Self::save_once);
+    /// `old == new` never self-expunges.
+    async fn expunge_old_only(
+        &self,
+        drafts_wire: &str,
+        old_uid: Option<u32>,
+        new_uid: u32,
+        expected_validity: Option<u32>,
+    ) -> Result<(), SyncError> {
+        let mut lease = self.lease_for(drafts_wire).await?;
+        let mut effective_old = old_uid;
+        if let (Some(expected), Some(actual)) =
+            (expected_validity, lease.selected_validity())
+        {
+            if expected != actual {
+                eprintln!(
+                    "[SGE imap] resume expunge-old {drafts_wire}: UIDVALIDITY {expected} -> {actual} — tracked server_uid is stale, skipping"
+                );
+                effective_old = None;
+            }
+        }
+        if let Some(old) = effective_old {
+            if old != new_uid {
+                let caps = match lease.cached_capabilities() {
+                    Some(caps) => caps,
+                    None => lease.session().capabilities().await?,
+                };
+                lease.session().store_deleted(old, true).await?;
+                expunge_single_on_session(lease.session(), old, &caps).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Expunge one tracked draft copy (discard path) under ONE held lease:
     /// mark `\Deleted` + scoped removal (UIDPLUS `UID EXPUNGE`, else the
     /// single-UID unmark dance — never a bare `expunge()`, T-12-05).
+    /// `expected_validity` is the store epoch read before the discard: when
+    /// the SELECT-time UIDVALIDITY differs, the tracked `uid` belongs to a
+    /// dead generation and the server leg is skipped (MJ-04 — the orphan is
+    /// reaped by the next sweep's expunge-diff, the already-documented
+    /// orphan posture). `None` disables the guard (epoch unknown).
     /// One reconnect-retry; [`SyncError::Refused`] never retried.
     pub async fn discard_server_copy_in(
         &self,
         drafts_wire: &str,
         uid: u32,
+        expected_validity: Option<u32>,
     ) -> Result<(), SyncError> {
         let mut lease = self.lease_for(drafts_wire).await?;
+        if uid_is_stale(expected_validity, lease.selected_validity()) {
+            eprintln!(
+                "[SGE imap] discard draft {drafts_wire} uid {uid}: UIDVALIDITY changed — tracked copy is stale, skipping server leg"
+            );
+            return Ok(());
+        }
         let caps = match lease.cached_capabilities() {
             Some(caps) => caps,
             None => lease.session().capabilities().await?,
@@ -418,12 +576,77 @@ impl SessionManager {
                 drop(lease);
                 self.reconnect().await?;
                 let mut lease = self.lease_for(drafts_wire).await?;
+                if uid_is_stale(expected_validity, lease.selected_validity()) {
+                    eprintln!(
+                        "[SGE imap] discard draft {drafts_wire} uid {uid}: UIDVALIDITY changed across reconnect — tracked copy is stale, skipping server leg"
+                    );
+                    return Ok(());
+                }
                 let caps = match lease.cached_capabilities() {
                     Some(caps) => caps,
                     None => lease.session().capabilities().await?,
                 };
                 discard_once(lease.session(), uid, &caps).await
             }
+        }
+    }
+
+    /// Resolve the Sent folder's wire name via LIST + Phase 11 roles
+    /// (Plan 13-03). `None` means no Sent-like folder — the filing leg
+    /// waits (rows stay `sent_unfiled`); creation follows the Phase 11
+    /// create-behind-confirmation flow, never an automatic CREATE from a
+    /// background pass (T-13-12).
+    pub async fn resolve_sent_wire(&self) -> Result<Option<String>, SyncError> {
+        use super::roles::{resolve_roles, Role};
+        let folders = self.list_mailboxes().await?;
+        Ok(resolve_roles(&folders)
+            .into_iter()
+            .find(|(_, role)| *role == Role::Sent)
+            .map(|(wire, _)| wire))
+    }
+
+    /// File one sent mail to Sent under ONE held lease (Phase 13, Plan
+    /// 13-03): probe-before-APPEND via `UID SEARCH HEADER Message-ID`
+    /// (T-13-09 — servers that auto-save on SMTP produce a hit, so the
+    /// APPEND is skipped and the copy is never duplicated), else APPEND
+    /// the verbatim `.eml` bytes with [`SENT_FLAGS`](super::SENT_FLAGS).
+    ///
+    /// One reconnect-retry; the retry is safe by construction (probe-first:
+    /// an APPEND that landed before the failure reconciles as `Deduped`,
+    /// never a second APPEND). Never calls `self.*_in` re-entrantly while
+    /// holding the lease — verbs run on `lease.session()` directly.
+    pub async fn file_sent_copy_in(
+        &self,
+        sent_wire: &str,
+        msg_id: &str,
+        bytes: &[u8],
+    ) -> Result<FileOutcome, SyncError> {
+        match self.file_sent_once(sent_wire, msg_id, bytes).await {
+            Ok(outcome) => Ok(outcome),
+            Err(first) => {
+                eprintln!(
+                    "[SGE imap] file sent {sent_wire} msg {msg_id} failed ({first}) — reconnecting once"
+                );
+                self.reconnect().await?;
+                self.file_sent_once(sent_wire, msg_id, bytes).await
+            }
+        }
+    }
+
+    /// One attempt of the Sent filing. Holds a SINGLE
+    /// `lease_for(sent_wire)` guard for the SEARCH → APPEND legs so the
+    /// probe and the write address the same folder.
+    async fn file_sent_once(
+        &self,
+        sent_wire: &str,
+        msg_id: &str,
+        bytes: &[u8],
+    ) -> Result<FileOutcome, SyncError> {
+        let mut lease = self.lease_for(sent_wire).await?;
+        if file_sent_on_session(lease.session(), sent_wire, msg_id, bytes).await? {
+            Ok(FileOutcome::Deduped)
+        } else {
+            Ok(FileOutcome::Filed)
         }
     }
 
@@ -531,10 +754,12 @@ pub async fn run_move_on_session(
 /// flush — one implementation, two callers).
 ///
 /// Issues no `select_mailbox` itself. Returns the reconciled new UID:
-/// exactly one SEARCH hit → it; zero → loud `Protocol` error (the server
-/// didn't persist the copy — the row stays `dirty=1`); multiple → max
-/// (a retried APPEND duet converges here; expunge-old still targets only
-/// the tracked `old_uid`, T-12-03). `old_uid == Some(new)` never
+/// exactly one SEARCH hit → it; zero → loud `Refused` error (the server
+/// didn't visibly persist the copy — and a blind re-APPEND could
+/// duplicate it, so like the unverifiable unmark dance this is
+/// deterministic and never retried; the row stays `dirty=1`); multiple →
+/// max (a retried APPEND duet converges here; expunge-old still targets
+/// only the tracked `old_uid`, T-12-03). `old_uid == Some(new)` never
 /// expunges (same copy — nothing superseded).
 pub async fn save_draft_on_session(
     session: &mut dyn SyncSession,
@@ -551,7 +776,7 @@ pub async fn save_draft_on_session(
     hits.sort_unstable();
     let new_uid = match hits.as_slice() {
         [] => {
-            return Err(SyncError::Protocol(format!(
+            return Err(SyncError::Refused(format!(
                 "APPEND draft {msg_id}: persisted copy not found"
             )))
         }
@@ -565,6 +790,53 @@ pub async fn save_draft_on_session(
         }
     }
     Ok(new_uid)
+}
+
+/// Outcome of [`SessionManager::file_sent_copy_in`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileOutcome {
+    /// Server auto-saved on SMTP (probe hit) — APPEND skipped, no duplicate.
+    Deduped,
+    /// Probe missed — verbatim bytes APPENDEd with `\Seen` exactly once.
+    Filed,
+}
+
+/// Sent probe-before-APPEND on an already-selected session, without a
+/// manager lease (Phase 13: shared body behind
+/// [`SessionManager::file_sent_copy_in`] and the worker's filing pass — one
+/// implementation, two callers).
+///
+/// Issues no `select_mailbox` itself. Returns `true` when the Message-ID
+/// already lives in Sent (server auto-save — caller skips APPEND), `false`
+/// after APPENDEing the verbatim bytes. APPEND failure propagates so the
+/// caller parks `sent_unfiled` (APPEND-only retry, never re-SMTP-send).
+pub async fn file_sent_on_session(
+    session: &mut dyn SyncSession,
+    sent_wire: &str,
+    msg_id: &str,
+    bytes: &[u8],
+) -> Result<bool, SyncError> {
+    let mut hits = session.uid_search_header("Message-ID", msg_id).await?;
+    hits.sort_unstable();
+    if !hits.is_empty() {
+        return Ok(true);
+    }
+    session
+        .append_message(sent_wire, SENT_FLAGS, bytes)
+        .await?;
+    Ok(false)
+}
+
+/// True when a tracked UID belongs to a dead folder generation (MJ-04):
+/// both epochs known and disagree. `None` on either side disables the
+/// guard (fail-open would expunge a stranger's UID; fail-closed would skip
+/// legitimate cleanup — unknown means "proceed", matching pre-guard
+/// behavior, with the sweep as the orphan backstop).
+fn uid_is_stale(expected_validity: Option<u32>, selected_validity: Option<u32>) -> bool {
+    matches!(
+        (expected_validity, selected_validity),
+        (Some(expected), Some(actual)) if expected != actual
+    )
 }
 
 /// Mark + scoped-expunge of one tracked draft copy on an
@@ -824,6 +1096,11 @@ mod tests {
         /// When true, `append_message` fails with a `Protocol` error
         /// (drives the draft save retry path).
         fail_append: bool,
+        /// When true, the next `select_mailbox` fails once with an
+        /// EOF-style `Protocol` error (simulates a SELECT on a pooled
+        /// session the server already closed — drives the `lease_for`
+        /// reconnect-retry path), then clears itself.
+        fail_select_once: bool,
     }
 
     impl FakeSession {
@@ -886,6 +1163,7 @@ mod tests {
                 appended_calls: Vec::new(),
                 search_header_results: Vec::new(),
                 fail_append: false,
+                fail_select_once: false,
             })))
         }
     }
@@ -901,17 +1179,22 @@ mod tests {
             &mut self,
             name: &str,
         ) -> PinBox<'_, Result<super::super::MailboxSummary, SyncError>> {
-            let summary = {
+            let outcome = {
                 let mut f = self.0.lock().unwrap();
                 f.select_calls.push(name.to_string());
-                super::super::MailboxSummary {
-                    selected_mailbox: name.to_string(),
-                    uid_validity: 100,
-                    uid_next: None,
-                    exists: f.live_uids().len() as u32,
+                if f.fail_select_once {
+                    f.fail_select_once = false;
+                    Err(SyncError::Protocol(format!("SELECT {name}: io: unexpected EOF")))
+                } else {
+                    Ok(super::super::MailboxSummary {
+                        selected_mailbox: name.to_string(),
+                        uid_validity: 100,
+                        uid_next: None,
+                        exists: f.live_uids().len() as u32,
+                    })
                 }
             };
-            Box::pin(async move { Ok(summary) })
+            Box::pin(async move { outcome })
         }
 
         fn search_uids(&mut self) -> PinBox<'_, Result<Vec<u32>, SyncError>> {
@@ -1446,10 +1729,14 @@ mod tests {
             .await
             .unwrap_err();
             assert!(err.to_string().contains("fake append failure"));
-            let f = probe.lock().unwrap();
-            assert_eq!(f.appended_calls.len(), 1);
-            assert!(f.deleted_calls.is_empty(), "no delete before append ack");
-            assert!(f.expunged_sets.is_empty());
+            // Scope the probe guard: it must drop before the re-lock below
+            // (same-thread re-lock of a std Mutex deadlocks).
+            {
+                let f = probe.lock().unwrap();
+                assert_eq!(f.appended_calls.len(), 1);
+                assert!(f.deleted_calls.is_empty(), "no delete before append ack");
+                assert!(f.expunged_sets.is_empty());
+            }
             // Toggle off — the next save succeeds (retry contract).
             probe.lock().unwrap().fail_append = false;
             let uid = super::save_draft_on_session(
@@ -1489,16 +1776,86 @@ mod tests {
     }
 
     #[test]
+    fn save_draft_resume_tail_expunges_old_without_reappend() {
+        run(async {
+            // MJ-03: the retry-resume tail removes the superseded copy and
+            // never APPENDs (Fake SELECT reports validity 100 = epoch).
+            let fake = FakeHandle::new(&["IMAP4rev1", "UIDPLUS"], &[7]);
+            let probe = fake.0.clone();
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            manager
+                .expunge_old_only("Drafts", Some(7), 9, Some(100))
+                .await
+                .unwrap();
+            let f = probe.lock().unwrap();
+            assert!(f.appended_calls.is_empty(), "resume never re-APPENDs");
+            assert!(f.deleted_calls.contains(&(7, true)));
+            assert_eq!(f.expunged_sets, vec!["7".to_string()]);
+        });
+    }
+
+    #[test]
+    fn save_draft_resume_tail_skips_stale_or_same_uid() {
+        run(async {
+            // Stale epoch (store 99 vs SELECT 100): the tracked UID belongs
+            // to a dead generation — resume must not touch it.
+            let fake = FakeHandle::new(&["IMAP4rev1", "UIDPLUS"], &[7]);
+            let probe = fake.0.clone();
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            manager
+                .expunge_old_only("Drafts", Some(7), 9, Some(99))
+                .await
+                .unwrap();
+            {
+                let f = probe.lock().unwrap();
+                assert!(f.deleted_calls.is_empty(), "stale UID never touched");
+                assert!(f.appended_calls.is_empty(), "resume never re-APPENDs");
+            }
+            // Same UID (nothing superseded): no self-expunge.
+            let fake = FakeHandle::new(&["IMAP4rev1", "UIDPLUS"], &[7]);
+            let probe = fake.0.clone();
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            manager
+                .expunge_old_only("Drafts", Some(7), 7, Some(100))
+                .await
+                .unwrap();
+            let f = probe.lock().unwrap();
+            assert!(f.deleted_calls.is_empty(), "old == new never expunges");
+        });
+    }
+
+    #[test]
     fn discard_server_copy_marks_and_scoped_expunges() {
         run(async {
             let fake = FakeHandle::new(&["IMAP4rev1", "UIDPLUS"], &[7]);
             let probe = fake.0.clone();
             let manager = SessionManager::for_test_session(Box::new(fake));
-            manager.discard_server_copy_in("Drafts", 7).await.unwrap();
+            manager
+                .discard_server_copy_in("Drafts", 7, None)
+                .await
+                .unwrap();
             let f = probe.lock().unwrap();
             assert!(f.deleted_calls.contains(&(7, true)));
             assert_eq!(f.expunged_sets, vec!["7".to_string()]);
             assert_eq!(f.plain_expunge_calls, 0, "never a bare expunge");
+        });
+    }
+
+    #[test]
+    fn discard_server_copy_skips_stale_uid_on_validity_bump() {
+        run(async {
+            // MJ-04: Fake SELECT reports validity 100; the store epoch says
+            // 99 — the tracked UID belongs to a dead generation.
+            let fake = FakeHandle::new(&["IMAP4rev1", "UIDPLUS"], &[7]);
+            let probe = fake.0.clone();
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            manager
+                .discard_server_copy_in("Drafts", 7, Some(99))
+                .await
+                .unwrap();
+            let f = probe.lock().unwrap();
+            assert!(f.deleted_calls.is_empty(), "stale UID never flagged");
+            assert!(f.expunged_sets.is_empty(), "stale UID never expunged");
         });
     }
 
@@ -1568,6 +1925,34 @@ mod tests {
             );
             let f = probe.lock().unwrap();
             assert_eq!(f.created_mailboxes, vec!["Pai".to_string()]);
+        });
+    }
+
+    #[test]
+    fn lease_select_on_dead_session_reconnects_once() {
+        run(async {
+            let fake = FakeHandle::new(&["IMAP4rev1"], &[1, 2]);
+            let probe = fake.0.clone();
+            {
+                probe.lock().unwrap().fail_select_once = true;
+            }
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            // The pooled session died idle: the first SELECT hits EOF.
+            // Offline the reconnect cannot succeed (test.invalid dials
+            // nothing): the retry path surfaces the reconnect error, and
+            // crucially SELECT fired exactly once — the second SELECT only
+            // runs after a successful reconnect.
+            let err = match manager.lease_for("Archives").await {
+                Ok(_) => panic!("offline retry must surface the reconnect error"),
+                Err(e) => e,
+            };
+            let msg = err.to_string().to_lowercase();
+            assert!(
+                msg.contains("reconnect"),
+                "expected a reconnect error, got: {err}"
+            );
+            let f = probe.lock().unwrap();
+            assert_eq!(f.select_calls, vec!["Archives".to_string()]);
         });
     }
 

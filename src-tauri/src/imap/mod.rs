@@ -443,6 +443,11 @@ pub fn deleted_store_arg(deleted: bool) -> &'static str {
 /// CONTEXT — the copy is the user's own text, already "read").
 pub const DRAFT_FLAGS: &str = "(\\Draft \\Seen)";
 
+/// The APPEND flags literal for a filed Sent copy (Phase 13, Plan 13-03):
+/// `\Seen` only — the copy is the user's own sent text, already "read".
+/// No `\Draft` atom: Sent copies must not read as drafts to other clients.
+pub const SENT_FLAGS: &str = "(\\Seen)";
+
 /// Which server verb carries a move, given the advertised capabilities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MovePath {
@@ -765,7 +770,7 @@ impl SyncSession for BoxedSession {
     ) -> PinBox<'_, Result<Vec<u32>, SyncError>> {
         let (field_owned, value_owned) = (field.to_string(), value.to_string());
         Box::pin(async move {
-            let query = format!("HEADER {field_owned} {value_owned}");
+            let query = format!("HEADER {field_owned} \"{value_owned}\"");
             let uids_set = self.uid_search(&query).await.map_err(|e| {
                 SyncError::Protocol(format!(
                     "UID SEARCH HEADER {field_owned} {value_owned}: {e}"

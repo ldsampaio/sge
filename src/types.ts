@@ -86,6 +86,47 @@ export interface DeleteFolderResult {
   fallback: string;
 }
 
+/**
+ * One compose-session row from the local `drafts` store (Phase 12 backend).
+ * Mirrors the Rust `DraftRow` struct from store/queries.rs — field
+ * addresses/recipients are comma-separated strings, `dirty` marks content
+ * newer than the last acknowledged server copy, `server_uid` is the Phase 13
+ * DRAFT-03 send-transaction handoff.
+ */
+export interface DraftRow {
+  id: string;
+  mailbox_id: number;
+  message_id: string;
+  subject: string;
+  body: string;
+  to: string;
+  cc: string;
+  bcc: string;
+  dirty: boolean;
+  server_uid: number | null;
+  attachments: string;
+  updated_at: string;
+}
+
+/**
+ * Outcome of the `save_draft` Tauri command (frozen 12-02 contract).
+ * The save lands locally instantly; `acked` tells whether the server
+ * confirmed the copy or the row stays dirty for the reconnect flush.
+ */
+export interface DraftSaveResult {
+  id: string;
+  dirty: boolean;
+  server_uid: number | null;
+  acked: boolean;
+  pending_count: number;
+}
+
+/** Outcome of the `discard_draft` Tauri command (frozen 12-02 contract). */
+export interface DiscardResult {
+  id: string;
+  discarded: boolean;
+}
+
 export interface SyncStatusInfo {
   mailbox: string;
   last_sync_at: string;
@@ -112,7 +153,6 @@ export interface SetSeenResult {
 
 /** Local UI event bus for flag toggles (list <-> reader -> status line). */
 export const FLAG_UPDATE_EVENT = "sge:flag-update";
-
 export interface FlagUpdateDetail {
   uid: number;
   /** Target seen state the toggle applied (or attempted). */
@@ -184,4 +224,13 @@ export function formatRowDate(date_utc: string): string {
     month: "2-digit",
     year: "numeric",
   });
+}
+
+export interface SendStatusResult {
+  pending_count: number;
+  failed: number;
+  queued: number;
+  sending: number;
+  uncertain: number;
+  sent_unfiled: number;
 }

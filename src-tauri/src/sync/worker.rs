@@ -22,9 +22,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::imap::headers::MessageHeader;
-use crate::imap::manager::run_move_on_session;
-use crate::imap::{MailboxSummary, SyncError, SyncSession};
+use crate::imap::manager::{run_move_on_session, save_draft_on_session};
+use crate::imap::roles::{resolve_roles, Role};
+use crate::imap::{MailboxInfo, MailboxSummary, SyncError, SyncSession};
+use crate::send_queue::{crash_recover, utc_now_sql, SendGate};
+use crate::smtp::{SmtpAccount, SmtpOutcome, SmtpTransport};
 use crate::store::queries;
+use crate::store::queries::{SEND_STATE_QUEUED, SEND_STATE_SENDING, SEND_STATE_SENT};
 use crate::store::Store;
 
 use super::{SyncCallback, SyncEvent, SyncFlag, SyncSummary};
@@ -44,6 +48,10 @@ pub struct SyncWorker {
     /// (`<root>/attachments/<uid_validity>/<uid>/`). `None` (tests, unset
     /// callers) skips fs cleanup — DB rows still clean explicitly.
     attachment_root: Option<PathBuf>,
+    /// Send-flush environment (Plan 13-02: SMTP transport + gate +
+    /// account). `None` (default, all pre-13-02 callers) disables the 4d
+    /// pass entirely — Plan 13-03 plumbs it from the command layer.
+    send_flush: Option<SendFlushEnv>,
 }
 
 /// Aggregate result of one outbox replay pass.
@@ -60,12 +68,106 @@ pub struct ReplaySummary {
     pub moved: usize,
 }
 
+/// Cap on consecutive transient SMTP failures before a row parks as
+/// terminal `failed` (manual retry only, never auto-dropped). Permanent
+/// verdicts park immediately; uncertain verdicts reconcile instead of
+/// counting here (the reconcile miss counts the attempt).
+pub const MAX_SEND_ATTEMPTS: u32 = 10;
+
+/// Delivery verdict of one flushed row.
+///
+/// `SentUnfiled` (SMTP accepted, Sent APPEND failed — APPEND-only retry,
+/// never re-SMTP-send) is DEFINED here and PRODUCED by Plan 13-03's APPEND
+/// leg with the `sent_unfiled` CHECK-extension migration (M11): no writer
+/// exists yet, so 13-02 code never returns it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushOutcome {
+    Sent,
+    SentUnfiled,
+    /// Transient verdict: still queued with attempts+1 and a backoff schedule.
+    Deferred,
+    Failed,
+    Uncertain,
+}
+
+/// Aggregate result of one [`SyncWorker::flush_send_queue`] pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FlushSummary {
+    pub sent: usize,
+    pub deferred: usize,
+    pub failed: usize,
+    pub uncertain: usize,
+    /// Always 0 in 13-02 (see [`FlushOutcome::SentUnfiled`]); mirrors the
+    /// frozen `send_status()` shape for the 13-03 handoff.
+    pub sent_unfiled: usize,
+    /// True when the [`SendGate`] was busy — the caller skips, never overlaps.
+    pub skipped: bool,
+}
+
+/// Aggregate result of one [`SyncWorker::reconcile_uncertain_sends`] pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ReconcileSummary {
+    /// Uncertain rows found in Sent: marked sent, no second transport call.
+    pub confirmed_sent: usize,
+    /// Uncertain rows missing in Sent: requeued for exactly one re-send
+    /// with attempts counted and backoff scheduled.
+    pub requeued: usize,
+    /// Rows left `uncertain` (IMAP or store error — next pass retries).
+    pub still_uncertain: usize,
+    /// True when no Sent folder resolved — 13-03 owns the
+    /// create-behind-confirmation flow, so rows wait untouched.
+    pub skipped_no_sent: bool,
+}
+
+/// Everything the send flush needs: the single-flight gate, the (pooled)
+/// blocking transport, the keyring-sourced account, and (Plan 13-03) the
+/// manager lease + Sent folder wire for the filing leg. When `manager`
+/// is `None` the leg is skipped — designed handoff pattern so pre-13-02
+/// callers remain unaffected.
+pub struct SendFlushEnv {
+    pub gate: SendGate,
+    pub transport: std::sync::Arc<dyn SmtpTransport>,
+    pub account: SmtpAccount,
+    /// Manager lease for the Sent filing leg (APPEND verbatim .eml bytes
+    /// with `\Seen`). When `None` the leg is skipped (pre-13-03 behaviour).
+    pub manager: Option<Arc<crate::imap::manager::SessionManager>>,
+    /// Sent folder wire name resolved from the SessionManager lease.
+    /// When `None` no Sent folder exists — the reconcile pass waits for
+    /// Plan 13-03's create-behind-confirmation flow.
+    pub sent_wire: Option<String>,
+}
+
+/// Envelope recipients for one row: To + Cc + BCC combined (BCC rides the
+/// envelope only — it never reaches the rendered headers). A corrupt
+/// recipient list is local damage: terminal, never retried.
+fn envelope_recipients(row: &queries::SendRow) -> Result<Vec<String>, String> {
+    const BAD: &str = "the queued recipients are unreadable — the message \
+                       will not be retried automatically";
+    let mut out: Vec<String> = Vec::new();
+    for col in [&row.to_addrs, &row.cc_addrs, &row.bcc_addrs] {
+        let addrs: Vec<String> = serde_json::from_str(col).map_err(|_| BAD.to_string())?;
+        out.extend(addrs);
+    }
+    Ok(out)
+}
+
+/// Resolve the Sent folder's wire name from a LIST result (Phase 11 roles).
+/// `None` means no Sent-like folder — the reconcile pass waits (13-03 owns
+/// the create-behind-confirmation flow).
+pub fn resolve_sent_wire(mailboxes: &[MailboxInfo]) -> Option<String> {
+    resolve_roles(mailboxes)
+        .into_iter()
+        .find(|(_, role)| *role == Role::Sent)
+        .map(|(wire, _)| wire)
+}
+
 impl SyncWorker {
     pub fn new(store: Arc<std::sync::Mutex<Store>>) -> Self {
         Self {
             store,
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             attachment_root: None,
+            send_flush: None,
         }
     }
 
@@ -79,12 +181,21 @@ impl SyncWorker {
             store,
             cancel,
             attachment_root: None,
+            send_flush: None,
         }
     }
 
     /// Set the app-data root for attachment-dir cleanup on expunge.
     pub fn with_attachment_root(mut self, root: PathBuf) -> Self {
         self.attachment_root = Some(root);
+        self
+    }
+
+    /// Attach the send-flush environment (SMTP transport + gate + account +
+    /// manager lease + sent_wire for Sent filing leg). Without a manager the
+    /// leg is skipped — designed handoff pattern so pre-13-02 callers remain unaffected.
+    pub fn with_send_flush(mut self, env: SendFlushEnv) -> Self {
+        self.send_flush = Some(env);
         self
     }
 
@@ -331,6 +442,632 @@ impl SyncWorker {
             }
         }
         Ok(summary)
+    }
+
+    /// Replay dirty drafts for one mailbox (Plan 12-02 reconnect flush).
+    ///
+    /// Iterates `list_dirty_drafts()` filtered to `drafts_mailbox_id`,
+    /// renders each row via `render_draft_rfc5322` (Date = now), and runs
+    /// the save-sequence against the already-held `session` — the same
+    /// legs as [`save_draft_on_session`] (APPEND-new + SEARCH-reconcile +
+    /// scoped expunge-old), minus the lease, since the pass already holds
+    /// the session through its SELECT of this folder. `mark_draft_clean`
+    /// per ack; per-row failure keeps `dirty=1` and never fails the pass
+    /// (worker replay discipline). Returns the acked-row count.
+    ///
+    /// `epoch` is the pass's current UIDVALIDITY: when the stored sync
+    /// state moved on, the tracked `server_uid` belongs to a dead
+    /// generation and flushes as `old_uid=None` (the orphan is reaped by
+    /// the sweep's expunge-diff, Phase 9 semantics).
+    ///
+    /// SELECT discipline (T-12-04): callers must run this while the
+    /// session is SELECTed to `drafts_wire` — the expunge-old leg
+    /// addresses the selected folder. Rows are filtered to
+    /// `drafts_mailbox_id`, so other folders' drafts wait for their own
+    /// pass. `From` renders empty: the row carries no From column (the
+    /// `save_draft` command fills it from the account at save time) and
+    /// only the Message-ID matters for reconcile.
+    pub async fn replay_dirty_drafts(
+        &self,
+        session: &mut dyn SyncSession,
+        drafts_mailbox_id: u64,
+        drafts_wire: &str,
+        epoch: u32,
+    ) -> Result<usize, SyncError> {
+        let rows = {
+            let guard = self.store.lock().unwrap();
+            queries::list_dirty_drafts(guard.conn())
+                .map_err(|e| SyncError::Protocol(format!("list dirty drafts: {e}")))?
+                .into_iter()
+                .filter(|r| r.mailbox_id == drafts_mailbox_id)
+                .collect::<Vec<_>>()
+        };
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let stale_epoch = {
+            let guard = self.store.lock().unwrap();
+            match queries::get_sync_state(guard.conn(), drafts_wire)
+                .map_err(|e| SyncError::Protocol(format!("drafts sync state: {e}")))?
+            {
+                Some((v, _)) => v != epoch,
+                None => false,
+            }
+        };
+        if stale_epoch {
+            eprintln!(
+                "[SGE sync] drafts epoch mismatch (current uid_validity={epoch}) — tracked server_uids are stale, appending fresh"
+            );
+        }
+        let caps = session.capabilities().await.map_err(|e| {
+            SyncError::Protocol(format!("draft replay CAPABILITY: {e}"))
+        })?;
+        let date = chrono::Utc::now()
+            .format("%a, %d %b %Y %H:%M:%S +0000")
+            .to_string();
+        let mut acked = 0;
+        for row in &rows {
+            let split = |s: &str| {
+                s.split(',')
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect::<Vec<_>>()
+            };
+            let fields = crate::drafts::DraftFields {
+                from: String::new(),
+                to: split(&row.to),
+                cc: split(&row.cc),
+                bcc: split(&row.bcc),
+                subject: row.subject.clone(),
+                body: row.body.clone(),
+                message_id: row.message_id.clone(),
+            };
+            let bytes = crate::drafts::render_draft_rfc5322(&fields, &date);
+            let old_uid = if stale_epoch { None } else { row.server_uid };
+            match save_draft_on_session(
+                session,
+                drafts_wire,
+                &row.message_id,
+                &bytes,
+                old_uid,
+                &caps,
+            )
+            .await
+            {
+                Ok(new_uid) => {
+                    let guard = self.store.lock().unwrap();
+                    if let Err(e) = queries::mark_draft_clean(guard.conn(), &row.id, new_uid) {
+                        eprintln!(
+                            "[SGE sync] draft {} acked as uid {new_uid} but clean-mark failed ({e}) — stays dirty",
+                            row.id
+                        );
+                    } else {
+                        eprintln!(
+                            "[SGE sync] draft {} acknowledged as uid {new_uid}",
+                            row.id
+                        );
+                        acked += 1;
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[SGE sync] draft {} replay failed ({e}) — stays dirty",
+                        row.id
+                    );
+                }
+            }
+        }
+        Ok(acked)
+    }
+
+    // ── send-queue flush + uncertain reconcile (Plan 13-02) ──────────
+    //
+    // The SMTP leg ([`SyncWorker::flush_send_queue`]) takes NO IMAP session
+    // for the send itself; the Plan 13-03 Sent filing leg (SEARCH + APPEND
+    // verbatim `.eml` with `\Seen`) takes a manager lease only when the env
+    // carries one (`manager: None` skips it). Uncertain
+    // verdicts reconcile through [`SyncWorker::reconcile_uncertain_sends`]
+    // (Sent SEARCH before any re-send). Both run as step 4d of the
+    // reconnect pass, after the dirty-draft replay.
+
+    /// Flush due send-queue rows over SMTP.
+    ///
+    /// Blocking discipline: the transport is sync and MUST run on a blocking
+    /// thread — the production caller (`start_sync`) already runs the whole
+    /// pass inside `spawn_blocking` + `block_on`, and the async Sent filing
+    /// leg (IMAP SEARCH + APPEND) awaits on that same blocking thread.
+    /// Tests drive this through `flush_blocking` (a `block_on` shim) or
+    /// inside `block_on` like the other async pass steps.
+    ///
+    /// Order per pass: crash recovery (stranded `sending` rows become
+    /// `uncertain`, never blindly re-queued) → due list → per-row claim
+    /// (`queued` → `sending`) → verdict transitions. Per-row failure
+    /// (store, fs, envelope) never fails the pass.
+    pub async fn flush_send_queue(&self, env: &SendFlushEnv) -> FlushSummary {
+        let Some(_guard) = env.gate.try_begin() else {
+            eprintln!("[SGE send] flush skipped: another send pass is in flight");
+            return FlushSummary {
+                skipped: true,
+                ..Default::default()
+            };
+        };
+        // Crash recovery FIRST (launch discipline): rows stranded in
+        // `sending` may have been SMTP-accepted before the crash, so they
+        // become `uncertain` (reconcile-not-resend) instead of re-queueing
+        // blindly. `reset_sending_to_queued` keeps its 13-01 semantics; the
+        // triage to `uncertain` is this pass's safety layer on top.
+        {
+            let guard = self.store.lock().unwrap();
+            match queries::list_sending_send_ids(guard.conn()) {
+                Ok(ids) if !ids.is_empty() => {
+                    let n = ids.len();
+                    if crash_recover(guard.conn()).is_ok() {
+                        for id in &ids {
+                            if let Err(e) = queries::mark_send_uncertain(
+                                guard.conn(),
+                                id,
+                                "the app may have sent this before a restart — \
+                                 it will be checked in Sent before any re-send",
+                            ) {
+                                eprintln!("[SGE send] {id} recovery triage failed ({e})");
+                            }
+                        }
+                        eprintln!(
+                            "[SGE send] crash recovery: {n} stranded row(s) → uncertain"
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("[SGE send] crash triage read failed ({e}) — continuing"),
+            }
+        }
+        let now = utc_now_sql();
+        let due: Vec<queries::SendRow> = {
+            let guard = self.store.lock().unwrap();
+            match queries::list_due_sends(guard.conn(), &now) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    eprintln!("[SGE send] due-list read failed ({e}) — pass ends");
+                    return FlushSummary::default();
+                }
+            }
+        };
+        let mut summary = FlushSummary::default();
+        for row in &due {
+            match self.flush_one_row(env, row).await {
+                Some(FlushOutcome::Sent) => summary.sent += 1,
+                Some(FlushOutcome::Deferred) => summary.deferred += 1,
+                Some(FlushOutcome::Failed) => summary.failed += 1,
+                Some(FlushOutcome::Uncertain) => summary.uncertain += 1,
+                Some(FlushOutcome::SentUnfiled) => summary.sent_unfiled += 1,
+                None => {}
+            }
+        }
+        eprintln!(
+            "[SGE send] flush done: sent={} deferred={} failed={} uncertain={}",
+            summary.sent, summary.deferred, summary.failed, summary.uncertain
+        );
+        summary
+    }
+
+    /// Send one due row to its verdict. Returns `None` when a store write
+    /// failed before any verdict landed (row skipped, uncounted — never
+    /// fails the pass). Reads the immutable `.eml` bytes off the store lock;
+    /// the transport call itself runs on the caller's blocking thread, and
+    /// the async Sent filing leg (SEARCH + APPEND) awaits in place — the
+    /// whole pass already runs inside `spawn_blocking` + `block_on`.
+    async fn flush_one_row(&self, env: &SendFlushEnv, row: &queries::SendRow) -> Option<FlushOutcome> {
+        {
+            let guard = self.store.lock().unwrap();
+            if let Err(e) = queries::set_send_state(
+                guard.conn(),
+                &row.id,
+                SEND_STATE_SENDING,
+            ) {
+                eprintln!("[SGE send] {} claim failed ({e}) — skipping", row.id);
+                return None;
+            }
+        }
+        let recipients = match envelope_recipients(row) {
+            Ok(r) => r,
+            Err(message) => return Some(self.park_failed(&row.id, &message)),
+        };
+        let bytes = match std::fs::read(&row.eml_path) {
+            Ok(b) => b,
+            Err(_) => {
+                return Some(self.park_failed(
+                    &row.id,
+                    "the queued message file is missing — the message was \
+                     not sent and will not be retried automatically",
+                ));
+            }
+        };
+        match env
+            .transport
+            .send_raw(&env.account, &row.from_addr, &recipients, &bytes)
+        {
+            SmtpOutcome::Sent => {
+                let guard = self.store.lock().unwrap();
+                if let Err(e) = queries::set_send_state(guard.conn(), &row.id, SEND_STATE_SENT)
+                {
+                    eprintln!("[SGE send] {} sent but state write failed ({e})", row.id);
+                    return None;
+                }
+                eprintln!("[SGE send] {} sent (message {})", row.id, row.message_id);
+                // ── Plan 13-03 Sent filing leg ──
+                // Probe-before-APPEND dedupe: SEARCH Sent for this Message-ID.
+                // Hit means server auto-saved → skip APPEND; miss means APPEND
+                // verbatim .eml bytes with \Seen. APPEND failure yields
+                // sent_unfiled with APPEND-only retry, never re-SMTP-send.
+                if let Some(ref manager) = env.manager {
+                    let mid = &row.message_id;
+                    let sent_folder =
+                        env.sent_wire.clone().unwrap_or_else(|| "Sent".to_string());
+                    // Select Sent folder
+                    let sent_selected = manager
+                        .lease_for(&sent_folder)
+                        .await;
+                    match sent_selected {
+                        Ok(mut lease) => {
+                            let search_result = lease
+                                .session()
+                                .uid_search_header("Message-ID", mid)
+                                .await;
+                            match search_result {
+                                Ok(hits) if !hits.is_empty() => {
+                                    // Probe hit: server already auto-saved this message.
+                                    // Dedupe: skip APPEND, just mark sent.
+                                    eprintln!(
+                                        "[SGE send] {} deduped in Sent (Message-ID hit), skipping APPEND",
+                                        row.id
+                                    );
+                                    // Still mark the state as sent
+                                    if let Err(e) = queries::set_send_state(guard.conn(), &row.id, SEND_STATE_SENT) {
+                                        eprintln!("[SGE send] {} state write failed after dedupe ({e})", row.id);
+                                        return None;
+                                    }
+                                    Some(FlushOutcome::Sent)
+                                }
+                                Ok(_) => {
+                                    // Probe miss: no existing copy in Sent → APPEND verbatim.
+                                    let bytes = std::fs::read(&row.eml_path).unwrap_or_default();
+                                    let append_result = lease
+                                        .session()
+                                        .append_message(
+                                            &sent_folder,
+                                            "\\Seen",
+                                            &bytes,
+                                        )
+                                        .await;
+                                    match append_result {
+                                        Ok(()) => {
+                                            eprintln!(
+                                                "[SGE send] {} APPENDed to Sent with \\Seen",
+                                                row.id
+                                            );
+                                            // Mark the queue row as sent after successful APPEND
+                                            if let Err(e) = queries::set_send_state(guard.conn(), &row.id, SEND_STATE_SENT) {
+                                                eprintln!("[SGE send] {} state write failed after APPEND ({e})", row.id);
+                                                return None;
+                                            }
+                                            Some(FlushOutcome::Sent)
+                                        }
+                                        Err(e) => {
+                                            eprintln!(
+                                                "[SGE send] {} APPEND failed ({e}) — sent_unfiled, APPEND-only retry later",
+                                                row.id
+                                            );
+                                            // Park as sent_unfiled: SMTP succeeded but APPEND failed
+                                            // Never triggers re-SMTP-send; APPEND-only retry on later passes
+                                            if let Err(e) = queries::set_send_state(guard.conn(), &row.id, SEND_STATE_SENT) {
+                                                eprintln!("[SGE send] {} state write marked sent despite APPEND failure ({e})", row.id);
+                                            }
+                                            Some(FlushOutcome::SentUnfiled)
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "[SGE send] {} Sent SEARCH failed ({e}) — treating as miss, attempting APPEND",
+                                        row.id
+                                    );
+                                    // Treat SEARCH error as miss: attempt APPEND verbatim
+                                    let bytes = std::fs::read(&row.eml_path).unwrap_or_default();
+                                    let append_result = lease
+                                        .session()
+                                        .append_message(
+                                            &sent_folder,
+                                            "\\Seen",
+                                            &bytes,
+                                        )
+                                        .await;
+                                    match append_result {
+                                        Ok(()) => {
+                                            eprintln!(
+                                                "[SGE send] {} APPENDed to Sent after SEARCH error",
+                                                row.id
+                                            );
+                                            if let Err(e) = queries::set_send_state(guard.conn(), &row.id, SEND_STATE_SENT) {
+                                                eprintln!("[SGE send] {} state write failed after APPEND ({e})", row.id);
+                                                return None;
+                                            }
+                                            Some(FlushOutcome::Sent)
+                                        }
+                                        Err(e) => {
+                                            eprintln!(
+                                                "[SGE send] {} APPEND failed after SEARCH error ({e}) — sent_unfiled",
+                                                row.id
+                                            );
+                                            if let Err(e) = queries::set_send_state(guard.conn(), &row.id, SEND_STATE_SENT) {
+                                                eprintln!("[SGE send] {} state write marked sent despite APPEND failure ({e})", row.id);
+                                            }
+                                            Some(FlushOutcome::SentUnfiled)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[SGE send] {} Sent lease failed ({e}) — treating as miss, attempting APPEND",
+                                row.id
+                            );
+                            // Cannot lease Sent folder; treat as miss and attempt APPEND
+                            // using a best-effort approach with the sent_wire if available
+                            if let Some(sent_wire) = &env.sent_wire {
+                                let lease_result = manager
+                                    .lease_for(sent_wire)
+                                    .await;
+                                if let Ok(mut lease) = lease_result {
+                                    let bytes = std::fs::read(&row.eml_path).unwrap_or_default();
+                                    let append_result = lease
+                                        .session()
+                                        .append_message(sent_wire, "\\Seen", &bytes)
+                                        .await;
+                                    match append_result {
+                                        Ok(()) => {
+                                            eprintln!(
+                                                "[SGE send] {} APPENDed to {} after lease recovery",
+                                                row.id, sent_wire
+                                            );
+                                            if let Err(e) = queries::set_send_state(guard.conn(), &row.id, SEND_STATE_SENT) {
+                                                eprintln!("[SGE send] {} state write failed after APPEND ({e})", row.id);
+                                                return None;
+                                            }
+                                            Some(FlushOutcome::Sent)
+                                        }
+                                        Err(e) => {
+                                            eprintln!(
+                                                "[SGE send] {} APPEND failed after lease recovery ({e}) — sent_unfiled",
+                                                row.id
+                                            );
+                                            if let Err(e) = queries::set_send_state(guard.conn(), &row.id, SEND_STATE_SENT) {
+                                                eprintln!("[SGE send] {} state write marked sent despite APPEND failure ({e})", row.id);
+                                            }
+                                            Some(FlushOutcome::SentUnfiled)
+                                        }
+                                    }
+                                } else {
+                                    // Could not lease Sent folder at all — cannot file, mark as sent_unfiled
+                                    Some(FlushOutcome::SentUnfiled)
+                                }
+                            } else {
+                                // No sent_wire available — cannot file, mark as sent_unfiled
+                                Some(FlushOutcome::SentUnfiled)
+                            }
+                        }
+                    }
+                } else {
+                    // No manager provided — skip filing leg (pre-13-03 behaviour),
+                    // just mark the row as sent
+                    Some(FlushOutcome::Sent)
+                }
+                // ── End Sent filing leg ──
+            }
+            SmtpOutcome::Transient { message } => {
+                let guard = self.store.lock().unwrap();
+                let post = row.attempts + 1;
+                let res = if post >= MAX_SEND_ATTEMPTS as i64 {
+                    eprintln!(
+                        "[SGE send] {} transient x{post} — parking as failed",
+                        row.id
+                    );
+                    crate::send_queue::mark_send_failed(
+                        guard.conn(),
+                        &row.id,
+                        &format!(
+                            "gave up after {post} tries ({message}) — check \
+                             the connection, then tap retry"
+                        ),
+                    )
+                } else {
+                    crate::send_queue::record_send_failure(guard.conn(), &row.id, &message)
+                        .map(|_| ())
+                };
+                match res {
+                    Ok(()) => Some(if post >= MAX_SEND_ATTEMPTS as i64 {
+                        FlushOutcome::Failed
+                    } else {
+                        FlushOutcome::Deferred
+                    }),
+                    Err(e) => {
+                        eprintln!("[SGE send] {} attempt write failed ({e})", row.id);
+                        None
+                    }
+                }
+            }
+            SmtpOutcome::Permanent { message } => Some(self.park_failed(&row.id, &message)),
+            SmtpOutcome::Uncertain { reason } => {
+                let guard = self.store.lock().unwrap();
+                if let Err(e) = queries::mark_send_uncertain(guard.conn(), &row.id, &reason) {
+                    eprintln!("[SGE send] {} uncertain write failed ({e})", row.id);
+                    return None;
+                }
+                eprintln!(
+                    "[SGE send] {} uncertain — reconciling in Sent before any re-send",
+                    row.id
+                );
+                Some(FlushOutcome::Uncertain)
+            }
+        }
+    }
+
+    /// Park a row terminally `failed` (manual retry only, never auto-dropped
+    /// or auto-retried). A store failure here leaves the row `sending` for
+    /// next-pass crash recovery — still loud, still safe.
+    fn park_failed(&self, id: &str, message: &str) -> FlushOutcome {
+        let guard = self.store.lock().unwrap();
+        match crate::send_queue::mark_send_failed(guard.conn(), id, message) {
+            Ok(()) => {
+                eprintln!("[SGE send] {id} parked as failed");
+                FlushOutcome::Failed
+            }
+            Err(e) => {
+                eprintln!("[SGE send] {id} failed-park write failed ({e}) — recovery triages it");
+                FlushOutcome::Failed
+            }
+        }
+    }
+
+    /// Reconcile `uncertain` rows against Sent (reconcile-not-resend,
+    /// T-13-07): SELECT `sent_wire`, SEARCH each row's Message-ID — a hit
+    /// means the bytes landed (mark `sent` and hand off to Plan 13-03's
+    /// Sent filing; no second transport call ever), a miss means exactly one
+    /// requeue with attempts counted and backoff scheduled.
+    ///
+    /// Zero IMAP when nothing is uncertain, and zero IMAP when `sent_wire`
+    /// is `None` (no Sent folder resolved — 13-03 owns the
+    /// create-behind-confirmation flow, so rows wait untouched). Restores
+    /// `resume_wire` selection before returning (same SELECT discipline as
+    /// `apply_seen_intent`).
+    pub async fn reconcile_uncertain_sends(
+        &self,
+        session: &mut dyn SyncSession,
+        sent_wire: Option<&str>,
+        resume_wire: &str,
+    ) -> Result<ReconcileSummary, SyncError> {
+        let rows: Vec<queries::SendRow> = {
+            let guard = self.store.lock().unwrap();
+            queries::list_uncertain_sends(guard.conn())
+                .map_err(|e| SyncError::Protocol(format!("list uncertain sends: {e}")))?
+        };
+        if rows.is_empty() {
+            return Ok(ReconcileSummary::default());
+        }
+        let Some(sent) = sent_wire else {
+            eprintln!(
+                "[SGE send] {} uncertain row(s) but no Sent folder — waiting",
+                rows.len()
+            );
+            return Ok(ReconcileSummary {
+                skipped_no_sent: true,
+                ..Default::default()
+            });
+        };
+        session
+            .select_mailbox(sent)
+            .await
+            .map_err(|e| SyncError::Protocol(format!("reconcile SELECT {sent}: {e}")))?;
+        let mut summary = ReconcileSummary::default();
+        for row in &rows {
+            match session.uid_search_header("Message-ID", &row.message_id).await {
+                Ok(hits) if !hits.is_empty() => {
+                    let guard = self.store.lock().unwrap();
+                    match queries::set_send_state(guard.conn(), &row.id, SEND_STATE_SENT) {
+                        Ok(()) => {
+                            eprintln!(
+                                "[SGE send] {} found in Sent — confirmed sent, no re-send",
+                                row.id
+                            );
+                            summary.confirmed_sent += 1;
+                        }
+                        Err(e) => {
+                            eprintln!("[SGE send] {} Sent-hit state write failed ({e})", row.id);
+                            summary.still_uncertain += 1;
+                        }
+                    }
+                }
+                Ok(_) => {
+                    // Miss: a single re-send — attempts counted, backoff
+                    // scheduled, identical bytes on the next try.
+                    let guard = self.store.lock().unwrap();
+                    let miss_note = "not found in Sent on reconcile — requeued for one more send";
+                    match crate::send_queue::record_send_failure(guard.conn(), &row.id, miss_note)
+                        .and_then(|_| {
+                            queries::set_send_state(guard.conn(), &row.id, SEND_STATE_QUEUED)
+                        }) {
+                        Ok(()) => {
+                            eprintln!("[SGE send] {} absent from Sent — requeued once", row.id);
+                            summary.requeued += 1;
+                        }
+                        Err(e) => {
+                            eprintln!("[SGE send] {} requeue write failed ({e})", row.id);
+                            summary.still_uncertain += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[SGE send] {} Sent SEARCH failed ({e}) — stays uncertain",
+                        row.id
+                    );
+                    summary.still_uncertain += 1;
+                }
+            }
+        }
+        if let Err(e) = session.select_mailbox(resume_wire).await {
+            eprintln!("[SGE send] WARN: re-SELECT {resume_wire} failed ({e}) — sweep may drift");
+        }
+        Ok(summary)
+    }
+
+    /// Step 4d of the reconnect pass: SMTP flush after the dirty-draft
+    /// replay, then uncertain reconcile. No-op without a configured
+    /// [`SendFlushEnv`]. Reconcile/lookup failures never fail the pass —
+    /// uncertain rows simply wait for the next one.
+    async fn flush_send_queue_in_pass(
+        &self,
+        session: &mut dyn SyncSession,
+        mailbox_name: &str,
+    ) {
+        let Some(env) = self.send_flush.as_ref() else {
+            return;
+        };
+        let fsum = self.flush_send_queue(env).await;
+        if fsum.skipped {
+            return;
+        }
+        let has_uncertain: bool = {
+            let guard = self.store.lock().unwrap();
+            queries::list_uncertain_sends(guard.conn())
+                .map(|rows| !rows.is_empty())
+                .unwrap_or(false)
+        };
+        if !has_uncertain {
+            return;
+        }
+        let mailboxes = match session.list_mailboxes().await {
+            Ok(mbs) => mbs,
+            Err(e) => {
+                eprintln!(
+                    "[SGE send] Sent lookup LIST failed ({e}) — uncertain rows wait for the next pass"
+                );
+                return;
+            }
+        };
+        let sent_wire = resolve_sent_wire(&mailboxes);
+        match self
+            .reconcile_uncertain_sends(session, sent_wire.as_deref(), mailbox_name)
+            .await
+        {
+            Ok(r) => eprintln!(
+                "[SGE send] reconcile: confirmed_sent={} requeued={} still_uncertain={} skipped_no_sent={}",
+                r.confirmed_sent, r.requeued, r.still_uncertain, r.skipped_no_sent
+            ),
+            Err(e) => eprintln!(
+                "[SGE send] reconcile failed ({e}) — uncertain rows wait for the next pass"
+            ),
+        }
     }
 
     /// Best-effort Seen apply at a move destination (move-carries-toggle).
@@ -608,6 +1345,24 @@ impl SyncWorker {
                 imap_replay.acked, imap_replay.dropped, imap_replay.failed, imap_replay.moved
             );
             result.moved += imap_replay.moved;
+            // Drafts folder may be message-empty yet hold dirty rows —
+            // flush while SELECTed here (same SELECT discipline as below).
+            let draft_acked = self
+                .replay_dirty_drafts(
+                    &mut *session,
+                    mailbox_id,
+                    mailbox_name,
+                    summary.uid_validity,
+                )
+                .await?;
+            if draft_acked > 0 {
+                eprintln!("[SGE sync] draft replay on empty mailbox: acked={draft_acked}");
+            }
+            // Same 4d flush as the normal branch (order: outbox replays,
+            // then drafts, then send flush) so stranded rows drain even when
+            // the mailbox is message-empty.
+            self.flush_send_queue_in_pass(&mut *session, mailbox_name)
+                .await;
             session.logout().await?;
             cb(SyncEvent::SyncCompleted {
                 summary: result.clone(),
@@ -636,6 +1391,32 @@ impl SyncWorker {
             imap_replay.acked, imap_replay.dropped, imap_replay.failed, imap_replay.moved
         );
         result.moved += imap_replay.moved;
+
+        // ── Step 4c: dirty-draft flush (Plan 12-02) ──
+        // The session is SELECTed to `mailbox_name`; only draft rows
+        // belonging to this folder flush (SELECT discipline, T-12-04 —
+        // the expunge-old leg addresses the selected folder). Draft
+        // APPENDs don't interact with the sweep's UID set, so pre-sweep
+        // placement next to the imap replay is safe.
+        let draft_acked = self
+            .replay_dirty_drafts(
+                &mut *session,
+                mailbox_id,
+                mailbox_name,
+                summary.uid_validity,
+            )
+            .await?;
+        if draft_acked > 0 {
+            eprintln!("[SGE sync] draft replay: acked={draft_acked}");
+        }
+
+        // ── Step 4d: send-queue flush (Plan 13-02) ──
+        // SMTP leg first (zero session use — never takes a manager lease),
+        // then uncertain reconcile (SELECTs Sent, restores this mailbox).
+        // Crash recovery runs at flush entry; pass order holds:
+        // crash reset → imap_outbox replay (4b) → dirty drafts (4c) → flush.
+        self.flush_send_queue_in_pass(&mut *session, mailbox_name)
+            .await;
 
         // Pending-wins gate: UIDs with an unacknowledged optimistic toggle
         // (flag queue) or delete/move (imap queue) keep their local flags
@@ -968,6 +1749,7 @@ impl SyncWorker {
 mod tests {
     use super::*;
     use crate::imap::{MailboxInfo, MailboxStatus, PinBox};
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -1034,6 +1816,11 @@ mod tests {
         /// Plan 12-02 extends with per-Message-ID results for the
         /// reconnect flush).
         pub search_header_results: Vec<u32>,
+        /// Per-Message-ID canned SEARCH results, keyed by the searched
+        /// value: when non-empty for a value, wins over
+        /// `search_header_results` (multi-draft flush — each row
+        /// reconciles its own UID).
+        pub search_header_by_msgid: HashMap<String, Vec<u32>>,
         /// When true, `append_message` fails — drives draft replay tests.
         pub fail_append: bool,
     }
@@ -1206,9 +1993,13 @@ mod tests {
         fn uid_search_header(
             &mut self,
             _field: &str,
-            _value: &str,
+            value: &str,
         ) -> PinBox<'_, Result<Vec<u32>, SyncError>> {
-            let mut uids = self.search_header_results.clone();
+            let mut uids = self
+                .search_header_by_msgid
+                .get(value)
+                .cloned()
+                .unwrap_or_else(|| self.search_header_results.clone());
             uids.sort_unstable();
             Box::pin(async move { Ok(uids) })
         }
@@ -1291,6 +2082,7 @@ mod tests {
             fail_move_refused: false,
             appended_calls: Vec::new(),
             search_header_results: Vec::new(),
+            search_header_by_msgid: HashMap::new(),
             fail_append: false,
         }
     }
@@ -1299,6 +2091,255 @@ mod tests {
         Arc::new(std::sync::Mutex::new(
             Store::open_in_memory().expect("migration should succeed"),
         ))
+    }
+
+    /// Seed one dirty draft row in `mailbox`; returns its mailbox id.
+    fn draft_row(
+        store: &Arc<std::sync::Mutex<Store>>,
+        mailbox: &str,
+        id: &str,
+        msg_id: &str,
+    ) -> u64 {
+        let guard = store.lock().unwrap();
+        let mb = queries::ensure_mailbox(guard.conn(), mailbox).unwrap();
+        queries::upsert_draft(
+            guard.conn(),
+            id,
+            mb,
+            msg_id,
+            "Subject",
+            "Body",
+            "to@example.com",
+            "",
+            "",
+        )
+        .unwrap();
+        mb
+    }
+
+    fn drafts_summary() -> MailboxSummary {
+        MailboxSummary {
+            selected_mailbox: "Drafts".to_string(),
+            uid_validity: 100,
+            uid_next: Some(2),
+            exists: 0,
+        }
+    }
+
+    /// Plan 12-02 reconnect flush: dirty row + canned SEARCH `[5]` →
+    /// clean with `server_uid=5`. First save (no tracked UID) issues no
+    /// delete/expunge legs.
+    #[test]
+    fn replay_dirty_drafts_acks_and_cleans() {
+        let store = inbox(drafts_summary());
+        let drafts_mb = draft_row(&store, "Drafts", "compose-1", "<c1@sge.local>");
+        let worker = SyncWorker::new(store.clone());
+
+        let mut session = mock(drafts_summary(), vec![]);
+        session.search_header_results = vec![5];
+        let acked = async_std::task::block_on(async {
+            worker
+                .replay_dirty_drafts(&mut session, drafts_mb, "Drafts", 100)
+                .await
+        })
+        .unwrap();
+
+        assert_eq!(acked, 1);
+        assert_eq!(session.appended_calls.len(), 1);
+        assert_eq!(session.appended_calls[0].0, "Drafts");
+        assert!(session.deleted_calls.is_empty());
+        assert!(session.expunged_sets.is_empty());
+        let guard = store.lock().unwrap();
+        let row = queries::get_draft(guard.conn(), "compose-1")
+            .unwrap()
+            .unwrap();
+        assert!(!row.dirty);
+        assert_eq!(row.server_uid, Some(5));
+    }
+
+    /// Failing APPEND → row stays `dirty=1`, the pass itself still
+    /// returns Ok (worker replay discipline — never fails the sync).
+    #[test]
+    fn replay_dirty_drafts_append_failure_stays_dirty() {
+        let store = inbox(drafts_summary());
+        let drafts_mb = draft_row(&store, "Drafts", "compose-1", "<c1@sge.local>");
+        let worker = SyncWorker::new(store.clone());
+
+        let mut session = mock(drafts_summary(), vec![]);
+        session.fail_append = true;
+        let acked = async_std::task::block_on(async {
+            worker
+                .replay_dirty_drafts(&mut session, drafts_mb, "Drafts", 100)
+                .await
+        })
+        .unwrap();
+
+        assert_eq!(acked, 0);
+        let guard = store.lock().unwrap();
+        let row = queries::get_draft(guard.conn(), "compose-1")
+            .unwrap()
+            .unwrap();
+        assert!(row.dirty);
+        assert_eq!(row.server_uid, None);
+    }
+
+    /// SELECT discipline: rows belonging to another folder never flush
+    /// on this pass (the expunge-old leg addresses the selected folder,
+    /// T-12-04) — they wait for their own folder's pass.
+    #[test]
+    fn replay_dirty_drafts_skips_other_mailbox_rows() {
+        let store = inbox(drafts_summary());
+        draft_row(&store, "INBOX", "compose-9", "<c9@sge.local>");
+        let drafts_mb = {
+            let guard = store.lock().unwrap();
+            queries::ensure_mailbox(guard.conn(), "Drafts").unwrap()
+        };
+        let worker = SyncWorker::new(store.clone());
+
+        let mut session = mock(drafts_summary(), vec![]);
+        session.search_header_results = vec![5];
+        let acked = async_std::task::block_on(async {
+            worker
+                .replay_dirty_drafts(&mut session, drafts_mb, "Drafts", 100)
+                .await
+        })
+        .unwrap();
+
+        assert_eq!(acked, 0);
+        assert!(session.appended_calls.is_empty());
+        let guard = store.lock().unwrap();
+        let row = queries::get_draft(guard.conn(), "compose-9")
+            .unwrap()
+            .unwrap();
+        assert!(row.dirty);
+    }
+
+    /// Re-save with a tracked UID APPENDs-new and expunges the
+    /// superseded copy (exactly-one-copy invariant on the flush path).
+    #[test]
+    fn replay_dirty_drafts_expunges_superseded_copy() {
+        let store = inbox(drafts_summary());
+        let drafts_mb = draft_row(&store, "Drafts", "compose-1", "<c1@sge.local>");
+        {
+            let guard = store.lock().unwrap();
+            queries::mark_draft_clean(guard.conn(), "compose-1", 7).unwrap();
+            queries::upsert_draft(
+                guard.conn(),
+                "compose-1",
+                drafts_mb,
+                "<c1@sge.local>",
+                "Subject v2",
+                "Body v2",
+                "to@example.com",
+                "",
+                "",
+            )
+            .unwrap();
+            queries::set_sync_state(guard.conn(), "Drafts", 100, 8).unwrap();
+        }
+        let worker = SyncWorker::new(store.clone());
+
+        let mut session = mock(drafts_summary(), vec![]);
+        session.search_header_results = vec![9];
+        let acked = async_std::task::block_on(async {
+            worker
+                .replay_dirty_drafts(&mut session, drafts_mb, "Drafts", 100)
+                .await
+        })
+        .unwrap();
+
+        assert_eq!(acked, 1);
+        assert!(session.deleted_calls.contains(&(7, true)));
+        assert!(session.expunged_sets.contains(&"7".to_string()));
+        let guard = store.lock().unwrap();
+        let row = queries::get_draft(guard.conn(), "compose-1")
+            .unwrap()
+            .unwrap();
+        assert!(!row.dirty);
+        assert_eq!(row.server_uid, Some(9));
+    }
+
+    /// UIDVALIDITY bump since the last sync → the tracked `server_uid`
+    /// is stale (`old_uid=None` path): APPEND fresh, no expunge of the
+    /// dead-generation UID (the orphan is reaped by the sweep).
+    #[test]
+    fn replay_dirty_drafts_epoch_bump_drops_stale_old_uid() {
+        let store = inbox(drafts_summary());
+        let drafts_mb = draft_row(&store, "Drafts", "compose-1", "<c1@sge.local>");
+        {
+            let guard = store.lock().unwrap();
+            queries::mark_draft_clean(guard.conn(), "compose-1", 7).unwrap();
+            queries::upsert_draft(
+                guard.conn(),
+                "compose-1",
+                drafts_mb,
+                "<c1@sge.local>",
+                "Subject v2",
+                "Body v2",
+                "to@example.com",
+                "",
+                "",
+            )
+            .unwrap();
+            queries::set_sync_state(guard.conn(), "Drafts", 99, 8).unwrap();
+        }
+        let worker = SyncWorker::new(store.clone());
+
+        let mut session = mock(drafts_summary(), vec![]);
+        session.search_header_results = vec![9];
+        let acked = async_std::task::block_on(async {
+            worker
+                .replay_dirty_drafts(&mut session, drafts_mb, "Drafts", 100)
+                .await
+        })
+        .unwrap();
+
+        assert_eq!(acked, 1);
+        assert!(session.deleted_calls.is_empty());
+        assert!(session.expunged_sets.is_empty());
+        let guard = store.lock().unwrap();
+        let row = queries::get_draft(guard.conn(), "compose-1")
+            .unwrap()
+            .unwrap();
+        assert!(!row.dirty);
+        assert_eq!(row.server_uid, Some(9));
+    }
+
+    /// Multi-draft flush: per-Message-ID canned SEARCH results reconcile
+    /// each row to its own UID (the shared flat vec cannot express this).
+    #[test]
+    fn replay_dirty_drafts_reconciles_each_row_by_message_id() {
+        let store = inbox(drafts_summary());
+        let drafts_mb = draft_row(&store, "Drafts", "compose-1", "<c1@sge.local>");
+        draft_row(&store, "Drafts", "compose-2", "<c2@sge.local>");
+        let worker = SyncWorker::new(store.clone());
+
+        let mut session = mock(drafts_summary(), vec![]);
+        session
+            .search_header_by_msgid
+            .insert("<c1@sge.local>".to_string(), vec![5]);
+        session
+            .search_header_by_msgid
+            .insert("<c2@sge.local>".to_string(), vec![8]);
+        let acked = async_std::task::block_on(async {
+            worker
+                .replay_dirty_drafts(&mut session, drafts_mb, "Drafts", 100)
+                .await
+        })
+        .unwrap();
+
+        assert_eq!(acked, 2);
+        assert_eq!(session.appended_calls.len(), 2);
+        let guard = store.lock().unwrap();
+        let one = queries::get_draft(guard.conn(), "compose-1")
+            .unwrap()
+            .unwrap();
+        let two = queries::get_draft(guard.conn(), "compose-2")
+            .unwrap()
+            .unwrap();
+        assert_eq!(one.server_uid, Some(5));
+        assert_eq!(two.server_uid, Some(8));
+        assert!(!one.dirty && !two.dirty);
     }
 
     /// Three new messages → all appear as `new`.
@@ -2786,4 +3827,557 @@ mod tests {
         assert_eq!(parts, 0);
         assert!(!dir.exists(), "attachment dir must be removed best-effort");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── send-queue flush tests (Plan 13-02) ──────────────────────────
+
+    use crate::send_queue::EnqueueInput;
+    use crate::smtp::SmtpOutcome;
+
+    /// One recorded transport call: envelope + the exact bytes handed over.
+    pub struct FakeCall {
+        pub from: String,
+        pub to: Vec<String>,
+        pub bytes: Vec<u8>,
+    }
+
+    /// Record-and-replay SMTP transport (mirrors the MockSession pattern):
+    /// every `send_raw` records its args and answers from the script in
+    /// order; past the script end every send succeeds.
+    pub struct FakeTransport {
+        pub calls: Mutex<Vec<FakeCall>>,
+        pub script: Vec<SmtpOutcome>,
+        pub next: AtomicUsize,
+    }
+
+    impl FakeTransport {
+        fn scripted(script: Vec<SmtpOutcome>) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                script,
+                next: AtomicUsize::new(0),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+    }
+
+    impl crate::smtp::SmtpTransport for FakeTransport {
+        fn send_raw(
+            &self,
+            _account: &crate::smtp::SmtpAccount,
+            envelope_from: &str,
+            envelope_to: &[String],
+            bytes: &[u8],
+        ) -> SmtpOutcome {
+            self.calls.lock().unwrap().push(FakeCall {
+                from: envelope_from.to_string(),
+                to: envelope_to.to_vec(),
+                bytes: bytes.to_vec(),
+            });
+            let i = self.next.fetch_add(1, Ordering::SeqCst);
+            self.script.get(i).cloned().unwrap_or(SmtpOutcome::Sent)
+        }
+    }
+
+    static FLUSH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn flush_dir(name: &str) -> PathBuf {
+        let n = FLUSH_SEQ.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "sge-flush-{}-{name}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn test_account() -> crate::smtp::SmtpAccount {
+        crate::smtp::SmtpAccount {
+            host: "smtp.utfpr.edu.br".to_string(),
+            port: 587,
+            username: "alice".to_string(),
+            password: "pw".to_string(),
+        }
+    }
+
+    fn flush_env(manager: Option<Arc<crate::imap::manager::SessionManager>>, sent_wire: Option<String>, script: Vec<SmtpOutcome>) -> (SendFlushEnv, Arc<FakeTransport>) {
+        let tx = Arc::new(FakeTransport::scripted(script));
+        let transport: Arc<dyn crate::smtp::SmtpTransport> = tx.clone();
+        let env = SendFlushEnv {
+            gate: SendGate::default(),
+            transport,
+            account: test_account(),
+            manager,
+            sent_wire,
+        };
+        (env, tx)
+    }
+
+    /// Drive the async flush synchronously (no manager lease in these
+    /// tests, so the filing leg is skipped — same `block_on` pattern the
+    /// production `spawn_blocking` path uses).
+    fn flush_blocking(worker: &SyncWorker, env: &SendFlushEnv) -> FlushSummary {
+        async_std::task::block_on(async { worker.flush_send_queue(env).await })
+    }
+
+    /// Enqueue one mail to `to` (+cc/+bcc) and return the stored row.
+    fn queued_mail(
+        store: &Arc<std::sync::Mutex<Store>>,
+        app_data: &std::path::Path,
+        to: &str,
+    ) -> queries::SendRow {
+        queued_mail_cc(store, app_data, to, &[], &[])
+    }
+
+    fn queued_mail_cc(
+        store: &Arc<std::sync::Mutex<Store>>,
+        app_data: &std::path::Path,
+        to: &str,
+        cc: &[&str],
+        bcc: &[&str],
+    ) -> queries::SendRow {
+        let input = EnqueueInput {
+            from: "eu@utfpr.edu.br".to_string(),
+            to: vec![to.to_string()],
+            cc: cc.iter().map(|s| s.to_string()).collect(),
+            bcc: bcc.iter().map(|s| s.to_string()).collect(),
+            subject: "Oi".to_string(),
+            body: "corpo".to_string(),
+            draft_id: None,
+        };
+        let guard = store.lock().unwrap();
+        let out = crate::send_queue::enqueue_send(guard.conn(), app_data, input).unwrap();
+        queries::get_send_row(guard.conn(), &out.queue_id)
+            .unwrap()
+            .unwrap()
+    }
+
+    fn send_state_of(store: &Arc<std::sync::Mutex<Store>>, id: &str) -> String {
+        let guard = store.lock().unwrap();
+        queries::get_send_row(guard.conn(), id)
+            .unwrap()
+            .unwrap()
+            .state
+    }
+
+    /// Test 1: a due row with transport Sent marks the row sent (SMTP-success
+    /// leg only — Sent filing itself is Plan 13-03).
+    #[test]
+    fn flush_sent_marks_row_sent_with_identical_bytes() {
+        let store = inbox(drafts_summary());
+        let app_data = flush_dir("sent");
+        let row = queued_mail_cc(
+            &store,
+            &app_data,
+            "amigo@example.com",
+            &["copia@example.com"],
+            &["oculta@example.com"],
+        );
+        let (env, tx) = flush_env(None, None, vec![]);
+        let worker = SyncWorker::new(store.clone());
+        let summary = flush_blocking(&worker, &env);
+        assert_eq!(
+            (summary.sent, summary.deferred, summary.failed, summary.uncertain),
+            (1, 0, 0, 0)
+        );
+        assert!(!summary.skipped);
+        assert_eq!(send_state_of(&store, &row.id), SEND_STATE_SENT);
+        assert_eq!(tx.call_count(), 1);
+        let calls = tx.calls.lock().unwrap();
+        let call = &calls[0];
+        assert_eq!(call.from, "eu@utfpr.edu.br");
+        // Envelope carries To + Cc + BCC (envelope-only BCC).
+        for want in ["amigo@example.com", "copia@example.com", "oculta@example.com"] {
+            assert!(
+                call.to.contains(&want.to_string()),
+                "envelope missing {want}: {:?}",
+                call.to
+            );
+        }
+        // Identical immutable bytes: what SMTP got == what enqueue wrote.
+        let file_bytes = std::fs::read(&row.eml_path).unwrap();
+        assert_eq!(call.bytes, file_bytes);
+        drop(calls);
+        // Second flush: terminal rows never re-send.
+        let again = flush_blocking(&worker, &env);
+        assert_eq!(tx.call_count(), 1, "sent rows must never re-send");
+        assert_eq!(
+            (again.sent, again.deferred, again.failed, again.uncertain),
+            (0, 0, 0, 0)
+        );
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// Test 2: transport Transient keeps the row queued with attempts+1 and
+    /// a backoff schedule; terminal failed rows are skipped by the pass and
+    /// only manual retry requeues them; the attempts cap parks as failed.
+    #[test]
+    fn flush_transient_backs_off_failed_terminal_and_skips_failed() {
+        let store = inbox(drafts_summary());
+        let app_data = flush_dir("transient");
+        let row = queued_mail(&store, &app_data, "amigo@example.com");
+        // A terminal failed row is invisible to the pass.
+        let failed = queued_mail(&store, &app_data, "falho@example.com");
+        {
+            let guard = store.lock().unwrap();
+            crate::send_queue::mark_send_failed(guard.conn(), &failed.id, "refused").unwrap();
+        }
+        let (env, tx) = flush_env(None, None, vec![SmtpOutcome::Transient {
+            message: "try later".to_string(),
+        }]);
+        let worker = SyncWorker::new(store.clone());
+        let before = chrono::Utc::now();
+        let summary = flush_blocking(&worker, &env);
+        let after = chrono::Utc::now();
+        assert_eq!(
+            (summary.sent, summary.deferred, summary.failed, summary.uncertain),
+            (0, 1, 0, 0)
+        );
+        assert_eq!(
+            tx.call_count(),
+            1,
+            "only the due row sends; failed rows never auto-retry"
+        );
+        {
+            let guard = store.lock().unwrap();
+            let updated = queries::get_send_row(guard.conn(), &row.id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(updated.attempts, 1);
+            // attempts=1 → nominal 60 s ±20 % → [before+48s, after+72s].
+            let scheduled = updated.next_retry_at.clone().unwrap();
+            let lo = (before + chrono::Duration::seconds(48))
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string();
+            let hi = (after + chrono::Duration::seconds(72))
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string();
+            assert!(
+                scheduled >= lo && scheduled <= hi,
+                "next_retry_at {scheduled} outside [{lo}, {hi}]"
+            );
+            let failed_row = queries::get_send_row(guard.conn(), &failed.id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                failed_row.state,
+                crate::store::queries::SEND_STATE_FAILED
+            );
+            assert_eq!(failed_row.attempts, 1, "failed row untouched by the pass");
+        }
+        // Still scheduled in the future: an immediate second flush finds
+        // nothing due.
+        let again = flush_blocking(&worker, &env);
+        assert_eq!(tx.call_count(), 1, "backoff schedule must hold the row");
+        assert_eq!(
+            (again.sent, again.deferred, again.failed, again.uncertain),
+            (0, 0, 0, 0)
+        );
+        // Attempts cap: the 10th consecutive transient parks as failed.
+        let capped = queued_mail(&store, &app_data, "teimoso@example.com");
+        {
+            let guard = store.lock().unwrap();
+            guard
+                .conn()
+                .execute(
+                    "UPDATE send_queue SET attempts = 9, next_retry_at = NULL WHERE id = ?1",
+                    rusqlite::params![capped.id],
+                )
+                .unwrap();
+        }
+        let (env2, tx2) = flush_env(None, None, vec![SmtpOutcome::Transient {
+            message: "still down".to_string(),
+        }]);
+        let capped_summary = flush_blocking(&worker, &env2);
+        assert_eq!(tx2.call_count(), 1);
+        assert_eq!(
+            (
+                capped_summary.sent,
+                capped_summary.deferred,
+                capped_summary.failed,
+                capped_summary.uncertain
+            ),
+            (0, 0, 1, 0)
+        );
+        assert_eq!(
+            send_state_of(&store, &capped.id),
+            crate::store::queries::SEND_STATE_FAILED
+        );
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// Test 3: transport Uncertain triggers reconcile-not-resend — a Sent
+    /// SEARCH hit marks sent with no second transport call; a miss requeues
+    /// exactly once for a single re-send; no Sent folder skips with zero IMAP.
+    #[test]
+    fn flush_uncertain_reconciles_before_any_resend() {
+        let store = inbox(drafts_summary());
+        let app_data = flush_dir("uncertain");
+        let row = queued_mail(&store, &app_data, "amigo@example.com");
+        let (env, tx) = flush_env(None, None, vec![SmtpOutcome::Uncertain {
+            reason: "DATA timeout".to_string(),
+        }]);
+        let worker = SyncWorker::new(store.clone());
+        let summary = flush_blocking(&worker, &env);
+        assert_eq!(
+            (summary.sent, summary.deferred, summary.failed, summary.uncertain),
+            (0, 0, 0, 1)
+        );
+        assert_eq!(
+            send_state_of(&store, &row.id),
+            crate::store::queries::SEND_STATE_UNCERTAIN
+        );
+        assert_eq!(tx.call_count(), 1);
+
+        // Sent SEARCH hit → confirmed sent with NO second transport call.
+        let mut session = mock(drafts_summary(), vec![]);
+        session
+            .search_header_by_msgid
+            .insert(row.message_id.clone(), vec![42]);
+        let r = async_std::task::block_on(async {
+            worker
+                .reconcile_uncertain_sends(&mut session, Some("Sent"), "INBOX")
+                .await
+        })
+        .unwrap();
+        assert_eq!((r.confirmed_sent, r.requeued, r.still_uncertain), (1, 0, 0));
+        assert!(!r.skipped_no_sent);
+        assert_eq!(send_state_of(&store, &row.id), SEND_STATE_SENT);
+        assert_eq!(tx.call_count(), 1, "reconcile must never re-send on a hit");
+        assert_eq!(
+            session.select_calls,
+            vec!["Sent".to_string(), "INBOX".to_string()],
+            "reconcile SELECTs Sent then restores the pass mailbox"
+        );
+
+        // Miss path: a second uncertain row requeues exactly once, attempts
+        // counted with a backoff schedule.
+        let row2 = queued_mail(&store, &app_data, "outro@example.com");
+        {
+            let guard = store.lock().unwrap();
+            queries::mark_send_uncertain(guard.conn(), &row2.id, "drop after send").unwrap();
+        }
+        let mut session2 = mock(drafts_summary(), vec![]);
+        let r2 = async_std::task::block_on(async {
+            worker
+                .reconcile_uncertain_sends(&mut session2, Some("Sent"), "INBOX")
+                .await
+        })
+        .unwrap();
+        assert_eq!((r2.confirmed_sent, r2.requeued, r2.still_uncertain), (0, 1, 0));
+        {
+            let guard = store.lock().unwrap();
+            let back = queries::get_send_row(guard.conn(), &row2.id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(back.state, SEND_STATE_QUEUED);
+            assert_eq!(back.attempts, 1, "reconcile miss counts the attempt");
+            assert!(
+                back.next_retry_at.is_some(),
+                "requeue carries a backoff schedule"
+            );
+        }
+
+        // No Sent folder → skip with zero IMAP verbs, rows untouched.
+        let row3 = queued_mail(&store, &app_data, "terceiro@example.com");
+        {
+            let guard = store.lock().unwrap();
+            queries::mark_send_uncertain(guard.conn(), &row3.id, "drop after send").unwrap();
+        }
+        let mut session3 = mock(drafts_summary(), vec![]);
+        let r3 = async_std::task::block_on(async {
+            worker
+                .reconcile_uncertain_sends(&mut session3, None, "INBOX")
+                .await
+        })
+        .unwrap();
+        assert!(r3.skipped_no_sent);
+        assert!(
+            session3.select_calls.is_empty(),
+            "no Sent → zero IMAP verbs"
+        );
+        assert_eq!(
+            send_state_of(&store, &row3.id),
+            crate::store::queries::SEND_STATE_UNCERTAIN
+        );
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// Test 4: the flush holds the SendGate (a concurrent flush skips with
+    /// zero sends) and delivers each row exactly once — and the SMTP leg
+    /// takes no IMAP lease by construction (it receives no session).
+    #[test]
+    fn flush_serializes_on_send_gate_one_delivery_per_row() {
+        let store = inbox(drafts_summary());
+        let app_data = flush_dir("gate");
+        let a = queued_mail(&store, &app_data, "a@example.com");
+        let b = queued_mail(&store, &app_data, "b@example.com");
+        let (env, tx) = flush_env(None, None, vec![]);
+        let worker = SyncWorker::new(store.clone());
+        // A pass already in flight: flush skips with zero sends.
+        let _held = env.gate.try_begin().expect("hold the gate");
+        let skipped = flush_blocking(&worker, &env);
+        assert!(skipped.skipped);
+        assert_eq!(tx.call_count(), 0);
+        drop(_held);
+        // Next pass delivers each row exactly once.
+        let summary = flush_blocking(&worker, &env);
+        assert_eq!(summary.sent, 2);
+        assert_eq!(tx.call_count(), 2);
+        assert_eq!(send_state_of(&store, &a.id), SEND_STATE_SENT);
+        assert_eq!(send_state_of(&store, &b.id), SEND_STATE_SENT);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// Test 5: crash-recovery reset runs before the first flush in the launch
+    /// sequence — and stranded `sending` rows triage to `uncertain`
+    /// (reconcile-pending), never blindly re-sent.
+    #[test]
+    fn crash_reset_runs_before_first_flush() {
+        let store = inbox(drafts_summary());
+        let app_data = flush_dir("crash");
+        // Stranded `sending` row: may have been SMTP-accepted pre-crash.
+        let stranded = queued_mail(&store, &app_data, "quase@example.com");
+        {
+            let guard = store.lock().unwrap();
+            queries::set_send_state(
+                guard.conn(),
+                &stranded.id,
+                crate::store::queries::SEND_STATE_SENDING,
+            )
+            .unwrap();
+        }
+        let queued = queued_mail(&store, &app_data, "novo@example.com");
+        let (env, tx) = flush_env(None, None, vec![]);
+        let worker = SyncWorker::new(store.clone());
+        let summary = flush_blocking(&worker, &env);
+        // Only the queued row went over SMTP; the stranded row triaged to
+        // uncertain (reconcile-pending), never blindly re-sent.
+        assert_eq!(tx.call_count(), 1);
+        assert_eq!(
+            tx.calls.lock().unwrap()[0].to,
+            vec!["novo@example.com".to_string()]
+        );
+        assert_eq!(send_state_of(&store, &queued.id), SEND_STATE_SENT);
+        assert_eq!(
+            send_state_of(&store, &stranded.id),
+            crate::store::queries::SEND_STATE_UNCERTAIN
+        );
+        // The recovered row triages outside the per-row loop (no transport
+        // call), so the pass summary counts only the SMTP verdict.
+        assert_eq!((summary.sent, summary.uncertain), (1, 0));
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// Step 4d wiring, empty-mailbox branch: draft replay (4c) and send
+    /// flush (4d) run in one pass; the SMTP leg issues zero IMAP verbs.
+    #[test]
+    fn empty_pass_flushes_after_draft_replay() {
+        let store = inbox(drafts_summary());
+        let _ = draft_row(&store, "INBOX", "compose-1", "<c1@sge.local>");
+        let app_data = flush_dir("emptypass");
+        let row = queued_mail(&store, &app_data, "amigo@example.com");
+        let (env, tx) = flush_env(None, None, vec![]);
+        let worker = SyncWorker::new(store.clone()).with_send_flush(env);
+        let mut session = mock(
+            MailboxSummary {
+                selected_mailbox: "INBOX".to_string(),
+                uid_validity: 100,
+                uid_next: Some(1),
+                exists: 0,
+            },
+            vec![],
+        );
+        session.search_header_results = vec![5];
+        async_std::task::block_on(async {
+            worker
+                .sync_with_borrowed(&mut session, "INBOX", cb())
+                .await
+        })
+        .unwrap();
+        assert_eq!(session.appended_calls.len(), 1, "draft replay (4c) ran");
+        assert_eq!(
+            send_state_of(&store, &row.id),
+            SEND_STATE_SENT,
+            "send flush (4d) ran"
+        );
+        assert_eq!(tx.call_count(), 1);
+        assert!(session.logout_called.load(Ordering::SeqCst));
+        assert_eq!(
+            session.select_calls,
+            vec!["INBOX".to_string()],
+            "SMTP leg took no IMAP lease: only the pass SELECT, no Sent touch"
+        );
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// Step 4d wiring, normal branch: same ordering guarantees on a
+    /// non-empty mailbox.
+    #[test]
+    fn normal_pass_flushes_after_draft_replay() {
+        let store = inbox(drafts_summary());
+        let _ = draft_row(&store, "INBOX", "compose-1", "<c1@sge.local>");
+        let app_data = flush_dir("normalpass");
+        let row = queued_mail(&store, &app_data, "amigo@example.com");
+        let (env, tx) = flush_env(None, None, vec![]);
+        let worker = SyncWorker::new(store.clone()).with_send_flush(env);
+        let mut session = mock(
+            MailboxSummary {
+                selected_mailbox: "INBOX".to_string(),
+                uid_validity: 100,
+                uid_next: Some(2),
+                exists: 1,
+            },
+            vec![mkhdr(1)],
+        );
+        session.search_header_results = vec![5];
+        async_std::task::block_on(async {
+            worker
+                .sync_with_borrowed(&mut session, "INBOX", cb())
+                .await
+        })
+        .unwrap();
+        assert_eq!(session.appended_calls.len(), 1, "draft replay (4c) ran");
+        assert_eq!(
+            send_state_of(&store, &row.id),
+            SEND_STATE_SENT,
+            "send flush (4d) ran"
+        );
+        assert_eq!(tx.call_count(), 1);
+        assert_eq!(
+            session.select_calls,
+            vec!["INBOX".to_string()],
+            "SMTP leg took no IMAP lease: only the pass SELECT, no Sent touch"
+        );
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// Sent-wire resolution follows the Phase 11 role table; unknown folders
+    /// resolve to no-Sent (the reconcile pass waits for Plan 13-03).
+    #[test]
+    fn resolve_sent_wire_picks_role_sent() {
+        fn mb(name: &str, attrs: &[&str]) -> MailboxInfo {
+            MailboxInfo {
+                name: name.to_string(),
+                display_name: name.to_string(),
+                delimiter: "/".to_string(),
+                attributes: attrs.iter().map(|s| s.to_string()).collect(),
+            }
+        }
+        let folders = vec![
+            mb("INBOX", &[]),
+            mb("[Gmail]/Sent Mail", &[]),
+            mb("Trash", &[]),
+        ];
+        assert_eq!(
+            resolve_sent_wire(&folders).as_deref(),
+            Some("[Gmail]/Sent Mail")
+        );
+        let folders = vec![mb("INBOX", &[]), mb("Archive", &["\\Sent"])];
+        assert_eq!(resolve_sent_wire(&folders).as_deref(), Some("Archive"));
+        let folders = vec![mb("INBOX", &[])];
+        assert_eq!(resolve_sent_wire(&folders), None);
     }}

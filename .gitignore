@@ -70,3 +70,13 @@ vendor/
 coverage/
 .cache/
 tmp/
+# Phase 15: sidecar weights + venvs are build artifacts (700MB+), never committed.
+# src-tauri/binaries/ holds the BUILT sidecar (294M frozen or dev shim) —
+# never committed. Fresh clones: `cp sidecar/dev-shim.sh
+# src-tauri/binaries/sge-laya-$(rustc -vV | sed -n 's/host: //p')`
+# (or run sidecar/build-sidecar.sh for the real frozen binary).
+src-tauri/binaries/sge-laya-*
+sidecar/weights/
+sidecar/weights-incoming/
+sidecar/.venv/
+sidecar/pins.json

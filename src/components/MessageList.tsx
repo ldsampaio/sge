@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { MessageRow, MailboxRow } from "../types";
 import {
   isUnread,
@@ -12,6 +13,16 @@ import type { FlagUpdateDetail, SetSeenResult } from "../types";
 import { IconInbox, IconPaperclip, IconTrash, IconMove } from "./icons";
 import MoveMenu from "./MoveMenu";
 import ExpungeModal from "./ExpungeModal";
+import { CategoryBadge } from "./ClassifyBadges";
+
+/** Bulk label row for list badges (mirrors the Rust MailboxLabel). */
+interface MailboxLabel {
+  uid: number;
+  primary_name: string;
+  secondary_name: string | null;
+  confidence: number;
+  needs_review: boolean;
+}
 
 export interface ListState {
   kind: "loading" | "error" | "empty" | "ready";
@@ -82,6 +93,8 @@ export default function MessageList({
   const [error, setError] = useState<string | null>(null);
   /** Uids with an optimistic toggle awaiting server acknowledgement (pending wash). */
   const [pendingUids, setPendingUids] = useState<Set<number>>(new Set());
+  /** Phase 18 badges: uid → label (one bulk fetch per mailbox). */
+  const [labelByUid, setLabelByUid] = useState<Map<number, MailboxLabel>>(new Map());
   const searchCache = useRef<{ query: string; rows: MessageRow[] } | null>(null);
   const countRef = useRef(onMessageCount);
   countRef.current = onMessageCount;
@@ -478,7 +491,28 @@ export default function MessageList({
     searchCache.current = null;
     setPage(0);
     void loadPage(0);
+    // Phase 18: bulk labels for badges (quiet failure keeps the list clean).
+    void fetchLabels();
   }, [mailbox, searchQuery, refreshKey]);
+
+  const fetchLabels = async () => {
+    try {
+      const rows = (await invoke("mailbox_labels", { mailbox })) as MailboxLabel[];
+      setLabelByUid(new Map(rows.map((r) => [r.uid, r])));
+    } catch {
+      setLabelByUid(new Map());
+    }
+  };
+
+  // Freshness: a drain completing anywhere refreshes this list's badges.
+  useEffect(() => {
+    const unlisten = listen("classification-drained", () => {
+      void fetchLabels();
+    });
+    return () => {
+      void unlisten.then((f) => f());
+    };
+  }, [mailbox]);
 
   useEffect(() => {
     void loadPage(safePage);
@@ -597,6 +631,16 @@ export default function MessageList({
                   <span className="message-subject">{msg.subject || "(sem assunto)"}</span>
                   {msg.preview && (
                     <span className="message-preview">{msg.preview.slice(0, 90)}</span>
+                  )}
+                  {labelByUid.get(msg.uid) && (
+                    <span style={{ marginTop: 2, display: "inline-block" }}>
+                      <CategoryBadge
+                        primary={labelByUid.get(msg.uid)!.primary_name}
+                        secondary={labelByUid.get(msg.uid)!.secondary_name}
+                        confidence={labelByUid.get(msg.uid)!.confidence}
+                        needsReview={labelByUid.get(msg.uid)!.needs_review}
+                      />
+                    </span>
                   )}
                 </span>
                 {msg.has_attachments && (

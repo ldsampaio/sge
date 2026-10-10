@@ -24,12 +24,28 @@ pub struct DraftFields {
 /// creation and kept across re-saves, so the post-APPEND
 /// `UID SEARCH HEADER Message-ID` reconcile always finds the same key
 /// (a fresh ID per save would orphan the previous server copy, T-12-03).
+///
+/// `compose_id` arrives over IPC as an arbitrary string (MN-02), so it is
+/// restricted to Message-ID-safe atoms (`[A-Za-z0-9_.-]`, capped at 128
+/// chars): spaces, `>`, non-ASCII, or an empty string would otherwise break
+/// the SEARCH-reconcile the whole phase keys on (zero-hit → permanent
+/// `dirty=1`, repeated APPENDs). A fully-rejected id falls back to a
+/// deterministic `rejected-<hash>` atom — stable per input, distinct per
+/// distinct input — instead of yielding the unsearchable `<@sge.local>`.
 pub fn new_message_id(compose_id: &str) -> String {
     let clean: String = compose_id
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
+        .take(128)
         .collect();
-    format!("<{clean}@sge.local>")
+    if clean.is_empty() {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        compose_id.hash(&mut hasher);
+        format!("<rejected-{:x}@sge.local>", hasher.finish())
+    } else {
+        format!("<{clean}@sge.local>")
+    }
 }
 
 /// Strip CR/LF from a header field value (T-12-02 injection guard).
@@ -253,5 +269,28 @@ mod tests {
             new_message_id("compose-1"),
             "<compose-1@sge.local>".to_string()
         );
+    }
+
+    #[test]
+    fn message_id_rejects_unsafe_atoms() {
+        // MN-02: spaces, `>`, and non-ASCII must not reach the wire header.
+        assert_eq!(
+            new_message_id("a b>c@d"),
+            "<abcd@sge.local>".to_string()
+        );
+        let long = "x".repeat(200);
+        let id = new_message_id(&long);
+        assert!(id.len() < 150, "capped at 128 atoms + domain");
+        assert!(id.starts_with('<') && id.ends_with('>'));
+    }
+
+    #[test]
+    fn message_id_empty_falls_back_to_deterministic_atom() {
+        // Empty / fully-rejected input never yields `<@sge.local>`.
+        let a = new_message_id("");
+        let b = new_message_id("   ");
+        assert!(a.starts_with("<rejected-") && a.ends_with("@sge.local>"));
+        assert_eq!(a, new_message_id(""), "stable per input");
+        assert_ne!(a, b, "distinct per distinct input");
     }
 }

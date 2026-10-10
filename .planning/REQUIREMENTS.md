@@ -1,49 +1,58 @@
 # Requirements: SGE — Linux IMAP Desktop Client
 
-**Defined:** 2026-10-06 (Milestone v1.2 Compose & Organize)
+**Defined:** 2026-10-10 (Milestone v1.3 Auto-Classify)
 **Core Value:** Connect to an IMAP server on Linux and read your mail locally in a fast Gmail-like UI.
 
-## v1.2 Requirements
+## v1.3 Requirements
 
-### Envio SMTP
+### Sidecar Engine
 
-- [ ] **SEND-01**: User can compose a new message with To/Cc/Bcc and send via SMTP (STARTTLS, keyring credentials)
-- [ ] **SEND-02**: User can reply with quote + threading headers (In-Reply-To/References per RFC 5322)
-- [ ] **SEND-03**: User can forward a message with its attachments re-attached
-- [ ] **SEND-04**: Outgoing mail queues durably offline and retries with backoff (no duplicate sends)
-- [ ] **SEND-05**: User can attach files via picker and drag & drop, including inline images
-- [ ] **SEND-06**: Sent mail is APPENDEd to the Sent folder on success
+- [x] **SIDE-01** (Phase 15): App serves email classifications fully offline via bundled Laya sidecar (multilingual checkpoint, loopback-only, no mail content leaves the machine)
+- [x] **SIDE-02** (Phase 15): Backend manages sidecar lifecycle — spawn/health/restart with backgrounded cold-start, sync and UI never block on the model
+- [x] **SIDE-03** (Phase 17): User can exclude folders from auto-classify (per-folder opt-out, e.g. Sent/Drafts never auto-filed)
 
-### Organização (delete/move)
+### Taxonomy
 
-- [ ] **DEL-01**: User can delete a message via move-to-Trash with undo
-- [ ] **DEL-02**: User can permanently expunge with an explicit confirmation dialog
-- [ ] **MOVE-01**: User can move messages between folders (UID MOVE with COPY+STORE+EXPUNGE fallback)
+- [x] **TAX-01**: App ships the UTFPR default taxonomy (hierarchical, versioned, ID-stable) in the local store — Phase 16 (23 ids, v1 embedded)
+- [x] **TAX-02** (Phase 19): User can add/rename/delete categories and edit keywords/rules in the options UI (ID-stable edits with migration — no orphaned labels)
+- [x] **TAX-03** (Phase 19): User can import/export taxonomy JSON with validation (no cycles, no duplicate IDs, `Auto` root reserved)
 
-### Pastas
+### Classify Loop
 
-- [x] **FOLD-04**: User can create a new folder via IMAP CREATE (respects hierarchy delimiter)
-- [x] **FOLD-05**: User can rename a folder (cache + outbox invalidated)
-- [x] **FOLD-06**: User can delete a folder via IMAP DELETE (INBOX protected, non-empty guarded)
+- [x] **CLS-01** (Phase 17): New mail is auto-classified after sync via a behind-sync queue (sync never awaits the model)
+- [x] **CLS-02** (Phase 17): User can classify/reclassify a single email manually
+- [x] **CLS-03** (Phase 18): Single-email moves require explicit user confirmation — suggest → confirm → MOVE into the auto-created `Auto/` tree (root always `Auto`)
+- [x] **CLS-04** (Phase 17): Low-confidence and edge mail lands in the `A Classificar` bucket for review instead of being misfiled
+- [x] **CLS-05** (Phase 18): User can set the confidence threshold that routes mail to `A Classificar` (sensible default shipped)
+- [x] **CLS-06**: Sensitive-data rule enforced backend-side — input redaction + output filter, justifications/logs never contain senhas/códigos/dados sigilosos, labels store pointers not content — Phase 16 (9 fixtures, schema-structural)
 
-### Rascunhos
+### Trust UX
 
-- [ ] **DRAFT-01**: User can save and edit drafts locally (local-first editing)
-- [ ] **DRAFT-02**: Drafts persist on the server via APPEND (old copy expunged on save)
-- [ ] **DRAFT-03**: Sending a draft deletes it in the same send transaction
+- [x] **TRUST-01** (Phase 18): User can override a classification (one-click correct → re-move + override logged)
+- [x] **TRUST-02** (Phase 18): User sees category badges in the message list (primary category per email, local-only secondary badged distinctly)
+- [x] **TRUST-03** (Phase 18): User sees the (redacted) justification for a suggestion at confirm time — transient UI string, never persisted
+
+### Batch Reorganization
+
+- [x] **BATCH-01** (Phase 20): User can run whole-account batch classification with live progress and a persisted report (no per-email confirmation)
+- [x] **BATCH-02** (Phase 20): Batch runs are journaled and resumable with undo-batch — a mid-run failure never leaves a half-filed account
 
 ## Future Requirements (deferred)
 
-- IDLE push (poll stays fallback)
-- CONDSTORE/QRESYNC fast path
-- Remote image auto-load policy for composed mail
-- Multiple SMTP identities / From aliases
+- Override history view (log from day one in v1.3, UI later)
+- Learning/fine-tuning Laya from overrides
+- Batch dry-run + retry-failed
+- Cross-device taxonomy sync
+- Per-category auto-confirm ("always file X without asking")
 
 ## Out of Scope
 
-- **PGP/S-MIME encryption** — key management + UX surface too large for this milestone; revisit with identities work
-- **Templates/snippets** — no evidence of need yet; revisit after compose ships
-- **Server-side filters/rules** — Sieve/ManageSieve is a separate protocol surface; out for v1.2
+- **Cloud AI fallback** — mail content never leaves the machine; violates the offline constraint
+- **Auto-delete/auto-archive via classifier** — worst case is `A Classificar`, never delete
+- **Unconfirmed single-email moves** — always-confirmed is structural, not polish
+- **Server-side (Sieve) rule export** — a second product
+- **GPU builds of the sidecar** — CPU-only for v1.3
+- **Laya checkpoint fine-tuning** — zero-shot + keyword-assisted only
 
 ## Traceability
 
@@ -51,18 +60,20 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| SEND-01 | 14 | Pending |
-| SEND-02 | 14 | Pending |
-| SEND-03 | 14 | Pending |
-| SEND-04 | 13 | Pending |
-| SEND-05 | 14 | Pending |
-| SEND-06 | 13 | Pending |
-| DEL-01 | 10 | Pending |
-| DEL-02 | 10 | Pending |
-| MOVE-01 | 10 | Pending |
-| FOLD-04 | 11 | Complete |
-| FOLD-05 | 11 | Complete |
-| FOLD-06 | 11 | Complete |
-| DRAFT-01 | 12 | Pending |
-| DRAFT-02 | 12 | Pending |
-| DRAFT-03 | 13 | Pending |
+| SIDE-01 | Phase 15 | Done |
+| SIDE-02 | Phase 15 | Done |
+| SIDE-03 | Phase 17 | Done |
+| TAX-01 | Phase 16 | Done |
+| TAX-02 | Phase 19 | Done |
+| TAX-03 | Phase 19 | Done |
+| CLS-01 | Phase 17 | Done |
+| CLS-02 | Phase 17 | Done |
+| CLS-03 | Phase 18 | Done |
+| CLS-04 | Phase 17 | Done |
+| CLS-05 | Phase 18 | Done |
+| CLS-06 | Phase 16 | Done |
+| TRUST-01 | Phase 18 | Done |
+| TRUST-02 | Phase 18 | Done |
+| TRUST-03 | Phase 18 | Done |
+| BATCH-01 | Phase 20 | Done |
+| BATCH-02 | Phase 20 | Done |

@@ -1437,6 +1437,51 @@
   color: var(--color-destructive);
 }
 
+/* Draft composer (Phase 12): stacked field form inside the reading pane. */
+.draft-editor {
+  display: grid;
+  gap: 12px;
+}
+
+.draft-fields {
+  display: grid;
+  gap: 8px;
+}
+
+.draft-fields label {
+  display: grid;
+  gap: 4px;
+  font-size: 13px;
+  font-weight: 700;
+  font-family: var(--font-display);
+}
+
+.draft-fields input,
+.draft-fields textarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 9px 12px;
+  font-size: 14px;
+  font-weight: 400;
+  font-family: var(--font-body);
+  color: var(--color-foreground);
+  background: #fff;
+  border: 2px solid var(--color-border);
+  border-radius: var(--primitive-radius-md);
+  outline: none;
+  resize: vertical;
+}
+
+.draft-fields input:focus,
+.draft-fields textarea:focus {
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 4px rgba(79, 70, 229, 0.16);
+}
+
+.draft-new-btn {
+  margin-bottom: 8px;
+}
+
 .folder-dialog-actions {
   display: flex;
   justify-content: flex-end;

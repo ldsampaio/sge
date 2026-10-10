@@ -33,7 +33,7 @@ use crate::store::queries;
 /// Load the active account config: prefer in-memory `active_account`
 /// (set by `connect_account`), fall back to the OS keyring so sync works
 /// after restart. Shared by `start_sync` and `set_seen`.
-async fn load_account_config(
+pub(crate) async fn load_account_config(
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<AccountConfig, String> {
     // In-memory first (works even when "remember me" is unchecked).
@@ -81,7 +81,7 @@ async fn load_account_config(
 /// Get the cached [`SessionManager`] for this account, creating it on first
 /// use and replacing it when the account changes. The slot holds only an
 /// `Arc` clone — never held across `.await`.
-fn manager_for(
+pub(crate) fn manager_for(
     state: &tauri::State<'_, crate::AppState>,
     cfg: &AccountConfig,
 ) -> Arc<SessionManager> {
@@ -107,6 +107,7 @@ fn manager_for(
 #[tauri::command]
 pub async fn start_sync(
     state: State<'_, crate::AppState>,
+    app: tauri::AppHandle,
     on_event: Channel<SyncEvent>,
     mailbox: String,
 ) -> Result<(), String> {
@@ -125,6 +126,7 @@ pub async fn start_sync(
     let gate = state.sync_gate.clone();
     let cancel_flag = state.sync_cancel.clone();
     let app_data = state.app_data.clone();
+    let mailbox_owned = mailbox.clone();
     tauri::async_runtime::spawn_blocking(move || {
         async_std::task::block_on(async {
             // Single-flight (Phase 8): a poll tick or second refresh that
@@ -142,7 +144,7 @@ pub async fn start_sync(
             // Lease SELECTs `mailbox` on the owned session (connecting
             // lazily on first use); the worker borrows it for the pass.
             // `connect_sync` stays reserved for bootstrap/probe paths only.
-            let mut lease = manager.lease_for(&mailbox).await
+            let mut lease = manager.lease_for(&mailbox_owned).await
                 .map_err(|e| format!("IMAP lease: {e}"))?;
             eprintln!("[SGE sync] Leased session -- starting worker...");
             let worker = SyncWorker::with_cancel(store, cancel_flag)
@@ -150,7 +152,7 @@ pub async fn start_sync(
             let cb: SyncCallback = Arc::new(move |event| {
                 let _ = on_event.send(event);
             });
-            let result = worker.sync_with_borrowed(lease.session(), &mailbox, cb).await
+            let result = worker.sync_with_borrowed(lease.session(), &mailbox_owned, cb).await
                 .map_err(|e| e.to_string());
             match &result {
                 Ok(s) => eprintln!("[SGE sync] Done: new={} updated={} deleted={}", s.new, s.updated, s.deleted),
@@ -162,6 +164,10 @@ pub async fn start_sync(
     .await
     .map_err(|e| format!("internal error: sync task failed ({e})"))?
     .map_err(|e| e)?;
+
+    // Phase 17 hook: enqueue unlabeled mail for behind-sync classification
+    // (fire-and-forget; sync never awaits it, failures never fail the sync).
+    crate::commands::classify::hook_after_sync(&state, &mailbox, &app);
 
     Ok(())
 }
@@ -744,6 +750,27 @@ fn find_drafts_wire(mailboxes: &[MailboxInfo]) -> Option<String> {
         .map(|(wire, _)| wire)
 }
 
+/// Find the Drafts wire name in the LOCALLY CACHED folder tree (no network).
+///
+/// Role column first (`drafts`, written on every LIST refresh — Phase 11
+/// T-11-07); case-insensitive known-name fallback for trees synced before
+/// roles existed. Missing → `None` so the caller can fall back to a LIST
+/// refresh or refuse with the frozen `drafts-missing:` prefix (Phase 11
+/// create-confirm flow). Never gates on network by itself: the local-first
+/// upsert must survive offline (DRAFT-01, CR-01).
+fn find_drafts_wire_cached(conn: &rusqlite::Connection) -> Option<String> {
+    let rows = queries::list_mailboxes(conn).ok()?;
+    if let Some(hit) = rows.iter().find(|m| m.role == "drafts") {
+        return Some(hit.name.clone());
+    }
+    rows.iter()
+        .find(|m| {
+            let lower = m.name.to_lowercase();
+            lower == "drafts" || lower == "rascunhos" || lower == "[gmail]/drafts"
+        })
+        .map(|m| m.name.clone())
+}
+
 /// Resolve the Drafts wire name: an explicit `mailbox` override wins
 /// (no network); otherwise LIST + role resolution. Missing → a
 /// `drafts-missing:` refusal so the UI can run the Phase 11
@@ -768,7 +795,10 @@ async fn resolve_drafts_wire(
 ///
 /// Under one store lock the compose session upserts `dirty=1` (stable
 /// `message_id` per session — read from the existing row, generated once
-/// via `new_message_id`), so the call returns even offline. When online,
+/// via `new_message_id`), so the call returns even offline. The wire name
+/// resolves from the locally cached folder tree first (CR-01: a network
+/// LIST before the upsert would fail offline before persisting anything);
+/// a LIST refresh runs only on a cold cache. When online,
 /// the manager persists the copy and the row marks clean with the
 /// reconciled `server_uid`; on failure the row stays dirty with
 /// `acked=false` and a plain-language detail (no secret leakage). A
@@ -791,7 +821,23 @@ pub async fn save_draft(
     let account_cfg: AccountConfig = load_account_config(state.clone()).await?;
     let from_addr = account_cfg.username.clone();
     let manager = manager_for(&state, &account_cfg);
-    let wire = resolve_drafts_wire(&manager, mailbox).await?;
+    // CR-01 (local-first ordering): explicit override wins; otherwise the
+    // cached tree — never a network LIST ahead of the local write. A LIST
+    // refresh is only a cold-cache fallback; offline with a warm cache the
+    // upsert below still lands `dirty=1` with `acked=false`.
+    let wire: String = match mailbox {
+        Some(w) => w,
+        None => {
+            let cached = {
+                let guard = state.store.lock().unwrap();
+                find_drafts_wire_cached(guard.conn())
+            };
+            match cached {
+                Some(w) => w,
+                None => resolve_drafts_wire(&manager, None).await?,
+            }
+        }
+    };
     let store = state.store.clone();
     tauri::async_runtime::spawn_blocking(move || {
         async_std::task::block_on(async {
@@ -941,12 +987,8 @@ pub async fn get_draft(
                 addr_list(parsed.cc()),
                 addr_list(parsed.bcc()),
             );
-            let from = parsed
-                .from()
-                .and_then(|a| a.first())
-                .and_then(|e| e.address().map(|s| s.to_string()))
-                .unwrap_or_default();
-            let _ = from;
+            // No From column by design (Phase 13 owns the sender identity):
+            // the sender address is intentionally not extracted here.
             let guard = store.lock().unwrap();
             let conn = guard.conn();
             let mb = queries::ensure_mailbox(conn, &wire)
@@ -970,37 +1012,60 @@ pub async fn get_draft(
 /// Drafts folder is missing), the local row is already gone and the orphan
 /// is reaped by the next sweep's expunge-diff. Always succeeds once the
 /// local row is deleted — the UI confirms only when dirty content exists
-/// (UI-side rule).
+/// (UI-side rule). The tracked UID is epoch-gated like the save path
+/// (MJ-04): a UIDVALIDITY bump since the save skips the server leg instead
+/// of expunging a stranger's UID.
 #[tauri::command]
 pub async fn discard_draft(
     state: State<'_, crate::AppState>,
     id: String,
 ) -> Result<DiscardResult, String> {
     let store = state.store.clone();
-    let tracked: Option<(u64, u32)> = {
+    let (tracked, epoch): (Option<(u64, u32)>, Option<u32>) = {
         let guard = store.lock().unwrap();
         let conn = guard.conn();
         let row = queries::get_draft(conn, &id).map_err(|e| format!("store: {e}"))?;
         let tracked = row.and_then(|r| r.server_uid.map(|u| (r.mailbox_id, u)));
+        // MJ-04: capture the Drafts epoch alongside the tracked UID (same
+        // lock, same `get_sync_state` lookup `save_draft` uses). Cold cache
+        // → `None` (guard disabled, pre-guard behavior for that corner).
+        let epoch = find_drafts_wire_cached(conn)
+            .and_then(|wire| queries::get_sync_state(conn, &wire).ok().flatten())
+            .map(|(v, _)| v);
         queries::delete_draft(conn, &id).map_err(|e| format!("store: {e}"))?;
-        tracked
+        (tracked, epoch)
     };
     if let Some((_mailbox_id, uid)) = tracked {
         // Best-effort server cleanup — failures only log (T-12-05: scoped
-        // single-UID expunge, never a bare `expunge()`).
+        // single-UID expunge, never a bare `expunge()`). Cached wire first
+        // (no LIST round-trip for best-effort cleanup); LIST refresh only
+        // on a cold cache.
         let account_cfg: AccountConfig = load_account_config(state.clone()).await?;
         let manager = manager_for(&state, &account_cfg);
-        match resolve_drafts_wire(&manager, None).await {
-            Ok(wire) => {
-                if let Err(e) = manager.discard_server_copy_in(&wire, uid).await {
+        let wire: Option<String> = {
+            let guard = store.lock().unwrap();
+            find_drafts_wire_cached(guard.conn())
+        };
+        match wire {
+            Some(wire) => {
+                if let Err(e) = manager.discard_server_copy_in(&wire, uid, epoch).await {
                     eprintln!(
                         "[SGE sync] discard_draft {id} uid {uid} server cleanup failed ({e}) — orphan reaped by sweep"
                     );
                 }
             }
-            Err(e) => eprintln!(
-                "[SGE sync] discard_draft {id}: no Drafts folder ({e}) — local row already gone"
-            ),
+            None => match resolve_drafts_wire(&manager, None).await {
+                Ok(wire) => {
+                    if let Err(e) = manager.discard_server_copy_in(&wire, uid, epoch).await {
+                        eprintln!(
+                            "[SGE sync] discard_draft {id} uid {uid} server cleanup failed ({e}) — orphan reaped by sweep"
+                        );
+                    }
+                }
+                Err(e) => eprintln!(
+                    "[SGE sync] discard_draft {id}: no Drafts folder ({e}) — local row already gone"
+                ),
+            },
         }
     }
     Ok(DiscardResult {
@@ -1095,6 +1160,93 @@ pub async fn search_messages(
     .map_err(|e| format!("internal error: search messages task failed ({e})"))?
 }
 
+/// **Frozen command** (Plan 13-01 contract, verbatim for Phase 14 consumers).
+///
+/// `queue_send({from, to[], cc[], bcc[], subject, body, draft_id?})`
+/// returns `{queue_id, message_id, state, pending_count}`.
+/// Error prefixes verbatim: `send-too-large`, `send-no-recipient`,
+/// `send-missing` (unknown `draft_id` at enqueue).
+#[tauri::command]
+pub async fn queue_send(
+    state: State<'_, crate::AppState>,
+    from: String,
+    to: Vec<String>,
+    cc: Vec<String>,
+    bcc: Vec<String>,
+    subject: String,
+    body: String,
+    draft_id: Option<String>,
+) -> Result<crate::send_queue::EnqueueOutcome, String> {
+    let app_data = state.app_data.clone();
+    let store = state.store.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let guard = store.lock().unwrap();
+        let out = crate::send_queue::enqueue_send(guard.conn(), &app_data, crate::send_queue::EnqueueInput {
+            from,
+            to,
+            cc,
+            bcc,
+            subject,
+            body,
+            draft_id,
+        }).map_err(|e| e.to_string())?;
+        Ok(out)
+    })
+    .await
+    .map_err(|e| format!("internal error: queue_send task failed ({e})"))?
+}
+
+/// **Frozen command** (Plan 13-01 contract, verbatim for Phase 14 consumers).
+///
+/// `retry_send({queue_id})` returns `{queue_id, state}` and only transitions
+/// `failed` → `queued`; unknown `queue_id` surfaces `send-missing: unknown send
+/// '<id>' — it may already be sent` (never a raw SQL error).
+#[tauri::command]
+pub async fn retry_send(
+    state: State<'_, crate::AppState>,
+    queue_id: String,
+) -> Result<crate::send_queue::EnqueueOutcome, String> {
+    let store = state.store.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let guard = store.lock().unwrap();
+        let success = crate::send_queue::requeue_failed(guard.conn(), &queue_id)
+            .map_err(|e| e.to_string())?;
+        if success {
+            let row = crate::store::queries::get_send_row(guard.conn(), &queue_id)
+                .unwrap()
+                .unwrap();
+            Ok(crate::send_queue::outcome_of(&row, false))
+        } else {
+            Err("send-missing: unknown send '".to_string() + &queue_id + "' — it may already be sent")
+        }
+    })
+    .await
+    .map_err(|e| format!("internal error: retry_send task failed ({e})"))?
+}
+
+/// **Frozen command** (Plan 13-01 contract, verbatim for Phase 14 consumers).
+///
+/// `send_status()` returns `{queued, sending, failed, uncertain, sent_unfiled,
+/// pending_count}` verbatim — this struct serializes to exactly that shape.
+/// `sent_unfiled` (SMTP succeeded but Sent APPEND did not) is produced by
+/// Plan 13-03's APPEND leg (with the `sent_unfiled` CHECK-extension migration,
+/// M11); until then it reads 0.
+/// `pending_count` (`queued + sending`) is the badge number and the
+/// `queue_send` fourth field.
+#[tauri::command]
+pub async fn send_status(
+    state: State<'_, crate::AppState>,
+) -> Result<crate::send_queue::SendStatusSnapshot, String> {
+    let store = state.store.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let guard = store.lock().unwrap();
+        crate::send_queue::send_status_snapshot(guard.conn())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("internal error: send_status task failed ({e})"))?
+}
+
 /// Cancel the currently running sync pass.
 ///
 /// Sets the cooperative flag; the worker checks it between sweep batches
@@ -1138,7 +1290,7 @@ pub async fn list_mailboxes(
 ///
 /// Caller runs this inside `spawn_blocking` + `block_on` (same as the
 /// folder commands); the store lock sections are brief and sync-only.
-async fn refresh_mailbox_tree(
+pub(crate) async fn refresh_mailbox_tree(
     manager: &Arc<SessionManager>,
     store: &Arc<std::sync::Mutex<crate::store::Store>>,
 ) -> Result<Vec<crate::store::queries::MailboxRow>, String> {
@@ -1351,7 +1503,7 @@ fn folder_name_error_copy(e: FolderNameError) -> String {
 /// Only the user-typed leaf is encoded: `parent` is already a RAW wire
 /// name from the cached tree, and re-encoding it would corrupt the `&…-`
 /// shift sequences of non-ASCII parents (`Caf&AOk-` → `Caf&-AOk-`).
-fn prepare_create_wire(
+pub(crate) fn prepare_create_wire(
     cached: &[queries::MailboxRow],
     parent: Option<&str>,
     leaf: &str,
@@ -1476,7 +1628,7 @@ fn effective_delimiter(old: &str, cached_delimiter: &str) -> Result<String, Stri
 /// Only the user-typed leaf is encoded: the kept parent prefix is already
 /// a RAW wire name, and re-encoding it would corrupt the `&…-` shift
 /// sequences of non-ASCII parents.
-fn guard_rename(
+pub(crate) fn guard_rename(
     cached: &[queries::MailboxRow],
     old: &str,
     new_leaf: &str,
@@ -1525,7 +1677,7 @@ pub(crate) enum DeleteDecision {
 /// cached delimiters) → non-empty confirm gates. The `\Noselect` check needs
 /// fresh LIST attributes, so the command applies it separately before calling
 /// this. Every refusal returns before any verb call (T-11-04/T-11-06).
-fn guard_delete(
+pub(crate) fn guard_delete(
     cached: &[queries::MailboxRow],
     wire: &str,
     messages: u32,
@@ -2021,11 +2173,12 @@ pub async fn save_attachment(
 #[cfg(test)]
 mod tests {
     use crate::imap::SyncError;
+    use crate::imap::MailboxInfo;
     use crate::store::queries;
     use crate::store::Store;
 
     use super::{
-        guard_delete, guard_rename, has_noselect_attr, is_connectivity_error,
+        find_drafts_wire, guard_delete, guard_rename, has_noselect_attr, is_connectivity_error,
         map_create_error, map_folder_error, pending_depth, prepare_create_wire,
         DeleteDecision,
     };
@@ -2107,6 +2260,100 @@ mod tests {
         // Other mailboxes are isolated.
         let other = queries::ensure_mailbox(conn, "Sent").unwrap();
         assert_eq!(pending_depth(conn, other), 0);
+    }
+
+    /// Draft rows feed the same pending indicator: a dirty draft counts,
+    /// a clean (acknowledged) one does not. Drives the `save_draft`
+    /// `pending_count` contract (frozen UI shape: `DraftSaveResult`
+    /// carries the depth so the indicator updates on every save).
+    #[test]
+    fn pending_depth_counts_dirty_drafts() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let drafts_mb = queries::ensure_mailbox(conn, "Drafts").unwrap();
+        assert_eq!(pending_depth(conn, drafts_mb), 0);
+
+        queries::upsert_draft(
+            conn, "compose-1", drafts_mb, "<compose-1@sge.local>",
+            "Subject", "Body", "to@example.com", "", "",
+        )
+        .unwrap();
+        assert_eq!(pending_depth(conn, drafts_mb), 1);
+
+        // Acknowledged (server copy confirmed) → depth drains.
+        queries::mark_draft_clean(conn, "compose-1", 5).unwrap();
+        assert_eq!(pending_depth(conn, drafts_mb), 0);
+
+        // Drafts in another mailbox never leak into this folder's depth.
+        let other = queries::ensure_mailbox(conn, "INBOX").unwrap();
+        queries::upsert_draft(
+            conn, "compose-2", other, "<compose-2@sge.local>",
+            "Subject", "Body", "to@example.com", "", "",
+        )
+        .unwrap();
+        assert_eq!(pending_depth(conn, other), 1);
+        assert_eq!(pending_depth(conn, drafts_mb), 0);
+    }
+
+    /// `save_draft`/`get_draft` return the local row including `server_uid`
+    /// + `dirty` — the Phase 13 DRAFT-03 send-transaction handoff. A clean
+    /// row exposes the reconciled UID; a freshly upserted row is dirty
+    /// with no server copy yet.
+    #[test]
+    fn draft_row_exposes_server_uid_and_dirty() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let drafts_mb = queries::ensure_mailbox(conn, "Drafts").unwrap();
+
+        queries::upsert_draft(
+            conn, "compose-9", drafts_mb, "<compose-9@sge.local>",
+            "Subject", "Body", "to@example.com", "", "",
+        )
+        .unwrap();
+        let row = queries::get_draft(conn, "compose-9").unwrap().unwrap();
+        assert!(row.dirty);
+        assert_eq!(row.server_uid, None);
+
+        queries::mark_draft_clean(conn, "compose-9", 7).unwrap();
+        let row = queries::get_draft(conn, "compose-9").unwrap().unwrap();
+        assert!(!row.dirty);
+        assert_eq!(row.server_uid, Some(7));
+    }
+
+    fn fixture_mailbox(name: &str, attributes: &[&str]) -> MailboxInfo {
+        MailboxInfo {
+            name: name.to_string(),
+            display_name: name.to_string(),
+            delimiter: "/".to_string(),
+            attributes: attributes.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// Drafts wire resolution: SPECIAL-USE `\Drafts` wins (the
+    /// `resolve_drafts_wire` path `save_draft`/`discard_draft` take before
+    /// any APPEND/expunge verb runs).
+    #[test]
+    fn find_drafts_wire_resolves_special_use() {
+        let folders = vec![
+            fixture_mailbox("INBOX", &[]),
+            fixture_mailbox("Rascunhos", &["\\Drafts"]),
+        ];
+        assert_eq!(
+            find_drafts_wire(&folders),
+            Some("Rascunhos".to_string())
+        );
+    }
+
+    /// No Drafts role anywhere → `None`, and the command layer turns that
+    /// into the `drafts-missing:` refusal (UI runs the Phase 11
+    /// create-confirm flow, then retries) — before any verb call.
+    #[test]
+    fn find_drafts_wire_missing_returns_none() {
+        let folders = vec![
+            fixture_mailbox("INBOX", &[]),
+            fixture_mailbox("Archive", &[]),
+        ];
+        assert_eq!(find_drafts_wire(&folders), None);
     }
 
     /// Cached-tree fixture for the folder guards: INBOX plus one

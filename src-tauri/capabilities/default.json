@@ -7,6 +7,17 @@
   ],
   "permissions": [
     "core:default",
-    "dialog:default"
+    "dialog:default",
+    "shell:default",
+    {
+      "identifier": "shell:allow-spawn",
+      "allow": [
+        {
+          "name": "sge-laya",
+          "sidecar": true,
+          "args": true
+        }
+      ]
+    }
   ]
 }
