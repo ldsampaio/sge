@@ -7,8 +7,8 @@
 
 ### Sidecar Engine
 
-- [ ] **SIDE-01**: App serves email classifications fully offline via bundled Laya sidecar (multilingual checkpoint, loopback-only, no mail content leaves the machine)
-- [ ] **SIDE-02**: Backend manages sidecar lifecycle — spawn/health/restart with backgrounded cold-start, sync and UI never block on the model
+- [x] **SIDE-01** (Phase 15): App serves email classifications fully offline via bundled Laya sidecar (multilingual checkpoint, loopback-only, no mail content leaves the machine)
+- [x] **SIDE-02** (Phase 15): Backend manages sidecar lifecycle — spawn/health/restart with backgrounded cold-start, sync and UI never block on the model
 - [x] **SIDE-03** (Phase 17): User can exclude folders from auto-classify (per-folder opt-out, e.g. Sent/Drafts never auto-filed)
 
 ### Taxonomy
@@ -60,8 +60,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| SIDE-01 | Phase 15 | Pending |
-| SIDE-02 | Phase 15 | Pending |
+| SIDE-01 | Phase 15 | Done |
+| SIDE-02 | Phase 15 | Done |
 | SIDE-03 | Phase 17 | Done |
 | TAX-01 | Phase 16 | Done |
 | TAX-02 | Phase 19 | Done |

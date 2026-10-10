@@ -36,7 +36,7 @@ Decimal phases appear between their surrounding integers in numeric order. v1.2 
 - [x] **Phase 12: Drafts** - Local-first draft editing synced to the server via APPEND (completed 2026-10-08)
 - [x] **Phase 13: Send Pipeline** - Durable SMTP send queue with retry and Sent filing (completed 2026-10-08)
 - [x] **Phase 14: Compose UI** - Compose, reply/forward, and attachments over the proven pipelines (completed 2026-10-08)
-- [ ] **Phase 15: Sidecar Packaging Spike** - Laya sidecar frozen, bundled, and supervised with measured cold-start
+- [x] **Phase 15: Sidecar Packaging Spike** - Laya sidecar frozen, bundled, and supervised with measured cold-start
 - [x] **Phase 16: Taxonomy + Store** - Versioned UTFPR taxonomy and M12 classification tables with redaction sanitizer
 - [x] **Phase 17: Classify Engine (No Moves)** - Behind-sync suggestions with confidence gate, exclusions, and fallback bucket
 - [x] **Phase 18: Confirm + Trust UX** - Confirm-gated MOVE, override, badges, justifications, and threshold setting
@@ -242,7 +242,7 @@ Phases execute in numeric order: 10 → 11 → 12 → 13 → 14 → 15 → 16 �
 | 12. Drafts | v1.2 | 3/3 | Complete | 2026-10-08 |
 | 13. Send Pipeline | v1.2 | 3/3 | Complete | 2026-10-08 |
 | 14. Compose UI | v1.2 | 2/5 | Complete | 2026-10-08 |
-| 15. Sidecar Packaging Spike | v1.3 | 0/0 | Not started | - |
+| 15. Sidecar Packaging Spike | v1.3 | 3/3 | Complete | 2026-10-10 |
 | 16. Taxonomy + Store | v1.3 | 3/3 | Complete | 2026-10-10 |
 | 17. Classify Engine (No Moves) | v1.3 | 2/2 | Complete | 2026-10-10 |
 | 18. Confirm + Trust UX | v1.3 | 2/2 | Complete | 2026-10-10 |
