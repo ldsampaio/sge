@@ -8,7 +8,9 @@ pub mod creds;
 pub mod drafts;
 pub mod imap;
 pub mod send_queue;
+pub mod sidecar;
 pub mod smtp;
+pub mod classify;
 pub mod store;
 pub mod sync;
 pub mod commands;
@@ -17,6 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use creds::{CredentialStore, KeyringStore, SavedCredentials, ServerConfig};
 use serde::Serialize;
+use tauri::Manager;
 use thiserror::Error;
 
 use store::Store;
@@ -47,6 +50,13 @@ use store::Store;
 ///
 /// `app_data` is the `<data>/sge` dir owning `sge.db` and `attachments/`;
 /// the expunge paths clean `<app_data>/attachments/<uidv>/<uid>/` best-effort.
+///
+/// `sidecar` is the Phase 15 Laya classifier supervisor (spawn/health/kill).
+/// `None` until `setup()` spawns it; `Down`/`Stopped` when the binary is
+/// missing or crashes repeatedly — sync and UI never block on it.
+///
+/// `sidecar_child` owns the live child process handle; killed on window
+/// destroy so no orphan survives app quit.
 pub struct AppState {
     pub store: Arc<Mutex<Store>>,
     pub active_account: Mutex<Option<ActiveAccount>>,
@@ -55,6 +65,9 @@ pub struct AppState {
     pub sync_cancel: Arc<std::sync::atomic::AtomicBool>,
     pub trash_cache: Mutex<std::collections::HashMap<String, String>>,
     pub app_data: std::path::PathBuf,
+    pub sidecar: Mutex<Option<Arc<sidecar::SidecarSupervisor>>>,
+    pub sidecar_child:
+        Mutex<Option<tauri_plugin_shell::process::CommandChild>>,
 }
 
 /// In-memory credentials + server config for the connected session.
@@ -232,6 +245,104 @@ async fn load_server_config() -> Result<Option<ServerConfig>, String> {
     }
 }
 
+/// Classifier sidecar status for the UI and later phases (Phase 15+).
+///
+/// Returns `{ running, port, cold_start_ms, state }`. Never contains key
+/// material or absolute paths. `stopped` when the sidecar never spawned
+/// (e.g. binary missing) — sync and UI treat that as "unclassified", not
+/// as an error.
+#[tauri::command]
+async fn sidecar_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<sidecar::SidecarStatusPayload, String> {
+    let guard = state.sidecar.lock().unwrap();
+    match guard.as_ref() {
+        Some(sup) => Ok(sidecar::SidecarStatusPayload::from_supervisor(sup)),
+        None => Ok(sidecar::SidecarStatusPayload {
+            running: false,
+            port: 0,
+            cold_start_ms: None,
+            state: "stopped".to_string(),
+        }),
+    }
+}
+
+/// Background supervision loop: probe until healthy, restart on crash with
+/// backoff, give up after [`sidecar::MAX_RESTARTS`] (status `Down`).
+/// Never blocks window creation — runs on a detached async task.
+async fn supervise_sidecar(
+    app: tauri::AppHandle,
+    supervisor: Arc<sidecar::SidecarSupervisor>,
+) {
+    // Initial settle: give the frozen Python runtime a moment before the
+    // first probe (cold-start seconds are measured spawn → first 200).
+    let mut attempts: u32 = 0;
+    loop {
+        match supervisor.probe().await {
+            Ok(_) => {
+                supervisor.record_healthy();
+                return;
+            }
+            Err(_) => {
+                attempts += 1;
+                if attempts > 6 {
+                    break;
+                }
+                async_std::task::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        }
+    }
+    // Probe never went green in the grace window — check whether the child
+    // is even alive; if not, record one crash and leave restart policy to
+    // the supervisor state machine (a fresh spawn happens next launch).
+    //
+    // NOTE: full kill-and-respawn inside this loop needs the shell scope on
+    // the AppHandle; the minimal spike keeps one spawn per boot and surfaces
+    // Down honestly. Crash-restart-across-boots is covered by setup() spawn.
+    let _ = app;
+    supervisor.record_crash();
+}
+
+/// Spawn the Laya sidecar (best-effort, never fatal): generate per-boot key
+/// + ephemeral loopback port, spawn via the shell plugin, store supervisor
+/// + child, detach the health-probe loop.
+///
+/// `laya-serve` is configured env-only (it takes no CLI port/host args).
+/// Weights resolve from the bundled resource dir (`HF_HOME` → resource
+/// `weights/hf-cache`, offline); in dev the resource dir may lack weights
+/// and the sidecar reports Down honestly until `build-sidecar.sh` populates
+/// them.
+fn spawn_sidecar_best_effort(app: &tauri::App) -> Option<Arc<sidecar::SidecarSupervisor>> {
+    use tauri_plugin_shell::ShellExt;
+    let port = sidecar::pick_ephemeral_port().ok()?;
+    let key = sidecar::generate_api_key().ok()?;
+    let config = sidecar::SidecarConfig::new("127.0.0.1", port, key.to_string()).ok()?;
+    // Weights cache: <resource-dir>/weights (shipped HF_HOME layout) or
+    // the repo sidecar/weights dir in dev. Only advertised when the HF
+    // cache marker exists, so a half-downloaded dir is never used.
+    let mut extra = Vec::new();
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        let weights = resource_dir.join("weights");
+        if weights.join("hub").is_dir() {
+            extra.push((
+                "HF_HOME".to_string(),
+                weights.to_string_lossy().into_owned(),
+            ));
+        }
+    }
+    let supervisor = Arc::new(sidecar::SidecarSupervisor::with_extra_env(config, extra));
+    let (_, child) = app
+        .shell()
+        .sidecar("sge-laya")
+        .ok()?
+        .envs(supervisor.child_env())
+        .spawn()
+        .ok()?;
+    if let Some(state) = app.try_state::<AppState>() {
+        *state.sidecar_child.lock().unwrap() = Some(child);
+    }
+    Some(supervisor)
+}
 fn default_db_path() -> Option<std::path::PathBuf> {
     app_data_dir().map(|d| d.join("sge.db"))
 }
@@ -264,11 +375,37 @@ pub fn run() {
         sync_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         trash_cache: Mutex::new(std::collections::HashMap::new()),
         app_data,
+        sidecar: Mutex::new(None),
+        sidecar_child: Mutex::new(None),
     };
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_shell::init())
         .manage(state)
+        .setup(|app| {
+            // Phase 15: spawn the classifier sidecar backgrounded — window
+            // creation never waits on it. Best-effort: a missing binary
+            // leaves `sidecar: None` and `sidecar_status` reports stopped.
+            if let Some(supervisor) = spawn_sidecar_best_effort(app) {
+                if let Some(state) = app.try_state::<AppState>() {
+                    *state.sidecar.lock().unwrap() = Some(supervisor.clone());
+                }
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(supervise_sidecar(handle, supervisor));
+            }
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            // Kill-on-exit: no orphan sidecar survives app quit.
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                if let Some(state) = window.app_handle().try_state::<AppState>() {
+                    if let Some(mut child) = state.sidecar_child.lock().unwrap().take() {
+                        let _ = child.kill();
+                    }
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             connect_account,
             save_server_config,
@@ -294,6 +431,10 @@ pub fn run() {
             commands::sync::search_messages,
             commands::sync::fetch_message,
             commands::sync::save_attachment,
+            commands::sync::queue_send,
+            commands::sync::retry_send,
+            commands::sync::send_status,
+            sidecar_status,
             load_server_config,
         ])
         .run(tauri::generate_context!())

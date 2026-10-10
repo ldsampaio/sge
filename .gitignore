@@ -70,3 +70,10 @@ vendor/
 coverage/
 .cache/
 tmp/
+# Phase 15: sidecar weights + venvs are build artifacts (700MB+), never committed.
+# NOTE: src-tauri/binaries/sge-laya-<triple> IS committed as a dev shim;
+# build-sidecar.sh overwrites it in place with the frozen binary.
+sidecar/weights/
+sidecar/weights-incoming/
+sidecar/.venv/
+sidecar/pins.json

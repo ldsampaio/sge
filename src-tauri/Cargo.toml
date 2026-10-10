@@ -29,6 +29,13 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
+tauri-plugin-shell = "2"
+# Phase 16 pin: regex 1.13.1 (already in lock as transitive) for the
+# classification redaction sanitizer. Cached offline — no network needed.
+regex = "1"
+# Phase 15 pin: reqwest 0.12 line, default-features off — loopback-only plain
+# HTTP health probe (no TLS needed); async via tauri::async_runtime (tokio).
+reqwest = { version = "0.12", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-imap = "0.11"

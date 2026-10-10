@@ -1,0 +1,167 @@
+{
+  "version": 1,
+  "name": "UTFPR padrão",
+  "categories": [
+    {
+      "id": "academico",
+      "name": "Acadêmico",
+      "parent": null,
+      "keywords": ["utfpr", "disciplina", "semestre", "calendário acadêmico"],
+      "rule": "Vida acadêmica: disciplinas, avaliações, TCC, pesquisa e biblioteca."
+    },
+    {
+      "id": "academico.aulas",
+      "name": "Aulas e Horários",
+      "parent": "academico",
+      "keywords": ["aula", "horário", "syllabus", "plano de ensino", "sala", "turma", "presença", "falta", "reposição"],
+      "rule": "Rotina de aulas: horários, salas, turmas e reposições."
+    },
+    {
+      "id": "academico.avaliacoes",
+      "name": "Provas e Notas",
+      "parent": "academico",
+      "keywords": ["prova", "exame", "nota", "gabarito", "avaliação", "média", "reavaliação", "vista de prova", "aprovado", "reprovado"],
+      "rule": "Avaliações e resultados: provas, notas e gabaritos."
+    },
+    {
+      "id": "academico.tcc",
+      "name": "TCC e Estágio",
+      "parent": "academico",
+      "keywords": ["tcc", "monografia", "banca", "orientação", "orientador", "estágio", "relatório de estágio", "defesa"],
+      "rule": "Trabalho final e estágio obrigatório: bancas, orientação e relatórios."
+    },
+    {
+      "id": "academico.pesquisa",
+      "name": "Pesquisa e Extensão",
+      "parent": "academico",
+      "keywords": ["pesquisa", "extensão", "iniciação científica", "pibic", "pibiti", "projeto", "edital de pesquisa", "artigo"],
+      "rule": "Pesquisa e extensão: IC, editais, projetos e publicações."
+    },
+    {
+      "id": "academico.biblioteca",
+      "name": "Biblioteca",
+      "parent": "academico",
+      "keywords": ["biblioteca", "empréstimo", "devolução", "acervo", "reserva de livro", "multa", "pergamum"],
+      "rule": "Biblioteca: empréstimos, devoluções e acervo."
+    },
+    {
+      "id": "administrativo",
+      "name": "Administrativo",
+      "parent": null,
+      "keywords": ["derac", "protocolo", "requerimento"],
+      "rule": "Burocracia universitária: documentos, matrícula, TI e comunicados oficiais."
+    },
+    {
+      "id": "administrativo.documentos",
+      "name": "Documentos e Requerimentos",
+      "parent": "administrativo",
+      "keywords": ["requerimento", "declaração", "histórico", "atestado", "protocolo", "documento", "certidão", "eprotocolo"],
+      "rule": "Documentos: declarações, históricos, atestados e protocolos."
+    },
+    {
+      "id": "administrativo.matricula",
+      "name": "Matrícula e Registro",
+      "parent": "administrativo",
+      "keywords": ["matrícula", "rematrícula", "trancamento", "derac", "registro acadêmico", "ajuste de matrícula", "veterano", "calouro"],
+      "rule": "Registro escolar: matrícula, rematrícula e trancamento."
+    },
+    {
+      "id": "administrativo.ti",
+      "name": "TI e Sistemas",
+      "parent": "administrativo",
+      "keywords": ["sistema", "login", "acesso", "wifi", "eduroam", "suporte", "e-mail institucional", "moodle", "portal do aluno"],
+      "rule": "Sistemas e acesso: logins, wifi, portais e suporte de TI."
+    },
+    {
+      "id": "administrativo.comunicados",
+      "name": "Comunicados Oficiais",
+      "parent": "administrativo",
+      "keywords": ["comunicado", "portaria", "resolução", "conselho", "reitoria", "direção-geral", "nota oficial"],
+      "rule": "Voz oficial da universidade: portarias, resoluções e notas."
+    },
+    {
+      "id": "financeiro",
+      "name": "Financeiro",
+      "parent": null,
+      "keywords": ["pagamento", "boleto", "bolsa"],
+      "rule": "Dinheiro: cobranças, bolsas e reembolsos."
+    },
+    {
+      "id": "financeiro.cobrancas",
+      "name": "Boletos e Cobranças",
+      "parent": "financeiro",
+      "keywords": ["boleto", "cobrança", "fatura", "vencimento", "pagamento", "código de barras", "pix", "mensalidade", "taxa"],
+      "rule": "Contas a pagar: boletos, faturas e vencimentos."
+    },
+    {
+      "id": "financeiro.bolsas",
+      "name": "Bolsas e Auxílios",
+      "parent": "financeiro",
+      "keywords": ["bolsa", "auxílio", "permanência", "auxílio-alimentação", "auxílio-moradia", "pnaes", "assistencia estudantil"],
+      "rule": "Apoio financeiro ao estudante: bolsas e auxílios."
+    },
+    {
+      "id": "financeiro.reembolsos",
+      "name": "Reembolsos",
+      "parent": "financeiro",
+      "keywords": ["reembolso", "restituição", "diária", "passagem", "prestação de contas", "solicitação de pagamento"],
+      "rule": "Dinheiro de volta: reembolsos, diárias e prestações de contas."
+    },
+    {
+      "id": "oportunidades",
+      "name": "Oportunidades",
+      "parent": null,
+      "keywords": ["vaga", "edital", "estágio", "evento"],
+      "rule": "Futuro: vagas, cursos, eventos e intercâmbio."
+    },
+    {
+      "id": "oportunidades.vagas",
+      "name": "Estágios e Empregos",
+      "parent": "oportunidades",
+      "keywords": ["estágio", "vaga", "emprego", "trainee", "recrutamento", "entrevista", "processo seletivo", "carreira", "linkedin"],
+      "rule": "Mercado: vagas de estágio e emprego, processos seletivos."
+    },
+    {
+      "id": "oportunidades.cursos",
+      "name": "Cursos e Eventos",
+      "parent": "oportunidades",
+      "keywords": ["curso", "workshop", "palestra", "congresso", "semana acadêmica", "certificado", "minicurso", "hackathon", "maratona"],
+      "rule": "Aprender além da grade: cursos, palestras e eventos."
+    },
+    {
+      "id": "oportunidades.intercambio",
+      "name": "Intercâmbio",
+      "parent": "oportunidades",
+      "keywords": ["intercâmbio", "mobilidade", "mobilidade acadêmica", "dupla diplomação", "edital de mobilidade", "abroad"],
+      "rule": "Mundo: mobilidade acadêmica e dupla diplomação."
+    },
+    {
+      "id": "comunidade",
+      "name": "Comunidade",
+      "parent": null,
+      "keywords": ["lista", "grupo", "diretório acadêmico", "aviso"],
+      "rule": "Vida no campus: listas, diretório acadêmico e avisos gerais."
+    },
+    {
+      "id": "comunidade.listas",
+      "name": "Listas e Grupos",
+      "parent": "comunidade",
+      "keywords": ["lista", "grupo", "whatsapp", "telegram", "discord", "lista de e-mails", "comunidade"],
+      "rule": "Canais da turma e do curso: listas e grupos."
+    },
+    {
+      "id": "comunidade.diretorio",
+      "name": "Diretório Acadêmico",
+      "parent": "comunidade",
+      "keywords": ["diretório acadêmico", "centro acadêmico", "atlética", "empresa júnior", "grêmio", "chapa"],
+      "rule": "Organização estudantil: DAs, atléticas e empresas juniores."
+    },
+    {
+      "id": "comunidade.avisos",
+      "name": "Avisos Gerais",
+      "parent": "comunidade",
+      "keywords": ["aviso", "informe", "divulgação", "campanha", "doação", "achados e perdidos", "manutenção", "feriado"],
+      "rule": "Quadro de avisos: informes, campanhas e comunicados informais."
+    }
+  ]
+}
