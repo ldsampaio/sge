@@ -453,13 +453,22 @@ pub fn run() {
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(supervise_sidecar(handle, supervisor));
             }
+            // Phase 17: crash safety — rows stuck `processing` from a killed
+            // run go back to `pending` for the next drain.
+            if let Some(state) = app.try_state::<AppState>() {
+                let guard = state.store.lock().unwrap();
+                let reaped = crate::classify::worker::reap_processing(&guard);
+                if reaped > 0 {
+                    eprintln!("[SGE classify] reaped {reaped} stuck processing rows");
+                }
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
             // Kill-on-exit: no orphan sidecar survives app quit.
             if matches!(event, tauri::WindowEvent::Destroyed) {
                 if let Some(state) = window.app_handle().try_state::<AppState>() {
-                    if let Some(mut child) = state.sidecar_child.lock().unwrap().take() {
+                    if let Some(child) = state.sidecar_child.lock().unwrap().take() {
                         let _ = child.kill();
                     }
                 }

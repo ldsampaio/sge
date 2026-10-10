@@ -215,9 +215,9 @@ pub async fn confirm_suggestion(
         let guard = store.lock().unwrap();
         filing::plan_filing(guard.conn(), message_id, &tax).map_err(|e| e.to_string())?
     };
-    if plan.needs_review && plan.confidence < plan.threshold_used {
-        // Review items confirm too (user judged them right) — the flag is
-        // informational here, not a refusal. Only missing/stale refuse.
+    if plan.needs_review {
+        // Review items confirm too (the user judged them right) — the flag
+        // is informational, not a refusal. Only missing/stale refuse.
     }
     let account_cfg = load_account_config(state.clone()).await?;
     let manager = manager_for(&state, &account_cfg);
@@ -993,7 +993,7 @@ pub async fn batch_classify(
                 }
                 live_chunk.push((*mid, mb.clone(), *uid));
             }
-            for (mid, mb, _uid) in live_chunk {
+            for (mid, _mb, _uid) in live_chunk {
                 if cancel.load(std::sync::atomic::Ordering::SeqCst) {
                     break;
                 }
@@ -1035,7 +1035,7 @@ pub async fn batch_classify(
                 }
                 // Destination + journal BEFORE the verb.
                 let dest_display = match &ready.child_id {
-                    Some(c) => {
+                    Some(_) => {
                         let top_name = tax.categories.iter()
                             .find(|c| c.id == ready.primary_id).map(|c| c.name.clone())
                             .unwrap_or_else(|| ready.primary_id.clone());

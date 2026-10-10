@@ -8,14 +8,11 @@
 //! persisted report + undo) — distinct from single-email always-confirmed.
 
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Serialize;
 
 use super::filing::move_one_uid;
-use super::suggest::DEFAULT_THRESHOLD;
 use super::taxonomy::{children_of, load_default, top_level};
-use super::worker::suggest_label;
 use crate::commands::sync::prepare_create_wire;
 use crate::imap::manager::SessionManager;
 use crate::store::queries;

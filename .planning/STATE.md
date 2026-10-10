@@ -26,10 +26,10 @@ See: .planning/PROJECT.md (updated 2026-10-10 — Milestone v1.3 started)
 
 ## Current Position
 
-Phase: 19 (Taxonomy Editor) — next; 15 freeze+bundle pending, 16+17+18 COMPLETE
-Plan: 19-01 backend next
-Status: 4/6 phases complete; executing 19→20 autonomously
-Last activity: 2026-10-10 — Phase 18 verified+closed (318 tests green, tsc clean)
+Phase: 15 (Sidecar Packaging Spike) — freeze relaunched, rest COMPLETE
+Plan: 15-03 (frozen numbers + bundle gate)
+Status: 5/6 phases complete (16,17,18,19,20); only Phase 15 measurements pending
+Last activity: 2026-10-10 — Phases 18/19/20 verified+closed (328 tests green, tsc clean); 15/17 requirements done except SIDE-01/02
 
 ## Performance Metrics
 
