@@ -1,194 +1,160 @@
-# FEATURES — Compose & Organize Milestone (v1.2) Research
+# Feature Research: Automatic Email Classification (SGE v1.3 Auto-Classify)
 
-> Question: How do compose/send, folder management, delete/move, drafts typically work in desktop mail clients? Expected behaviors, table stakes vs differentiators vs anti-features, complexity, dependencies on existing triage features.
-> Date: 2026-10-06. Sources: RFC 5322 (§3.6 reply/threading headers), RFC 6851 (MOVE), RFC 4315 (UIDPLUS/COPYUID), Thunderbird account-settings + support docs, Apple Mail / Gmail IMAP behavior notes, SGE `.planning/PROJECT.md` + repo layout (`src-tauri/src/imap|sync|store`, `src/components/*`).
+**Domain:** Desktop mail client — on-device AI email classification + taxonomy-driven folder organization
+**Researched:** 2026-10-10
+**Confidence:** MEDIUM (competitor UX from current web sources; Laya-specific UX inferred from SGE constraints)
 
-Already built — do NOT re-spec: read/unread sync (Seen STORE, optimistic UI, outbox), folder-tree browsing + per-folder sync + STATUS UNSEEN badges, 5-min poll + manual refresh (single-flight SyncGate), UID backfill (range-diff/tombstoning/convergence), global search, attachment list/download, keyring auth, Linux bundle.
+## Feature Landscape
 
----
+### Table Stakes (Users Expect These)
 
-## 1. Compose & Send (SMTP via `smtp.utfpr.edu.br:587/STARTTLS`)
+Features users assume exist once any client promises "automatic organization". Missing these = the feature feels broken or untrustworthy.
 
-### 1.1 Expected behaviors (table stakes)
+| Feature | Why Expected | Complexity | Notes |
+|---------|--------------|------------|-------|
+| Classify-on-arrival (auto-classify during sync) | Every reference client does this: Thunderbird filters fire on Inbox delivery, Gmail filters run on new mail, Superhuman auto-labels every incoming message. Users expect new mail to already be sorted when they open the client. | MEDIUM | SGE: hook into post-sync pipeline (after headers land in SQLite). Classify headers + on-demand body snippet. Must not block first paint — classify async after list renders. Depends on existing poll/manual-refresh sync path (Phase 8). |
+| Per-email confirm-before-move dialog | AI misfiles; every AI-mail product keeps a human-review gate (ThinkAutomation sends an explicit validation request and waits; Inbox Zero / Missive-style agents "surface results for review"). Moving mail physically (IMAP MOVE) is destructive-adjacent — user must see destination + reason and approve. | LOW | SGE: modal/banner in reading pane: suggested category, confidence, one-line justification, [Move] [Change] [Dismiss]. Reuses Phase 10 MOVE verb + outbox queue. |
+| Override / correct a classification | Superhuman lets users define their own auto-labels; Gmail users edit filters; Shortwave splits are user-tunable. A classifier without a correction path trains distrust — users must fix a wrong filing in one click. | LOW | SGE: "wrong folder?" action → re-move + record override (SQLite table: message UID, old/new category, timestamp). Override log is the future training signal (v1.3 only records, no fine-tuning — out of scope per PROJECT.md). |
+| Fallback / unclassified bucket | Gmail has Primary catch-all; every rule engine has a no-match path (Thunderbird leaves unmatched mail in Inbox). Low-confidence classifications must land somewhere reviewable, never silently misplaced. | LOW | SGE: `A Classificar` folder/bucket for low-confidence or ambiguous mail. Requires explicit review UI (list + classify actions), else it becomes a graveyard. |
+| Manual per-email "classify now" | Thunderbird "Run Filters on Folder/Message", Gmail "Filter messages like these". Users expect to trigger classification on demand for a selected message, not only on arrival. | LOW | SGE: context-menu / toolbar button → same confirm dialog as auto path. Shares one classify code path with sync-time flow. |
+| Batch "organize existing mail" | Gmail's "Also apply filter to N matching conversations" checkbox is the canonical pattern — users creating any organization scheme immediately want it applied retroactively. Thunderbird has Run-Now on folder. | MEDIUM | SGE: whole-account batch = same classifier, no per-email confirmation, with progress bar + final report (moved count, per-category counts, failures, low-confidence routed to `A Classificar`). Must reuse Phase 10/11 verbs (MOVE + CREATE) with the offline outbox so large runs survive disconnects. |
+| Taxonomy / category editor UI | Gmail filter list (edit/delete), Thunderbird Message Filters dialog, Superhuman custom auto-label prompts, Shortwave custom splits. Users must see, add, rename, and delete categories — a hardcoded invisible taxonomy is unacceptable. | MEDIUM | SGE: settings screen listing categories (name, parent, keywords/rules), add/rename/delete with guards (cannot delete `Auto` root or non-empty without confirm — mirrors Phase 11 destructive-folder guards backend-side). Hierarchical pt-BR tree, UTFPR default shipped. |
+| Confidence display + threshold | AI classifiers (Dynamics 365 Email Classification, Fyxer-style AI triage) surface "needs attention vs noise" — users calibrate trust via visible confidence. A bare label with no confidence hides the model's uncertainty. | LOW | SGE: store confidence per classification in SQLite; show badge (high/med/low) in confirm dialog and list; threshold setting routes below-threshold to `A Classificar`. |
+| Classification survives restart / offline | Desktop mail is offline-first (SGE core value). Labels and folder assignments must persist in SQLite and reconcile with server on reconnect. | LOW | SGE: primary+secondary labels as SQLite columns; moves queued in existing outbox (Phase 10/13 machinery). No new infra — reuse. |
 
-| Behavior | Convention (TB / Apple Mail / Gmail / Outlook) | Notes for SGE |
-|---|---|---|
-| New compose: To/Cc/Bcc + Subject + rich/plain body | All clients; Bcc hidden but sent | Validate ≥1 recipient; empty-subject confirm dialog ("Send anyway?") |
-| Reply-To honored | RFC 5322 §3.6: reply goes to `Reply-To:` if present, else `From:` | Must parse `Reply-To` from cached headers (already stored) |
-| Reply headers | `In-Reply-To:` = parent `Message-ID`; `References:` = parent `References` + parent `Message-ID` (RFC 5322 §3.6.4) | Without these, threading breaks on every other client — non-negotiable |
-| Reply subject | Prefix `Re:` once (don't stack `Re: Re:`) | Trivial string check |
-| Reply quoting | Quote original below attribution line (`On <date>, <author> wrote:`), `> `-prefixed, original headers (From/Date/To/Subject) included; cursor above quote | Thunderbird/Apple/Gmail default = top-post + quoted history. Trim signatures (`-- `) optionally |
-| Reply-All | To = original From + To, Cc = original Cc, **minus own identity** | Needs "own address" config; else self-echo loops |
-| Forward semantics | New message, subject `Fwd:` once, body = forward banner + quoted/inline original (attachments re-attached, see below); **no** In-Reply-To/References threading to original | Forward-as-inline (default) vs forward-as-attachment (EML, niche) — ship inline only first |
-| Attachments on send | Pick files → MIME multipart/mixed, correct Content-Type + filename*, size shown, removable pre-send; forward re-attaches original parts | SGE already downloads attachments → has MIME parse to reuse for re-attach |
-| Send flow | SMTP 587/STARTTLS + same creds (keyring) → on 250 OK, APPEND copy to Sent (`\Seen`) | Gmail auto-saves Sent server-side; generic IMAP (UTFPR) does **not** — client must APPEND, else Sent folder empty |
-| Offline/outbox | Send failure → queue in local outbox, retry on reconnect, surfaced in UI (not silent drop) | SGE already has durable outbox pattern for flag sync — reuse |
-| Identity/From | `From:` = configured account name+address; optional display-name setting | Single identity is fine for v1.2 |
+### Differentiators (Competitive Advantage)
 
-### 1.2 Differentiators (do later)
+| Feature | Value Proposition | Complexity | Notes |
+|---------|-------------------|------------|-------|
+| Fully offline on-device classification (Laya sidecar) | Superhuman/Shortwave/Gmail classify server-side or in-cloud — mail content leaves the machine. SGE classifies locally: privacy story nobody in the AI-mail space offers, strong fit for university (UTFPR) mail with sensitive content. | HIGH | Biggest v1.3 risk (packaging, model size, inference latency). But it IS the milestone's identity — do not compromise to a cloud API. |
+| Secondary label that never moves | Gmail labels vs folders distinction, but taken further: primary = physical `Auto/` location, secondary = SQLite-only tag. Lets one email belong to two taxonomy nodes without IMAP double-filing complexity (COPY + dual-sync bookkeeping). | LOW | Cheap to build (one SQLite column + filter UI), genuinely useful for cross-cutting categories (e.g. primary `Auto/Financeiro`, secondary `Urgente`). Local-only must be clearly badged so users don't expect it on other clients. |
+| Portuguese-first hierarchical taxonomy (UTFPR default, JSON import) | Competitors ship English-generic categories (Promotions/Social/Updates). A shipped pt-BR academic taxonomy (administrativo, acadêmico, eventos, financeiro…) + JSON import/export istailor-made for the actual user and portable across machines. | LOW–MEDIUM | JSON schema: name, parent, keywords, optional rules. Validate on import (cycle check, duplicate names, reserved `Auto` root). Export enables backup/sharing. |
+| Justification line per classification | AI-mail agents increasingly explain ("why this label") — builds trust during the low-accuracy early period. Combined with the sensitive-data rule (never reproduce passwords/codes) it becomes a privacy-respecting explanation. | LOW | One short sentence stored alongside the label; shown in confirm dialog and message detail. Redaction must happen at generation time (prompt-level instruction + post-filter), not display time. |
+| Batch report with per-category counts + failure list | Gmail's retroactive apply is fire-and-forget with no report. A real report (N moved, per-folder breakdown, K to `A Classificar`, failures with retry action) turns batch from scary to trustworthy — especially for whole-account reorganizations. | LOW | Report view persisted (SQLite run record) so users can audit after the fact. Retry-failed button reuses outbox. |
+| Override log as visible history | Most clients silently accept corrections. Showing "you corrected X → Y (n times)" per category gives users a sense of control and provides the dataset for any future fine-tuning milestone. | LOW | Simple list UI over the overrides table. v1.3 records only; explicitly no learning yet. |
 
-- HTML compose with sanitized paste; stationery/templates; signatures editor (per-identity).
-- Send-later / scheduled send; undo-send window (5–30 s delay-hold, Gmail-style).
-- Smart recipients (recent-contact ranking), contact autocomplete from history.
-- Large-attachment handling (size warning >20–25 MB, the de-facto SMTP ceiling).
+### Anti-Features (Commonly Requested, Often Problematic)
 
-### 1.3 Anti-features (do NOT build)
+| Feature | Why Requested | Why Problematic | Alternative |
+|---------|---------------|-----------------|-------------|
+| Auto-move without any confirmation on single emails | "Full automation" sounds efficient (some Outlook-agent case studies do this) | One wrong MOVE on important mail (boleto, matrícula) destroys trust; IMAP MOVE across folders is hard for users to audit after the fact | Keep single-email always-confirmed (already decided); unconfirmed only in explicit batch mode with report |
+| Server-side rules / Sieve sync | "My rules should work in webmail too" | SGE has no Sieve support; syncing local taxonomy to server filters is a second product (protocol negotiation, capability detection). Scope explosion. | Local classification only via existing MOVE verbs (already decided, PROJECT.md out-of-scope) |
+| Fine-tuning Laya on user mail in v1.3 | "It should learn from my corrections" | Training pipeline (dataset curation, eval, checkpoint versioning, rollback) dwarfs the milestone; override volume too small to matter initially | Zero-shot + keyword-assisted only; record overrides now, learn later (already decided) |
+| Real-time classification of every flag/sync event | "Everything should always be instantly classified" | Reclassifying on each poll wastes inference cycles and can thrash folders (move → re-move loops) when taxonomy edits change mappings | Classify once per message (new arrivals + explicit triggers); taxonomy edits apply prospectively + optional re-run batch |
+| Cloud AI fallback ("use GPT when unsure") | Higher accuracy temptation | Violates the offline constraint and leaks mail content off-machine; two code paths to maintain | Keep fully offline; low-confidence → `A Classificar` for human review |
+| Auto-deleting / auto-archiving low-value mail | Superhuman auto-archives marketing; sounds tidy | Destructive-adjacent without user history; SGE has no trash-restore UX maturity for classifier-driven deletes yet | Never delete via classifier in v1.3; worst case is `A Classificar` or a low-priority `Auto/` branch |
 
-- Read receipts / tracking pixels on send — privacy-hostile, server support spotty.
-- Auto-external-recipient rewriting, plug-in-driven "AI rewrite" in the send path — scope creep, blocks the send milestone.
-- POP-style "leave on server" toggles — irrelevant to IMAP+SMTP milestone.
+## Feature Dependencies
 
-### 1.4 Complexity & dependencies
+```
+Batch whole-account classification
+    └──requires──> Per-email classify + confirm pipeline (same classifier, minus dialog)
+                        └──requires──> Phase 10 MOVE verb + offline outbox
+                        └──requires──> Phase 11 CREATE verb (Auto/ tree on demand)
+    └──requires──> Taxonomy store (SQLite) + shipped UTFPR default
+    └──requires──> A Classificar fallback bucket
 
-| Item | Complexity | Depends on |
-|---|---|---|
-| MIME build + SMTP send (lettre crate, STARTTLS 587) | **M** — new `smtp/` module, keyring creds reuse, TLS | keyring auth ✓, attachment parse ✓ |
-| Reply/Reply-All/Forward header + quote construction | **S–M** — pure function on cached headers/body | headers-first store ✓, bodies-on-demand ✓ |
-| APPEND-to-Sent + Sent folder refresh | **S** — IMAP APPEND + reuse per-folder sync | folder-tree/per-folder sync ✓ (Phase 7), poll ✓ |
-| Outbox queue + retry + "Sent/Failed" UI | **M** — mirrors existing flag-outbox | SyncGate/outbox pattern ✓, SyncStatus UI ✓ |
-| Attachment re-attach on forward | **M** — fetch full part bytes, re-encode | attachment download ✓ (Phase 4) |
+Override / correction UI
+    └──requires──> Per-email classify pipeline (reuses confirm dialog)
+    └──enhances──> Override log table (future training data)
 
-Risk: UTFPR SMTP auth policy may differ from IMAP creds (some servers require full address vs bare user) — make SMTP username configurable, default = IMAP username.
+Secondary local-only label
+    └──requires──> SQLite label columns (no IMAP dependency)
+    └──conflicts──> Server-side folder expectations (must badge as local-only)
 
----
+Taxonomy JSON import/export
+    └──requires──> Taxonomy store + editor UI
+    └──requires──> Validation (cycles, duplicates, reserved Auto root)
 
-## 2. Folder Management (IMAP CREATE / RENAME / DELETE)
+Sensitive-data redaction in justifications/logs
+    └──requires──> Justification generation (prompt-level + post-filter)
+    ──cross-cuts──> ALL classification UI and logs (confirm dialog, report, SQLite)
+```
 
-### 2.1 Expected behaviors (table stakes)
+### Dependency Notes
 
-| Behavior | Convention | Notes for SGE |
-|---|---|---|
-| Create | `CREATE` with user-typed name under selected parent; hierarchy delimiter from LIST (`.` or `/` — **server-dependent**, must use probed delimiter, cf. imap-probe/CAPABILITY+LIST decision) | Validate against existing names; handle non-ASCII via modified-UTF7 encode (SGE already has `imap/mutf7.rs` ✓) |
-| Rename | `RENAME old new`; children move with it (server-side); update local DB folder rows + cached UIDs' folder mapping | INBOX itself must be non-renamable (guard in UI) |
-| Delete | `DELETE`; refuse non-empty without confirm; standard clients offer "delete folder + contents" vs "cancel" | Never delete by flagging messages — `DELETE` removes the **mailbox** |
-| Special folders | INBOX, Sent, Drafts, Trash (+Junk) pinned at top, special icons, excluded from rename/delete | SGE sidebar already special-cases Sent/Drafts (Phase 7) — extend with Trash role |
-| Subscribe/unsubscribe | LIST-Subscribed vs full LIST; "Show only subscribed" toggle (Thunderbird setting) | Table stakes for servers with many shared folders; cheap (LSUB/UNSUBSCRIBE) |
-| Refresh after op | Re-LIST tree + STATUS on affected branch; optimistic add/rename with rollback on NO response | Reuses poll/manual-refresh single path ✓ |
+- **Batch requires the single-email pipeline first:** build classify → confirm → MOVE once, then batch is "same loop, dialog off, progress on". Do not build two classifiers.
+- **Everything classification touches needs Phase 10/11 verbs:** MOVE (Phase 10) and CREATE (Phase 11) are the only IMAP surface the classifier needs — no new protocol work, but those verbs' offline queue + UIDVALIDITY gating must be respected (large batches amplify edge cases: expunged UIDs mid-run, folder created mid-run).
+- **Taxonomy store is the foundation:** the SQLite taxonomy table (categories, parents, keywords) must exist before classify-on-sync, editor UI, import, or batch. It is the natural Phase 1 of the milestone.
+- **Redaction cross-cuts everything:** the sensitive-data rule is not a feature but a constraint on every surface that displays or logs classification output — design it once (shared sanitizer in Rust backend), apply everywhere.
 
-### 2.2 Differentiators (later)
+## MVP Definition (v1.3 scope)
 
-- Drag-drop folder reorder, folder colors/icons, per-folder retention/auto-archive rules, favorite pinning.
-- Namespace-aware display stripping (`INBOX.` prefix hiding).
+### Launch With (v1.3)
 
-### 2.3 Anti-features
+Minimum for "classifica e organiza com confirmação":
 
-- Client-side-only "virtual folders" that diverge from server LIST — breaks cross-client consistency.
-- Recursive expunge-on-delete ("empty folder then delete") as silent default — data-loss risk; always confirm.
-- Allowing CREATE with empty name / leading-trailing spaces / delimiter collisions — server NO storms.
+- [ ] Taxonomy store in SQLite + shipped UTFPR default taxonomy — nothing works without it
+- [ ] Laya sidecar serving classifications to Rust backend (offline) — the milestone's identity
+- [ ] Classify-on-sync + manual per-email classify, both with confirm-before-move dialog — the core loop
+- [ ] `Auto/` tree auto-created on demand (Phase 11 CREATE reuse) — physical organization
+- [ ] Override UI (correct + log) — trust repair, one click
+- [ ] `A Classificar` fallback bucket + review list — safety net for low confidence
+- [ ] Primary + secondary SQLite labels (secondary never moves) — local organization model
+- [ ] Sensitive-data redaction across justifications/logs — privacy constraint, non-negotiable
+- [ ] Batch whole-account run with progress + report (no per-email confirm) — the "reorganize everything" payoff
 
-### 2.4 Complexity & dependencies
+### Add After Validation (v1.3.x)
 
-| Item | Complexity | Depends on |
-|---|---|---|
-| CREATE/RENAME/DELETE commands + error mapping | **S–M** — thin `imap/manager.rs` extension + mutf7 reuse | session manager ✓, mutf7 ✓, folder tree ✓ |
-| Local DB folder-table migration (roles, parent, delimiter) | **S** — rusqlite_migration pattern exists | store/queries ✓ |
-| Special-folder roles + Trash wiring (see §3) | **M** — policy decision with server variance | folder browsing ✓, STATUS badges ✓ |
-| Subscribe/unsubscribe | **S** | LIST path ✓ |
+- [ ] Taxonomy JSON import/export — ship with default first; import when users ask to share/tweak at scale (editor UI covers basic tweaks)
+- [ ] Confidence threshold setting — ship with sensible default; expose tuning after observing real confidence distributions
+- [ ] Override history view — log data from day one, build the visible UI once corrections accumulate
+- [ ] Batch retry-failed + scheduled/dry-run batch — after first real whole-account runs prove the happy path
 
-Risk: UTFPR namespace/delimiter unknown until live LIST — probe at account setup and persist per-account.
+### Future Consideration (v2+)
 
----
+- [ ] Learning from overrides (fine-tune or keyword auto-suggest) — needs accumulated override dataset; explicitly out of scope now
+- [ ] Server-side (Sieve) rule export — second product, revisit only if webmail parity demanded
+- [ ] Cross-device taxonomy sync — no sync story exists in SGE at all yet
 
-## 3. Delete & Move
+## Feature Prioritization Matrix
 
-### 3.1 Expected behaviors (table stakes) — the trash-vs-expunge decision
+| Feature | User Value | Implementation Cost | Priority |
+|---------|------------|---------------------|----------|
+| Laya sidecar classification service | HIGH | HIGH | P1 |
+| Taxonomy store + UTFPR default | HIGH | MEDIUM | P1 |
+| Classify-on-sync + confirm dialog | HIGH | MEDIUM | P1 |
+| Manual per-email classify | HIGH | LOW | P1 |
+| Auto/ tree auto-creation | HIGH | LOW (reuse) | P1 |
+| Override + log | HIGH | LOW | P1 |
+| A Classificar bucket + review | HIGH | LOW | P1 |
+| Primary/secondary SQLite labels | MEDIUM | LOW | P1 |
+| Sensitive-data redaction | HIGH | LOW–MEDIUM | P1 |
+| Batch run + progress + report | HIGH | MEDIUM | P1 |
+| Taxonomy editor UI | HIGH | MEDIUM | P1 |
+| JSON import/export | MEDIUM | LOW | P2 |
+| Confidence threshold setting | MEDIUM | LOW | P2 |
+| Override history view | LOW–MEDIUM | LOW | P2 |
+| Batch retry / dry-run | MEDIUM | LOW–MEDIUM | P2 |
 
-Two models exist; **desktop default is Trash-move, not raw expunge**:
+**Priority key:**
+- P1: Must have for v1.3 (the milestone goal already commits to all of these)
+- P2: Should have, add when possible (v1.3.x)
+- P3: Nice to have, future consideration (v2+)
 
-1. **Move-to-Trash (default delete):** `UID COPY`/`UID MOVE` → Trash, then flag source `\Deleted` + expunge source (RFC 6851 `UID MOVE` if server advertises MOVE capability, else COPY + STORE +FLAGS + UID EXPUNGE — the UIDPLUS fallback). Message remains recoverable in Trash.
-2. **Permanent delete (Shift+Delete / "Empty Trash"):** STORE `\Deleted` + `UID EXPUNGE` (UIDPLUS) or `EXPUNGE` scoped to Trash selection. Thunderbird exposes exactly this trio: *Move to Trash / Just mark deleted / Remove immediately* + *Empty Trash on Exit* + *Compact(=expunge)*.
+## Competitor Feature Analysis
 
-| Behavior | Convention | Notes for SGE |
-|---|---|---|
-| Del key = move to Trash | Thunderbird/Apple/Outlook default | Needs Trash folder identity (auto-detect `Trash`/`Deleted`/`Lixeira`/Gmail `[Gmail]/Trash`, else CREATE `Trash` once with confirm) |
-| Undo delete (Ctrl+Z / toast "Undo") | Move back from Trash (reverse MOVE); ~5–10 s window | Only feasible with Trash model — another reason raw-expunge-as-default is wrong |
-| Empty Trash = true expunge | STORE \Deleted + EXPUNGE on Trash | Confirm dialog; show count |
-| Move between folders (drag-drop / "Move to" menu) | `UID MOVE` preferred; COPY+STORE+EXPUNGE fallback; COPYUID response maps old→new UIDs for local DB update | Without COPYUID, re-sync target folder (cheap since per-folder sync exists) |
-| Copy (Ctrl+drag / "Copy to") | `UID COPY` without flagging source | Minor extra once move exists |
-| Archive (optional sibling) | One-key move to `Archive/YYYY` | Gmail-popularized; cheap given move exists — consider bundling |
-| Offline delete/move queue | Flag locally (`deleted_local` tombstone / `move_pending`), replay on reconnect — same reconcile as Seen flags | Reuses pending-wins outbox + tombstoning from Phases 6/9 |
+| Feature | Thunderbird | Gmail | Superhuman / Shortwave | SGE v1.3 Approach |
+|---------|-------------|-------|------------------------|-------------------|
+| Auto-organize new mail | Filters fire on delivery (header/sender rules only) | Filters run on arrival (header criteria only) | Auto-labels / AI filters on content (cloud) | Content classification on-device (Laya), confirm before move |
+| Rule/taxonomy management | Message Filters dialog per account | Filters tab in settings | Custom auto-label prompts / custom splits | Hierarchical pt-BR taxonomy editor + JSON import, UTFPR default |
+| Retroactive apply | Run Filters on Folder (manual, no report) | "Also apply to matching conversations" checkbox (no report) | N/A (labels are views, not moves) | Whole-account batch with progress + persisted report + retry |
+| Correction path | Edit filter, re-run | Edit filter, re-apply | Retune prompt / split definition | One-click override (re-move + log), no filter editing needed |
+| Unclassifiable mail | Left in Inbox | Left in Inbox / Primary | N/A | Explicit `A Classificar` bucket with review UI |
+| Multi-label | Tags + folders (both server-side) | Multiple labels (server-side, no move needed) | Labels as views | Primary (physical Auto/ folder) + secondary (SQLite-only label) |
+| Privacy model | Local rules, no content leaves | Server-side, content mined | Cloud AI reads mail | Fully offline — content never leaves machine |
+| Explanation | None (deterministic rules) | None | Minimal | One-line justification per classification, redacted |
 
-### 3.2 Differentiators (later)
+## Sources
 
-- Swipe-to-delete/archive gestures, bulk triage shortcuts (`e` archive, `#` delete à la Gmail/Superhuman), auto-empty-Trash-after-N-days setting.
-
-### 3.3 Anti-features
-
-- **Raw EXPUNGE as the only delete** — irreversible, diverges from every desktop client, and on Gmail only removes the label (message lingers in All Mail). PROJECT.md "expunge" line must be read as *expunge-under-the-hood*, with Trash UX on top.
-- Full-mailbox `EXPUNGE` (no UID scoping) on servers without UIDPLUS — can nuke other clients' `\Deleted` messages; always prefer `UID EXPUNGE` and capability-check first.
-- Silent permanent delete with no confirm and no undo — data-loss + trust-loss.
-
-### 3.4 Complexity & dependencies
-
-| Item | Complexity | Depends on |
-|---|---|---|
-| Capability probe (MOVE? UIDPLUS?) at SELECT time | **S** — CAPABILITY parse already partially exists | session/probe ✓ |
-| Delete→Trash + undo + Empty Trash | **M** — reuse move path + outbox | folder tree ✓, poll ✓, outbox ✓ |
-| Drag-drop / Move-to / Copy-to | **M** (UI-heavy; protocol is same COPY/MOVE) | MessageList + Sidebar DnD (new), per-folder sync ✓ |
-| Tombstone + replay for offline ops | **M** — extend Phase 9 tombstoning | UID backfill/convergence ✓ |
-| Archive shortcut | **S** once move exists | move path |
-
----
-
-## 4. Drafts (save / edit / autosave / send)
-
-### 4.1 Expected behaviors (table stakes)
-
-| Behavior | Convention (TB/Apple Mail/Gmail web) | Notes for SGE |
-|---|---|---|
-| Autosave while composing | Every ~30–60 s + on pause; Thunderbird/Apple save to IMAP Drafts; Gmail saves continuously | Start with explicit Save + timed autosave (30 s, only-if-dirty) |
-| Server copy via APPEND | Draft stored with `APPEND Drafts (\Seen \Draft)` + MIME body; each autosave **replaces** the previous server copy (APPEND new + EXPUNGE old — IMAP has no in-place edit; Thunderbird's duplicate-draft bugs are exactly failure to delete the old copy) | Track `draft_uid` per compose session; delete-then-append atomically-ish |
-| Edit draft | Open from Drafts → compose prefilled; saving updates same UID chain | Drafts folder browsing already exists (Phase 7) — needs "open as editable" vs read-only distinction |
-| Send draft | Normal SMTP send → delete draft copy (APPEND…no — STORE \Deleted + EXPUNGE the draft UID) → APPEND to Sent | The #1 Thunderbird complaint is orphan drafts left after send — delete-on-send must be in the send transaction |
-| Discard draft | Confirm → delete draft UID | — |
-| Drafts sync across clients | Draft appears in Drafts on phone/webmail (standard IMAP) | Free via APPEND; verify against UTFPR webmail |
-| Offline drafts | Save to local SQLite with `sync_pending`; APPEND on reconnect | Same outbox pattern as flags/deletes |
-
-### 4.2 Differentiators (later)
-
-- Multi-device conflict banner ("edited elsewhere"), draft templates/snippets, resume-composer on restart (restore open compose windows).
-
-### 4.3 Anti-features
-
-- Saving drafts to **Sent** folder on misconfiguration (classic Thunderbird footgun from wrong Copies&Folders mapping) — hard-code Drafts role, no user-mappable folder paths in v1.2.
-- Autosave creating a **new copy every tick** (Thunderbird duplicate-draft bug, Apple Mail/Gmail-bin incidents) — must track-and-replace; cap: one server copy per compose session.
-- Autosave overwriting a draft the user is editing on another device without warning — last-writer-wins silently; at minimum compare `INTERNALDATE`/size before replace (banner is v-later).
-
-### 4.4 Complexity & dependencies
-
-| Item | Complexity | Depends on |
-|---|---|---|
-| Draft MIME build + APPEND + replace-old | **M** — new `drafts` sync path; MIME builder shared with compose | compose MIME builder (§1), per-folder sync ✓ |
-| `draft_uid` session tracking (compose ↔ Drafts list) | **M** — frontend compose state + backend mapping | MessageList/ReadingPane, SQLite store ✓ |
-| Delete-on-send transaction | **S–M** — ordering: SMTP OK → delete draft → APPEND Sent | send flow (§1), outbox ✓ |
-| Autosave timer (dirty-check, 30 s) | **S** — UI timer like existing 5-min poll | poll pattern ✓ |
-| Offline draft queue | **M** — same tombstone/outbox reuse | backfill/convergence ✓ |
+- Thunderbird message filters (support.mozilla.org — organize-your-messages-using-filters; Fedora Magazine intro; msgFilterRules.dat per-account storage)
+- Gmail filters (support.google.com/mail/answer/6579; "Also apply filter to matching conversations" retroactive pattern)
+- Superhuman auto labels + split inbox + auto archive (superhuman.com; tutorial coverage of custom auto-label prompts)
+- Shortwave AI filters in plain English + splits/bundles (shortwave.com; Zapier comparison 2026)
+- AI triage with human review gate (ThinkAutomation validation-request pattern; Missive 9-best-AI-assistants 2026 roundup; Inbox Zero agent-on-existing-inbox)
+- AI pre-filing evaluation + irrelevant filtering (Dynamics 365 Email Classification, GA 2026)
+- SGE PROJECT.md v1.3 scoping decisions (confirm-except-batch, Auto/ root, secondary local-only, offline, sensitive-data rule)
 
 ---
-
-## 5. Cross-cutting: table stakes / differentiators / anti-features summary
-
-**Table stakes (ship in milestone):** SMTP send + APPEND-to-Sent; reply/reply-all/forward with correct threading headers + quoting; attachments on send/forward; trash-move delete + undo + empty-trash; drag-drop or Move-to + Copy-to; CREATE/RENAME/DELETE folders with special-folder guards + delimiter/mutf7 handling; draft autosave-replace + edit + delete-on-send; offline queue for all four (reuse flag/outbox + tombstones); own-address identity config (required by reply-all + sent-copy correctness).
-
-**Differentiators (explicitly later):** undo-send window, send-later, signatures/templates, archive shortcut + shortcuts triage, folder colors/pinning/retention, draft conflict banners, contact ranking, send retry backoff UI.
-
-**Anti-features (refuse):** raw-expunge-only delete; permanent-delete-without-confirm; client-only virtual folders; tracking pixels/read-receipts; Sent-folder draft misrouting; autosave-duplication; AI-rewrite in send path.
-
----
-
-## 6. Suggested build order (dependency-aware)
-
-1. **Move + Trash-delete + Empty Trash** — unlocks everything; exercises UID MOVE/COPYUID fallback, Trash detection, outbox reuse. (Needs: capability probe.)
-2. **Folder CREATE/RENAME/DELETE + roles** — Trash from step 1 needs role; delimiter probe here.
-3. **SMTP send + APPEND-to-Sent + MIME builder** — standalone vertical slice (new compose only).
-4. **Reply/Reply-All/Forward quoting on top of (3)** — pure functions + UI; forward re-attach reuses Phase 4 parse.
-5. **Drafts (save/replace/edit/delete-on-send + autosave)** — reuses MIME builder (3) + APPEND/move machinery (1); hardest state tracking, so last.
-6. **Offline queue + undo toasts across all** — horizontal hardening over the outbox/tombstone pattern once paths exist.
-
-## 7. Open questions for discuss-phase
-
-- Trash auto-detect vs fixed name on `mail.utfpr.edu.br` (needs live LIST; fallback CREATE `Trash`?).
-- Server capabilities: does UTFPR advertise MOVE / UIDPLUS / IDLE? (Probe determines fallback code needed.)
-- SMTP auth identity format (bare user vs full address) + Sent auto-save by server or client-APPEND?
-- `Junk` handling in scope or deferred? (Affects special-folder set.)
-- Quota exposure: does server return QUOTA that compose/APPEND should surface before large sends?
+*Feature research for: SGE v1.3 Auto-Classify (classification UX)*
+*Researched: 2026-10-10*
