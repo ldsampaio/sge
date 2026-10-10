@@ -90,8 +90,16 @@ cat sidecar/pins.json
 
 echo "==> [5/6] offline /health smoke (unfrozen server)"
 # Smoke against weights-incoming (the swap happens only after GREEN).
+# LAYA_EXTRA_MODELS re-point is mandatory: the Router resolves
+# "multilingual" to the bundle repo, which we do not ship (Phase 15 finding).
+SNAP_DIR="$(echo sidecar/weights-incoming/hub/models--convaiinnovations--laya-multilingual/snapshots/*/)"
+mkdir -p sidecar/weights-incoming/checkpoints
+rm -rf sidecar/weights-incoming/checkpoints/multilingual
+cp -rL "${SNAP_DIR}" sidecar/weights-incoming/checkpoints/multilingual
+chmod -R u+rw sidecar/weights-incoming/checkpoints
 export HF_HOME="$PWD/sidecar/weights-incoming"
 export HF_HUB_OFFLINE=1
+export LAYA_EXTRA_MODELS="{\"multilingual\": \"$PWD/sidecar/weights-incoming/checkpoints/multilingual\"}"
 export LAYA_HOST=127.0.0.1
 export LAYA_PORT=43121
 export LAYA_MODELS=multilingual

@@ -33,7 +33,7 @@ use crate::store::queries;
 /// Load the active account config: prefer in-memory `active_account`
 /// (set by `connect_account`), fall back to the OS keyring so sync works
 /// after restart. Shared by `start_sync` and `set_seen`.
-async fn load_account_config(
+pub(crate) async fn load_account_config(
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<AccountConfig, String> {
     // In-memory first (works even when "remember me" is unchecked).
@@ -81,7 +81,7 @@ async fn load_account_config(
 /// Get the cached [`SessionManager`] for this account, creating it on first
 /// use and replacing it when the account changes. The slot holds only an
 /// `Arc` clone — never held across `.await`.
-fn manager_for(
+pub(crate) fn manager_for(
     state: &tauri::State<'_, crate::AppState>,
     cfg: &AccountConfig,
 ) -> Arc<SessionManager> {
@@ -1290,7 +1290,7 @@ pub async fn list_mailboxes(
 ///
 /// Caller runs this inside `spawn_blocking` + `block_on` (same as the
 /// folder commands); the store lock sections are brief and sync-only.
-async fn refresh_mailbox_tree(
+pub(crate) async fn refresh_mailbox_tree(
     manager: &Arc<SessionManager>,
     store: &Arc<std::sync::Mutex<crate::store::Store>>,
 ) -> Result<Vec<crate::store::queries::MailboxRow>, String> {
@@ -1503,7 +1503,7 @@ fn folder_name_error_copy(e: FolderNameError) -> String {
 /// Only the user-typed leaf is encoded: `parent` is already a RAW wire
 /// name from the cached tree, and re-encoding it would corrupt the `&…-`
 /// shift sequences of non-ASCII parents (`Caf&AOk-` → `Caf&-AOk-`).
-fn prepare_create_wire(
+pub(crate) fn prepare_create_wire(
     cached: &[queries::MailboxRow],
     parent: Option<&str>,
     leaf: &str,
@@ -1628,7 +1628,7 @@ fn effective_delimiter(old: &str, cached_delimiter: &str) -> Result<String, Stri
 /// Only the user-typed leaf is encoded: the kept parent prefix is already
 /// a RAW wire name, and re-encoding it would corrupt the `&…-` shift
 /// sequences of non-ASCII parents.
-fn guard_rename(
+pub(crate) fn guard_rename(
     cached: &[queries::MailboxRow],
     old: &str,
     new_leaf: &str,
@@ -1677,7 +1677,7 @@ pub(crate) enum DeleteDecision {
 /// cached delimiters) → non-empty confirm gates. The `\Noselect` check needs
 /// fresh LIST attributes, so the command applies it separately before calling
 /// this. Every refusal returns before any verb call (T-11-04/T-11-06).
-fn guard_delete(
+pub(crate) fn guard_delete(
     cached: &[queries::MailboxRow],
     wire: &str,
     messages: u32,

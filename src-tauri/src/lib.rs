@@ -70,6 +70,8 @@ pub struct AppState {
         Mutex<Option<tauri_plugin_shell::process::CommandChild>>,
     /// Phase 17 single-flight drain guard (shared by hook + commands).
     pub classify_gate: Arc<classify::worker::ClassifyGate>,
+    /// Phase 20 cooperative batch-cancel flag (checked per chunk).
+    pub batch_cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// In-memory credentials + server config for the connected session.
@@ -433,6 +435,7 @@ pub fn run() {
         sidecar: Mutex::new(None),
         sidecar_child: Mutex::new(None),
         classify_gate: Arc::new(classify::worker::ClassifyGate::default()),
+        batch_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -492,6 +495,26 @@ pub fn run() {
             commands::sync::send_status,
             commands::classify::classify_message,
             commands::classify::classify_status,
+            commands::classify::confirm_suggestion,
+            commands::classify::override_label,
+            commands::classify::dismiss_suggestion,
+            commands::classify::set_confidence_threshold,
+            commands::classify::review_list,
+            commands::classify::suggestion_detail,
+            commands::classify::suggestion_for_uid,
+            commands::classify::mailbox_labels,
+            commands::classify::list_taxonomy,
+            commands::classify::add_category,
+            commands::classify::rename_category,
+            commands::classify::merge_categories,
+            commands::classify::delete_category,
+            commands::classify::update_category_keywords,
+            commands::classify::import_taxonomy,
+            commands::classify::export_taxonomy,
+            commands::classify::batch_classify,
+            commands::classify::cancel_batch,
+            commands::classify::batch_report,
+            commands::classify::undo_batch,
             sidecar_status,
             load_server_config,
         ])

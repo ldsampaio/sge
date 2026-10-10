@@ -1,7 +1,11 @@
 import type { ReactNode } from "react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import "./MailboxView.css";
 import FolderContextMenu from "./FolderContextMenu";
+import { ReviewPanel } from "./ReviewPanel";
+import { TaxonomyEditor } from "./TaxonomyEditor";
+import { BatchPanel } from "./BatchPanel";
 import { IconBook, IconFolderPlus, IconInbox, IconMail, IconTrash } from "./icons";
 import type { MailboxRow } from "../types";
 
@@ -131,6 +135,31 @@ export default function Sidebar({
   const showMailboxItems = mailboxes.length > 0;
   const tree = buildTree(mailboxes);
   const [menu, setMenu] = useState<{ name: string; x: number; y: number } | null>(null);
+  /** Phase 18 review queue: count badge + modal (quiet when empty). */
+  const [reviewOpen, setReviewOpen] = useState(false);
+  const [reviewCount, setReviewCount] = useState(0);
+  /** Phase 19 taxonomy editor modal. */
+  const [editorOpen, setEditorOpen] = useState(false);
+  /** Phase 20 batch panel modal. */
+  const [batchOpen, setBatchOpen] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    const fetchCount = async () => {
+      try {
+        const rows = (await invoke("review_list", { limit: 200 })) as unknown[];
+        if (alive) setReviewCount(rows.length);
+      } catch {
+        /* sidecar/store hiccup — badge stays stale, modal shows the error */
+      }
+    };
+    void fetchCount();
+    const timer = setInterval(fetchCount, 30000);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+    };
+  }, [mailboxes]);
 
   /** Open the folder context menu (right-click or keyboard), clamped to viewport. */
   function openMenu(mb: MailboxRow, clientX: number, clientY: number) {
@@ -244,6 +273,33 @@ export default function Sidebar({
         )}
       </ul>
       <div className="sidebar-foot">
+        {reviewCount > 0 && (
+          <button
+            type="button"
+            className="sidebar-review"
+            onClick={() => setReviewOpen(true)}
+            aria-label={`${reviewCount} e-mails para revisar`}
+            style={{
+              display: "flex",
+              width: "100%",
+              alignItems: "center",
+              gap: 8,
+              marginBottom: 8,
+              padding: "6px 10px",
+              borderRadius: 8,
+              border: "1px dashed #3b82f6",
+              background: "transparent",
+              color: "#93c5fd",
+              fontSize: "0.8rem",
+              cursor: "pointer",
+            }}
+          >
+            <span aria-hidden="true">🔍</span>
+            <span>
+              A Classificar <strong>({reviewCount})</strong>
+            </span>
+          </button>
+        )}
         <button
           type="button"
           className="sidebar-newfolder"
@@ -255,9 +311,48 @@ export default function Sidebar({
           </span>
           <span>Nova pasta</span>
         </button>
+        <button
+          type="button"
+          className="sidebar-newfolder"
+          onClick={() => setEditorOpen(true)}
+          aria-label="Editar categorias do classificador"
+        >
+          <span className="sidebar-newfolder-icon" aria-hidden="true">
+            <IconBook size={17} />
+          </span>
+          <span>Categorias</span>
+        </button>
+        <button
+          type="button"
+          className="sidebar-newfolder"
+          onClick={() => setBatchOpen(true)}
+          aria-label="Reorganizar toda a conta"
+        >
+          <span className="sidebar-newfolder-icon" aria-hidden="true">
+            <IconMail size={17} />
+          </span>
+          <span>Reorganizar</span>
+        </button>
         <strong>Tudo em dia</strong>
         <p>Nenhuma mensagem nova pendente. Sincronize para buscar avisos recentes.</p>
       </div>
+      {reviewOpen && (
+        <ReviewPanel
+          onClose={() => setReviewOpen(false)}
+          onChanged={() => {
+            void (async () => {
+              try {
+                const rows = (await invoke("review_list", { limit: 200 })) as unknown[];
+                setReviewCount(rows.length);
+              } catch {
+                /* keep stale count */
+              }
+            })();
+          }}
+        />
+      )}
+      {editorOpen && <TaxonomyEditor onClose={() => setEditorOpen(false)} />}
+      {batchOpen && <BatchPanel onClose={() => setBatchOpen(false)} />}
       {menu !== null &&
         (() => {
           const menuRow = mailboxes.find((m) => m.name === menu.name);

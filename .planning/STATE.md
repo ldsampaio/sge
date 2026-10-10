@@ -26,10 +26,10 @@ See: .planning/PROJECT.md (updated 2026-10-10 — Milestone v1.3 started)
 
 ## Current Position
 
-Phase: 15 (Sidecar Packaging Spike) — IN PROGRESS (autonomous run, 2026-10-10)
-Plan: 15-02 done (supervision + wiring, 12 tests); 15-01 running (weights download + freeze)
-Status: All 6 phases discussed+planned (CONTEXT + PLANs committed); executing 15→20
-Last activity: 2026-10-10 — autonomous start; Phase 15-02 implemented, Phase 16-01/03 implemented (untested), build-sidecar.sh running
+Phase: 19 (Taxonomy Editor) — next; 15 freeze+bundle pending, 16+17+18 COMPLETE
+Plan: 19-01 backend next
+Status: 4/6 phases complete; executing 19→20 autonomously
+Last activity: 2026-10-10 — Phase 18 verified+closed (318 tests green, tsc clean)
 
 ## Performance Metrics
 

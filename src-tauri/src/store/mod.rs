@@ -93,6 +93,9 @@ impl Store {
             M::up(M11_SENT_UNFILED_SQL),
             M::up(M12_CLASSIFY_SQL),
             M::up(M13_EXCLUSIONS_SQL),
+            M::up(M14_REVIEW_SETTINGS_SQL),
+            M::up(M15_DISMISSED_SQL),
+            M::up(M16_BATCH_ITEMS_SQL),
         ]);
         migrations.to_latest(conn)?;
         Ok(())
@@ -400,6 +403,49 @@ const M13_EXCLUSIONS_SQL: &str = concat!(
     "  reason       TEXT NOT NULL DEFAULT '',",
     "  excluded_at  TEXT NOT NULL DEFAULT (datetime('now'))",
     ");",
+);
+
+/// M14 forward migration: review flag + settings (Phase 18, Plan 18-01).
+///
+/// `labels.needs_review` persists the suggester's routing (gate + keyword
+/// veto) so confirm can distinguish "confident suggestion" from "review
+/// item" WITHOUT recomputing. `classify_settings` holds `threshold` and
+/// the `auto_root` marker (ours-vs-theirs `Auto` collision answer).
+const M14_REVIEW_SETTINGS_SQL: &str = concat!(
+    "ALTER TABLE labels ADD COLUMN needs_review INTEGER NOT NULL DEFAULT 0;",
+    "CREATE TABLE classify_settings (",
+    "  key          TEXT PRIMARY KEY,",
+    "  value        TEXT NOT NULL DEFAULT ''",
+    ");",
+);
+
+/// M15 forward migration: suggestion dismissal (Phase 18, Plan 18-01).
+///
+/// Dismissed suggestions leave the mail alone: the hook only enqueues
+/// UNLABELED rows (dismissed rows keep their label), and the review list
+/// filters them out. Confirm stays possible (user changed mind).
+const M15_DISMISSED_SQL: &str =
+    "ALTER TABLE labels ADD COLUMN dismissed INTEGER NOT NULL DEFAULT 0;";
+
+/// M16 forward migration: batch journal (Phase 20, Plan 20-01).
+///
+/// Per-message journal enabling resume (skip journaled) + undo-batch
+/// (reverse `moved` rows). `moved` distinguishes journaled-intent from
+/// journaled-fact so a crash between journal-write and MOVE retries the
+/// row instead of double-moving it.
+const M16_BATCH_ITEMS_SQL: &str = concat!(
+    "CREATE TABLE batch_items (",
+    "  id           INTEGER PRIMARY KEY,",
+    "  run_id       INTEGER NOT NULL REFERENCES batch_runs(id) ON DELETE CASCADE,",
+    "  message_id   INTEGER NOT NULL,",
+    "  from_folder  TEXT NOT NULL,",
+    "  to_folder    TEXT NOT NULL,",
+    "  label_id     TEXT NOT NULL,",
+    "  chunk        INTEGER NOT NULL DEFAULT 0,",
+    "  moved        INTEGER NOT NULL DEFAULT 0,",
+    "  undone       INTEGER NOT NULL DEFAULT 0",
+    ");",
+    "CREATE INDEX idx_batch_items_run ON batch_items(run_id, id);",
 );
 
 /// Returns the app-data attachment directory for a given mailbox UID.

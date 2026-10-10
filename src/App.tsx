@@ -2,6 +2,9 @@ import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import LoginForm from "./components/LoginForm";
 import SyncStatus from "./components/SyncStatus";
+import { OutboxBadgeWired } from "./components/OutboxBadge";
+import { ClassifyStatusWired } from "./components/ClassifyStatus";
+import SendStatus from "./components/SendStatus";
 import MailboxView from "./components/MailboxView";
 import { IconCap, IconSparkle, IconArrowLeft } from "./components/icons";
 import "./App.css";
@@ -136,6 +139,9 @@ function App() {
           <LoginForm onConnect={handleConnect} />
           <div style={{ marginTop: 16 }}>
             <SyncStatus />
+            <OutboxBadgeWired mailbox="INBOX" />
+            <ClassifyStatusWired />
+            <SendStatus mailbox="INBOX" onRetry={(id) => console.error(`retry ${id}`)} />
           </div>
         </>
       ) : connected ? (

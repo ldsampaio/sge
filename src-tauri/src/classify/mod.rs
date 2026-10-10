@@ -5,9 +5,12 @@
 // orphan labels or break the classifier contract (cycles, dup IDs,
 // Auto-root collision, flat-choice budget overflow).
 
+pub mod batch;
 pub mod bridge;
 pub mod evidence;
+pub mod filing;
 pub mod redact;
 pub mod suggest;
+pub mod taxedit;
 pub mod taxonomy;
 pub mod worker;

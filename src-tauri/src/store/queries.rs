@@ -1804,7 +1804,7 @@ pub struct TaxonomyRow {
 }
 
 /// A label row: category POINTERS for one cached message.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LabelRow {
     pub message_id: u64,
     pub primary_id: String,
@@ -1812,6 +1812,7 @@ pub struct LabelRow {
     pub confidence: f64,
     pub threshold: f64,
     pub stale: bool,
+    pub needs_review: bool,
 }
 
 /// Install (or replace) the taxonomy singleton + version.
@@ -1850,21 +1851,23 @@ pub fn upsert_label(
     secondary_id: Option<&str>,
     confidence: f64,
     threshold: f64,
+    needs_review: bool,
 ) -> StoreResult<()> {
     conn.execute(
-        "INSERT INTO labels (message_id, primary_id, secondary_id, confidence, threshold, stale)
-         VALUES (?1, ?2, ?3, ?4, ?5, 0)
+        "INSERT INTO labels (message_id, primary_id, secondary_id, confidence, threshold, stale, needs_review)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
          ON CONFLICT (message_id) DO UPDATE SET primary_id = excluded.primary_id,
            secondary_id = excluded.secondary_id, confidence = excluded.confidence,
-           threshold = excluded.threshold, stale = 0, labeled_at = datetime('now')",
-        rusqlite::params![message_id, primary_id, secondary_id, confidence, threshold],
+           threshold = excluded.threshold, stale = 0, needs_review = excluded.needs_review,
+           labeled_at = datetime('now')",
+        rusqlite::params![message_id, primary_id, secondary_id, confidence, threshold, needs_review as i64],
     )?;
     Ok(())
 }
 
 pub fn get_label(conn: &Connection, message_id: u64) -> StoreResult<Option<LabelRow>> {
     conn.query_row(
-        "SELECT message_id, primary_id, secondary_id, confidence, threshold, stale
+        "SELECT message_id, primary_id, secondary_id, confidence, threshold, stale, needs_review
          FROM labels WHERE message_id = ?1",
         rusqlite::params![message_id],
         |r| {
@@ -1875,6 +1878,7 @@ pub fn get_label(conn: &Connection, message_id: u64) -> StoreResult<Option<Label
                 confidence: r.get(3)?,
                 threshold: r.get(4)?,
                 stale: r.get::<_, i64>(5)? != 0,
+                needs_review: r.get::<_, i64>(6)? != 0,
             })
         },
     )
@@ -2076,6 +2080,134 @@ pub fn seed_default_exclusions(conn: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
+/// Read a classify setting (threshold, auto_root marker). None when unset.
+pub fn get_setting(conn: &Connection, key: &str) -> StoreResult<Option<String>> {
+    conn.query_row(
+        "SELECT value FROM classify_settings WHERE key = ?1",
+        rusqlite::params![key],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(super::StoreError::Sql)
+}
+
+pub fn set_setting(conn: &Connection, key: &str, value: &str) -> StoreResult<()> {
+    conn.execute(
+        "INSERT INTO classify_settings (key, value) VALUES (?1, ?2)
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![key, value],
+    )?;
+    Ok(())
+}
+
+/// Effective confidence threshold: stored setting or the shipped default.
+pub fn effective_threshold(conn: &Connection) -> f64 {
+    get_setting(conn, "threshold")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| (0.0..=1.0).contains(v))
+        .unwrap_or(crate::classify::suggest::DEFAULT_THRESHOLD)
+}
+
+/// Dismiss a suggestion: mail stays where it is; the review list hides it.
+/// Confirm remains possible (user changed mind via the review list).
+pub fn dismiss_label(conn: &Connection, message_id: u64) -> StoreResult<()> {
+    conn.execute(
+        "UPDATE labels SET dismissed = 1 WHERE message_id = ?1",
+        rusqlite::params![message_id],
+    )?;
+    Ok(())
+}
+
+/// Remap a category id across labels (merge/delete): primary AND secondary
+/// columns. Returns rows touched.
+pub fn remap_label_ids(conn: &Connection, from: &str, to: &str) -> StoreResult<usize> {
+    let a = conn.execute(
+        "UPDATE labels SET primary_id = ?2 WHERE primary_id = ?1",
+        rusqlite::params![from, to],
+    )?;
+    let b = conn.execute(
+        "UPDATE labels SET secondary_id = ?2 WHERE secondary_id = ?1",
+        rusqlite::params![from, to],
+    )?;
+    Ok(a + b)
+}
+
+/// Count labels still pointing at `id` (orphan check after migration).
+pub fn labels_using(conn: &Connection, id: &str) -> StoreResult<i64> {
+    conn.query_row(
+        "SELECT count(*) FROM labels WHERE primary_id = ?1 OR secondary_id = ?1",
+        rusqlite::params![id],
+        |r| r.get(0),
+    )
+    .map_err(super::StoreError::Sql)
+}
+
+/// Is this label dismissed?
+pub fn is_dismissed(conn: &Connection, message_id: u64) -> StoreResult<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT count(*) FROM labels WHERE message_id = ?1 AND dismissed = 1",
+        rusqlite::params![message_id],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// Review list: labeled + needs_review + not dismissed (newest first).
+pub fn review_list(conn: &Connection, limit: usize) -> StoreResult<Vec<LabelRow>> {
+    review_list_inner(conn, limit)
+}
+
+/// Bulk labels for a folder's rows: (uid, label). Drives list badges with
+/// ONE query instead of N per-message lookups.
+pub fn labels_in_mailbox(conn: &Connection, mailbox: &str) -> StoreResult<Vec<(u32, LabelRow)>> {
+    conn.prepare(
+        "SELECT m.uid, l.message_id, l.primary_id, l.secondary_id, l.confidence,
+                l.threshold, l.stale, l.needs_review
+         FROM labels l JOIN messages m ON m.id = l.message_id
+         JOIN mailboxes mb ON mb.id = m.mailbox_id
+         WHERE mb.name = ?1 AND l.dismissed = 0",
+    )?
+    .query_map(rusqlite::params![mailbox], |r| {
+        Ok((
+            r.get::<_, u32>(0)?,
+            LabelRow {
+                message_id: r.get(1)?,
+                primary_id: r.get(2)?,
+                secondary_id: r.get(3)?,
+                confidence: r.get(4)?,
+                threshold: r.get(5)?,
+                stale: r.get::<_, i64>(6)? != 0,
+                needs_review: r.get::<_, i64>(7)? != 0,
+            },
+        ))
+    })?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(super::StoreError::Sql)
+}
+
+fn review_list_inner(conn: &Connection, limit: usize) -> StoreResult<Vec<LabelRow>> {
+    conn.prepare(
+        "SELECT message_id, primary_id, secondary_id, confidence, threshold, stale, needs_review
+         FROM labels WHERE needs_review = 1 AND dismissed = 0
+         ORDER BY labeled_at DESC LIMIT ?1",
+    )?
+    .query_map(rusqlite::params![limit as i64], |r| {
+        Ok(LabelRow {
+            message_id: r.get(0)?,
+            primary_id: r.get(1)?,
+            secondary_id: r.get(2)?,
+            confidence: r.get(3)?,
+            threshold: r.get(4)?,
+            stale: r.get::<_, i64>(5)? != 0,
+            needs_review: r.get::<_, i64>(6)? != 0,
+        })
+    })?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(super::StoreError::Sql)
+}
+
 /// Message ids in a folder that have no label row yet (hook source).
 pub fn unlabeled_in_mailbox(conn: &Connection, mailbox: &str) -> StoreResult<Vec<u64>> {
     conn.prepare(
@@ -2104,6 +2236,22 @@ pub fn message_classify_fields(
                 r.get::<_, i64>(3)? != 0,
             ))
         },
+    )
+    .optional()
+    .map_err(super::StoreError::Sql)
+}
+
+/// (mailbox wire name, uid) for a cached message id. Needed to address
+/// IMAP verbs (UID-only) from classifier flows (id-addressed).
+pub fn message_location(
+    conn: &Connection,
+    message_id: u64,
+) -> StoreResult<Option<(String, u32)>> {
+    conn.query_row(
+        "SELECT mb.name, m.uid FROM messages m
+         JOIN mailboxes mb ON m.mailbox_id = mb.id WHERE m.id = ?1",
+        rusqlite::params![message_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )
     .optional()
     .map_err(super::StoreError::Sql)
@@ -2941,13 +3089,13 @@ mod classify_tests {
         let conn = store.conn();
         let mid = seeded_msg(conn);
         assert!(get_label(conn, mid).unwrap().is_none());
-        upsert_label(conn, mid, "academico.avaliacoes", Some("academico.aulas"), 0.81, 0.6).unwrap();
+        upsert_label(conn, mid, "academico.avaliacoes", Some("academico.aulas"), 0.81, 0.6, false).unwrap();
         let l = get_label(conn, mid).unwrap().unwrap();
         assert_eq!(l.primary_id, "academico.avaliacoes");
         assert_eq!(l.secondary_id.as_deref(), Some("academico.aulas"));
         assert!(!l.stale);
         // Reclassify overwrites (no duplicate rows).
-        upsert_label(conn, mid, "financeiro.bolsas", None, 0.9, 0.6).unwrap();
+        upsert_label(conn, mid, "financeiro.bolsas", None, 0.9, 0.6, false).unwrap();
         let l2 = get_label(conn, mid).unwrap().unwrap();
         assert_eq!((l2.primary_id.as_str(), l2.secondary_id, l2.confidence),
             ("financeiro.bolsas", None, 0.9));
@@ -2962,8 +3110,8 @@ mod classify_tests {
         upsert_message(conn, mb, 2, None, "x", "y", "[]", "[]",
             "2026-10-10T00:00:00Z", "[]", false, "").unwrap();
         let b = find_message_id(conn, mb, 2).unwrap().unwrap();
-        upsert_label(conn, a, "academico.aulas", None, 0.7, 0.6).unwrap();
-        upsert_label(conn, b, "removida.xyz", None, 0.7, 0.6).unwrap();
+        upsert_label(conn, a, "academico.aulas", None, 0.7, 0.6, false).unwrap();
+        upsert_label(conn, b, "removida.xyz", None, 0.7, 0.6, true).unwrap();
         let n = mark_stale_unknown(conn, &["academico.aulas", "financeiro.bolsas"]).unwrap();
         assert_eq!(n, 1);
         assert!(!get_label(conn, a).unwrap().unwrap().stale);
@@ -3010,5 +3158,47 @@ mod classify_tests {
             "SELECT state, totals_json FROM batch_runs WHERE id = ?1",
             rusqlite::params![run], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
         assert_eq!((state.as_str(), totals.as_str()), ("done", r#"{"moved":3}"#));
+    }
+}
+
+#[cfg(test)]
+mod taxroundtrip_tests {
+    use super::*;
+    use crate::store::Store;
+
+    #[test]
+    fn export_import_roundtrip_keeps_labels() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let json = include_str!("../../src/classify/taxonomy_default.json");
+        install_taxonomy(conn, 1, "UTFPR padrão", json).unwrap();
+        // Export = stored json; import validates clean.
+        let row = get_taxonomy(conn).unwrap().unwrap();
+        let tax: serde_json::Value = serde_json::from_str(&row.json).unwrap();
+        assert_eq!(tax["version"], 1);
+        assert_eq!(tax["categories"].as_array().unwrap().len(), 23);
+        // Re-import bumps version + stale-flags nothing (ids match).
+        let n = mark_stale_unknown(
+            conn,
+            &["academico", "financeiro", "academico.aulas", "x"],
+        )
+        .unwrap();
+        assert_eq!(n, 0); // no labels yet — nothing to flag
+    }
+
+    #[test]
+    fn remap_and_orphan_check() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let mb = ensure_mailbox(conn, "INBOX").unwrap();
+        upsert_message(conn, mb, 1, None, "s", "f", "[]", "[]",
+            "2026-10-10T00:00:00Z", "[]", false, "").unwrap();
+        let mid = find_message_id(conn, mb, 1).unwrap().unwrap();
+        upsert_label(conn, mid, "financeiro.bolsas", Some("financeiro.cobrancas"), 0.8, 0.6, false).unwrap();
+        let touched = remap_label_ids(conn, "financeiro.bolsas", "financeiro.cobrancas").unwrap();
+        assert_eq!(touched, 1);
+        assert_eq!(labels_using(conn, "financeiro.bolsas").unwrap(), 0);
+        let l = get_label(conn, mid).unwrap().unwrap();
+        assert_eq!(l.primary_id, "financeiro.cobrancas");
     }
 }

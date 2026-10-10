@@ -15,8 +15,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::Serialize;
 
 use super::bridge::{Bridge, BridgeError};
-use super::suggest::{suggest, DEFAULT_THRESHOLD};
-use super::taxonomy::{children_of, load_default, top_level};
+use super::suggest::suggest;
+use super::taxonomy::{load_default, top_level};
 use crate::store::queries;
 use crate::store::Store;
 
@@ -87,6 +87,7 @@ pub async fn classify_one(
         ready.secondary_id.as_deref(),
         ready.confidence,
         threshold,
+        ready.needs_review,
     )
     .map_err(BridgeError::Io)?;
     Ok(ClassificationReady { message_id, ..ready })
@@ -130,7 +131,6 @@ pub async fn suggest_label(
         .find(|t| t.name == outcome.choice)
         .map(|t| t.id.clone())
         .unwrap_or_else(|| outcome.choice.clone());
-    let kids: Vec<&super::taxonomy::Category> = children_of(&tax, &top_id);
     let runner_name = outcome.runner_up();
     let runner_id = runner_name.as_ref().and_then(|n| {
         tops.iter()
@@ -141,7 +141,7 @@ pub async fn suggest_label(
         &top_id,
         outcome.confidence,
         runner_id.as_deref(),
-        &kids,
+        &tax,
         &evidence,
         threshold,
     );
@@ -165,6 +165,7 @@ pub fn persist_label(
     secondary_id: Option<&str>,
     confidence: f64,
     threshold: f64,
+    needs_review: bool,
 ) -> Result<(), String> {
     let _ = child_id; // child rides inside primary tree path (Phase 18 folders)
     queries::upsert_label(
@@ -174,6 +175,7 @@ pub fn persist_label(
         secondary_id,
         confidence,
         threshold,
+        needs_review,
     )
     .map_err(|e| e.to_string())
 }
@@ -213,6 +215,16 @@ async fn drain_inner(
     };
     let mut labeled = 0usize;
     for (message_id, folder) in rows {
+        // Pinned override: a user correction stands — never re-suggest.
+        let pinned = {
+            let guard = store.lock().unwrap();
+            queries::latest_override(guard.conn(), message_id).unwrap_or(None)
+        };
+        if pinned.is_some() {
+            let guard = store.lock().unwrap();
+            let _ = queries::set_queue_state(guard.conn(), message_id, &folder, "done");
+            continue;
+        }
         let Some((subject, snippet, domain, atts, reply)) = fetch(message_id) else {
             let guard = store.lock().unwrap();
             let _ = queries::set_queue_state(guard.conn(), message_id, &folder, "done");
@@ -257,6 +269,7 @@ fn worker_persist(
         ready.secondary_id.as_deref(),
         ready.confidence,
         threshold,
+        ready.needs_review,
     )
 }
 

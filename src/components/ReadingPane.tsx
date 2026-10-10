@@ -6,7 +6,24 @@ import { isUnread, dispatchFlagUpdate } from "../types";
 import { IconBook, IconDownload, IconMail, IconTrash, IconMove } from "./icons";
 import MoveMenu from "./MoveMenu";
 import ExpungeModal from "./ExpungeModal";
+import { SuggestionBar } from "./ClassifyBadges";
 import "./MailboxView.css";
+
+/** Suggestion detail for the reader bar (mirrors the Rust struct). */
+interface SuggestionDetail {
+  message_id: number;
+  primary_id: string;
+  primary_name: string;
+  child_name: string | null;
+  secondary_name: string | null;
+  confidence: number;
+  needs_review: boolean;
+  stale: boolean;
+  dismissed: boolean;
+  dest_display: string;
+  justification: string;
+  tops: Array<[string, string]>;
+}
 
 function isTauriRuntime(): boolean {
   const w = window as unknown as Record<string, unknown>;
@@ -34,6 +51,80 @@ export default function ReadingPane({ selectedMessage, mailbox = "INBOX", mailbo
     uid: number | null;
     triggerRef: React.MutableRefObject<HTMLButtonElement | null>;
   }>({ open: false, uid: null, triggerRef: { current: null } });
+  /** Phase 18 suggestion bar state (reader-scoped, per selected message). */
+  const [suggestion, setSuggestion] = useState<SuggestionDetail | null>(null);
+  const [suggestBusy, setSuggestBusy] = useState(false);
+  const [suggestMsg, setSuggestMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    setSuggestion(null);
+    setSuggestMsg(null);
+    if (!selectedMessage) return;
+    void (async () => {
+      try {
+        const d = (await invoke("suggestion_for_uid", {
+          mailbox,
+          uid: selectedMessage.uid,
+        })) as SuggestionDetail | null;
+        setSuggestion(d && !d.dismissed ? d : null);
+      } catch {
+        setSuggestion(null);
+      }
+    })();
+  }, [selectedMessage, mailbox]);
+
+  const confirmSuggestion = async (allowNest: boolean) => {
+    if (!suggestion) return;
+    setSuggestBusy(true);
+    setSuggestMsg(null);
+    try {
+      const r = (await invoke("confirm_suggestion", {
+        messageId: suggestion.message_id,
+        allowNest,
+      })) as { detail: string };
+      setSuggestMsg(r.detail);
+      setSuggestion(null);
+    } catch (e) {
+      const s = String(e);
+      if (s.includes("COLLISION")) {
+        if (window.confirm("Já existe uma pasta Auto. Arquivar dentro dela?")) {
+          await confirmSuggestion(true);
+        }
+      } else {
+        setSuggestMsg(`Falha ao arquivar: ${e}`);
+      }
+    } finally {
+      setSuggestBusy(false);
+    }
+  };
+
+  const correctSuggestion = async (toId: string) => {
+    if (!suggestion) return;
+    setSuggestBusy(true);
+    setSuggestMsg(null);
+    try {
+      const r = (await invoke("override_label", {
+        messageId: suggestion.message_id,
+        toCategory: toId,
+      })) as { detail: string };
+      setSuggestMsg(r.detail);
+      setSuggestion(null);
+    } catch (e) {
+      setSuggestMsg(`Falha ao corrigir: ${e}`);
+    } finally {
+      setSuggestBusy(false);
+    }
+  };
+
+  const dismissSuggestion = async () => {
+    if (!suggestion) return;
+    try {
+      await invoke("dismiss_suggestion", { messageId: suggestion.message_id });
+      setSuggestion(null);
+    } catch (e) {
+      setSuggestMsg(`Falha ao dispensar: ${e}`);
+    }
+  };
   // Expunge modal state
   const [expungeModal, setExpungeModal] = useState<{
     open: boolean;
@@ -361,6 +452,26 @@ export default function ReadingPane({ selectedMessage, mailbox = "INBOX", mailbo
             {new Date(message.date_utc).toLocaleString("pt-BR")}
           </time>
         </div>
+        {/* Phase 18: confirm-gated suggestion bar (backend-enforced gate). */}
+        {suggestion && (
+          <SuggestionBar
+            destDisplay={suggestion.dest_display}
+            confidence={suggestion.confidence}
+            needsReview={suggestion.needs_review}
+            justification={suggestion.justification}
+            tops={suggestion.tops.map(([id, name]) => ({ id, name }))}
+            busy={suggestBusy}
+            message={suggestMsg}
+            onConfirm={() => void confirmSuggestion(false)}
+            onCorrect={(toId) => void correctSuggestion(toId)}
+            onDismiss={() => void dismissSuggestion()}
+          />
+        )}
+        {!suggestion && suggestMsg && (
+          <div role="status" style={{ color: "#4ade80", fontSize: "0.82rem" }}>
+            {suggestMsg}
+          </div>
+        )}
         {/* Action row: delete/move or restore/expunge when in Trash */}
         <div className="reading-actions" role="group" aria-label="Ações da mensagem">
           {mailbox.toLowerCase() === "trash" || mailbox.toLowerCase() === "lixeira" ? (

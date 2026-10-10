@@ -9,33 +9,33 @@
 
 - [ ] **SIDE-01**: App serves email classifications fully offline via bundled Laya sidecar (multilingual checkpoint, loopback-only, no mail content leaves the machine)
 - [ ] **SIDE-02**: Backend manages sidecar lifecycle — spawn/health/restart with backgrounded cold-start, sync and UI never block on the model
-- [ ] **SIDE-03**: User can exclude folders from auto-classify (per-folder opt-out, e.g. Sent/Drafts never auto-filed)
+- [x] **SIDE-03** (Phase 17): User can exclude folders from auto-classify (per-folder opt-out, e.g. Sent/Drafts never auto-filed)
 
 ### Taxonomy
 
-- [ ] **TAX-01**: App ships the UTFPR default taxonomy (hierarchical, versioned, ID-stable) in the local store
-- [ ] **TAX-02**: User can add/rename/delete categories and edit keywords/rules in the options UI (ID-stable edits with migration — no orphaned labels)
-- [ ] **TAX-03**: User can import/export taxonomy JSON with validation (no cycles, no duplicate IDs, `Auto` root reserved)
+- [x] **TAX-01**: App ships the UTFPR default taxonomy (hierarchical, versioned, ID-stable) in the local store — Phase 16 (23 ids, v1 embedded)
+- [x] **TAX-02** (Phase 19): User can add/rename/delete categories and edit keywords/rules in the options UI (ID-stable edits with migration — no orphaned labels)
+- [x] **TAX-03** (Phase 19): User can import/export taxonomy JSON with validation (no cycles, no duplicate IDs, `Auto` root reserved)
 
 ### Classify Loop
 
-- [ ] **CLS-01**: New mail is auto-classified after sync via a behind-sync queue (sync never awaits the model)
-- [ ] **CLS-02**: User can classify/reclassify a single email manually
-- [ ] **CLS-03**: Single-email moves require explicit user confirmation — suggest → confirm → MOVE into the auto-created `Auto/` tree (root always `Auto`)
-- [ ] **CLS-04**: Low-confidence and edge mail lands in the `A Classificar` bucket for review instead of being misfiled
-- [ ] **CLS-05**: User can set the confidence threshold that routes mail to `A Classificar` (sensible default shipped)
-- [ ] **CLS-06**: Sensitive-data rule enforced backend-side — input redaction + output filter, justifications/logs never contain senhas/códigos/dados sigilosos, labels store pointers not content
+- [x] **CLS-01** (Phase 17): New mail is auto-classified after sync via a behind-sync queue (sync never awaits the model)
+- [x] **CLS-02** (Phase 17): User can classify/reclassify a single email manually
+- [x] **CLS-03** (Phase 18): Single-email moves require explicit user confirmation — suggest → confirm → MOVE into the auto-created `Auto/` tree (root always `Auto`)
+- [x] **CLS-04** (Phase 17): Low-confidence and edge mail lands in the `A Classificar` bucket for review instead of being misfiled
+- [x] **CLS-05** (Phase 18): User can set the confidence threshold that routes mail to `A Classificar` (sensible default shipped)
+- [x] **CLS-06**: Sensitive-data rule enforced backend-side — input redaction + output filter, justifications/logs never contain senhas/códigos/dados sigilosos, labels store pointers not content — Phase 16 (9 fixtures, schema-structural)
 
 ### Trust UX
 
-- [ ] **TRUST-01**: User can override a classification (one-click correct → re-move + override logged)
-- [ ] **TRUST-02**: User sees category badges in the message list (primary category per email, local-only secondary badged distinctly)
-- [ ] **TRUST-03**: User sees the (redacted) justification for a suggestion at confirm time — transient UI string, never persisted
+- [x] **TRUST-01** (Phase 18): User can override a classification (one-click correct → re-move + override logged)
+- [x] **TRUST-02** (Phase 18): User sees category badges in the message list (primary category per email, local-only secondary badged distinctly)
+- [x] **TRUST-03** (Phase 18): User sees the (redacted) justification for a suggestion at confirm time — transient UI string, never persisted
 
 ### Batch Reorganization
 
-- [ ] **BATCH-01**: User can run whole-account batch classification with live progress and a persisted report (no per-email confirmation)
-- [ ] **BATCH-02**: Batch runs are journaled and resumable with undo-batch — a mid-run failure never leaves a half-filed account
+- [x] **BATCH-01** (Phase 20): User can run whole-account batch classification with live progress and a persisted report (no per-email confirmation)
+- [x] **BATCH-02** (Phase 20): Batch runs are journaled and resumable with undo-batch — a mid-run failure never leaves a half-filed account
 
 ## Future Requirements (deferred)
 
@@ -62,18 +62,18 @@ Which phases cover which requirements. Updated during roadmap creation.
 |-------------|-------|--------|
 | SIDE-01 | Phase 15 | Pending |
 | SIDE-02 | Phase 15 | Pending |
-| SIDE-03 | Phase 17 | Pending |
-| TAX-01 | Phase 16 | Pending |
-| TAX-02 | Phase 19 | Pending |
-| TAX-03 | Phase 19 | Pending |
-| CLS-01 | Phase 17 | Pending |
-| CLS-02 | Phase 17 | Pending |
-| CLS-03 | Phase 18 | Pending |
-| CLS-04 | Phase 17 | Pending |
-| CLS-05 | Phase 18 | Pending |
-| CLS-06 | Phase 16 | Pending |
-| TRUST-01 | Phase 18 | Pending |
-| TRUST-02 | Phase 18 | Pending |
-| TRUST-03 | Phase 18 | Pending |
-| BATCH-01 | Phase 20 | Pending |
-| BATCH-02 | Phase 20 | Pending |
+| SIDE-03 | Phase 17 | Done |
+| TAX-01 | Phase 16 | Done |
+| TAX-02 | Phase 19 | Done |
+| TAX-03 | Phase 19 | Done |
+| CLS-01 | Phase 17 | Done |
+| CLS-02 | Phase 17 | Done |
+| CLS-03 | Phase 18 | Done |
+| CLS-04 | Phase 17 | Done |
+| CLS-05 | Phase 18 | Done |
+| CLS-06 | Phase 16 | Done |
+| TRUST-01 | Phase 18 | Done |
+| TRUST-02 | Phase 18 | Done |
+| TRUST-03 | Phase 18 | Done |
+| BATCH-01 | Phase 20 | Done |
+| BATCH-02 | Phase 20 | Done |
