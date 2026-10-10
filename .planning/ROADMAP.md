@@ -136,5 +136,5 @@ Phases execute in numeric order: 10 → 11 → 12 → 13 → 14
 | 10. Delete + Move | v1.2 | 4/4 | Complete | 2026-10-06 |
 | 11. Folder CRUD | v1.2 | 3/3 | Complete    | 2026-10-06 |
 | 12. Drafts | v1.2 | 3/3 | Complete | 2026-10-08 |
-| 13. Send Pipeline | v1.2 | 0/TBD | Not started | - |
-| 14. Compose UI | v1.2 | 0/TBD | Not started | - |
+| 13. Send Pipeline | v1.2 | 3/3 | Complete | 2026-10-08 |
+| 14. Compose UI | v1.2 | 2/5 | Complete | 2026-10-08 |
