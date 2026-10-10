@@ -3750,6 +3750,7 @@ dependencies = [
  "tauri-plugin-fs",
  "tauri-plugin-shell",
  "thiserror 2.0.21",
+ "tokio",
  "zeroize",
 ]
 

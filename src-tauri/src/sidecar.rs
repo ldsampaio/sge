@@ -198,6 +198,16 @@ impl SidecarSupervisor {
         self.config.port()
     }
 
+    /// Bridge connection params: base URL + per-boot key clone. The key
+    /// clone travels only into the in-memory bridge client (same machine,
+    /// Authorization header) — never into logs, errors, or IPC payloads.
+    pub fn bridge_params(&self) -> (String, zeroize::Zeroizing<String>) {
+        (
+            format!("http://127.0.0.1:{}", self.config.port()),
+            self.config.api_key.clone(),
+        )
+    }
+
     /// Mark a successful health probe. First success transitions
     /// Starting → Running and records cold-start latency.
     pub fn record_healthy(&self) {
@@ -455,6 +465,17 @@ mod tests {
         let get = |k: &str| env.iter().find(|(key, _)| key == k).unwrap().1.clone();
         assert_eq!(get("HF_HOME"), "/r/weights/hf-cache");
         assert_eq!(get("LAYA_API_KEY"), "test-key-abc");
+    }
+
+    #[test]
+    fn bridge_params_expose_url_but_tests_guard_key() {
+        // The key clone exists (bridge needs it); the guard is that NO
+        // Display/Debug/Serialize path carries it — covered by
+        // describe_and_errors_never_leak_key + status_payload tests.
+        let sup = SidecarSupervisor::new(test_config());
+        let (url, key) = sup.bridge_params();
+        assert_eq!(url, "http://127.0.0.1:43121");
+        assert_eq!(key.as_str(), "test-key-abc");
     }
 
     #[test]

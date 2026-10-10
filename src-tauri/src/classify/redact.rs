@@ -23,6 +23,10 @@ fn rules() -> &'static Rules {
     static CELL: OnceLock<Rules> = OnceLock::new();
     CELL.get_or_init(|| {
         let pair = |pat: &str, kind: &'static str| (Regex::new(pat).unwrap(), kind);
+        // ORDER MATTERS: longest/most-specific first. The phone pattern can
+        // match digit slices inside longer runs, so barcode + CPF run before
+        // it; otherwise a boleto line gets shredded into phone-shaped pieces
+        // and the barcode rule never fires.
         Rules {
             pairs: vec![
                 // Passwords: `senha[: =] <value>`, password/passwd variants.
@@ -35,23 +39,37 @@ fn rules() -> &'static Rules {
                     r"(?i)(c[oó]digos?|tokens?|otps?|verifica[cç][aã]o|chave\s+de\s+acesso)\s*[:=\-]\s*\S+",
                     "code",
                 ),
-                // API keys / secrets / bearer tokens.
+                // Bare codes: `código 739201` (value MUST contain a digit —
+                // otherwise benign `código de conduta` would be eaten).
                 pair(
-                    r"(?i)(api[_-]?keys?|secrets?|bearer)\s*[:=\-]\s*\S+",
+                    r"(?i)\b(c[oó]digos?|tokens?|otps?|verifica[cç][aã]o)\s+(\S*\d\S*)",
+                    "code",
+                ),
+                // Bare passwords: `senha Temp1234` (digit-shaped only).
+                pair(
+                    r"(?i)\b(senhas?|password|passwd|pwd)\s+(\S*\d\S*)",
+                    "password",
+                ),
+                // API keys / secrets / bearer: separator OR bare space
+                // (`bearer XXX`). Over-redaction beats leakage.
+                pair(
+                    r"(?i)\b(api[_-]?keys?|secrets?|bearer)\b\s*(?:[:=\-]\s*)?\S+",
                     "secret",
                 ),
+                // Barcodes / long digit runs typical of boletos (44–48 digits).
+                pair(r"\b\d{44,48}\b", "barcode"),
                 // CPF formatted + bare 11-digit (word-boundary guarded).
                 pair(r"\b\d{3}\.\d{3}\.\d{3}-\d{2}\b", "cpf"),
                 pair(r"\b\d{11}\b", "cpf"),
                 // RA / matrícula: `RA 12345`, `matrícula: 2024...`.
                 pair(r"(?i)\b(ra|matr[ií]cula)\s*[:=\-]?\s*\d[\d.\-]*", "ra"),
                 // BR phones: (41) 99999-0000, 41999990000, +55 41 ....
+                // `(?:55)?` — optional country code (NOT `55?`, which would
+                // require a literal 5).
                 pair(
-                    r"\+?55?\s*\(?\d{2}\)?\s*\d{4,5}[-.\s]?\d{4}\b",
+                    r"\+?(?:55)?\s*\(?\d{2}\)?\s*\d{4,5}[-.\s]?\d{4}\b",
                     "phone",
                 ),
-                // Barcodes / long digit runs typical of boletos (44–48 digits).
-                pair(r"\b\d{44,48}\b", "barcode"),
             ],
             digit_run: Regex::new(r"\b\d{6,}\b").unwrap(),
         }
@@ -164,6 +182,15 @@ mod tests {
         assert_eq!(redact_input(ok), ok);
         assert_eq!(filter_output(ok), ok);
         assert!(looks_clean(ok));
+    }
+
+    #[test]
+    fn benign_code_words_without_digits_survive() {
+        // `código de conduta` has no digit-shaped value — must NOT redact.
+        let ok = "Leia o código de conduta antes da prova.";
+        assert_eq!(redact_input(ok), ok);
+        let bare = "digite o código 739201 para continuar";
+        assert!(!redact_input(bare).contains("739201"));
     }
 
     #[test]

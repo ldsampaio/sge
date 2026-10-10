@@ -16,7 +16,7 @@ pub mod queries;
 pub const BODY_CACHE_CAP_BYTES: usize = 262144;
 
 /// Schema version managed by rusqlite_migration.
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 11;
 
 // v1 = full schema.sql (canonical DDL from ARCHITECTURE.md)
 // M2 = flag_outbox durable queue (Phase 6, Plan 06-01). The schema.sql v1
@@ -90,6 +90,9 @@ impl Store {
             M::up(M8_ROLES_SQL),
             M::up(M9_DRAFTS_SQL),
             M::up(M10_SEND_QUEUE_SQL),
+            M::up(M11_SENT_UNFILED_SQL),
+            M::up(M12_CLASSIFY_SQL),
+            M::up(M13_EXCLUSIONS_SQL),
         ]);
         migrations.to_latest(conn)?;
         Ok(())
@@ -294,6 +297,111 @@ const M10_SEND_QUEUE_SQL: &str = concat!(
     "CREATE INDEX idx_send_queue_next_retry ON send_queue(next_retry_at);",
 );
 
+/// M11 forward migration: `sent_unfiled` send state (Phase 13, Plan 13-03).
+///
+/// SMTP accepted the bytes but the Sent APPEND did not land (or has not run
+/// yet) — APPEND-only retry, never re-SMTP-send. SQLite cannot ALTER a CHECK
+/// constraint, so the table is rebuilt: copy all 13 columns into the new
+/// shape (CHECK extended with `sent_unfiled`), drop, rename, re-index.
+/// Row-preserving by construction (same columns, plain INSERT..SELECT).
+const M11_SENT_UNFILED_SQL: &str = concat!(
+    "CREATE TABLE send_queue_new (",
+    "  id            TEXT PRIMARY KEY,",
+    "  message_id    TEXT NOT NULL UNIQUE,",
+    "  from_addr     TEXT NOT NULL DEFAULT '',",
+    "  to_addrs      TEXT NOT NULL DEFAULT '[]',",
+    "  cc_addrs      TEXT NOT NULL DEFAULT '[]',",
+    "  bcc_addrs     TEXT NOT NULL DEFAULT '[]',",
+    "  eml_path      TEXT NOT NULL DEFAULT '',",
+    "  state         TEXT NOT NULL DEFAULT 'queued'",
+    "    CHECK (state IN ('queued','sending','sent','failed','uncertain','sent_unfiled')),",
+    "  attempts      INTEGER NOT NULL DEFAULT 0,",
+    "  next_retry_at TEXT,",
+    "  last_error    TEXT,",
+    "  draft_id      TEXT,",
+    "  created_at    TEXT NOT NULL DEFAULT (datetime('now'))",
+    ");",
+    "INSERT INTO send_queue_new (id, message_id, from_addr, to_addrs, cc_addrs, \
+       bcc_addrs, eml_path, state, attempts, next_retry_at, last_error, \
+       draft_id, created_at) \
+     SELECT id, message_id, from_addr, to_addrs, cc_addrs, bcc_addrs, \
+       eml_path, state, attempts, next_retry_at, last_error, draft_id, \
+       created_at FROM send_queue;",
+    "DROP TABLE send_queue;",
+    "ALTER TABLE send_queue_new RENAME TO send_queue;",
+    "CREATE INDEX idx_send_queue_state ON send_queue(state);",
+    "CREATE INDEX idx_send_queue_next_retry ON send_queue(next_retry_at);",
+);
+
+/// M12 forward migration: classification store (Phase 16, Plan 16-02).
+///
+/// Foundation for the v1.3 Auto-Classify lane. Pointer-only by design:
+/// `labels` carries category IDs + confidence, NEVER snippet/body/evidence
+/// text (privacy is structural — the schema cannot hold content even if a
+/// later phase tries). `label_overrides` is append-only from day one (the
+/// history VIEW lands later; the log must already exist). `classify_queue`
+/// is the behind-sync work list with UIDVALIDITY epoch hygiene (same drop
+/// rule as `imap_outbox`: whole-folder rows drop on UIDVALIDITY bump).
+/// `batch_runs` exists now so the milestone needs exactly one migration.
+const M12_CLASSIFY_SQL: &str = concat!(
+    "CREATE TABLE taxonomy (",
+    "  id           INTEGER PRIMARY KEY CHECK (id = 1),",
+    "  version      INTEGER NOT NULL,",
+    "  name         TEXT NOT NULL DEFAULT '',",
+    "  json         TEXT NOT NULL,",
+    "  installed_at TEXT NOT NULL DEFAULT (datetime('now'))",
+    ");",
+    "CREATE TABLE labels (",
+    "  message_id   INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,",
+    "  primary_id   TEXT NOT NULL,",
+    "  secondary_id TEXT,",
+    "  confidence   REAL NOT NULL DEFAULT 0,",
+    "  threshold    REAL NOT NULL DEFAULT 0.6,",
+    "  stale        INTEGER NOT NULL DEFAULT 0,",
+    "  labeled_at   TEXT NOT NULL DEFAULT (datetime('now'))",
+    ");",
+    "CREATE INDEX idx_labels_primary ON labels(primary_id);",
+    "CREATE TABLE label_overrides (",
+    "  id           INTEGER PRIMARY KEY,",
+    "  message_id   INTEGER NOT NULL,",
+    "  from_id      TEXT NOT NULL,",
+    "  to_id        TEXT NOT NULL,",
+    "  at           TEXT NOT NULL DEFAULT (datetime('now'))",
+    ");",
+    "CREATE INDEX idx_overrides_message ON label_overrides(message_id);",
+    "CREATE TABLE classify_queue (",
+    "  id           INTEGER PRIMARY KEY,",
+    "  message_id   INTEGER NOT NULL,",
+    "  folder       TEXT NOT NULL,",
+    "  status       TEXT NOT NULL DEFAULT 'pending'",
+    "    CHECK (status IN ('pending','processing','done','failed')),",
+    "  attempts     INTEGER NOT NULL DEFAULT 0,",
+    "  uidvalidity  INTEGER NOT NULL DEFAULT 0,",
+    "  enqueued_at  TEXT NOT NULL DEFAULT (datetime('now')),",
+    "  UNIQUE (message_id, folder)",
+    ");",
+    "CREATE INDEX idx_classify_queue_status ON classify_queue(status, folder);",
+    "CREATE TABLE batch_runs (",
+    "  id           INTEGER PRIMARY KEY,",
+    "  started_at   TEXT NOT NULL DEFAULT (datetime('now')),",
+    "  finished_at  TEXT,",
+    "  state        TEXT NOT NULL DEFAULT 'running'",
+    "    CHECK (state IN ('running','done','interrupted','undone')),",
+    "  totals_json  TEXT NOT NULL DEFAULT '{}'",
+    ");",
+);
+
+/// M13 forward migration: auto-classify folder exclusions (Phase 17,
+/// SIDE-03). Per-folder opt-out; the automatic pass skips these folders
+/// entirely while manual `classify_message` still works on them.
+const M13_EXCLUSIONS_SQL: &str = concat!(
+    "CREATE TABLE classify_excluded_folders (",
+    "  folder       TEXT PRIMARY KEY,",
+    "  reason       TEXT NOT NULL DEFAULT '',",
+    "  excluded_at  TEXT NOT NULL DEFAULT (datetime('now'))",
+    ");",
+);
+
 /// Returns the app-data attachment directory for a given mailbox UID.
 ///
 /// Files live under `<app_data>/attachments/<uid_validity>/<uid>/` —
@@ -382,8 +490,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_10_with_send_queue() {
-        assert_eq!(SCHEMA_VERSION, 10);
+    fn schema_version_is_11_with_sent_unfiled() {
+        assert_eq!(SCHEMA_VERSION, 11);
         let store = Store::open_in_memory().expect("migration should succeed");
         let conn = store.conn();
         let count: i64 = conn
@@ -418,6 +526,17 @@ mod tests {
             )
             .expect("query should succeed");
         assert_eq!(role_cols, 2, "mailboxes.role + attributes should exist at schema v8");
+        let send_check: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'send_queue'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("query should succeed");
+        assert!(
+            send_check.contains("sent_unfiled"),
+            "send_queue CHECK should admit sent_unfiled at schema v11"
+        );
     }
 
     #[test]
@@ -862,7 +981,7 @@ mod tests {
         )
         .unwrap();
 
-        // Forward-upgrade with the production set — only M10 applies.
+        // Forward-upgrade with the production set — M10 + M11 apply.
         Store::apply_migrations(&mut conn).unwrap();
 
         // v9 rows survive the upgrade.
@@ -915,6 +1034,91 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM send_queue", [], |r| r.get(0))
             .unwrap();
         assert_eq!(queued, 0);
+    }
+
+    #[test]
+    fn m12_adds_classify_tables_preserving_rows() {
+        // Simulate a v11 database (through M11, as shipped after Phase 14).
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        Migrations::new(vec![
+            M::up(include_str!("schema.sql")),
+            M::up(M2_FLAG_OUTBOX_SQL),
+            M::up(M3_UNSEEN_COUNT_SQL),
+            M::up(M4_BACKFILL_SQL),
+            M::up(M5_STATUS_TS_SQL),
+            M::up(M6_DELIMITER_SQL),
+            M::up(M7_IMAP_OUTBOX_SQL),
+            M::up(M8_ROLES_SQL),
+            M::up(M9_DRAFTS_SQL),
+            M::up(M10_SEND_QUEUE_SQL),
+            M::up(M11_SENT_UNFILED_SQL),
+        ])
+        .to_latest(&mut conn)
+        .unwrap();
+        // Seed v11 rows: mailbox + cached message + send_queue row.
+        conn.execute(
+            "INSERT INTO mailboxes (name, uid_validity, uid_next, delimiter, role, attributes) \
+             VALUES ('INBOX', 100, 4, '', 'inbox', '')",
+            [],
+        )
+        .unwrap();
+        let mb: i64 = conn
+            .query_row("SELECT id FROM mailboxes WHERE name = 'INBOX'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO messages (mailbox_id, uid, subject, from_addr, date_utc, flags, preview) \
+             VALUES (?1, 1, 'Old', 'a@x.com', '2024-01-01T00:00:00Z', '[]', 'p')",
+            rusqlite::params![mb],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO send_queue (id, message_id, from_addr, eml_path) \
+             VALUES ('q-1', '<q@sge.local>', 'a@x.com', '/tmp/x.eml')",
+            [],
+        )
+        .unwrap();
+
+        // Forward-upgrade with the production set — only M12 applies.
+        Store::apply_migrations(&mut conn).unwrap();
+
+        // v11 rows survive the upgrade.
+        let msgs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(msgs, 1, "forward migration must preserve cached rows");
+        let queued: i64 = conn
+            .query_row("SELECT COUNT(*) FROM send_queue", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(queued, 1, "forward migration must preserve send_queue rows");
+        for (kind, name) in [
+            ("table", "taxonomy"),
+            ("table", "labels"),
+            ("index", "idx_labels_primary"),
+            ("table", "label_overrides"),
+            ("index", "idx_overrides_message"),
+            ("table", "classify_queue"),
+            ("index", "idx_classify_queue_status"),
+            ("table", "batch_runs"),
+        ] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = ?1 AND name = ?2",
+                    rusqlite::params![kind, name],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{kind} {name} should exist at schema v12");
+        }
+        // Fresh classify tables start empty.
+        for table in ["taxonomy", "labels", "label_overrides", "classify_queue", "batch_runs"] {
+            let n: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 0, "{table} must start empty");
+        }
     }
 
     #[test]

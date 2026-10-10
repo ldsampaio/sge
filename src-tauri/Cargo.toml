@@ -56,6 +56,10 @@ chrono = "0.4"
 futures = "0.3"
 native-tls = "0.2"
 ammonia = "4"
+# Phase 17: tokio sync primitives (single-flight bridge mutex) + rt for tests.
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+
+[dev-dependencies]
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

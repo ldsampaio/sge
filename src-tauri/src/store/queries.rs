@@ -1792,6 +1792,323 @@ pub fn mark_send_uncertain(conn: &Connection, id: &str, reason: &str) -> StoreRe
     Ok(())
 }
 
+// ── Plan 16-02: classification store queries ─────────────────────
+// Pointer-only: IDs + confidence, never content (schema-enforced).
+
+/// Installed taxonomy version row (singleton id=1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaxonomyRow {
+    pub version: u32,
+    pub name: String,
+    pub json: String,
+}
+
+/// A label row: category POINTERS for one cached message.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LabelRow {
+    pub message_id: u64,
+    pub primary_id: String,
+    pub secondary_id: Option<String>,
+    pub confidence: f64,
+    pub threshold: f64,
+    pub stale: bool,
+}
+
+/// Install (or replace) the taxonomy singleton + version.
+pub fn install_taxonomy(conn: &Connection, version: u32, name: &str, json: &str) -> StoreResult<()> {
+    conn.execute(
+        "INSERT INTO taxonomy (id, version, name, json) VALUES (1, ?1, ?2, ?3)
+         ON CONFLICT (id) DO UPDATE SET version = excluded.version,
+           name = excluded.name, json = excluded.json,
+           installed_at = datetime('now')",
+        rusqlite::params![version, name, json],
+    )?;
+    Ok(())
+}
+
+pub fn get_taxonomy(conn: &Connection) -> StoreResult<Option<TaxonomyRow>> {
+    conn.query_row(
+        "SELECT version, name, json FROM taxonomy WHERE id = 1",
+        [],
+        |r| {
+            Ok(TaxonomyRow {
+                version: r.get(0)?,
+                name: r.get(1)?,
+                json: r.get(2)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(super::StoreError::Sql)
+}
+
+/// Upsert a label row (reclassify overwrites; moves never duplicate).
+pub fn upsert_label(
+    conn: &Connection,
+    message_id: u64,
+    primary_id: &str,
+    secondary_id: Option<&str>,
+    confidence: f64,
+    threshold: f64,
+) -> StoreResult<()> {
+    conn.execute(
+        "INSERT INTO labels (message_id, primary_id, secondary_id, confidence, threshold, stale)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0)
+         ON CONFLICT (message_id) DO UPDATE SET primary_id = excluded.primary_id,
+           secondary_id = excluded.secondary_id, confidence = excluded.confidence,
+           threshold = excluded.threshold, stale = 0, labeled_at = datetime('now')",
+        rusqlite::params![message_id, primary_id, secondary_id, confidence, threshold],
+    )?;
+    Ok(())
+}
+
+pub fn get_label(conn: &Connection, message_id: u64) -> StoreResult<Option<LabelRow>> {
+    conn.query_row(
+        "SELECT message_id, primary_id, secondary_id, confidence, threshold, stale
+         FROM labels WHERE message_id = ?1",
+        rusqlite::params![message_id],
+        |r| {
+            Ok(LabelRow {
+                message_id: r.get(0)?,
+                primary_id: r.get(1)?,
+                secondary_id: r.get(2)?,
+                confidence: r.get(3)?,
+                threshold: r.get(4)?,
+                stale: r.get::<_, i64>(5)? != 0,
+            })
+        },
+    )
+    .optional()
+    .map_err(super::StoreError::Sql)
+}
+
+/// Stale-flag every label whose primary id is no longer in the taxonomy
+/// (Phase 19 import path). Returns the flagged count.
+pub fn mark_stale_unknown(conn: &Connection, known_ids: &[&str]) -> StoreResult<usize> {
+    if known_ids.is_empty() {
+        return Ok(0);
+    }
+    let placeholders = known_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!("UPDATE labels SET stale = 1 WHERE primary_id NOT IN ({placeholders})");
+    let mut stmt = conn.prepare(&sql)?;
+    let n = stmt.execute(rusqlite::params_from_iter(known_ids.iter()))?;
+    Ok(n)
+}
+
+/// Append an override log row (append-only; history view lands later).
+pub fn log_override(
+    conn: &Connection,
+    message_id: u64,
+    from_id: &str,
+    to_id: &str,
+) -> StoreResult<()> {
+    conn.execute(
+        "INSERT INTO label_overrides (message_id, from_id, to_id) VALUES (?1, ?2, ?3)",
+        rusqlite::params![message_id, from_id, to_id],
+    )?;
+    Ok(())
+}
+
+/// Is there a pinned override for this message? (Phase 18: future syncs
+/// must not re-suggest the overridden label.)
+pub fn latest_override(conn: &Connection, message_id: u64) -> StoreResult<Option<String>> {
+    conn.query_row(
+        "SELECT to_id FROM label_overrides WHERE message_id = ?1 ORDER BY id DESC LIMIT 1",
+        rusqlite::params![message_id],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(super::StoreError::Sql)
+}
+
+/// Enqueue a message for classification (idempotent per message+folder).
+pub fn enqueue_classify(
+    conn: &Connection,
+    message_id: u64,
+    folder: &str,
+    uidvalidity: u32,
+) -> StoreResult<()> {
+    conn.execute(
+        "INSERT INTO classify_queue (message_id, folder, uidvalidity) VALUES (?1, ?2, ?3)
+         ON CONFLICT (message_id, folder) DO NOTHING",
+        rusqlite::params![message_id, folder, uidvalidity],
+    )?;
+    Ok(())
+}
+
+/// Dequeue up to `limit` pending rows (oldest first). Marks them processing.
+pub fn dequeue_classify(conn: &Connection, limit: usize) -> StoreResult<Vec<(u64, String)>> {
+    let rows: Vec<(i64, u64, String)> = conn
+        .prepare(
+            "SELECT id, message_id, folder FROM classify_queue
+             WHERE status = 'pending' ORDER BY enqueued_at ASC LIMIT ?1",
+        )?
+        .query_map(rusqlite::params![limit as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    for (id, _, _) in &rows {
+        conn.execute("UPDATE classify_queue SET status = 'processing' WHERE id = ?1", rusqlite::params![id])?;
+    }
+    Ok(rows.into_iter().map(|(_, mid, folder)| (mid, folder)).collect())
+}
+
+pub fn set_queue_state(
+    conn: &Connection,
+    message_id: u64,
+    folder: &str,
+    status: &str,
+) -> StoreResult<()> {
+    debug_assert!(["pending", "processing", "done", "failed"].contains(&status));
+    conn.execute(
+        "UPDATE classify_queue SET status = ?1,
+           attempts = attempts + CASE WHEN ?1 = 'failed' THEN 1 ELSE 0 END
+         WHERE message_id = ?2 AND folder = ?3",
+        rusqlite::params![status, message_id, folder],
+    )?;
+    Ok(())
+}
+
+/// Drop a folder's queue rows when UIDVALIDITY shifted (epoch hygiene —
+/// same rule as imap_outbox: never classify against a stale UID map).
+/// Returns dropped count.
+pub fn drop_queue_on_uidvalidity_shift(
+    conn: &Connection,
+    folder: &str,
+    uidvalidity: u32,
+) -> StoreResult<usize> {
+    let n = conn.execute(
+        "DELETE FROM classify_queue WHERE folder = ?1 AND uidvalidity != ?2",
+        rusqlite::params![folder, uidvalidity],
+    )?;
+    Ok(n)
+}
+
+pub fn queue_depth(conn: &Connection) -> StoreResult<i64> {
+    conn.query_row(
+        "SELECT count(*) FROM classify_queue WHERE status IN ('pending','processing')",
+        [],
+        |r| r.get(0),
+    )
+    .map_err(super::StoreError::Sql)
+}
+
+pub fn create_batch_run(conn: &Connection) -> StoreResult<i64> {
+    conn.execute("INSERT INTO batch_runs DEFAULT VALUES", [])?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn finish_batch_run(
+    conn: &Connection,
+    run_id: i64,
+    state: &str,
+    totals_json: &str,
+) -> StoreResult<()> {
+    debug_assert!(["done", "interrupted", "undone"].contains(&state));
+    conn.execute(
+        "UPDATE batch_runs SET state = ?1, totals_json = ?2, finished_at = datetime('now')
+         WHERE id = ?3",
+        rusqlite::params![state, totals_json, run_id],
+    )?;
+    Ok(())
+}
+
+// ── Plan 17-01: folder exclusions (SIDE-03) ───────────────────────
+
+/// Folders the automatic pass must skip (manual classify still works).
+/// Matching is exact on the wire name; role-resolved defaults (Sent,
+/// Drafts) are seeded by the caller, not the schema.
+pub fn exclude_folder(conn: &Connection, folder: &str, reason: &str) -> StoreResult<()> {
+    conn.execute(
+        "INSERT INTO classify_excluded_folders (folder, reason) VALUES (?1, ?2)
+         ON CONFLICT (folder) DO UPDATE SET reason = excluded.reason",
+        rusqlite::params![folder, reason],
+    )?;
+    Ok(())
+}
+
+pub fn include_folder(conn: &Connection, folder: &str) -> StoreResult<()> {
+    conn.execute(
+        "DELETE FROM classify_excluded_folders WHERE folder = ?1",
+        rusqlite::params![folder],
+    )?;
+    Ok(())
+}
+
+pub fn is_excluded(conn: &Connection, folder: &str) -> StoreResult<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT count(*) FROM classify_excluded_folders WHERE folder = ?1",
+        rusqlite::params![folder],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+pub fn excluded_folders(conn: &Connection) -> StoreResult<Vec<String>> {
+    conn.prepare("SELECT folder FROM classify_excluded_folders ORDER BY folder")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(super::StoreError::Sql)
+}
+
+/// Seed Sent/Drafts opt-outs on first use (SIDE-03 defaults). Role-resolved
+/// first (LIST truth), literal fallback second. Idempotent: runs only when
+/// the table is empty.
+pub fn seed_default_exclusions(conn: &Connection) -> StoreResult<()> {
+    let n: i64 = conn.query_row("SELECT count(*) FROM classify_excluded_folders", [], |r| {
+        r.get(0)
+    })?;
+    if n > 0 {
+        return Ok(());
+    }
+    let mut names: Vec<String> = conn
+        .prepare("SELECT name FROM mailboxes WHERE role IN ('sent','drafts')")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for fallback in ["Sent", "Drafts"] {
+        if !names.iter().any(|n| n == fallback) {
+            names.push(fallback.to_string());
+        }
+    }
+    for name in names {
+        exclude_folder(conn, &name, "default opt-out (Sent/Drafts never auto-filed)")?;
+    }
+    Ok(())
+}
+
+/// Message ids in a folder that have no label row yet (hook source).
+pub fn unlabeled_in_mailbox(conn: &Connection, mailbox: &str) -> StoreResult<Vec<u64>> {
+    conn.prepare(
+        "SELECT m.id FROM messages m JOIN mailboxes mb ON m.mailbox_id = mb.id
+         LEFT JOIN labels l ON l.message_id = m.id
+         WHERE mb.name = ?1 AND l.message_id IS NULL",
+    )?
+    .query_map(rusqlite::params![mailbox], |r| r.get(0))?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(super::StoreError::Sql)
+}
+
+/// Cached fields the evidence pipeline needs (no body FETCH).
+pub fn message_classify_fields(
+    conn: &Connection,
+    message_id: u64,
+) -> StoreResult<Option<(String, String, String, bool)>> {
+    conn.query_row(
+        "SELECT subject, preview, from_addr, has_attachments FROM messages WHERE id = ?1",
+        rusqlite::params![message_id],
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)? != 0,
+            ))
+        },
+    )
+    .optional()
+    .map_err(super::StoreError::Sql)
+}
+
 // ── tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2589,5 +2906,109 @@ mod tests {
         // Upsert creates the row when missing (refresh path).
         set_mailbox_role(conn, "Nova", "custom", "").unwrap();
         assert!(list_mailboxes(conn).unwrap().iter().any(|r| r.name == "Nova"));
+    }
+}
+
+// ── Plan 16-02 tests: classification store ───────────────────────
+
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+    use crate::store::Store;
+
+    fn seeded_msg(conn: &Connection) -> u64 {
+        let mb = ensure_mailbox(conn, "INBOX").unwrap();
+        upsert_message(conn, mb, 1, None, "Prova", "prof@utfpr.edu.br", "[]", "[]",
+            "2026-10-10T00:00:00Z", "[]", false, "prev").unwrap();
+        find_message_id(conn, mb, 1).unwrap().unwrap()
+    }
+
+    #[test]
+    fn taxonomy_install_roundtrip() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        assert!(get_taxonomy(conn).unwrap().is_none());
+        install_taxonomy(conn, 1, "UTFPR padrão", r#"{"version":1}"#).unwrap();
+        let row = get_taxonomy(conn).unwrap().unwrap();
+        assert_eq!((row.version, row.name.as_str()), (1, "UTFPR padrão"));
+        install_taxonomy(conn, 2, "v2", "{}").unwrap();
+        assert_eq!(get_taxonomy(conn).unwrap().unwrap().version, 2);
+    }
+
+    #[test]
+    fn label_upsert_overwrites_and_gets() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let mid = seeded_msg(conn);
+        assert!(get_label(conn, mid).unwrap().is_none());
+        upsert_label(conn, mid, "academico.avaliacoes", Some("academico.aulas"), 0.81, 0.6).unwrap();
+        let l = get_label(conn, mid).unwrap().unwrap();
+        assert_eq!(l.primary_id, "academico.avaliacoes");
+        assert_eq!(l.secondary_id.as_deref(), Some("academico.aulas"));
+        assert!(!l.stale);
+        // Reclassify overwrites (no duplicate rows).
+        upsert_label(conn, mid, "financeiro.bolsas", None, 0.9, 0.6).unwrap();
+        let l2 = get_label(conn, mid).unwrap().unwrap();
+        assert_eq!((l2.primary_id.as_str(), l2.secondary_id, l2.confidence),
+            ("financeiro.bolsas", None, 0.9));
+    }
+
+    #[test]
+    fn stale_flags_unknown_ids_only() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let a = seeded_msg(conn);
+        let mb = mailbox_id(conn, "INBOX").unwrap().unwrap();
+        upsert_message(conn, mb, 2, None, "x", "y", "[]", "[]",
+            "2026-10-10T00:00:00Z", "[]", false, "").unwrap();
+        let b = find_message_id(conn, mb, 2).unwrap().unwrap();
+        upsert_label(conn, a, "academico.aulas", None, 0.7, 0.6).unwrap();
+        upsert_label(conn, b, "removida.xyz", None, 0.7, 0.6).unwrap();
+        let n = mark_stale_unknown(conn, &["academico.aulas", "financeiro.bolsas"]).unwrap();
+        assert_eq!(n, 1);
+        assert!(!get_label(conn, a).unwrap().unwrap().stale);
+        assert!(get_label(conn, b).unwrap().unwrap().stale);
+    }
+
+    #[test]
+    fn override_log_pinned_and_latest() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let mid = seeded_msg(conn);
+        assert!(latest_override(conn, mid).unwrap().is_none());
+        log_override(conn, mid, "academico.aulas", "academico.avaliacoes").unwrap();
+        log_override(conn, mid, "academico.avaliacoes", "financeiro.bolsas").unwrap();
+        assert_eq!(latest_override(conn, mid).unwrap().as_deref(), Some("financeiro.bolsas"));
+    }
+
+    #[test]
+    fn queue_enqueue_dequeue_state_and_epoch_drop() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let mid = seeded_msg(conn);
+        enqueue_classify(conn, mid, "INBOX", 1234).unwrap();
+        enqueue_classify(conn, mid, "INBOX", 1234).unwrap(); // idempotent
+        assert_eq!(queue_depth(conn).unwrap(), 1);
+        let rows = dequeue_classify(conn, 10).unwrap();
+        assert_eq!(rows, vec![(mid, "INBOX".to_string())]);
+        set_queue_state(conn, mid, "INBOX", "done").unwrap();
+        assert_eq!(queue_depth(conn).unwrap(), 0);
+        // Stale epoch rows drop wholesale.
+        enqueue_classify(conn, mid, "INBOX", 1234).unwrap();
+        let dropped = drop_queue_on_uidvalidity_shift(conn, "INBOX", 9999).unwrap();
+        assert_eq!(dropped, 1);
+        assert_eq!(queue_depth(conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn batch_run_lifecycle() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let run = create_batch_run(conn).unwrap();
+        finish_batch_run(conn, run, "done", r#"{"moved":3}"#).unwrap();
+        let (state, totals): (String, String) = conn.query_row(
+            "SELECT state, totals_json FROM batch_runs WHERE id = ?1",
+            rusqlite::params![run], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!((state.as_str(), totals.as_str()), ("done", r#"{"moved":3}"#));
     }
 }

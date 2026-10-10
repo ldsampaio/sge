@@ -43,11 +43,17 @@ LAYA_VER="$($VPY -c 'import importlib.metadata as m; print(m.version("laya"))')"
 echo "laya version: ${LAYA_VER}"
 
 echo "==> [2/6] pin multilingual checkpoint revision"
-REVISION="$($VPY -c "
+# Pinned 2026-10-10 (measured). Override with LAYA_MULTI_REVISION=... to
+# re-pin deliberately; empty falls back to live Hub lookup (not reproducible).
+if [ -n "${LAYA_MULTI_REVISION:-1720e3e3357cfe1e281542e223f8273b0890ca34}" ]; then
+  REVISION="${LAYA_MULTI_REVISION:-1720e3e3357cfe1e281542e223f8273b0890ca34}"
+else
+  REVISION="$($VPY -c "
 from huggingface_hub import HfApi
 api = HfApi()
 print(api.model_info('${MULTI_REPO}').sha)
 ")"
+fi
 echo "revision: ${REVISION}"
 
 echo "==> [3/6] download weights snapshot (revision-pinned)"
@@ -115,7 +121,10 @@ else
 fi
 
 if [ "$SKIP_FREEZE" = 1 ]; then
-  echo "==> [5b/6] atomic swap weights-incoming -> weights (smoke GREEN)"
+  echo "==> [5b/6] normalize perms + atomic swap weights-incoming -> weights (smoke GREEN)"
+  # HF downloads land read-only; tauri-build's fs::copy preserves the mode,
+  # which poisons all later builds (read-only dest cannot be truncated).
+  chmod -R u+rw sidecar/weights-incoming
   rm -rf sidecar/weights
   mv sidecar/weights-incoming sidecar/weights
   echo "==> [6/6] freeze skipped (--skip-freeze); dev shim stays in place"

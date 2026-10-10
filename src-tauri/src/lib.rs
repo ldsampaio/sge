@@ -68,6 +68,8 @@ pub struct AppState {
     pub sidecar: Mutex<Option<Arc<sidecar::SidecarSupervisor>>>,
     pub sidecar_child:
         Mutex<Option<tauri_plugin_shell::process::CommandChild>>,
+    /// Phase 17 single-flight drain guard (shared by hook + commands).
+    pub classify_gate: Arc<classify::worker::ClassifyGate>,
 }
 
 /// In-memory credentials + server config for the connected session.
@@ -303,6 +305,42 @@ async fn supervise_sidecar(
     supervisor.record_crash();
 }
 
+/// Weights dir under the Tauri resource dir (production bundles).
+fn resource_weights_dir(app: &tauri::App) -> std::path::PathBuf {
+    app.path()
+        .resource_dir()
+        .map(|d| d.join("weights"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("weights"))
+}
+
+/// Build the weights-related child env for a candidate weights dir.
+///
+/// Advertises `HF_HOME` (offline snapshot cache) when the HF marker exists
+/// and `LAYA_EXTRA_MODELS` (checkpoint re-point at the materialized
+/// standalone snapshot) when the checkpoints dir exists. Empty when neither
+/// marker is present — the sidecar then starts without preloadable weights
+/// and reports Down honestly instead of crash-looping.
+fn weights_extra_env(weights: &std::path::Path) -> Vec<(String, String)> {
+    let mut extra = Vec::new();
+    if weights.join("hub").is_dir() {
+        extra.push((
+            "HF_HOME".to_string(),
+            weights.to_string_lossy().into_owned(),
+        ));
+    }
+    let ckpt = weights.join("checkpoints").join("multilingual");
+    if ckpt.is_dir() {
+        extra.push((
+            "LAYA_EXTRA_MODELS".to_string(),
+            format!(
+                "{{\"multilingual\": \"{}\"}}",
+                ckpt.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"")
+            ),
+        ));
+    }
+    extra
+}
+
 /// Spawn the Laya sidecar (best-effort, never fatal): generate per-boot key
 /// + ephemeral loopback port, spawn via the shell plugin, store supervisor
 /// + child, detach the health-probe loop.
@@ -320,14 +358,31 @@ fn spawn_sidecar_best_effort(app: &tauri::App) -> Option<Arc<sidecar::SidecarSup
     // Weights cache: <resource-dir>/weights (shipped HF_HOME layout) or
     // the repo sidecar/weights dir in dev. Only advertised when the HF
     // cache marker exists, so a half-downloaded dir is never used.
-    let mut extra = Vec::new();
-    if let Ok(resource_dir) = app.path().resource_dir() {
-        let weights = resource_dir.join("weights");
-        if weights.join("hub").is_dir() {
-            extra.push((
-                "HF_HOME".to_string(),
-                weights.to_string_lossy().into_owned(),
-            ));
+    //
+    // Checkpoint re-point: the Router resolves "multilingual" to the BUNDLE
+    // repo (convaiinnovations/laya subfolder), which we do NOT ship. The
+    // build script materializes the pinned standalone snapshot at
+    // weights/checkpoints/multilingual/, and LAYA_EXTRA_MODELS re-points
+    // the name at that local dir (documented laya mechanism — a matching
+    // name re-points the checkpoint instead of adding one).
+    let mut extra = weights_extra_env(&resource_weights_dir(app));
+    if extra.is_empty() {
+        // Dev fallback: `cargo run` / `tauri dev` binaries live in
+        // src-tauri/target/{debug,release}/ — the repo sidecar/weights dir
+        // is found by walking up from the current exe. Production bundles
+        // use resource_dir above.
+        if let Ok(exe) = std::env::current_exe() {
+            let mut dir = exe.as_path();
+            for _ in 0..5 {
+                if let Some(parent) = dir.parent() {
+                    dir = parent;
+                    let cand = dir.join("sidecar").join("weights");
+                    extra = weights_extra_env(&cand);
+                    if !extra.is_empty() {
+                        break;
+                    }
+                }
+            }
         }
     }
     let supervisor = Arc::new(sidecar::SidecarSupervisor::with_extra_env(config, extra));
@@ -377,6 +432,7 @@ pub fn run() {
         app_data,
         sidecar: Mutex::new(None),
         sidecar_child: Mutex::new(None),
+        classify_gate: Arc::new(classify::worker::ClassifyGate::default()),
     };
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -434,6 +490,8 @@ pub fn run() {
             commands::sync::queue_send,
             commands::sync::retry_send,
             commands::sync::send_status,
+            commands::classify::classify_message,
+            commands::classify::classify_status,
             sidecar_status,
             load_server_config,
         ])

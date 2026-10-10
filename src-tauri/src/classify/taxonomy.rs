@@ -353,7 +353,7 @@ mod tests {
 
     #[test]
     fn rejects_too_many_tops() {
-        let mut tax = Taxonomy {
+        let tax = Taxonomy {
             version: 1,
             name: "t".to_string(),
             categories: (0..9)
@@ -395,12 +395,11 @@ mod tests {
     fn keyword_match_folds_accents_and_case() {
         let tax = load_default().unwrap();
         let kids = children_of(&tax, "academico");
-        let refs: Vec<&Category> = kids.iter().collect();
-        let scored = match_keywords("PROVA final e GABARITO de calculo, codigo 123", &refs);
+        let scored = match_keywords("PROVA final e GABARITO de calculo, codigo 123", &kids);
         assert!(!scored.is_empty());
         assert_eq!(scored[0].0, "academico.avaliacoes");
         // Accent-insensitive: "código" keyword matches "codigo", "avaliação" matches "AVALIAÇÃO"-less text.
-        let scored2 = match_keywords("avaliação de desempenho e nota", &refs);
+        let scored2 = match_keywords("avaliação de desempenho e nota", &kids);
         assert_eq!(scored2[0].0, "academico.avaliacoes");
     }
 
@@ -408,7 +407,6 @@ mod tests {
     fn keyword_match_empty_on_no_hits() {
         let tax = load_default().unwrap();
         let kids = children_of(&tax, "financeiro");
-        let refs: Vec<&Category> = kids.iter().collect();
-        assert!(match_keywords("gato cachorro passarinho", &refs).is_empty());
+        assert!(match_keywords("gato cachorro passarinho", &kids).is_empty());
     }
 }

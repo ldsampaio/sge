@@ -107,6 +107,7 @@ fn manager_for(
 #[tauri::command]
 pub async fn start_sync(
     state: State<'_, crate::AppState>,
+    app: tauri::AppHandle,
     on_event: Channel<SyncEvent>,
     mailbox: String,
 ) -> Result<(), String> {
@@ -125,6 +126,7 @@ pub async fn start_sync(
     let gate = state.sync_gate.clone();
     let cancel_flag = state.sync_cancel.clone();
     let app_data = state.app_data.clone();
+    let mailbox_owned = mailbox.clone();
     tauri::async_runtime::spawn_blocking(move || {
         async_std::task::block_on(async {
             // Single-flight (Phase 8): a poll tick or second refresh that
@@ -142,7 +144,7 @@ pub async fn start_sync(
             // Lease SELECTs `mailbox` on the owned session (connecting
             // lazily on first use); the worker borrows it for the pass.
             // `connect_sync` stays reserved for bootstrap/probe paths only.
-            let mut lease = manager.lease_for(&mailbox).await
+            let mut lease = manager.lease_for(&mailbox_owned).await
                 .map_err(|e| format!("IMAP lease: {e}"))?;
             eprintln!("[SGE sync] Leased session -- starting worker...");
             let worker = SyncWorker::with_cancel(store, cancel_flag)
@@ -150,7 +152,7 @@ pub async fn start_sync(
             let cb: SyncCallback = Arc::new(move |event| {
                 let _ = on_event.send(event);
             });
-            let result = worker.sync_with_borrowed(lease.session(), &mailbox, cb).await
+            let result = worker.sync_with_borrowed(lease.session(), &mailbox_owned, cb).await
                 .map_err(|e| e.to_string());
             match &result {
                 Ok(s) => eprintln!("[SGE sync] Done: new={} updated={} deleted={}", s.new, s.updated, s.deleted),
@@ -162,6 +164,10 @@ pub async fn start_sync(
     .await
     .map_err(|e| format!("internal error: sync task failed ({e})"))?
     .map_err(|e| e)?;
+
+    // Phase 17 hook: enqueue unlabeled mail for behind-sync classification
+    // (fire-and-forget; sync never awaits it, failures never fail the sync).
+    crate::commands::classify::hook_after_sync(&state, &mailbox, &app);
 
     Ok(())
 }
@@ -1152,6 +1158,93 @@ pub async fn search_messages(
     })
     .await
     .map_err(|e| format!("internal error: search messages task failed ({e})"))?
+}
+
+/// **Frozen command** (Plan 13-01 contract, verbatim for Phase 14 consumers).
+///
+/// `queue_send({from, to[], cc[], bcc[], subject, body, draft_id?})`
+/// returns `{queue_id, message_id, state, pending_count}`.
+/// Error prefixes verbatim: `send-too-large`, `send-no-recipient`,
+/// `send-missing` (unknown `draft_id` at enqueue).
+#[tauri::command]
+pub async fn queue_send(
+    state: State<'_, crate::AppState>,
+    from: String,
+    to: Vec<String>,
+    cc: Vec<String>,
+    bcc: Vec<String>,
+    subject: String,
+    body: String,
+    draft_id: Option<String>,
+) -> Result<crate::send_queue::EnqueueOutcome, String> {
+    let app_data = state.app_data.clone();
+    let store = state.store.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let guard = store.lock().unwrap();
+        let out = crate::send_queue::enqueue_send(guard.conn(), &app_data, crate::send_queue::EnqueueInput {
+            from,
+            to,
+            cc,
+            bcc,
+            subject,
+            body,
+            draft_id,
+        }).map_err(|e| e.to_string())?;
+        Ok(out)
+    })
+    .await
+    .map_err(|e| format!("internal error: queue_send task failed ({e})"))?
+}
+
+/// **Frozen command** (Plan 13-01 contract, verbatim for Phase 14 consumers).
+///
+/// `retry_send({queue_id})` returns `{queue_id, state}` and only transitions
+/// `failed` → `queued`; unknown `queue_id` surfaces `send-missing: unknown send
+/// '<id>' — it may already be sent` (never a raw SQL error).
+#[tauri::command]
+pub async fn retry_send(
+    state: State<'_, crate::AppState>,
+    queue_id: String,
+) -> Result<crate::send_queue::EnqueueOutcome, String> {
+    let store = state.store.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let guard = store.lock().unwrap();
+        let success = crate::send_queue::requeue_failed(guard.conn(), &queue_id)
+            .map_err(|e| e.to_string())?;
+        if success {
+            let row = crate::store::queries::get_send_row(guard.conn(), &queue_id)
+                .unwrap()
+                .unwrap();
+            Ok(crate::send_queue::outcome_of(&row, false))
+        } else {
+            Err("send-missing: unknown send '".to_string() + &queue_id + "' — it may already be sent")
+        }
+    })
+    .await
+    .map_err(|e| format!("internal error: retry_send task failed ({e})"))?
+}
+
+/// **Frozen command** (Plan 13-01 contract, verbatim for Phase 14 consumers).
+///
+/// `send_status()` returns `{queued, sending, failed, uncertain, sent_unfiled,
+/// pending_count}` verbatim — this struct serializes to exactly that shape.
+/// `sent_unfiled` (SMTP succeeded but Sent APPEND did not) is produced by
+/// Plan 13-03's APPEND leg (with the `sent_unfiled` CHECK-extension migration,
+/// M11); until then it reads 0.
+/// `pending_count` (`queued + sending`) is the badge number and the
+/// `queue_send` fourth field.
+#[tauri::command]
+pub async fn send_status(
+    state: State<'_, crate::AppState>,
+) -> Result<crate::send_queue::SendStatusSnapshot, String> {
+    let store = state.store.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let guard = store.lock().unwrap();
+        crate::send_queue::send_status_snapshot(guard.conn())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("internal error: send_status task failed ({e})"))?
 }
 
 /// Cancel the currently running sync pass.
