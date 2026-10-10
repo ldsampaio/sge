@@ -255,7 +255,7 @@ export default function DraftEditor({
     return () => {
       window.clearInterval(timer);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // Intentional: mount-once interval; cleared on unmount.
   }, []);
 
   // Indicator copy follows the SyncStatus tone (CONTEXT agent's discretion).

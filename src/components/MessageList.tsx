@@ -327,7 +327,8 @@ export default function MessageList({
 
   /** Undo move: invoke undo_queued_op + restore row. */
   const handleUndoMove = useCallback(
-    async (uid: number, _destRaw: string) => {
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    async (uid: number, _dest: string) => {
       try {
         const result = await invoke<{ restored: boolean; detail: string }>("undo_queued_op", {
           uid,

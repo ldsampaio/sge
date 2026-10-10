@@ -353,7 +353,8 @@ export default function ReadingPane({ selectedMessage, mailbox = "INBOX", mailbo
     }
   };
 
-  const handleUndoMove = async (uid: number, _destRaw: string) => {
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const handleUndoMove = async (uid: number, _dest: string) => {
     try {
       await invoke<{ restored: boolean; detail: string }>("undo_queued_op", { uid, mailbox });
       hideUndoToast();

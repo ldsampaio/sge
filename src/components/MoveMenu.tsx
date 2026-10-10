@@ -85,11 +85,12 @@ export default function MoveMenu({
           setFocusedIndex((i) => Math.max(i - 1, 0));
           break;
         case "Enter":
-        case " ":
+        case " ": {
           e.preventDefault();
           const btn = itemsRef.current[focusedIndex];
           if (btn) btn.click();
           break;
+        }
         case "Escape":
           e.preventDefault();
           onClose();
