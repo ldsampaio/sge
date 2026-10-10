@@ -60,20 +60,20 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| SIDE-01 | TBD | Pending |
-| SIDE-02 | TBD | Pending |
-| SIDE-03 | TBD | Pending |
-| TAX-01 | TBD | Pending |
-| TAX-02 | TBD | Pending |
-| TAX-03 | TBD | Pending |
-| CLS-01 | TBD | Pending |
-| CLS-02 | TBD | Pending |
-| CLS-03 | TBD | Pending |
-| CLS-04 | TBD | Pending |
-| CLS-05 | TBD | Pending |
-| CLS-06 | TBD | Pending |
-| TRUST-01 | TBD | Pending |
-| TRUST-02 | TBD | Pending |
-| TRUST-03 | TBD | Pending |
-| BATCH-01 | TBD | Pending |
-| BATCH-02 | TBD | Pending |
+| SIDE-01 | Phase 15 | Pending |
+| SIDE-02 | Phase 15 | Pending |
+| SIDE-03 | Phase 17 | Pending |
+| TAX-01 | Phase 16 | Pending |
+| TAX-02 | Phase 19 | Pending |
+| TAX-03 | Phase 19 | Pending |
+| CLS-01 | Phase 17 | Pending |
+| CLS-02 | Phase 17 | Pending |
+| CLS-03 | Phase 18 | Pending |
+| CLS-04 | Phase 17 | Pending |
+| CLS-05 | Phase 18 | Pending |
+| CLS-06 | Phase 16 | Pending |
+| TRUST-01 | Phase 18 | Pending |
+| TRUST-02 | Phase 18 | Pending |
+| TRUST-03 | Phase 18 | Pending |
+| BATCH-01 | Phase 20 | Pending |
+| BATCH-02 | Phase 20 | Pending |
