@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { MessageRow, MailboxRow } from "../types";
 import {
   isUnread,
@@ -491,15 +492,27 @@ export default function MessageList({
     setPage(0);
     void loadPage(0);
     // Phase 18: bulk labels for badges (quiet failure keeps the list clean).
-    void (async () => {
-      try {
-        const rows = (await invoke("mailbox_labels", { mailbox })) as MailboxLabel[];
-        setLabelByUid(new Map(rows.map((r) => [r.uid, r])));
-      } catch {
-        setLabelByUid(new Map());
-      }
-    })();
+    void fetchLabels();
   }, [mailbox, searchQuery, refreshKey]);
+
+  const fetchLabels = async () => {
+    try {
+      const rows = (await invoke("mailbox_labels", { mailbox })) as MailboxLabel[];
+      setLabelByUid(new Map(rows.map((r) => [r.uid, r])));
+    } catch {
+      setLabelByUid(new Map());
+    }
+  };
+
+  // Freshness: a drain completing anywhere refreshes this list's badges.
+  useEffect(() => {
+    const unlisten = listen("classification-drained", () => {
+      void fetchLabels();
+    });
+    return () => {
+      void unlisten.then((f) => f());
+    };
+  }, [mailbox]);
 
   useEffect(() => {
     void loadPage(safePage);

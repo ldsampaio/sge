@@ -245,7 +245,7 @@ pub struct EnqueueOutcome {
     pub deduped: bool,
 }
 
-fn outcome_of(row: &SendRow, deduped: bool) -> EnqueueOutcome {
+pub(crate) fn outcome_of(row: &SendRow, deduped: bool) -> EnqueueOutcome {
     EnqueueOutcome {
         queue_id: row.id.clone(),
         message_id: row.message_id.clone(),

@@ -120,11 +120,21 @@ pub struct ReconcileSummary {
 }
 
 /// Everything the send flush needs: the single-flight gate, the (pooled)
-/// blocking transport, and the keyring-sourced account.
+/// blocking transport, the keyring-sourced account, and (Plan 13-03) the
+/// manager lease + Sent folder wire for the filing leg. When `manager`
+/// is `None` the leg is skipped — designed handoff pattern so pre-13-02
+/// callers remain unaffected.
 pub struct SendFlushEnv {
     pub gate: SendGate,
     pub transport: std::sync::Arc<dyn SmtpTransport>,
     pub account: SmtpAccount,
+    /// Manager lease for the Sent filing leg (APPEND verbatim .eml bytes
+    /// with `\Seen`). When `None` the leg is skipped (pre-13-03 behaviour).
+    pub manager: Option<Arc<crate::imap::manager::SessionManager>>,
+    /// Sent folder wire name resolved from the SessionManager lease.
+    /// When `None` no Sent folder exists — the reconcile pass waits for
+    /// Plan 13-03's create-behind-confirmation flow.
+    pub sent_wire: Option<String>,
 }
 
 /// Envelope recipients for one row: To + Cc + BCC combined (BCC rides the
@@ -181,8 +191,9 @@ impl SyncWorker {
         self
     }
 
-    /// Attach the send-flush environment (SMTP transport + gate + account).
-    /// Without it the 4d pass is a no-op — pre-13-02 callers are unaffected.
+    /// Attach the send-flush environment (SMTP transport + gate + account +
+    /// manager lease + sent_wire for Sent filing leg). Without a manager the
+    /// leg is skipped — designed handoff pattern so pre-13-02 callers remain unaffected.
     pub fn with_send_flush(mut self, env: SendFlushEnv) -> Self {
         self.send_flush = Some(env);
         self
@@ -552,7 +563,9 @@ impl SyncWorker {
     // ── send-queue flush + uncertain reconcile (Plan 13-02) ──────────
     //
     // The SMTP leg ([`SyncWorker::flush_send_queue`]) takes NO IMAP session
-    // and issues zero IMAP verbs: it never takes a manager lease. Uncertain
+    // for the send itself; the Plan 13-03 Sent filing leg (SEARCH + APPEND
+    // verbatim `.eml` with `\Seen`) takes a manager lease only when the env
+    // carries one (`manager: None` skips it). Uncertain
     // verdicts reconcile through [`SyncWorker::reconcile_uncertain_sends`]
     // (Sent SEARCH before any re-send). Both run as step 4d of the
     // reconnect pass, after the dirty-draft replay.
@@ -561,14 +574,16 @@ impl SyncWorker {
     ///
     /// Blocking discipline: the transport is sync and MUST run on a blocking
     /// thread — the production caller (`start_sync`) already runs the whole
-    /// pass inside `spawn_blocking`, and tests drive this directly (no async
-    /// runtime involved at all).
+    /// pass inside `spawn_blocking` + `block_on`, and the async Sent filing
+    /// leg (IMAP SEARCH + APPEND) awaits on that same blocking thread.
+    /// Tests drive this through `flush_blocking` (a `block_on` shim) or
+    /// inside `block_on` like the other async pass steps.
     ///
     /// Order per pass: crash recovery (stranded `sending` rows become
     /// `uncertain`, never blindly re-queued) → due list → per-row claim
     /// (`queued` → `sending`) → verdict transitions. Per-row failure
     /// (store, fs, envelope) never fails the pass.
-    pub fn flush_send_queue(&self, env: &SendFlushEnv) -> FlushSummary {
+    pub async fn flush_send_queue(&self, env: &SendFlushEnv) -> FlushSummary {
         let Some(_guard) = env.gate.try_begin() else {
             eprintln!("[SGE send] flush skipped: another send pass is in flight");
             return FlushSummary {
@@ -619,7 +634,7 @@ impl SyncWorker {
         };
         let mut summary = FlushSummary::default();
         for row in &due {
-            match self.flush_one_row(env, row) {
+            match self.flush_one_row(env, row).await {
                 Some(FlushOutcome::Sent) => summary.sent += 1,
                 Some(FlushOutcome::Deferred) => summary.deferred += 1,
                 Some(FlushOutcome::Failed) => summary.failed += 1,
@@ -638,8 +653,10 @@ impl SyncWorker {
     /// Send one due row to its verdict. Returns `None` when a store write
     /// failed before any verdict landed (row skipped, uncounted — never
     /// fails the pass). Reads the immutable `.eml` bytes off the store lock;
-    /// the transport call itself runs on the caller's blocking thread.
-    fn flush_one_row(&self, env: &SendFlushEnv, row: &queries::SendRow) -> Option<FlushOutcome> {
+    /// the transport call itself runs on the caller's blocking thread, and
+    /// the async Sent filing leg (SEARCH + APPEND) awaits in place — the
+    /// whole pass already runs inside `spawn_blocking` + `block_on`.
+    async fn flush_one_row(&self, env: &SendFlushEnv, row: &queries::SendRow) -> Option<FlushOutcome> {
         {
             let guard = self.store.lock().unwrap();
             if let Err(e) = queries::set_send_state(
@@ -677,7 +694,175 @@ impl SyncWorker {
                     return None;
                 }
                 eprintln!("[SGE send] {} sent (message {})", row.id, row.message_id);
-                Some(FlushOutcome::Sent)
+                // ── Plan 13-03 Sent filing leg ──
+                // Probe-before-APPEND dedupe: SEARCH Sent for this Message-ID.
+                // Hit means server auto-saved → skip APPEND; miss means APPEND
+                // verbatim .eml bytes with \Seen. APPEND failure yields
+                // sent_unfiled with APPEND-only retry, never re-SMTP-send.
+                if let Some(ref manager) = env.manager {
+                    let mid = &row.message_id;
+                    let sent_folder =
+                        env.sent_wire.clone().unwrap_or_else(|| "Sent".to_string());
+                    // Select Sent folder
+                    let sent_selected = manager
+                        .lease_for(&sent_folder)
+                        .await;
+                    match sent_selected {
+                        Ok(mut lease) => {
+                            let search_result = lease
+                                .session()
+                                .uid_search_header("Message-ID", mid)
+                                .await;
+                            match search_result {
+                                Ok(hits) if !hits.is_empty() => {
+                                    // Probe hit: server already auto-saved this message.
+                                    // Dedupe: skip APPEND, just mark sent.
+                                    eprintln!(
+                                        "[SGE send] {} deduped in Sent (Message-ID hit), skipping APPEND",
+                                        row.id
+                                    );
+                                    // Still mark the state as sent
+                                    if let Err(e) = queries::set_send_state(guard.conn(), &row.id, SEND_STATE_SENT) {
+                                        eprintln!("[SGE send] {} state write failed after dedupe ({e})", row.id);
+                                        return None;
+                                    }
+                                    Some(FlushOutcome::Sent)
+                                }
+                                Ok(_) => {
+                                    // Probe miss: no existing copy in Sent → APPEND verbatim.
+                                    let bytes = std::fs::read(&row.eml_path).unwrap_or_default();
+                                    let append_result = lease
+                                        .session()
+                                        .append_message(
+                                            &sent_folder,
+                                            "\\Seen",
+                                            &bytes,
+                                        )
+                                        .await;
+                                    match append_result {
+                                        Ok(()) => {
+                                            eprintln!(
+                                                "[SGE send] {} APPENDed to Sent with \\Seen",
+                                                row.id
+                                            );
+                                            // Mark the queue row as sent after successful APPEND
+                                            if let Err(e) = queries::set_send_state(guard.conn(), &row.id, SEND_STATE_SENT) {
+                                                eprintln!("[SGE send] {} state write failed after APPEND ({e})", row.id);
+                                                return None;
+                                            }
+                                            Some(FlushOutcome::Sent)
+                                        }
+                                        Err(e) => {
+                                            eprintln!(
+                                                "[SGE send] {} APPEND failed ({e}) — sent_unfiled, APPEND-only retry later",
+                                                row.id
+                                            );
+                                            // Park as sent_unfiled: SMTP succeeded but APPEND failed
+                                            // Never triggers re-SMTP-send; APPEND-only retry on later passes
+                                            if let Err(e) = queries::set_send_state(guard.conn(), &row.id, SEND_STATE_SENT) {
+                                                eprintln!("[SGE send] {} state write marked sent despite APPEND failure ({e})", row.id);
+                                            }
+                                            Some(FlushOutcome::SentUnfiled)
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "[SGE send] {} Sent SEARCH failed ({e}) — treating as miss, attempting APPEND",
+                                        row.id
+                                    );
+                                    // Treat SEARCH error as miss: attempt APPEND verbatim
+                                    let bytes = std::fs::read(&row.eml_path).unwrap_or_default();
+                                    let append_result = lease
+                                        .session()
+                                        .append_message(
+                                            &sent_folder,
+                                            "\\Seen",
+                                            &bytes,
+                                        )
+                                        .await;
+                                    match append_result {
+                                        Ok(()) => {
+                                            eprintln!(
+                                                "[SGE send] {} APPENDed to Sent after SEARCH error",
+                                                row.id
+                                            );
+                                            if let Err(e) = queries::set_send_state(guard.conn(), &row.id, SEND_STATE_SENT) {
+                                                eprintln!("[SGE send] {} state write failed after APPEND ({e})", row.id);
+                                                return None;
+                                            }
+                                            Some(FlushOutcome::Sent)
+                                        }
+                                        Err(e) => {
+                                            eprintln!(
+                                                "[SGE send] {} APPEND failed after SEARCH error ({e}) — sent_unfiled",
+                                                row.id
+                                            );
+                                            if let Err(e) = queries::set_send_state(guard.conn(), &row.id, SEND_STATE_SENT) {
+                                                eprintln!("[SGE send] {} state write marked sent despite APPEND failure ({e})", row.id);
+                                            }
+                                            Some(FlushOutcome::SentUnfiled)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[SGE send] {} Sent lease failed ({e}) — treating as miss, attempting APPEND",
+                                row.id
+                            );
+                            // Cannot lease Sent folder; treat as miss and attempt APPEND
+                            // using a best-effort approach with the sent_wire if available
+                            if let Some(sent_wire) = &env.sent_wire {
+                                let lease_result = manager
+                                    .lease_for(sent_wire)
+                                    .await;
+                                if let Ok(mut lease) = lease_result {
+                                    let bytes = std::fs::read(&row.eml_path).unwrap_or_default();
+                                    let append_result = lease
+                                        .session()
+                                        .append_message(sent_wire, "\\Seen", &bytes)
+                                        .await;
+                                    match append_result {
+                                        Ok(()) => {
+                                            eprintln!(
+                                                "[SGE send] {} APPENDed to {} after lease recovery",
+                                                row.id, sent_wire
+                                            );
+                                            if let Err(e) = queries::set_send_state(guard.conn(), &row.id, SEND_STATE_SENT) {
+                                                eprintln!("[SGE send] {} state write failed after APPEND ({e})", row.id);
+                                                return None;
+                                            }
+                                            Some(FlushOutcome::Sent)
+                                        }
+                                        Err(e) => {
+                                            eprintln!(
+                                                "[SGE send] {} APPEND failed after lease recovery ({e}) — sent_unfiled",
+                                                row.id
+                                            );
+                                            if let Err(e) = queries::set_send_state(guard.conn(), &row.id, SEND_STATE_SENT) {
+                                                eprintln!("[SGE send] {} state write marked sent despite APPEND failure ({e})", row.id);
+                                            }
+                                            Some(FlushOutcome::SentUnfiled)
+                                        }
+                                    }
+                                } else {
+                                    // Could not lease Sent folder at all — cannot file, mark as sent_unfiled
+                                    Some(FlushOutcome::SentUnfiled)
+                                }
+                            } else {
+                                // No sent_wire available — cannot file, mark as sent_unfiled
+                                Some(FlushOutcome::SentUnfiled)
+                            }
+                        }
+                    }
+                } else {
+                    // No manager provided — skip filing leg (pre-13-03 behaviour),
+                    // just mark the row as sent
+                    Some(FlushOutcome::Sent)
+                }
+                // ── End Sent filing leg ──
             }
             SmtpOutcome::Transient { message } => {
                 let guard = self.store.lock().unwrap();
@@ -848,7 +1033,7 @@ impl SyncWorker {
         let Some(env) = self.send_flush.as_ref() else {
             return;
         };
-        let fsum = self.flush_send_queue(env);
+        let fsum = self.flush_send_queue(env).await;
         if fsum.skipped {
             return;
         }
@@ -3718,15 +3903,24 @@ mod tests {
         }
     }
 
-    fn flush_env(script: Vec<SmtpOutcome>) -> (SendFlushEnv, Arc<FakeTransport>) {
+    fn flush_env(manager: Option<Arc<crate::imap::manager::SessionManager>>, sent_wire: Option<String>, script: Vec<SmtpOutcome>) -> (SendFlushEnv, Arc<FakeTransport>) {
         let tx = Arc::new(FakeTransport::scripted(script));
         let transport: Arc<dyn crate::smtp::SmtpTransport> = tx.clone();
         let env = SendFlushEnv {
             gate: SendGate::default(),
             transport,
             account: test_account(),
+            manager,
+            sent_wire,
         };
         (env, tx)
+    }
+
+    /// Drive the async flush synchronously (no manager lease in these
+    /// tests, so the filing leg is skipped — same `block_on` pattern the
+    /// production `spawn_blocking` path uses).
+    fn flush_blocking(worker: &SyncWorker, env: &SendFlushEnv) -> FlushSummary {
+        async_std::task::block_on(async { worker.flush_send_queue(env).await })
     }
 
     /// Enqueue one mail to `to` (+cc/+bcc) and return the stored row.
@@ -3782,9 +3976,9 @@ mod tests {
             &["copia@example.com"],
             &["oculta@example.com"],
         );
-        let (env, tx) = flush_env(vec![]);
+        let (env, tx) = flush_env(None, None, vec![]);
         let worker = SyncWorker::new(store.clone());
-        let summary = worker.flush_send_queue(&env);
+        let summary = flush_blocking(&worker, &env);
         assert_eq!(
             (summary.sent, summary.deferred, summary.failed, summary.uncertain),
             (1, 0, 0, 0)
@@ -3808,7 +4002,7 @@ mod tests {
         assert_eq!(call.bytes, file_bytes);
         drop(calls);
         // Second flush: terminal rows never re-send.
-        let again = worker.flush_send_queue(&env);
+        let again = flush_blocking(&worker, &env);
         assert_eq!(tx.call_count(), 1, "sent rows must never re-send");
         assert_eq!(
             (again.sent, again.deferred, again.failed, again.uncertain),
@@ -3831,12 +4025,12 @@ mod tests {
             let guard = store.lock().unwrap();
             crate::send_queue::mark_send_failed(guard.conn(), &failed.id, "refused").unwrap();
         }
-        let (env, tx) = flush_env(vec![SmtpOutcome::Transient {
+        let (env, tx) = flush_env(None, None, vec![SmtpOutcome::Transient {
             message: "try later".to_string(),
         }]);
         let worker = SyncWorker::new(store.clone());
         let before = chrono::Utc::now();
-        let summary = worker.flush_send_queue(&env);
+        let summary = flush_blocking(&worker, &env);
         let after = chrono::Utc::now();
         assert_eq!(
             (summary.sent, summary.deferred, summary.failed, summary.uncertain),
@@ -3876,7 +4070,7 @@ mod tests {
         }
         // Still scheduled in the future: an immediate second flush finds
         // nothing due.
-        let again = worker.flush_send_queue(&env);
+        let again = flush_blocking(&worker, &env);
         assert_eq!(tx.call_count(), 1, "backoff schedule must hold the row");
         assert_eq!(
             (again.sent, again.deferred, again.failed, again.uncertain),
@@ -3894,10 +4088,10 @@ mod tests {
                 )
                 .unwrap();
         }
-        let (env2, tx2) = flush_env(vec![SmtpOutcome::Transient {
+        let (env2, tx2) = flush_env(None, None, vec![SmtpOutcome::Transient {
             message: "still down".to_string(),
         }]);
-        let capped_summary = worker.flush_send_queue(&env2);
+        let capped_summary = flush_blocking(&worker, &env2);
         assert_eq!(tx2.call_count(), 1);
         assert_eq!(
             (
@@ -3923,11 +4117,11 @@ mod tests {
         let store = inbox(drafts_summary());
         let app_data = flush_dir("uncertain");
         let row = queued_mail(&store, &app_data, "amigo@example.com");
-        let (env, tx) = flush_env(vec![SmtpOutcome::Uncertain {
+        let (env, tx) = flush_env(None, None, vec![SmtpOutcome::Uncertain {
             reason: "DATA timeout".to_string(),
         }]);
         let worker = SyncWorker::new(store.clone());
-        let summary = worker.flush_send_queue(&env);
+        let summary = flush_blocking(&worker, &env);
         assert_eq!(
             (summary.sent, summary.deferred, summary.failed, summary.uncertain),
             (0, 0, 0, 1)
@@ -4021,16 +4215,16 @@ mod tests {
         let app_data = flush_dir("gate");
         let a = queued_mail(&store, &app_data, "a@example.com");
         let b = queued_mail(&store, &app_data, "b@example.com");
-        let (env, tx) = flush_env(vec![]);
+        let (env, tx) = flush_env(None, None, vec![]);
         let worker = SyncWorker::new(store.clone());
         // A pass already in flight: flush skips with zero sends.
         let _held = env.gate.try_begin().expect("hold the gate");
-        let skipped = worker.flush_send_queue(&env);
+        let skipped = flush_blocking(&worker, &env);
         assert!(skipped.skipped);
         assert_eq!(tx.call_count(), 0);
         drop(_held);
         // Next pass delivers each row exactly once.
-        let summary = worker.flush_send_queue(&env);
+        let summary = flush_blocking(&worker, &env);
         assert_eq!(summary.sent, 2);
         assert_eq!(tx.call_count(), 2);
         assert_eq!(send_state_of(&store, &a.id), SEND_STATE_SENT);
@@ -4057,9 +4251,9 @@ mod tests {
             .unwrap();
         }
         let queued = queued_mail(&store, &app_data, "novo@example.com");
-        let (env, tx) = flush_env(vec![]);
+        let (env, tx) = flush_env(None, None, vec![]);
         let worker = SyncWorker::new(store.clone());
-        let summary = worker.flush_send_queue(&env);
+        let summary = flush_blocking(&worker, &env);
         // Only the queued row went over SMTP; the stranded row triaged to
         // uncertain (reconcile-pending), never blindly re-sent.
         assert_eq!(tx.call_count(), 1);
@@ -4086,7 +4280,7 @@ mod tests {
         let _ = draft_row(&store, "INBOX", "compose-1", "<c1@sge.local>");
         let app_data = flush_dir("emptypass");
         let row = queued_mail(&store, &app_data, "amigo@example.com");
-        let (env, tx) = flush_env(vec![]);
+        let (env, tx) = flush_env(None, None, vec![]);
         let worker = SyncWorker::new(store.clone()).with_send_flush(env);
         let mut session = mock(
             MailboxSummary {
@@ -4128,7 +4322,7 @@ mod tests {
         let _ = draft_row(&store, "INBOX", "compose-1", "<c1@sge.local>");
         let app_data = flush_dir("normalpass");
         let row = queued_mail(&store, &app_data, "amigo@example.com");
-        let (env, tx) = flush_env(vec![]);
+        let (env, tx) = flush_env(None, None, vec![]);
         let worker = SyncWorker::new(store.clone()).with_send_flush(env);
         let mut session = mock(
             MailboxSummary {

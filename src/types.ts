@@ -225,3 +225,12 @@ export function formatRowDate(date_utc: string): string {
     year: "numeric",
   });
 }
+
+export interface SendStatusResult {
+  pending_count: number;
+  failed: number;
+  queued: number;
+  sending: number;
+  uncertain: number;
+  sent_unfiled: number;
+}

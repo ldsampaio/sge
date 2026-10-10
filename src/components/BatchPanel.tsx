@@ -27,12 +27,32 @@ interface BatchPanelProps {
   onClose: () => void;
 }
 
+interface BatchRunRow {
+  id: number;
+  state: string;
+  started_at: string;
+}
+
 export function BatchPanel({ onClose }: BatchPanelProps) {
   const [runId, setRunId] = React.useState<number | null>(null);
   const [progress, setProgress] = React.useState<BatchProgressEvent | null>(null);
   const [report, setReport] = React.useState<BatchReport | null>(null);
   const [message, setMessage] = React.useState<string | null>(null);
   const [busy, setBusy] = React.useState(false);
+  const [pastRuns, setPastRuns] = React.useState<BatchRunRow[]>([]);
+
+  const loadRuns = React.useCallback(async () => {
+    try {
+      const rows = (await invoke("batch_runs_list")) as BatchRunRow[];
+      setPastRuns(rows);
+    } catch {
+      /* panel shows start-only */
+    }
+  }, []);
+
+  React.useEffect(() => {
+    void loadRuns();
+  }, [loadRuns]);
 
   React.useEffect(() => {
     const unlisten = listen<BatchProgressEvent>("batch-progress", (e) => {
@@ -56,15 +76,18 @@ export function BatchPanel({ onClose }: BatchPanelProps) {
     }
   };
 
-  const start = async () => {
-    if (!window.confirm("Reorganizar toda a conta sem confirmação por e-mail? Dá para desfazer depois.")) return;
+  const start = async (resume?: number) => {
+    if (resume === undefined) {
+      if (!window.confirm("Reorganizar toda a conta sem confirmação por e-mail? Dá para desfazer depois.")) return;
+    }
     setBusy(true);
     setMessage(null);
     setReport(null);
     setProgress(null);
     try {
-      const id = (await invoke("batch_classify", { scope: null, resumeRun: null })) as number;
+      const id = (await invoke("batch_classify", { scope: null, resumeRun: resume ?? null })) as number;
       setRunId(id);
+      await loadRuns();
     } catch (e) {
       setMessage(`Falha ao iniciar: ${e}`);
       setBusy(false);
@@ -129,9 +152,22 @@ export function BatchPanel({ onClose }: BatchPanelProps) {
           </div>
         )}
         {!progress && !busy && (
-          <button type="button" className="btn" onClick={() => void start()}>
-            Começar agora
-          </button>
+          <>
+            <button type="button" className="btn" onClick={() => void start()}>
+              Começar agora
+            </button>
+            {pastRuns.filter((r) => r.state === "interrupted").map((r) => (
+              <button
+                key={r.id}
+                type="button"
+                className="btn btn-small"
+                style={{ marginLeft: 8 }}
+                onClick={() => void start(r.id)}
+              >
+                Retomar #{r.id}
+              </button>
+            ))}
+          </>
         )}
         {(busy || progress) && (
           <div style={{ margin: "12px 0" }}>

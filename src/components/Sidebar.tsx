@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import "./MailboxView.css";
 import FolderContextMenu from "./FolderContextMenu";
 import { ReviewPanel } from "./ReviewPanel";
@@ -155,9 +156,14 @@ export default function Sidebar({
     };
     void fetchCount();
     const timer = setInterval(fetchCount, 30000);
+    // Freshness: drains anywhere refresh the review badge immediately.
+    const unlisten = listen("classification-drained", () => {
+      void fetchCount();
+    });
     return () => {
       alive = false;
       clearInterval(timer);
+      void unlisten.then((f) => f());
     };
   }, [mailboxes]);
 

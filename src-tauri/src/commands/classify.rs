@@ -1213,3 +1213,66 @@ pub async fn undo_batch(state: State<'_, AppState>, run_id: i64) -> Result<usize
     let manager = manager_for(&state, &account_cfg);
     batch::undo_run(&manager, &store, run_id).await
 }
+
+// ── Integration-closeout commands (audit fixes) ──────────────────
+
+/// Classify by (mailbox, uid) — the reader knows UIDs, not row ids.
+/// Used for unlabeled/excluded mail (no suggestion row exists yet).
+#[tauri::command]
+pub async fn classify_message_uid(
+    state: State<'_, AppState>,
+    mailbox: String,
+    uid: u32,
+) -> Result<ClassificationReady, String> {
+    let message_id = {
+        let guard = state.store.lock().unwrap();
+        let mb = mailbox_id_of(guard.conn(), &mailbox)?;
+        crate::store::queries::find_message_id(guard.conn(), mb, uid)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "message not found in local cache".to_string())?
+    };
+    classify_message(state, message_id).await
+}
+
+/// Exclude (or re-include) a folder from auto-classify. Manual classify
+/// still works on excluded folders.
+#[tauri::command]
+pub async fn set_folder_excluded(
+    state: State<'_, AppState>,
+    folder: String,
+    excluded: bool,
+) -> Result<Vec<String>, String> {
+    let guard = state.store.lock().unwrap();
+    let conn = guard.conn();
+    if excluded {
+        crate::store::queries::exclude_folder(conn, &folder, "user opt-out")
+            .map_err(|e| e.to_string())?;
+    } else {
+        crate::store::queries::include_folder(conn, &folder).map_err(|e| e.to_string())?;
+    }
+    crate::store::queries::excluded_folders(conn).map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchRunRow {
+    pub id: i64,
+    pub state: String,
+    pub started_at: String,
+}
+
+/// Past runs for the resume affordance (newest first).
+#[tauri::command]
+pub async fn batch_runs_list(state: State<'_, AppState>) -> Result<Vec<BatchRunRow>, String> {
+    let guard = state.store.lock().unwrap();
+    let rows: Vec<BatchRunRow> = guard
+        .conn()
+        .prepare("SELECT id, state, started_at FROM batch_runs ORDER BY id DESC LIMIT 20")
+        .map_err(|e| e.to_string())?
+        .query_map([], |r| {
+            Ok(BatchRunRow { id: r.get(0)?, state: r.get(1)?, started_at: r.get(2)? })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}

@@ -43,10 +43,12 @@ Connect to an IMAP server on Linux and read your mail locally in a fast Gmail-li
 - ✓ User can save/edit drafts (local-first + server APPEND, one server copy per session) — Phase 12 (226 tests green; live round-trip deferred)
 - ✓ Outgoing mail queues durably offline, retries with backoff, files to Sent exactly once — Phase 13 (live 587 send deferred)
 - ✓ User can compose/reply/forward with attachments over the proven pipelines — Phase 14 (compose UI + outbox badge)
+- ✓ **v1.3: 17/17 requirements validated** — Auto-Classify milestone complete (Phase 15-20)
+- ✓ **v1.3: All phases complete** — 6/6 phases, milestone passed (Phase 15-20)
 
 ### Active (v1.3)
 
-- [ ] A definir em REQUIREMENTS.md (ciclo de requirements do milestone)
+All v1.3 requirements validated — 17/17 passed (see `.planning/v1.3-MILESTONE-AUDIT.md`). Milestone complete.
 
 ### Shipped (v1.2 — 2026-10-08)
 
@@ -105,10 +107,10 @@ Previous Active items all delivered (see Validated above + `.planning/v1.1-MILES
 | Destructive folder guards enforced backend-side, not UI-only | Direct IPC invoke must refuse INBOX/system-role/\Noselect/non-empty-without-confirm; UI restraint is bypassable | ✓ Good |
 | Leaf-only modified-UTF-7 encoding for hierarchical names | Encoding whole parent+leaf path corrupts non-ASCII parent shift sequences; encode leaf, join with raw delimiter | ✓ Good |
 | Convergence skips sweeps; full sweep every 5th pass | Zero-FETCH idle polls; remote flag-only changes surface within ~5 intervals (documented blind spot) | ✓ Good |
-| v1.3: classification MOVEs mail into auto-created `Auto/` tree | Physical organization is what the user asked ("reorganizing the whole email account"); reuses proven MOVE + CREATE verbs | — Pending |
-| v1.3: Laya as bundled offline sidecar, multilingual checkpoint | pt-BR mail needs the multilingual checkpoint; offline keeps mail content on-machine; user chose bundled over external service | — Pending (research spike confirms packaging) |
-| v1.3: single-email always user-confirmed, batch unconfirmed | Trust gate for the classifier era; batch is an explicit whole-account op with progress + report | — Pending |
-| v1.3: secondary category local-only | Avoids double-filing complexity; mail lives in primary folder, second label is SQLite-only | — Pending |
+| v1.3: classification MOVEs mail into auto-created `Auto/` tree | Physical organization is what the user asked ("reorganizing the whole email account"); reuses proven MOVE + CREATE verbs | — Pending (completed v1.3) |
+| v1.3: Laya as bundled offline sidecar, multilingual checkpoint | pt-BR mail needs the multilingual checkpoint; offline keeps mail content on-machine; user chose bundled over external service | — Pending (completed v1.3) |
+| v1.3: single-email always user-confirmed, batch unconfirmed | Trust gate for the classifier era; batch is an explicit whole-account op with progress + report | — Pending (completed v1.3) |
+| v1.3: secondary category local-only | Avoids double-filing complexity; mail lives in primary folder, second label is SQLite-only | — Pending (completed v1.3) |
 
 ## Evolution
 
@@ -127,5 +129,4 @@ This document evolves at phase transitions and milestone boundaries.
 3. Audit Out of Scope — reasons still valid?
 4. Update Context with current state
 
----
-*Last updated: 2026-10-10 — Milestone v1.3 started*
+*Last updated: 2026-10-10 — Milestone v1.3 Auto-Classify complete ✅*

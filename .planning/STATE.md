@@ -2,34 +2,50 @@
 gsd_state_version: "1.0"
 milestone: v1.3
 milestone_name: Auto-Classify
-status: planning
-last_updated: "2026-10-10T00:00:00.000Z"
+status: complete
+last_updated: "2026-10-10T18:30:00Z"
 last_activity: 2026-10-10
 progress:
   total_phases: 6
-  completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
-  percent: 0
+  completed_phases: 6
+  total_plans: 12
+  completed_plans: 12
+  percent: 100
 ---
 
 ---
-
 # Project State
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-10-10 — Milestone v1.3 started)
+See: .planning/PROJECT.md (updated 2026-10-10 — Milestone v1.3 complete)
 
 **Core value:** Connect to an IMAP server on Linux and read your mail locally in a fast Gmail-like UI.
-**Current focus:** v1.3 Auto-Classify (Phases 15-20, roadmap created, not started)
+**Current focus:** v1.3 Auto-Classify — all 6 phases complete (Phases 15-20)
+
+## Milestone Status
+
+**v1.3 Auto-Classify: PASSED** — 17/17 requirements, 6/6 phases, integration conditional-pass closed in-audit.
+
+- Milestone audit: `.planning/v1.3-MILESTONE-AUDIT.md` — status: passed, scores: requirements 17/17, phases 6/6, integration 18/18 paths wired (1 blocker found + fixed in-audit)
+- All phase summaries verified and complete
 
 ## Current Position
 
-Phase: 15 (Sidecar Packaging Spike) — freeze relaunched, rest COMPLETE
-Plan: 15-03 (frozen numbers + bundle gate)
-Status: 5/6 phases complete (16,17,18,19,20); only Phase 15 measurements pending
-Last activity: 2026-10-10 — Phases 18/19/20 verified+closed (328 tests green, tsc clean); 15/17 requirements done except SIDE-01/02
+All 6 phases (15-20) are **complete** as of 2026-10-10:
+
+| Phase | Status | Key Deliverables |
+|-------|--------|-----------------|
+| 15. Sidecar Packaging Spike | complete | Frozen binary 294MB, 6s cold-start, CONTRACT.md verified, 13 unit tests |
+| 16. Taxonomy + Store | complete | 23 ID-stable taxonomy ids, M12+ migrations, redaction sanitizer, 56 store tests |
+| 17. Classify Engine (No Moves) | complete | Behind-sync suggestions, keyword veto → review bucket, 44 classify tests |
+| 18. Confirm + Trust UX | complete | Confirm-gated MOVE, override/log/pin, badges, threshold, 6 filing tests |
+| 19. Taxonomy Editor + Import | complete | Add/rename/delete/merge, import/export, ID-stable ops, 10 taxedit tests |
+| 20. Batch Reorganization | complete | Journal/resume/undo, chunked 25, UIDVALIDITY re-check, 3 batch tests |
+
+**Integration:** 18/18 paths wired; 1 blocker (`classify_message` orphaned from UI) found and fixed in-audit.
+
+**Performance:** 328 Rust tests green, tsc clean, zero warnings. Frozen binary: 294MB, 6s cold-start. Bundles: .deb (sge-laya + 63 weights files) + AppImage (RC=0).
 
 ## Performance Metrics
 
@@ -39,16 +55,16 @@ Last activity: 2026-10-10 — Phases 18/19/20 verified+closed (328 tests green, 
 - v1.1 shipped 2026-10-05: 4 phases (6-9), 8 plans
 - v1.0 shipped 2026-10-03: 5 phases (1-5)
 
-**By Phase:**
+**By Phase:** (all complete)
 
 | Phase | Plans | Status |
 |-------|-------|--------|
-| 15. Sidecar Packaging Spike | 0/0 | Not started |
-| 16. Taxonomy + Store | 0/0 | Not started |
-| 17. Classify Engine (No Moves) | 0/0 | Not started |
-| 18. Confirm + Trust UX | 0/0 | Not started |
-| 19. Taxonomy Editor + Import | 0/0 | Not started |
-| 20. Batch Reorganization | 0/0 | Not started |
+| 15. Sidecar Packaging Spike | 3/3 | Complete | 2026-10-10 |
+| 16. Taxonomy + Store | 3/3 | Complete | 2026-10-10 |
+| 17. Classify Engine (No Moves) | 2/2 | Complete | 2026-10-10 |
+| 18. Confirm + Trust UX | 2/2 | Complete | 2026-10-10 |
+| 19. Taxonomy Editor + Import | 2/2 | Complete | 2026-10-10 |
+| 20. Batch Reorganization | 2/2 | Complete | 2026-10-10 |
 
 ## Accumulated Context
 
@@ -62,15 +78,14 @@ Decisions are logged in PROJECT.md Key Decisions table. v1.3 structural decision
 
 ### Pending Todos
 
-- Plan Phase 15 (packaging spike — measure, don't research: size, cold-start, lifecycle in dev AND built bundle).
-- Research flags for later planning: Phase 17 needs Laya 0.4.2 question-shaping re-verification (`--research-phase`); Phase 20 needs chunk/journal/UIDVALIDITY + live throttling verification.
-- Live validation deferred from earlier milestones: `/gsd-verify-work 6/7/8` (v1.1), `/gsd-verify-work 12/13` (v1.2 send/draft round-trips).
+- None — all phases complete, milestone passed
+- Validate live when convenient: `/gsd-verify-work 6/7/8` (v1.1) + `/gsd-verify-work 12/13` (v1.2) — standing deferred items
 
 ### Blockers/Concerns
 
-- Bundle size (~1 GB est.) and cold-start seconds unknown until the Phase 15 spike measures them — fallback trigger armed if packaging limits break.
-- Confidence threshold default must be tuned on representative pt-BR mail in Phase 17 (no universal value).
-- `Auto`-root collision (user already owns `Auto`) → confirm-then-nest dialog decided at Phase 18 planning.
+- Bundle size (~1 GB est.) and cold-start seconds — measured: 294MB, 6s ship fine
+- Confidence threshold default tuned on representative pt-BR mail (Phase 17 default holds)
+- `Auto`-root collision resolved: user already owns `Auto` → confirm-then-nest dialog (Phase 18 planning)
 
 ## Deferred Items
 
@@ -91,10 +106,10 @@ Items acknowledged and deferred at milestone close, most recent first:
 ## Session Continuity
 
 Last session: 2026-10-10
-Stopped at: v1.3 roadmap created, ready to plan Phase 15
+Milestone: v1.3 Auto-Classify complete
 Resume file: None
 
 ## Operator Next Steps
 
-- Plan Phase 15: `/gsd-plan-phase 15` (after `/gsd-discuss-phase 15` per workflow)
-- Validate live when convenient: `/gsd-verify-work 6/7/8` (v1.1) + `/gsd-verify-work 12/13` (v1.2)
+- Milestone v1.3 complete — no further agent actions required; work archived
+- Future v1.4 planning may reference deferred items above

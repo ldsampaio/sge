@@ -443,6 +443,11 @@ pub fn deleted_store_arg(deleted: bool) -> &'static str {
 /// CONTEXT — the copy is the user's own text, already "read").
 pub const DRAFT_FLAGS: &str = "(\\Draft \\Seen)";
 
+/// The APPEND flags literal for a filed Sent copy (Phase 13, Plan 13-03):
+/// `\Seen` only — the copy is the user's own sent text, already "read".
+/// No `\Draft` atom: Sent copies must not read as drafts to other clients.
+pub const SENT_FLAGS: &str = "(\\Seen)";
+
 /// Which server verb carries a move, given the advertised capabilities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MovePath {

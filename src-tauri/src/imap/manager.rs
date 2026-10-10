@@ -17,7 +17,7 @@
 
 use super::{
     choose_expunge_path, choose_move_path, chunk_uid_set, AccountConfig, ExpungePath,
-    MovePath, SyncError, SyncSession, DRAFT_FLAGS,
+    MovePath, SyncError, SyncSession, DRAFT_FLAGS, SENT_FLAGS,
 };
 use crate::imap::session::connect_sync;
 use std::collections::HashSet;
@@ -70,39 +70,96 @@ impl SessionManager {
     /// Connects on first use, (re-)SELECTs `mailbox` whenever the session is
     /// fresh or a different folder is selected, and serializes concurrent
     /// callers through the state mutex (FOLD-03: per-folder leases).
+    ///
+    /// One transparent reconnect (same shape as the `set_seen_in` family):
+    /// a pooled session may have died idle (server-side timeout) — the
+    /// SELECT on it then fails with an EOF-style error. Only a *reused*
+    /// session earns the retry: a fresh connect that fails is a hard error
+    /// (server down, unknown folder) and surfaces immediately without a
+    /// second dial. The dead session is dropped before reconnecting so a
+    /// later lease can never reuse it.
     pub async fn lease_for(&self, mailbox: &str) -> Result<MailboxLease<'_>, SyncError> {
         let mut guard = self.state.lock().await;
-        if guard.session.is_none() {
-            let session = connect_sync(&self.config).await.map_err(|e| {
-                SyncError::Protocol(format!("SessionManager connect: {e}"))
-            })?;
-            guard.session = Some(Box::new(session));
-            guard.selected_mailbox = None;
-            guard.cached_capabilities = None;
-        }
-        let needs_select = guard.selected_mailbox.as_deref() != Some(mailbox);
-        if needs_select {
-            let session = guard.session.as_mut().expect("connected above");
-            let summary = session.select_mailbox(mailbox).await.map_err(|e| {
-                SyncError::Protocol(format!("SessionManager SELECT {mailbox}: {e}"))
-            })?;
-            eprintln!(
-                "[SGE imap] lease selected {mailbox}: uid_validity={} exists={}",
-                summary.uid_validity, summary.exists
-            );
-            guard.selected_mailbox = Some(mailbox.to_string());
-            guard.selected_validity = Some(summary.uid_validity);
-        }
-        // Capability cache: the atom set is stable per connection, so one
-        // `CAPABILITY` per fresh session serves every gated op until the
-        // next reconnect. Failing closed here surfaces a broken session
-        // immediately instead of misrouting MOVE/expunge fallbacks.
-        if guard.cached_capabilities.is_none() {
-            let session = guard.session.as_mut().expect("connected above");
-            let caps = session.capabilities().await.map_err(|e| {
-                SyncError::Protocol(format!("SessionManager CAPABILITY: {e}"))
-            })?;
-            guard.cached_capabilities = Some(caps);
+        let mut can_retry = guard.session.is_some();
+        let mut retried = false;
+        loop {
+            if guard.session.is_none() {
+                let session = connect_sync(&self.config).await.map_err(|e| {
+                    SyncError::Protocol(format!(
+                        "SessionManager {}: {e}",
+                        if retried { "reconnect" } else { "connect" }
+                    ))
+                })?;
+                guard.session = Some(Box::new(session));
+                guard.selected_mailbox = None;
+                guard.selected_validity = None;
+                guard.cached_capabilities = None;
+            }
+            if guard.selected_mailbox.as_deref() != Some(mailbox) {
+                let select_outcome = {
+                    let session = guard.session.as_mut().expect("connected above");
+                    session.select_mailbox(mailbox).await
+                };
+                match select_outcome {
+                    Ok(summary) => {
+                        eprintln!(
+                            "[SGE imap] lease selected {mailbox}: uid_validity={} exists={}",
+                            summary.uid_validity, summary.exists
+                        );
+                        guard.selected_mailbox = Some(mailbox.to_string());
+                        guard.selected_validity = Some(summary.uid_validity);
+                    }
+                    Err(e) => {
+                        let err = SyncError::Protocol(format!(
+                            "SessionManager SELECT {mailbox}: {e}"
+                        ));
+                        if can_retry {
+                            can_retry = false;
+                            retried = true;
+                            eprintln!(
+                                "[SGE imap] lease {mailbox} SELECT failed ({err}) — reconnecting once"
+                            );
+                            guard.session = None;
+                            guard.selected_mailbox = None;
+                            guard.selected_validity = None;
+                            guard.cached_capabilities = None;
+                            continue;
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+            // Capability cache: the atom set is stable per connection, so one
+            // `CAPABILITY` per fresh session serves every gated op until the
+            // next reconnect. Failing closed here surfaces a broken session
+            // immediately instead of misrouting MOVE/expunge fallbacks.
+            if guard.cached_capabilities.is_none() {
+                let caps_outcome = {
+                    let session = guard.session.as_mut().expect("connected above");
+                    session.capabilities().await
+                };
+                match caps_outcome {
+                    Ok(caps) => guard.cached_capabilities = Some(caps),
+                    Err(e) => {
+                        let err =
+                            SyncError::Protocol(format!("SessionManager CAPABILITY: {e}"));
+                        if can_retry {
+                            can_retry = false;
+                            retried = true;
+                            eprintln!(
+                                "[SGE imap] lease {mailbox} CAPABILITY failed ({err}) — reconnecting once"
+                            );
+                            guard.session = None;
+                            guard.selected_mailbox = None;
+                            guard.selected_validity = None;
+                            guard.cached_capabilities = None;
+                            continue;
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+            break;
         }
         Ok(MailboxLease { guard })
     }
@@ -534,6 +591,65 @@ impl SessionManager {
         }
     }
 
+    /// Resolve the Sent folder's wire name via LIST + Phase 11 roles
+    /// (Plan 13-03). `None` means no Sent-like folder — the filing leg
+    /// waits (rows stay `sent_unfiled`); creation follows the Phase 11
+    /// create-behind-confirmation flow, never an automatic CREATE from a
+    /// background pass (T-13-12).
+    pub async fn resolve_sent_wire(&self) -> Result<Option<String>, SyncError> {
+        use super::roles::{resolve_roles, Role};
+        let folders = self.list_mailboxes().await?;
+        Ok(resolve_roles(&folders)
+            .into_iter()
+            .find(|(_, role)| *role == Role::Sent)
+            .map(|(wire, _)| wire))
+    }
+
+    /// File one sent mail to Sent under ONE held lease (Phase 13, Plan
+    /// 13-03): probe-before-APPEND via `UID SEARCH HEADER Message-ID`
+    /// (T-13-09 — servers that auto-save on SMTP produce a hit, so the
+    /// APPEND is skipped and the copy is never duplicated), else APPEND
+    /// the verbatim `.eml` bytes with [`SENT_FLAGS`](super::SENT_FLAGS).
+    ///
+    /// One reconnect-retry; the retry is safe by construction (probe-first:
+    /// an APPEND that landed before the failure reconciles as `Deduped`,
+    /// never a second APPEND). Never calls `self.*_in` re-entrantly while
+    /// holding the lease — verbs run on `lease.session()` directly.
+    pub async fn file_sent_copy_in(
+        &self,
+        sent_wire: &str,
+        msg_id: &str,
+        bytes: &[u8],
+    ) -> Result<FileOutcome, SyncError> {
+        match self.file_sent_once(sent_wire, msg_id, bytes).await {
+            Ok(outcome) => Ok(outcome),
+            Err(first) => {
+                eprintln!(
+                    "[SGE imap] file sent {sent_wire} msg {msg_id} failed ({first}) — reconnecting once"
+                );
+                self.reconnect().await?;
+                self.file_sent_once(sent_wire, msg_id, bytes).await
+            }
+        }
+    }
+
+    /// One attempt of the Sent filing. Holds a SINGLE
+    /// `lease_for(sent_wire)` guard for the SEARCH → APPEND legs so the
+    /// probe and the write address the same folder.
+    async fn file_sent_once(
+        &self,
+        sent_wire: &str,
+        msg_id: &str,
+        bytes: &[u8],
+    ) -> Result<FileOutcome, SyncError> {
+        let mut lease = self.lease_for(sent_wire).await?;
+        if file_sent_on_session(lease.session(), sent_wire, msg_id, bytes).await? {
+            Ok(FileOutcome::Deduped)
+        } else {
+            Ok(FileOutcome::Filed)
+        }
+    }
+
     /// Move `uid_set` (comma-joined `"1,2,3"`) from `src` to `dest` (raw
     /// wire names) under ONE held lease, with reconnect-retry and
     /// capability-gated fallback orchestration (Plan 10-02, MOVE-01 slice).
@@ -674,6 +790,41 @@ pub async fn save_draft_on_session(
         }
     }
     Ok(new_uid)
+}
+
+/// Outcome of [`SessionManager::file_sent_copy_in`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileOutcome {
+    /// Server auto-saved on SMTP (probe hit) — APPEND skipped, no duplicate.
+    Deduped,
+    /// Probe missed — verbatim bytes APPENDEd with `\Seen` exactly once.
+    Filed,
+}
+
+/// Sent probe-before-APPEND on an already-selected session, without a
+/// manager lease (Phase 13: shared body behind
+/// [`SessionManager::file_sent_copy_in`] and the worker's filing pass — one
+/// implementation, two callers).
+///
+/// Issues no `select_mailbox` itself. Returns `true` when the Message-ID
+/// already lives in Sent (server auto-save — caller skips APPEND), `false`
+/// after APPENDEing the verbatim bytes. APPEND failure propagates so the
+/// caller parks `sent_unfiled` (APPEND-only retry, never re-SMTP-send).
+pub async fn file_sent_on_session(
+    session: &mut dyn SyncSession,
+    sent_wire: &str,
+    msg_id: &str,
+    bytes: &[u8],
+) -> Result<bool, SyncError> {
+    let mut hits = session.uid_search_header("Message-ID", msg_id).await?;
+    hits.sort_unstable();
+    if !hits.is_empty() {
+        return Ok(true);
+    }
+    session
+        .append_message(sent_wire, SENT_FLAGS, bytes)
+        .await?;
+    Ok(false)
 }
 
 /// True when a tracked UID belongs to a dead folder generation (MJ-04):
@@ -945,6 +1096,11 @@ mod tests {
         /// When true, `append_message` fails with a `Protocol` error
         /// (drives the draft save retry path).
         fail_append: bool,
+        /// When true, the next `select_mailbox` fails once with an
+        /// EOF-style `Protocol` error (simulates a SELECT on a pooled
+        /// session the server already closed — drives the `lease_for`
+        /// reconnect-retry path), then clears itself.
+        fail_select_once: bool,
     }
 
     impl FakeSession {
@@ -1007,6 +1163,7 @@ mod tests {
                 appended_calls: Vec::new(),
                 search_header_results: Vec::new(),
                 fail_append: false,
+                fail_select_once: false,
             })))
         }
     }
@@ -1022,17 +1179,22 @@ mod tests {
             &mut self,
             name: &str,
         ) -> PinBox<'_, Result<super::super::MailboxSummary, SyncError>> {
-            let summary = {
+            let outcome = {
                 let mut f = self.0.lock().unwrap();
                 f.select_calls.push(name.to_string());
-                super::super::MailboxSummary {
-                    selected_mailbox: name.to_string(),
-                    uid_validity: 100,
-                    uid_next: None,
-                    exists: f.live_uids().len() as u32,
+                if f.fail_select_once {
+                    f.fail_select_once = false;
+                    Err(SyncError::Protocol(format!("SELECT {name}: io: unexpected EOF")))
+                } else {
+                    Ok(super::super::MailboxSummary {
+                        selected_mailbox: name.to_string(),
+                        uid_validity: 100,
+                        uid_next: None,
+                        exists: f.live_uids().len() as u32,
+                    })
                 }
             };
-            Box::pin(async move { Ok(summary) })
+            Box::pin(async move { outcome })
         }
 
         fn search_uids(&mut self) -> PinBox<'_, Result<Vec<u32>, SyncError>> {
@@ -1763,6 +1925,34 @@ mod tests {
             );
             let f = probe.lock().unwrap();
             assert_eq!(f.created_mailboxes, vec!["Pai".to_string()]);
+        });
+    }
+
+    #[test]
+    fn lease_select_on_dead_session_reconnects_once() {
+        run(async {
+            let fake = FakeHandle::new(&["IMAP4rev1"], &[1, 2]);
+            let probe = fake.0.clone();
+            {
+                probe.lock().unwrap().fail_select_once = true;
+            }
+            let manager = SessionManager::for_test_session(Box::new(fake));
+            // The pooled session died idle: the first SELECT hits EOF.
+            // Offline the reconnect cannot succeed (test.invalid dials
+            // nothing): the retry path surfaces the reconnect error, and
+            // crucially SELECT fired exactly once — the second SELECT only
+            // runs after a successful reconnect.
+            let err = match manager.lease_for("Archives").await {
+                Ok(_) => panic!("offline retry must surface the reconnect error"),
+                Err(e) => e,
+            };
+            let msg = err.to_string().to_lowercase();
+            assert!(
+                msg.contains("reconnect"),
+                "expected a reconnect error, got: {err}"
+            );
+            let f = probe.lock().unwrap();
+            assert_eq!(f.select_calls, vec!["Archives".to_string()]);
         });
     }
 

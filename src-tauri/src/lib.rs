@@ -524,6 +524,9 @@ pub fn run() {
             commands::classify::cancel_batch,
             commands::classify::batch_report,
             commands::classify::undo_batch,
+            commands::classify::classify_message_uid,
+            commands::classify::set_folder_excluded,
+            commands::classify::batch_runs_list,
             sidecar_status,
             load_server_config,
         ])

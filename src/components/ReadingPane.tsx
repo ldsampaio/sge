@@ -125,6 +125,27 @@ export default function ReadingPane({ selectedMessage, mailbox = "INBOX", mailbo
       setSuggestMsg(`Falha ao dispensar: ${e}`);
     }
   };
+
+  /** Manual classify (unlabeled or excluded mail, stale re-do). Wires the
+   *  `classify_message_uid` command the audit found orphaned. */
+  const classifyNow = async () => {
+    if (!selectedMessage) return;
+    setSuggestBusy(true);
+    setSuggestMsg(null);
+    try {
+      await invoke("classify_message_uid", { mailbox, uid: selectedMessage.uid });
+      const d = (await invoke("suggestion_for_uid", {
+        mailbox,
+        uid: selectedMessage.uid,
+      })) as SuggestionDetail | null;
+      setSuggestion(d && !d.dismissed ? d : null);
+      if (!d) setSuggestMsg("Sem confiança suficiente — foi para A Classificar.");
+    } catch (e) {
+      setSuggestMsg(`Falha ao classificar: ${e}`);
+    } finally {
+      setSuggestBusy(false);
+    }
+  };
   // Expunge modal state
   const [expungeModal, setExpungeModal] = useState<{
     open: boolean;
@@ -453,7 +474,7 @@ export default function ReadingPane({ selectedMessage, mailbox = "INBOX", mailbo
           </time>
         </div>
         {/* Phase 18: confirm-gated suggestion bar (backend-enforced gate). */}
-        {suggestion && (
+        {suggestion && !suggestion.stale && (
           <SuggestionBar
             destDisplay={suggestion.dest_display}
             confidence={suggestion.confidence}
@@ -467,7 +488,29 @@ export default function ReadingPane({ selectedMessage, mailbox = "INBOX", mailbo
             onDismiss={() => void dismissSuggestion()}
           />
         )}
-        {!suggestion && suggestMsg && (
+        {suggestion && suggestion.stale && (
+          <div role="group" aria-label="Sugestão desatualizada" style={{ margin: "8px 0", fontSize: "0.82rem" }}>
+            <span style={{ color: "#eab308" }}>
+              A taxonomia mudou desde esta sugestão —{" "}
+            </span>
+            <button type="button" className="btn btn-small" disabled={suggestBusy} onClick={() => void classifyNow()}>
+              Reclassificar
+            </button>
+          </div>
+        )}
+        {!suggestion && selectedMessage && (
+          <div style={{ margin: "8px 0", fontSize: "0.82rem" }}>
+            <button type="button" className="btn btn-small" disabled={suggestBusy} onClick={() => void classifyNow()}>
+              Classificar agora
+            </button>
+            {suggestMsg && (
+              <span role="status" style={{ marginLeft: 8, color: "#94a3b8" }}>
+                {suggestMsg}
+              </span>
+            )}
+          </div>
+        )}
+        {suggestion && !suggestion.stale && suggestMsg && (
           <div role="status" style={{ color: "#4ade80", fontSize: "0.82rem" }}>
             {suggestMsg}
           </div>

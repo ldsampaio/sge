@@ -35,6 +35,31 @@ export function TaxonomyEditor({ onClose }: TaxonomyEditorProps) {
   const [formKeywords, setFormKeywords] = React.useState("");
   const [formRule, setFormRule] = React.useState("");
   const [reassign, setReassign] = React.useState("");
+  /** Folder exclusions (SIDE-03 management surface). */
+  const [excluded, setExcluded] = React.useState<string[]>([]);
+  const [newExclude, setNewExclude] = React.useState("");
+
+  const loadExcluded = React.useCallback(async () => {
+    try {
+      const s = (await invoke("classify_status")) as { excluded: string[] };
+      setExcluded(s.excluded ?? []);
+    } catch {
+      /* panel keeps stale list */
+    }
+  }, []);
+
+  React.useEffect(() => {
+    void loadExcluded();
+  }, [loadExcluded]);
+
+  const toggleExclude = async (folder: string, off: boolean) => {
+    try {
+      const list = (await invoke("set_folder_excluded", { folder, excluded: off })) as string[];
+      setExcluded(list);
+    } catch (e) {
+      setMessage(`Falha nas exclusões: ${e}`);
+    }
+  };
 
   const reload = React.useCallback(async () => {
     try {
@@ -246,6 +271,42 @@ export function TaxonomyEditor({ onClose }: TaxonomyEditorProps) {
           <button type="button" className="btn btn-small" onClick={() => void exportFile()}>
             Exportar
           </button>
+        </div>
+        <div style={{ marginTop: 12, borderTop: "1px solid #1e293b", paddingTop: 12 }}>
+          <h3 style={{ margin: "0 0 4px" }}>Pastas excluídas da classificação automática</h3>
+          <p style={{ color: "#94a3b8", fontSize: "0.8rem", margin: "0 0 8px" }}>
+            Estas pastas nunca entram na fila automática — classificar à mão continua valendo.
+          </p>
+          {excluded.length === 0 && <p style={{ fontSize: "0.8rem" }}>Nenhuma pasta excluída.</p>}
+          <ul style={{ listStyle: "none", padding: 0 }}>
+            {excluded.map((f) => (
+              <li key={f} style={{ display: "flex", gap: 8, alignItems: "center", padding: "3px 0" }}>
+                <span style={{ flex: 1 }}>{f}</span>
+                <button type="button" className="btn btn-small" disabled={busy} onClick={() => void toggleExclude(f, false)}>
+                  Incluir
+                </button>
+              </li>
+            ))}
+          </ul>
+          <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
+            <input
+              value={newExclude}
+              onChange={(e) => setNewExclude(e.target.value)}
+              placeholder="Nome da pasta (ex.: Sent)"
+              style={{ flex: 1 }}
+            />
+            <button
+              type="button"
+              className="btn btn-small"
+              disabled={busy || !newExclude.trim()}
+              onClick={() => {
+                void toggleExclude(newExclude.trim(), true);
+                setNewExclude("");
+              }}
+            >
+              Excluir
+            </button>
+          </div>
         </div>
         {editing && (
           <div style={{ marginTop: 12, borderTop: "1px solid #1e293b", paddingTop: 12 }}>
