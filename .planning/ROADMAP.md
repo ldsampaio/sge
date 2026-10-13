@@ -247,7 +247,11 @@ Plans:
 - [x] 23-03-PLAN.md — UI: SearchScopeSelector + SavedFiltersPanel + results header/cap hint + state restore (tsc clean)
 
 ### Phase 24: Auto-Archive
-**Goal:** Age-based MOVE to `Auto/Archive/`; journaled batch with resume/undo; never deletes. **Requires:** Phase 20 + 19. **Requirements:** ARCH-01/02. **UI:** yes. **Plans:** TBD.
+**Goal:** Age-based MOVE to `Auto/Archive/`; journaled batch with resume/undo; never deletes. **Requires:** Phase 20 + 19. **Requirements:** ARCH-01/02. **UI:** yes.
+
+Plans:
+- [x] 24-01-PLAN.md — Backend: archive settings + age selector + archive_run on verbatim batch machinery (kind tag) + structural never-delete (472 green)
+- [x] 24-02-PLAN.md — UI: rule editor + manual trigger panel + kind-aware resume/undo on BatchPanel (tsc clean)
 
 ### Phase 25: Smart Folder Rules
 **Goal:** User-defined rules (keyword/sender/pattern) validated → applies at sync/on-demand; conflict = confirm; SQLite-persisted. **Requires:** Phase 18 + 11. **Requirements:** RULE-01/02/03. **UI:** yes. **Plans:** TBD.
@@ -287,3 +291,4 @@ Plans:
 | 21. SMTP Send — Live Gate | v1.4 | 2/2 | Complete (offline green; live run pending human via scripts/live-21.sh) | 2026-10-13 |
 | 22. Draft & Seen Round-Trip — Live Gate | v1.4 | 2/2 | Complete (offline 19/19 green; live run pending human via scripts/live-22.sh) | 2026-10-13 |
 | 23. Search + Filters | v1.4 | 3/3 | Complete (345 lib tests green, tsc clean; vite bundle blocked environmentally — Node 18 vs required 20+) | 2026-10-13 |
+| 24. Auto-Archive | v1.4 | 2/2 | Complete (472 tests green, tsc clean; scheduler structurally absent) | 2026-10-13 |
