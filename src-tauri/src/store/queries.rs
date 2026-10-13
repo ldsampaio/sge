@@ -2697,6 +2697,47 @@ pub fn rule_suggestions_for_rule(
     .map_err(super::StoreError::Sql)
 }
 
+/// All pending rule suggestions (confirm-dialog surfacing, newest last).
+pub fn list_rule_suggestions(
+    conn: &Connection,
+    limit: usize,
+) -> StoreResult<Vec<RuleSuggestionRow>> {
+    conn.prepare(
+        "SELECT message_id, rule_id, dest_kind, destination FROM rule_suggestions \
+         ORDER BY suggested_at ASC LIMIT ?1",
+    )?
+    .query_map(rusqlite::params![limit as i64], |r| {
+        Ok(RuleSuggestionRow {
+            message_id: r.get(0)?,
+            rule_id: r.get(1)?,
+            dest_kind: r.get(2)?,
+            destination: r.get(3)?,
+        })
+    })?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(super::StoreError::Sql)
+}
+
+/// (message_id, mailbox wire, from_addr, subject, preview) for rule
+/// evaluation: already-synced cached rows ONLY — never triggers a fetch.
+/// `mailbox = None` scopes whole-account (on-demand bulk); the caller
+/// applies exclusion/scope policy, never this function.
+pub fn rule_candidate_rows(
+    conn: &Connection,
+    mailbox: Option<&str>,
+) -> StoreResult<Vec<(u64, String, String, String, String)>> {
+    let sql = "SELECT m.id, mb.name, m.from_addr, m.subject, m.preview \
+               FROM messages m JOIN mailboxes mb ON mb.id = m.mailbox_id \
+               WHERE m.pending_delete = 0 AND (?1 IS NULL OR mb.name = ?1) \
+               ORDER BY m.id ASC";
+    conn.prepare(sql)?
+        .query_map(rusqlite::params![mailbox], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(super::StoreError::Sql)
+}
+
 // ── tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]

@@ -541,6 +541,8 @@ pub fn run() {
             commands::classify::delete_rule,
             commands::classify::set_rule_enabled,
             commands::classify::set_rule_priority,
+            commands::classify::apply_rules,
+            commands::classify::pending_rule_suggestions,
             commands::classify::archive_run,
             commands::classify::get_archive_settings,
             commands::classify::set_archive_settings,

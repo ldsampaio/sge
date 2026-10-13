@@ -147,6 +147,10 @@ pub fn hook_after_sync(state: &AppState, mailbox: &str, app: &tauri::AppHandle) 
         }
     }
     trigger_drain(app);
+    // Phase 25: fire-and-forget rule evaluation behind sync (3 lines:
+    // excluded folders skip inside; sync never awaits, failures never
+    // fail the sync — same discipline as the classify hook above).
+    rule_after_sync(state, mailbox, app);
 }
 
 /// Fire-and-forget drain under the shared gate. No-op when the sidecar is
@@ -209,6 +213,68 @@ pub async fn confirm_suggestion(
     allow_nest: Option<bool>,
 ) -> Result<ConfirmResult, String> {
     let store = state.store.clone();
+    // Phase 25: rule-sourced rows confirm through this SAME path unchanged
+    // in contract — the hit carries its own destination (plain folder or
+    // taxonomy category) instead of a classifier label row. The move below
+    // reuses Phase 10 `move_one_uid` + `imap_outbox` (UID-only addressing,
+    // UIDVALIDITY epoch gating); the suggestion row clears on resolution
+    // and the log carries rule-id + message-id only (T-25-06).
+    let rule_hit = {
+        let guard = store.lock().unwrap();
+        plan_rule_filing(guard.conn(), message_id).ok()
+    };
+    if let Some(plan) = rule_hit {
+        let account_cfg = load_account_config(state.clone()).await?;
+        let manager = manager_for(&state, &account_cfg);
+        let (dest_wire, dest_display) = if plan.dest_kind == "category" {
+            let tax = load_default().map_err(|e| e.to_string())?;
+            let (dest_display, top_name, child_name) =
+                filing::auto_path_for_id(&tax, &plan.destination)
+                    .map_err(|e| e.to_string())?;
+            let fplan = filing::FilePlan {
+                message_id,
+                mailbox: plan.mailbox.clone(),
+                uid: plan.uid,
+                dest_display: dest_display.clone(),
+                top_name,
+                child_name,
+                threshold_used: 0.0,
+                confidence: 1.0,
+                needs_review: false,
+            };
+            let wire = filing::ensure_auto_tree(
+                &manager,
+                &store,
+                &fplan,
+                allow_nest.unwrap_or(false),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            (wire, dest_display)
+        } else {
+            let wire = ensure_rule_folder(&manager, &store, &plan.destination).await?;
+            (wire, plan.destination.clone())
+        };
+        let result = filing::move_one_uid(
+            &manager,
+            &store,
+            &plan.mailbox,
+            plan.uid,
+            &dest_wire,
+            &format!("Arquivado em {dest_display}"),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        {
+            let guard = store.lock().unwrap();
+            let _ =
+                crate::store::queries::delete_rule_suggestion(guard.conn(), message_id);
+        }
+        eprintln!(
+            "[SGE rules] confirmed message={message_id} -> {dest_wire} (rule suggestion resolved)"
+        );
+        return Ok(result);
+    }
     let tax = load_default().map_err(|e| e.to_string())?;
     // Short lock: plan only.
     let plan = {
@@ -291,7 +357,11 @@ pub async fn dismiss_suggestion(
     message_id: u64,
 ) -> Result<(), String> {
     let guard = state.store.lock().unwrap();
-    crate::store::queries::dismiss_label(guard.conn(), message_id).map_err(|e| e.to_string())
+    crate::store::queries::dismiss_label(guard.conn(), message_id).map_err(|e| e.to_string())?;
+    // Dismissal keeps mail in place: a pending rule hit for the same
+    // message clears alongside the label dismissal.
+    let _ = crate::store::queries::delete_rule_suggestion(guard.conn(), message_id);
+    Ok(())
 }
 
 /// Tune the confidence threshold (0–1). Future suggestions only.
@@ -1714,4 +1784,524 @@ pub async fn set_rule_priority(
     let guard = state.store.lock().unwrap();
     crate::store::queries::set_rule_priority(guard.conn(), &id, priority)
         .map_err(|e| e.to_string())
+}
+
+// ── Phase 25: at-sync hook + apply_rules through confirm_suggestion ──
+// (RULE-02 engine, RULE-03 MOVE-only)
+//
+// Application point (CONTEXT D-02): post-sync hook enqueues rule
+// evaluation fire-and-forget under the EXISTING ClassifyGate
+// single-flight (no new gate type) — sync NEVER awaits rules, rules NEVER
+// block sync completion or UI paint. Order per message: override-pin
+// first (Phase 18 pins always win) → user rules by priority (first match
+// wins, evaluation stops) → classifier suggestion (untouched).
+// A rule hit writes a rule-sourced suggestion row flowing through the
+// SAME confirm_suggestion path unchanged; rules never move mail directly
+// in the single-message flow. Zero new IMAP verbs: CREATE-when-missing
+// (Phase 11 guards) + MOVE (Phase 10 machinery, UID-only + UIDVALIDITY
+// epoch gating). BODY.PEEK-only preserved (matcher input is cached text).
+
+use crate::classify::rules::Rule;
+use crate::store::queries::RuleSuggestionRow;
+
+/// One rule hit: message + winning rule + resolved destination.
+#[derive(Debug, Clone)]
+pub struct RuleHit {
+    pub message_id: u64,
+    pub rule_id: String,
+    pub dest_kind: String,
+    pub destination: String,
+}
+
+/// Evaluate enabled rules over cached candidates
+/// `(message_id, mailbox, sender, subject, snippet)`. Pure store +
+/// matcher — no IMAP, never awaits. Skips: override-pinned, already
+/// labeled (classifier territory — 25-02 adds the comparison dialog),
+/// already suggested, disabled rules, out-of-scope rules. First match
+/// wins per message (priority ASC, oldest wins ties — `list_rules`
+/// ordering); evaluation stops at the hit.
+pub fn evaluate_rules(
+    conn: &rusqlite::Connection,
+    candidates: &[(u64, String, String, String, String)],
+) -> Vec<RuleHit> {
+    let rows = match crate::store::queries::list_rules(conn) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let mut typed: Vec<Rule> = Vec::new();
+    for row in rows.iter().filter(|r| r.enabled) {
+        let conditions: RuleConditions = match serde_json::from_str(&row.conditions_json) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let scope_folders: Vec<String> =
+            serde_json::from_str(&row.scope_json).unwrap_or_default();
+        let destination = if row.dest_kind == "category" {
+            RuleDestination::TaxonomyCategory { id: row.destination.clone() }
+        } else {
+            RuleDestination::Folder { display: row.destination.clone() }
+        };
+        typed.push(Rule {
+            id: row.id.clone(),
+            name: row.name.clone(),
+            priority: row.priority,
+            conditions,
+            destination,
+            scope: RuleScope { folders: scope_folders },
+            enabled: true,
+        });
+    }
+    let mut hits = Vec::new();
+    for (mid, mailbox, sender, subject, snippet) in candidates {
+        if crate::store::queries::latest_override(conn, *mid).ok().flatten().is_some() {
+            continue;
+        }
+        if crate::store::queries::get_label(conn, *mid).ok().flatten().is_some() {
+            continue;
+        }
+        if crate::store::queries::get_rule_suggestion(conn, *mid).ok().flatten().is_some() {
+            continue;
+        }
+        for rule in &typed {
+            if !rule.scope.folders.is_empty()
+                && !rule.scope.folders.iter().any(|f| f == mailbox)
+            {
+                continue;
+            }
+            if rules::evaluate_rule(rule, sender, subject, snippet) {
+                let (dest_kind, destination) = match &rule.destination {
+                    RuleDestination::Folder { display } => {
+                        ("folder".to_string(), display.clone())
+                    }
+                    RuleDestination::TaxonomyCategory { id } => {
+                        ("category".to_string(), id.clone())
+                    }
+                };
+                hits.push(RuleHit {
+                    message_id: *mid,
+                    rule_id: rule.id.clone(),
+                    dest_kind,
+                    destination,
+                });
+                break;
+            }
+        }
+    }
+    hits
+}
+
+/// Post-sync rule hook: evaluate behind sync, persist hits as confirmable
+/// suggestion rows. Fire-and-forget (spawned, gate single-flights);
+/// returns immediately and never fails the sync. Folders excluded from
+/// auto-classify (Sent/Drafts + opt-outs) are skipped automatically —
+/// manual `apply_rules` still serves them on demand.
+pub fn rule_after_sync(state: &AppState, mailbox: &str, app: &tauri::AppHandle) {
+    let excluded = {
+        let guard = state.store.lock().unwrap();
+        queries::is_excluded(guard.conn(), mailbox).unwrap_or(false)
+    };
+    if excluded {
+        return;
+    }
+    let store = state.store.clone();
+    let gate: Arc<ClassifyGate> = state.classify_gate.clone();
+    let app_h = app.clone();
+    let mb = mailbox.to_string();
+    tauri::async_runtime::spawn(async move {
+        if !gate.try_acquire() {
+            return;
+        }
+        let hits = {
+            let guard = store.lock().unwrap();
+            let conn = guard.conn();
+            let cands = queries::rule_candidate_rows(conn, Some(&mb)).unwrap_or_default();
+            let hits = evaluate_rules(conn, &cands);
+            for h in &hits {
+                let _ = queries::upsert_rule_suggestion(
+                    conn,
+                    &RuleSuggestionRow {
+                        message_id: h.message_id,
+                        rule_id: h.rule_id.clone(),
+                        dest_kind: h.dest_kind.clone(),
+                        destination: h.destination.clone(),
+                    },
+                );
+            }
+            hits.len()
+        };
+        gate.release();
+        if hits > 0 {
+            let _ = app_h.emit("rule-suggestions", hits);
+        }
+    });
+}
+
+/// Pure rule filing plan: suggestion row + cached location (UID-only
+/// addressing — no sequence numbers anywhere on this path).
+pub struct RuleFilePlan {
+    pub message_id: u64,
+    pub mailbox: String,
+    pub uid: u32,
+    pub dest_kind: String,
+    pub destination: String,
+}
+
+pub fn plan_rule_filing(
+    conn: &rusqlite::Connection,
+    message_id: u64,
+) -> Result<RuleFilePlan, String> {
+    let hit = crate::store::queries::get_rule_suggestion(conn, message_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "sem sugestão de regra para este e-mail".to_string())?;
+    let (mailbox, uid) = crate::store::queries::message_location(conn, message_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "message not found in local cache".to_string())?;
+    Ok(RuleFilePlan {
+        message_id,
+        mailbox,
+        uid,
+        dest_kind: hit.dest_kind,
+        destination: hit.destination,
+    })
+}
+
+/// Ensure a plain-folder rule destination exists via Phase 11 CREATE
+/// guards, returning its wire name. Existing folders pass through
+/// untouched (display or wire match). Levels are created top-down with
+/// `prepare_create_wire` leaf validation — folder-injection refused
+/// backend-side before any verb fires.
+async fn ensure_rule_folder(
+    manager: &std::sync::Arc<crate::imap::manager::SessionManager>,
+    store: &std::sync::Arc<std::sync::Mutex<crate::store::Store>>,
+    display: &str,
+) -> Result<String, String> {
+    use crate::commands::sync::{prepare_create_wire, refresh_mailbox_tree};
+    let delimiter = {
+        let guard = store.lock().unwrap();
+        let cached = queries::list_mailboxes(guard.conn()).map_err(|e| e.to_string())?;
+        if let Some(row) =
+            cached.iter().find(|r| r.display_name == display || r.name == display)
+        {
+            return Ok(row.name.clone());
+        }
+        cached.first().map(|r| r.delimiter.clone()).unwrap_or_default()
+    };
+    let mut parent_wire: Option<String> = None;
+    let mut display_prefix = String::new();
+    for leaf in display.split('/') {
+        if !display_prefix.is_empty() {
+            display_prefix.push('/');
+        }
+        display_prefix.push_str(leaf);
+        let cached_now = {
+            let guard = store.lock().unwrap();
+            queries::list_mailboxes(guard.conn()).map_err(|e| e.to_string())?
+        };
+        if let Some(row) = cached_now.iter().find(|r| r.display_name == display_prefix) {
+            parent_wire = Some(row.name.clone());
+            continue;
+        }
+        let wire = prepare_create_wire(&cached_now, parent_wire.as_deref(), leaf, &delimiter)?;
+        manager
+            .create_mailbox_in(&wire)
+            .await
+            .map_err(|e| format!("não foi possível criar {display_prefix}: {e}"))?;
+        parent_wire = Some(wire);
+    }
+    refresh_mailbox_tree(manager, store).await?;
+    parent_wire.ok_or_else(|| "destino vazio".to_string())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApplyRulesResult {
+    pub evaluated: usize,
+    pub hits: usize,
+}
+
+/// On-demand rule application over already-synced mail (whole account
+/// when `mailbox` is None, else one folder). Manual intent: excluded
+/// folders ARE served here. Hits surface as confirmable suggestion rows
+/// (dialog ON in the UI through `confirm_suggestion`); whole-account bulk
+/// journaling/progress/undo is the 25-02 depth decision — this thin loop
+/// is what it builds on.
+#[tauri::command]
+pub async fn apply_rules(
+    state: State<'_, AppState>,
+    mailbox: Option<String>,
+) -> Result<ApplyRulesResult, String> {
+    let guard = state.store.lock().unwrap();
+    let conn = guard.conn();
+    let cands =
+        queries::rule_candidate_rows(conn, mailbox.as_deref()).map_err(|e| e.to_string())?;
+    let evaluated = cands.len();
+    let hits = evaluate_rules(conn, &cands);
+    for h in &hits {
+        queries::upsert_rule_suggestion(
+            conn,
+            &RuleSuggestionRow {
+                message_id: h.message_id,
+                rule_id: h.rule_id.clone(),
+                dest_kind: h.dest_kind.clone(),
+                destination: h.destination.clone(),
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(ApplyRulesResult { evaluated, hits: hits.len() })
+}
+
+/// Pending rule hits for the confirm surface: ids + destination + a
+/// TRANSIENT redacted justification (rebuilt here, never persisted —
+/// RULE-03 verbatim; logs carry rule-id + message-id only).
+#[derive(Debug, Clone, Serialize)]
+pub struct RuleSuggestionView {
+    pub message_id: u64,
+    pub rule_id: String,
+    pub rule_name: String,
+    pub dest_kind: String,
+    pub destination: String,
+    pub justification: String,
+}
+
+#[tauri::command]
+pub async fn pending_rule_suggestions(
+    state: State<'_, AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<RuleSuggestionView>, String> {
+    let guard = state.store.lock().unwrap();
+    let conn = guard.conn();
+    let rows =
+        queries::list_rule_suggestions(conn, limit.unwrap_or(100)).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for s in rows {
+        let rule = queries::get_rule(conn, &s.rule_id).map_err(|e| e.to_string())?;
+        let (name, just) = match rule {
+            Some(r) => {
+                let conditions: RuleConditions =
+                    serde_json::from_str(&r.conditions_json).unwrap_or_default();
+                let destination = if r.dest_kind == "category" {
+                    RuleDestination::TaxonomyCategory { id: r.destination.clone() }
+                } else {
+                    RuleDestination::Folder { display: r.destination.clone() }
+                };
+                let typed = Rule {
+                    id: r.id.clone(),
+                    name: r.name.clone(),
+                    priority: r.priority,
+                    conditions,
+                    destination,
+                    scope: RuleScope { folders: vec![] },
+                    enabled: r.enabled,
+                };
+                let just = crate::classify::redact::filter_output(
+                    &rules::rule_justification(&typed),
+                );
+                (r.name, just)
+            }
+            None => (s.rule_id.clone(), String::new()),
+        };
+        out.push(RuleSuggestionView {
+            message_id: s.message_id,
+            rule_id: s.rule_id,
+            rule_name: name,
+            dest_kind: s.dest_kind,
+            destination: s.destination,
+            justification: just,
+        });
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod rule_apply_tests {
+    use super::*;
+    use crate::store::Store;
+
+    fn seed_db() -> Store {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        conn.execute(
+            "INSERT INTO mailboxes (name, uid_validity, uid_next, delimiter) \
+             VALUES ('INBOX', 77, 10, '/'), ('Arquivo', 77, 10, '/')",
+            [],
+        )
+        .unwrap();
+        let mb: i64 = conn
+            .query_row("SELECT id FROM mailboxes WHERE name = 'INBOX'", [], |r| r.get(0))
+            .unwrap();
+        // Three cached messages (headers + preview only — the matcher never
+        // sees more than this).
+        for (uid, subject, from, preview) in [
+            (1u32, "Fatura de energia", "contas@utfpr.edu.br", "segue o boleto de outubro"),
+            (2, "Reunião quinta", "chefe@empresa.com", "pauta da reunião"),
+            (3, "Fatura de água", "contas@utfpr.edu.br", "segunda via do boleto"),
+        ] {
+            queries::upsert_message(
+                conn, mb as u64, uid, None, subject, from, "[]", "[]",
+                "2024-01-01T00:00:00Z", "[]", false, preview,
+            )
+            .unwrap();
+        }
+        store
+    }
+
+    fn seed_rule(
+        conn: &rusqlite::Connection,
+        id: &str,
+        name: &str,
+        priority: i64,
+        conditions_json: &str,
+        enabled: bool,
+    ) {
+        queries::insert_rule(
+            conn,
+            &RuleRow {
+                id: id.to_string(),
+                name: name.to_string(),
+                priority,
+                conditions_json: conditions_json.to_string(),
+                dest_kind: "folder".to_string(),
+                destination: "Arquivo".to_string(),
+                scope_json: "[]".to_string(),
+                enabled,
+            },
+        )
+        .unwrap();
+    }
+
+    fn sender_rule_json(domain: &str) -> String {
+        format!(r#"{{"sender_domain":{domain:?}}}"#)
+    }
+
+    fn cands(conn: &rusqlite::Connection) -> Vec<(u64, String, String, String, String)> {
+        queries::rule_candidate_rows(conn, Some("INBOX")).unwrap()
+    }
+
+    #[test]
+    fn rule_apply_first_match_wins_by_priority() {
+        let store = seed_db();
+        let conn = store.conn();
+        seed_rule(conn, "r-lo", "Baixa", 20, &sender_rule_json("utfpr.edu.br"), true);
+        seed_rule(conn, "r-hi", "Alta", 10, &sender_rule_json("utfpr.edu.br"), true);
+        let hits = evaluate_rules(conn, &cands(conn));
+        // Uids 1 and 3 match; EACH carries only the priority-10 winner.
+        assert_eq!(hits.len(), 2);
+        for h in &hits {
+            assert_eq!(h.rule_id, "r-hi", "lower-priority rule must never fire on the same message");
+        }
+        // Explicit reorder flips the winner (priority persists).
+        queries::set_rule_priority(conn, "r-lo", 5).unwrap();
+        let hits2 = evaluate_rules(conn, &cands(conn));
+        assert!(hits2.iter().all(|h| h.rule_id == "r-lo"));
+    }
+
+    #[test]
+    fn rule_apply_override_pin_beats_rules() {
+        let store = seed_db();
+        let conn = store.conn();
+        seed_rule(conn, "r-1", "R", 10, &sender_rule_json("utfpr.edu.br"), true);
+        let mid: u64 = conn
+            .query_row("SELECT id FROM messages WHERE uid = 1", [], |r| r.get(0))
+            .unwrap();
+        queries::log_override(conn, mid, "financas", "trabalho").unwrap();
+        let hits = evaluate_rules(conn, &cands(conn));
+        // Uid 1 pinned away; uid 3 still hits.
+        assert_eq!(hits.len(), 1);
+        assert_ne!(
+            hits[0].message_id, mid,
+            "pinned override must beat the rule"
+        );
+    }
+
+    #[test]
+    fn rule_apply_labeled_mail_left_to_classifier() {
+        let store = seed_db();
+        let conn = store.conn();
+        seed_rule(conn, "r-1", "R", 10, &sender_rule_json("utfpr.edu.br"), true);
+        let mid: u64 = conn
+            .query_row("SELECT id FROM messages WHERE uid = 1", [], |r| r.get(0))
+            .unwrap();
+        queries::upsert_label(conn, mid, "financas", None, 0.9, 0.6, false).unwrap();
+        let hits = evaluate_rules(conn, &cands(conn));
+        assert!(hits.iter().all(|h| h.message_id != mid));
+    }
+
+    #[test]
+    fn rule_apply_disabled_and_out_of_scope_never_fire() {
+        let store = seed_db();
+        let conn = store.conn();
+        seed_rule(conn, "r-off", "Off", 1, &sender_rule_json("utfpr.edu.br"), false);
+        queries::insert_rule(
+            conn,
+            &RuleRow {
+                id: "r-scope".to_string(),
+                name: "Scoped".to_string(),
+                priority: 2,
+                conditions_json: sender_rule_json("utfpr.edu.br"),
+                dest_kind: "folder".to_string(),
+                destination: "Arquivo".to_string(),
+                scope_json: r#"["Sent"]"#.to_string(),
+                enabled: true,
+            },
+        )
+        .unwrap();
+        let hits = evaluate_rules(conn, &cands(conn));
+        assert!(hits.is_empty(), "disabled/out-of-scope rules must never fire: {hits:?}");
+    }
+
+    #[test]
+    fn rule_apply_evaluation_emits_zero_imap_traffic() {
+        // Mirrors the Phase 18 secondary-labels assertion style: rule
+        // evaluation (match + suggestion persist) must leave BOTH durable
+        // outboxes empty — suggestions confirm later through the gated path.
+        let store = seed_db();
+        let conn = store.conn();
+        seed_rule(conn, "r-1", "R", 10, &sender_rule_json("utfpr.edu.br"), true);
+        let mb: i64 = conn
+            .query_row("SELECT id FROM mailboxes WHERE name = 'INBOX'", [], |r| r.get(0))
+            .unwrap();
+        let hits = evaluate_rules(conn, &cands(conn));
+        assert!(!hits.is_empty());
+        for h in &hits {
+            queries::upsert_rule_suggestion(
+                conn,
+                &RuleSuggestionRow {
+                    message_id: h.message_id,
+                    rule_id: h.rule_id.clone(),
+                    dest_kind: h.dest_kind.clone(),
+                    destination: h.destination.clone(),
+                },
+            )
+            .unwrap();
+        }
+        // Re-evaluation is idempotent (PK): no duplicate rows, still hits==2.
+        let hits2 = evaluate_rules(conn, &cands(conn));
+        assert!(hits2.is_empty(), "already-suggested mail must not re-hit");
+        assert_eq!(queries::imap_outbox_count(conn, mb as u64).unwrap(), 0);
+        assert_eq!(queries::outbox_count(conn, mb as u64).unwrap(), 0);
+    }
+
+    #[test]
+    fn rule_apply_plan_carries_uid_only_addressing() {
+        let store = seed_db();
+        let conn = store.conn();
+        seed_rule(conn, "r-1", "R", 10, &sender_rule_json("utfpr.edu.br"), true);
+        let hits = evaluate_rules(conn, &cands(conn));
+        assert!(!hits.is_empty());
+        let h = &hits[0];
+        queries::upsert_rule_suggestion(
+            conn,
+            &RuleSuggestionRow {
+                message_id: h.message_id,
+                rule_id: h.rule_id.clone(),
+                dest_kind: h.dest_kind.clone(),
+                destination: h.destination.clone(),
+            },
+        )
+        .unwrap();
+        let plan = plan_rule_filing(conn, h.message_id).unwrap();
+        assert_eq!(plan.mailbox, "INBOX");
+        assert!((1..=3).contains(&plan.uid), "uid-only addressing, got {}", plan.uid);
+        assert_eq!(plan.destination, "Arquivo");
+    }
 }
