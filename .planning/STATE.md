@@ -3,7 +3,7 @@ gsd_state_version: "1.0"
 milestone: v1.4
 milestone_name: SMTP Send + Search/Filters + Live Validation + Auto-Archive + Smart Folder Rules
 status: starting
-stopped_at: 22-01 SUMMARY written + verified (10/10 offline green, SKIP exit-2); 22-02 executing in background; 23 smart-discuss in background
+stopped_at: 23 planned (3 plans, 26b810d) + executing; 24 planned (2 plans, d542972) QUEUED behind 23-exec (shared store/queries.rs); 25 planning; 22-02 executing
 last_updated: "2026-10-13T14:18:40.048Z"
 state_head: 95082b99cf54cf70b1da3b7165f63a8526f320ff
 progress:
