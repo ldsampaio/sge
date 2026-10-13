@@ -284,9 +284,8 @@ impl SyncSession for FakeSession {
 
     fn mailbox_status(
         &mut self,
-        name: &str,
+        _name: &str,
     ) -> sge_lib::imap::PinBox<'_, Result<MailboxStatus, SyncError>> {
-        let name = name.to_string();
         Box::pin(async move {
             Ok(MailboxStatus {
                 uid_validity: 4242,
@@ -480,6 +479,132 @@ fn live_gate_21_offline_flush_shape_enqueue_to_sent() {
     }
     std::fs::remove_dir_all(&app_data).ok();
 }
+// ── No-duplicate + sent-unfiled shapes (D-07 — zero network) ─────────────
+// Double-enqueue of one Message-ID (via the draft anchor, the DRAFT-03
+// link) dedupes to one row + one .eml through the REAL prod path; a
+// server-side twin (two APPENDs, one Message-ID) is DETECTED by the
+// exactly-one assert (2 hits refuse); parked sent rows are never re-sent
+// (second flush: empty summary, zero new transport calls). The live legs
+// assert the same shapes against the real server.
+
+#[test]
+fn live_gate_21_double_enqueue_same_draft_dedupes_to_one_row() {
+    let store = Store::open_in_memory().unwrap();
+    let conn = store.conn();
+    let app_data = test_app_data("dedupe");
+    let mb = queries::ensure_mailbox(conn, "INBOX").unwrap();
+    let draft_id = "live21-safety-nondup";
+    let mid = sge_lib::drafts::new_message_id("live21-safety-nondup");
+    queries::upsert_draft(
+        conn,
+        draft_id,
+        mb,
+        &mid,
+        "SGE-TEST-safety-nondup",
+        "probe",
+        "me@example.com",
+        "",
+        "",
+    )
+    .unwrap();
+    let mk = || EnqueueInput {
+        from: "me@example.com".to_string(),
+        to: vec!["me@example.com".to_string()],
+        cc: vec![],
+        bcc: vec![],
+        subject: format!("{}safety-nondup", harness::SUBJECT_PREFIX),
+        body: "probe".to_string(),
+        draft_id: Some(draft_id.to_string()),
+    };
+    let first = send_queue::enqueue_send(conn, &app_data, mk()).unwrap();
+    assert!(!first.deduped);
+    assert_eq!(first.message_id, mid, "draft anchor reuses the draft Message-ID");
+    let second = send_queue::enqueue_send(conn, &app_data, mk()).unwrap();
+    assert!(second.deduped, "second enqueue of one Message-ID must dedupe");
+    assert_eq!(second.queue_id, first.queue_id);
+    assert_eq!(second.message_id, first.message_id);
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM send_queue WHERE message_id = ?1", [mid], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(n, 1, "one Message-ID → exactly one row");
+    let eml_count = std::fs::read_dir(app_data.join("outbox")).map(|rd| rd.count()).unwrap_or(0);
+    assert_eq!(eml_count, 1, "one Message-ID → exactly one .eml");
+    std::fs::remove_dir_all(&app_data).ok();
+}
+
+#[test]
+fn live_gate_21_server_side_twin_is_detected_not_collapsed() {
+    // A server holding TWO copies of one Message-ID (the duplicate-delivery
+    // failure) must FAIL the exactly-one assert — the harness never
+    // "collapses" twins, it refuses them.
+    let mut session = FakeSession::with_mailbox("INBOX");
+    let mid = "<live21-twin@sge.local>".to_string();
+    let bytes = format!("Message-ID: {mid}\r\nSubject: {0}twin\r\n\r\nb", harness::SUBJECT_PREFIX).into_bytes();
+    block_on(session.append_message("INBOX", "\\Seen", &bytes)).unwrap();
+    block_on(session.append_message("INBOX", "\\Seen", &bytes)).unwrap();
+    let hits = block_on(session.uid_search_header("Message-ID", &mid)).unwrap();
+    assert_eq!(hits.len(), 2);
+    assert!(
+        harness::assert_exactly_one(&hits, "no-duplicate").is_err(),
+        "twin delivery must refuse, never collapse"
+    );
+}
+
+#[test]
+fn live_gate_21_sent_unfiled_shape_never_resends() {
+    use sge_lib::send_queue::SendGate;
+    use sge_lib::sync::worker::{FlushSummary, SendFlushEnv};
+
+    // Gate-closed APPEND fails (the offline analogue of the APPEND-failure
+    // half of SentUnfiled) with zero transport involvement.
+    let mut inner = FakeSession::with_mailbox("Sent");
+    let flag = Arc::new(AtomicBool::new(true));
+    let mut gate = harness::GateSession::new(&mut inner, flag.clone());
+    gate.set_closed(true);
+    assert!(block_on(gate.append_message("Sent", "\\Seen", b"bytes")).is_err());
+
+    // Parked sent rows are never re-sent: first flush sends once, second
+    // flush is empty with zero new transport calls.
+    let store = Arc::new(std::sync::Mutex::new(Store::open_in_memory().unwrap()));
+    let app_data = test_app_data("unfiled-shape");
+    {
+        let guard = store.lock().unwrap();
+        send_queue::enqueue_send(guard.conn(), &app_data, self_input("unfiled")).unwrap();
+    }
+    let (transport, calls) = harness::CountingTransport::offline();
+    let transport: Arc<dyn SmtpTransport> = Arc::new(transport);
+    let worker = SyncWorker::new(store.clone());
+    let env = SendFlushEnv {
+        gate: SendGate::default(),
+        transport,
+        account: SmtpAccount {
+            host: "smtp.example".to_string(),
+            port: 587,
+            username: "u".to_string(),
+            password: "p".to_string(),
+        },
+        manager: None,
+        sent_wire: None,
+    };
+    let first = block_on(worker.flush_send_queue(&env));
+    assert_eq!(first.sent, 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let second = block_on(worker.flush_send_queue(&env));
+    assert_eq!(second, FlushSummary::default(), "parked rows must never be due");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "no second send_raw after park");
+    // A-07 observability gap, pinned (RESEARCH Pitfall 5): the snapshot
+    // hard-codes sent_unfiled 0 — A-07 asserts via flush outcomes +
+    // call counts, never via this field.
+    {
+        let guard = store.lock().unwrap();
+        let snap = send_queue::send_status_snapshot(guard.conn()).unwrap();
+        assert_eq!(snap.sent_unfiled, 0, "gap pin: snapshot hard-codes 0");
+    }
+    std::fs::remove_dir_all(&app_data).ok();
+}
+
 // ── D-12 doubles (explicit, offline only — never attempted live) ───────────
 // (a) oversize input over the 25 MB cap rejected before any transport call
 // (zero send_raw calls); (b) envelope log of a self-send contains no Bcc:

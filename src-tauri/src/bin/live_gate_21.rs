@@ -36,10 +36,11 @@ use sge_lib::imap::{
     normalize_host, AccountConfig, MailboxInfo, MailboxStatus, MailboxSummary, PinBox,
     SecurityMode, SyncError, SyncSession,
 };
+use sge_lib::drafts::new_message_id;
 use sge_lib::send_queue::{self, EnqueueInput, SendGate};
 use sge_lib::smtp::{SmtpAccount, SmtpOutcome, SmtpTransport, SmtpTransporter};
 use sge_lib::store::{queries, Store};
-use sge_lib::sync::worker::{resolve_sent_wire, SendFlushEnv, SyncWorker};
+use sge_lib::sync::worker::{resolve_sent_wire, FlushSummary, SendFlushEnv, SyncWorker};
 
 /// Sandbox folder prefix (D-03, mirrored from Phase 22). Every harness-issued
 /// mutating call asserts it in code; Phase 21 creates no sandbox folder (the
@@ -422,6 +423,35 @@ impl SmtpTransport for CountingTransport {
     }
 }
 
+/// Shared-counter SMTP decorator: forwards to the inner transport while
+/// counting into a caller-owned counter that outlives one flush pass. The
+/// never-resend proof (D-07) spans legs — one counter across the arrival,
+/// no-duplicate and sent-unfiled flushes — so per-env counters would hide a
+/// second `send_raw`.
+pub struct SharedCountingTransport {
+    inner: Arc<dyn SmtpTransport>,
+    calls: Arc<AtomicUsize>,
+}
+
+impl SharedCountingTransport {
+    pub fn new(inner: Arc<dyn SmtpTransport>, calls: Arc<AtomicUsize>) -> Self {
+        Self { inner, calls }
+    }
+}
+
+impl SmtpTransport for SharedCountingTransport {
+    fn send_raw(
+        &self,
+        account: &SmtpAccount,
+        envelope_from: &str,
+        envelope_to: &[String],
+        bytes: &[u8],
+    ) -> SmtpOutcome {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.send_raw(account, envelope_from, envelope_to, bytes)
+    }
+}
+
 // ── Config (env-only, D-04/D-13) ──────────────────────────────────────────
 
 struct LiveConfig {
@@ -631,6 +661,30 @@ fn step(n: usize, name: &str, ok: bool, detail: &str) -> bool {
     ok
 }
 
+/// Expunge one tracked UID through its own folder wire (T-21-05: tracked
+/// UIDs only, never bare expunge), retry 3x with backoff, then give up to
+/// manual steps — never blind infinite retry.
+async fn expunge_tracked(mgr: &SessionManager, wire: &str, uid: u32, mid: &str) -> bool {
+    for (attempt, secs) in CLEANUP_BACKOFF_SECS.iter().enumerate() {
+        match mgr.discard_server_copy_in(wire, uid, None).await {
+            Ok(()) => return true,
+            Err(e) => {
+                eprintln!(
+                    "[live-gate] cleanup expunge {} uid {} ({}) attempt {} failed ({}) — backoff {}s",
+                    wire,
+                    uid,
+                    mid,
+                    attempt + 1,
+                    e,
+                    secs
+                );
+                std::thread::sleep(std::time::Duration::from_secs(*secs));
+            }
+        }
+    }
+    false
+}
+
 fn manual_cleanup_steps(mids: &[String]) -> String {
     format!(
         "MANUAL-CLEANUP test message-ids {mids:?}: webmail → INBOX + Sent → \
@@ -649,6 +703,10 @@ struct TrackedMail {
     inbox_uids: Vec<(String, u32)>,
     sent_uids: Vec<(String, u32)>,
     unfiled: Vec<String>,
+    /// Sent folder wire, set at preflight — cleanup expunges Sent UIDs via
+    /// this wire (UIDs are per-folder; INBOX expunge of a Sent UID would
+    /// delete the WRONG mail — T-21-05).
+    sent_wire: Option<String>,
 }
 
 // ── Run ──────────────────────────────────────────────────────────────────
@@ -699,6 +757,7 @@ async fn run() -> i32 {
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
     };
+    tracked.sent_wire = Some(sent_wire.clone());
     let inbox_validity = match current_validity(&manager, "INBOX").await {
         Ok(v) => v,
         Err(e) => {
@@ -809,8 +868,12 @@ async fn run() -> i32 {
     // decorator (never a second SMTP client — RESEARCH Pitfall 1), manager
     // leases for the filing leg.
     let worker = SyncWorker::new(store.clone());
-    let (counting, send_calls) = CountingTransport::live(Arc::new(SmtpTransporter::new()));
-    let transport: Arc<dyn SmtpTransport> = Arc::new(counting);
+    // Run-wide shared call counter (D-07 never-resend proof spans legs).
+    let send_calls = Arc::new(AtomicUsize::new(0));
+    let transport: Arc<dyn SmtpTransport> = Arc::new(SharedCountingTransport::new(
+        Arc::new(SmtpTransporter::new()),
+        send_calls.clone(),
+    ));
     let flush_env = SendFlushEnv {
         gate: SendGate::default(),
         transport,
@@ -992,7 +1055,323 @@ async fn run() -> i32 {
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
 
-    // 5. no-duplicate + 6. sent-unfiled (Task 3) plug in here.
+    // 5. no-duplicate (D-07) — double-enqueue the same Message-ID (via a
+    // seeded draft anchor, the DRAFT-03 link), flush, assert single delivery:
+    // exactly 1 INBOX UID for the Message-ID.
+    let nondup_mid = {
+        let guard = store.lock().unwrap();
+        let mb = match queries::ensure_mailbox(guard.conn(), "INBOX") {
+            Ok(id) => id,
+            Err(e) => {
+                step(5, "no-duplicate", false, &format!("temp mailbox seed failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        };
+        let draft_id = format!("live21-{}-nondup", tag);
+        let mid = new_message_id(&format!("live21-{}-nondup", tag));
+        if let Err(e) = queries::upsert_draft(
+            guard.conn(),
+            &draft_id,
+            mb,
+            &mid,
+            &format!("{}{}-nondup", SUBJECT_PREFIX, tag),
+            "live gate no-duplicate probe",
+            &cfg.self_addr,
+            "",
+            "",
+        ) {
+            step(5, "no-duplicate", false, &format!("temp draft seed failed: {}", e));
+            return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+        }
+        let mk_input = |did: Option<String>| EnqueueInput {
+            from: cfg.self_addr.clone(),
+            to: vec![cfg.self_addr.clone()],
+            cc: vec![],
+            bcc: vec![],
+            subject: format!("{}{}-nondup", SUBJECT_PREFIX, tag),
+            body: "live gate no-duplicate probe".to_string(),
+            draft_id: did,
+        };
+        let first = match send_queue::enqueue_send(guard.conn(), &app_data, mk_input(Some(draft_id.clone()))) {
+            Ok(o) => o,
+            Err(e) => {
+                step(5, "no-duplicate", false, &format!("first enqueue failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        };
+        // Recipient guard re-checked on the resolved second envelope too.
+        if let Err(e) = assert_self_only(&cfg.self_addr, &[cfg.self_addr.clone()], &[], &[], &cfg.self_addr) {
+            step(5, "no-duplicate", false, &e);
+            return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+        }
+        let second = match send_queue::enqueue_send(guard.conn(), &app_data, mk_input(Some(draft_id))) {
+            Ok(o) => o,
+            Err(e) => {
+                step(5, "no-duplicate", false, &format!("second enqueue failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        };
+        if !(second.deduped && second.queue_id == first.queue_id && second.message_id == first.message_id) {
+            step(
+                5,
+                "no-duplicate",
+                false,
+                &format!(
+                    "dedupe failed: second enqueue deduped={} queue_id={} (want {} + deduped)",
+                    second.deduped, second.queue_id, first.queue_id
+                ),
+            );
+            return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+        }
+        // One row, one .eml for the double-enqueued Message-ID.
+        let row_count: i64 = guard
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM send_queue WHERE message_id = ?1",
+                rusqlite::params![first.message_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(-1);
+        if row_count != 1 {
+            step(5, "no-duplicate", false, &format!("{} rows for one Message-ID (want 1)", row_count));
+            return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+        }
+        mid
+    };
+    let calls_before_nondup = send_calls.load(Ordering::SeqCst);
+    eprintln!("[live-gate] {} (no-duplicate leg)", envelope_log_line(&cfg.self_addr, &[cfg.self_addr.clone()]));
+    let nondup_summary = worker.flush_send_queue(&flush_env).await;
+    eprintln!(
+        "[live-gate] no-duplicate flush done: sent={} deferred={} failed={} uncertain={} unfiled={} transport_calls={}",
+        nondup_summary.sent,
+        nondup_summary.deferred,
+        nondup_summary.failed,
+        nondup_summary.uncertain,
+        nondup_summary.sent_unfiled,
+        send_calls.load(Ordering::SeqCst)
+    );
+    if nondup_summary.sent != 1 {
+        step(
+            5,
+            "no-duplicate",
+            false,
+            &format!("flush sent={} (want 1 for the deduped row)", nondup_summary.sent),
+        );
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    // Single delivery: exactly 1 INBOX UID for the double-enqueued ID.
+    let nondup_uid = match manager.lease_for("INBOX").await {
+        Ok(mut lease) => match lease.session().uid_search_header("Message-ID", &nondup_mid).await {
+            Ok(hits) => match assert_exactly_one(&hits, "no-duplicate arrival") {
+                Ok(u) => u,
+                Err(e) => {
+                    step(5, "no-duplicate", false, &e);
+                    return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+                }
+            },
+            Err(e) => {
+                step(5, "no-duplicate", false, &format!("INBOX SEARCH failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        },
+        Err(e) => {
+            step(5, "no-duplicate", false, &format!("INBOX lease failed: {}", e));
+            return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+        }
+    };
+    // ...and exactly 1 filed Sent copy.
+    let nondup_sent_uid = match manager.lease_for(&sent_wire).await {
+        Ok(mut lease) => match lease.session().uid_search_header("Message-ID", &nondup_mid).await {
+            Ok(hits) => match assert_exactly_one(&hits, "no-duplicate sent-copy") {
+                Ok(u) => u,
+                Err(e) => {
+                    step(5, "no-duplicate", false, &e);
+                    return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+                }
+            },
+            Err(e) => {
+                step(5, "no-duplicate", false, &format!("Sent SEARCH failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        },
+        Err(e) => {
+            step(5, "no-duplicate", false, &format!("Sent lease failed: {}", e));
+            return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+        }
+    };
+    tracked.message_ids.push(nondup_mid.clone());
+    tracked.inbox_uids.push((nondup_mid.clone(), nondup_uid));
+    tracked.sent_uids.push((nondup_mid.clone(), nondup_sent_uid));
+    if !step(
+        5,
+        "no-duplicate",
+        true,
+        &format!(
+            "double-enqueue deduped, 1 INBOX UID + 1 Sent UID (transport_calls {} -> {})",
+            calls_before_nondup,
+            send_calls.load(Ordering::SeqCst)
+        ),
+    ) {
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    if !check_list_stable(&manager, &before, &list_guard, 5, "no-duplicate-list").await {
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+
+    // 6. sent-unfiled (D-07) — SMTP succeeds but the Sent APPEND cannot land:
+    // drive the production APPEND-failure path with an unresolvable Sent
+    // wire (lease fails → SentUnfiled, APPEND-only retry, never re-SMTP-send
+    // per worker.rs filing leg). Assert the outcome + exactly one transport
+    // call + row parked sent (never failed); a second flush must add zero
+    // transport calls (reconcile-not-resend encoded as call-count assert).
+    let unfiled_mid = {
+        let guard = store.lock().unwrap();
+        match send_queue::enqueue_send(
+            guard.conn(),
+            &app_data,
+            EnqueueInput {
+                from: cfg.self_addr.clone(),
+                to: vec![cfg.self_addr.clone()],
+                cc: vec![],
+                bcc: vec![],
+                subject: format!("{}{}-unfiled", SUBJECT_PREFIX, tag),
+                body: "live gate sent-unfiled probe".to_string(),
+                draft_id: None,
+            },
+        ) {
+            Ok(out) => out.message_id,
+            Err(e) => {
+                step(6, "sent-unfiled", false, &format!("enqueue_send failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        }
+    };
+    let bogus_sent_wire = format!("SGE-NoSuchFolder-{}", tag);
+    // Shared run-wide call counter: the never-resend proof spans legs.
+    let unfiled_transport: Arc<dyn SmtpTransport> = Arc::new(SharedCountingTransport::new(
+        Arc::new(SmtpTransporter::new()),
+        send_calls.clone(),
+    ));
+    let unfiled_env = SendFlushEnv {
+        gate: SendGate::default(),
+        transport: unfiled_transport,
+        account: smtp_account(&cfg),
+        manager: Some(manager.clone()),
+        sent_wire: Some(bogus_sent_wire.clone()),
+    };
+    let calls_before_unfiled = send_calls.load(Ordering::SeqCst);
+    eprintln!(
+        "[live-gate] {} (sent-unfiled leg, sent_wire={})",
+        envelope_log_line(&cfg.self_addr, &[cfg.self_addr.clone()]),
+        bogus_sent_wire
+    );
+    let unfiled_summary = worker.flush_send_queue(&unfiled_env).await;
+    let calls_after_unfiled = send_calls.load(Ordering::SeqCst);
+    eprintln!(
+        "[live-gate] sent-unfiled flush done: sent={} unfiled={} failed={} uncertain={} transport_calls={}",
+        unfiled_summary.sent,
+        unfiled_summary.sent_unfiled,
+        unfiled_summary.failed,
+        unfiled_summary.uncertain,
+        calls_after_unfiled
+    );
+    if unfiled_summary.sent_unfiled != 1 {
+        step(
+            6,
+            "sent-unfiled",
+            false,
+            &format!("flush sent_unfiled={} (want 1 via bogus Sent wire)", unfiled_summary.sent_unfiled),
+        );
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    if calls_after_unfiled != calls_before_unfiled + 1 {
+        step(
+            6,
+            "sent-unfiled",
+            false,
+            &format!("transport calls {} -> {} (want exactly +1 SMTP send)", calls_before_unfiled, calls_after_unfiled),
+        );
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    // Row parked sent (never failed).
+    let parked_sent = {
+        let guard = store.lock().unwrap();
+        match queries::get_send_row_by_message_id(guard.conn(), &unfiled_mid) {
+            Ok(Some(row)) => row.state == queries::SEND_STATE_SENT,
+            _ => false,
+        }
+    };
+    if !parked_sent {
+        step(6, "sent-unfiled", false, "row not parked sent after SentUnfiled");
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    // Never-resend: a second flush adds zero transport calls (parked sent
+    // rows are not due — reconcile-not-resend, no second send_raw).
+    let reflush_summary = worker.flush_send_queue(&unfiled_env).await;
+    let calls_after_reflush = send_calls.load(Ordering::SeqCst);
+    if reflush_summary != FlushSummary::default() {
+        step(
+            6,
+            "sent-unfiled",
+            false,
+            &format!(
+                "re-flush summary not empty ({:?}) — parked rows must never be due",
+                reflush_summary
+            ),
+        );
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    if calls_after_reflush != calls_after_unfiled {
+        step(
+            6,
+            "sent-unfiled",
+            false,
+            &format!("re-flush re-sent (calls {} -> {}) — SentUnfiled must never re-SMTP-send", calls_after_unfiled, calls_after_reflush),
+        );
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    // The mail WAS delivered (SMTP succeeded) — track the INBOX arrival for
+    // cleanup. Sent side: 0 (no autosave) or 1 (server autosaved) — the
+    // autosave probe (step 7) reports which.
+    let unfiled_inbox_uid = match manager.lease_for("INBOX").await {
+        Ok(mut lease) => match lease.session().uid_search_header("Message-ID", &unfiled_mid).await {
+            Ok(hits) => match assert_exactly_one(&hits, "sent-unfiled arrival") {
+                Ok(u) => u,
+                Err(e) => {
+                    step(6, "sent-unfiled", false, &e);
+                    return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+                }
+            },
+            Err(e) => {
+                step(6, "sent-unfiled", false, &format!("INBOX SEARCH failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        },
+        Err(e) => {
+            step(6, "sent-unfiled", false, &format!("INBOX lease failed: {}", e));
+            return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+        }
+    };
+    tracked.message_ids.push(unfiled_mid.clone());
+    tracked.inbox_uids.push((unfiled_mid.clone(), unfiled_inbox_uid));
+    tracked.unfiled.push(unfiled_mid.clone());
+    // A-07 observability gap (RESEARCH Pitfall 5, plan-recorded):
+    // send_status_snapshot().sent_unfiled hard-codes 0 — A-07 is asserted
+    // via FlushOutcome::SentUnfiled counts + transport call counts, never via
+    // the snapshot field.
+    if !step(
+        6,
+        "sent-unfiled",
+        true,
+        &format!(
+            "SentUnfiled outcome, 1 SMTP send, row parked sent, re-flush +0 calls (A-07 via outcomes+call-counts; snapshot.sent_unfiled hard-codes 0 — recorded gap)"
+        ),
+    ) {
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    if !check_list_stable(&manager, &before, &list_guard, 6, "sent-unfiled-list").await {
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
 
     // 7. autosave-probe (D-08): the end state must be exactly 1 Sent UID
     // either way — explicit APPEND or server auto-save deduped by the filing
@@ -1048,27 +1427,16 @@ async fn cleanup(
     tracked: &TrackedMail,
 ) -> i32 {
     let mut ok = true;
-    for (mid, uid) in tracked.inbox_uids.iter().chain(tracked.sent_uids.iter()) {
-        let mut deleted = false;
-        for (attempt, secs) in CLEANUP_BACKOFF_SECS.iter().enumerate() {
-            match mgr.discard_server_copy_in("INBOX", *uid, None).await {
-                Ok(()) => {
-                    deleted = true;
-                    break;
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[live-gate] cleanup expunge uid {uid} ({mid}) attempt {} failed ({e}) — backoff {secs}s",
-                        attempt + 1
-                    );
-                    std::thread::sleep(std::time::Duration::from_secs(*secs));
-                }
-            }
+    // INBOX arrivals expunged via INBOX, Sent copies via the Sent wire —
+    // UIDs are per-folder (T-21-05).
+    for (mid, uid) in tracked.inbox_uids.iter() {
+        if !expunge_tracked(mgr, "INBOX", *uid, mid).await {
+            ok = false;
         }
-        if !deleted {
-            // One folder may be wrong (Sent UIDs expunged via INBOX lease
-            // fail) — retry through the Sent wire before giving up.
-            eprintln!("[live-gate] cleanup uid {uid} ({mid}) not removed via INBOX path");
+    }
+    let sent_folder = tracked.sent_wire.clone().unwrap_or_else(|| "INBOX".to_string());
+    for (mid, uid) in tracked.sent_uids.iter() {
+        if !expunge_tracked(mgr, &sent_folder, *uid, mid).await {
             ok = false;
         }
     }
