@@ -23,6 +23,10 @@ name = "sync_demo"
 path = "src/bin/sync_demo.rs"
 
 [[bin]]
+name = "live_gate_26"
+path = "src/bin/live_gate_26.rs"
+
+[[bin]]
 name = "live_gate_22"
 path = "src/bin/live_gate_22.rs"
 
