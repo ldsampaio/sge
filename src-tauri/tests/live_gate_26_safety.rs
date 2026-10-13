@@ -969,3 +969,76 @@ pub mod live_gate_26_batch {
         let _ = std::fs::remove_file(&db);
     }
 }
+
+/// 12/13 citation-row shapes (Task 2): re-run vs cite branching, SKIP-row
+/// emission with reason + resume pointer, and the no-duplication contract
+/// (the bundle cites the locked 21/22 runners — it holds no draft-send or
+/// SMTP-send implementation of its own).
+pub mod live_gate_26_cite {
+    use super::*;
+
+    #[test]
+    fn cite_evidence_found_branch_shape() {
+        // Prior-run log carries the locked runner's REPORT line → PASS cite
+        // row naming the source (binary STEP id / REPORT path + line).
+        let log = "STEP 1/13 preflight: PASS x\nSTEP 5/13 one-copy: PASS exactly-one-copy uid=7\nREPORT steps=13\n";
+        let line = harness::citation_evidence(log, harness::CITE_DRAFT_MARKER);
+        assert_eq!(
+            line,
+            Some("STEP 5/13 one-copy: PASS exactly-one-copy uid=7".to_string())
+        );
+        let row = format!("REPORT gate=cite-draft-onecopy verdict=PASS evidence=cite=/tmp/prior22.log line={}", line.unwrap());
+        assert!(row.contains("cite=") && row.contains("one-copy: PASS"));
+    }
+
+    #[test]
+    fn cite_evidence_absent_branch_emits_reasoned_skip() {
+        // No prior run (normal case: 21/22 live pending creds) → SKIP row
+        // with concrete reason + resume pointer, never a bare deferred.
+        let reason = "no prior-run log at $SGE_LIVE22_LOG (locked 21/22 live run still pending creds)";
+        let row = format!(
+            "REPORT gate=cite-draft-onecopy verdict=SKIP evidence={}",
+            harness::deferral_evidence(reason, "scripts/live-22.sh")
+        );
+        assert!(row.contains("verdict=SKIP"));
+        let evidence = row.split_once("evidence=").unwrap().1;
+        assert!(harness::is_reasoned_deferral(evidence));
+        // A marker that never passed there is a concrete reason too.
+        let reason2 = "prior log /tmp/x.log lacks \"one-copy: PASS\" (that leg never passed there)";
+        assert!(harness::is_reasoned_deferral(&harness::deferral_evidence(
+            reason2,
+            "scripts/live-22.sh"
+        )));
+    }
+
+    #[test]
+    fn cite_markers_name_locked_runners() {
+        // The citation contract: three distinct, non-empty markers naming
+        // the locked 21/22 STEP/REPORT ids (binary plus STEP id, or REPORT
+        // path plus line) — the bundle re-runs nothing.
+        for marker in [
+            harness::CITE_DRAFT_MARKER,
+            harness::CITE_SEND_MARKER,
+            harness::CITE_SEEN_MARKER,
+        ] {
+            assert!(!marker.trim().is_empty());
+        }
+        assert_ne!(harness::CITE_DRAFT_MARKER, harness::CITE_SEEN_MARKER);
+        assert!(harness::CITE_SEND_MARKER.contains("REPORT draft-send binary verdict"));
+        // Empty markers never match (no vacuous PASS cites).
+        assert_eq!(harness::citation_evidence("one-copy: PASS", ""), None);
+    }
+
+    #[test]
+    fn cite_skip_rows_refuse_bare_deferral() {
+        // D-47 enforcement shape: the wrapper + REPORT accept a SKIP row
+        // only with reason and resume pointer both present and non-empty.
+        assert!(!harness::is_reasoned_deferral("reason= resume=scripts/live-21.sh"));
+        assert!(!harness::is_reasoned_deferral("reason=locked run pending resume="));
+        assert!(!harness::is_reasoned_deferral("resume=scripts/live-21.sh reason="));
+        assert!(harness::is_reasoned_deferral(&harness::deferral_evidence(
+            "smtp would duplicate sends (T-26-10)",
+            "scripts/live-21.sh"
+        )));
+    }
+}

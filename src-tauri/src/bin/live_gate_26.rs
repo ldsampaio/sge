@@ -52,7 +52,7 @@ pub const SUBJECT_PREFIX: &str = "SGE-TEST-";
 
 /// Step count for the full live run (gates 6/7/8 + audit + v1.3 legs +
 /// 12/13 citation rows + cleanup).
-pub const TOTAL_STEPS: usize = 12;
+pub const TOTAL_STEPS: usize = 15;
 
 /// Cleanup discipline (D-37): 3 retries with backoff, then exact manual
 /// steps — never an unbounded destructive loop.
@@ -263,6 +263,67 @@ pub fn assert_folder_delete_allowed(wire: &str, messages: u32) -> Result<(), Str
         ));
     }
     Ok(())
+}
+
+/// Prior-run log pointers for the 12/13 citation STEPs (D-30): when the
+/// human has already run live-21/live-22, these env vars point at the
+/// captured /tmp logs and the bundle cites their REPORT lines instead of
+/// re-implementing (or duplicate-sending) the 21/22 legs. Unset — the
+/// normal case until the human runs them — yields reasoned SKIP deferral
+/// rows with resume pointers, never silent drops.
+pub const CITE_ENV_21: &str = "SGE_LIVE21_LOG";
+pub const CITE_ENV_22: &str = "SGE_LIVE22_LOG";
+
+/// REPORT markers the citation STEPs grep for in the prior logs:
+/// live_gate_22 STEP 5 (draft one-copy save), the live_gate_21 draft-send
+/// binary verdict (SMTP 587 send), live_gate_22 STEP 11 (Seen both ways).
+pub const CITE_DRAFT_MARKER: &str = "one-copy: PASS";
+pub const CITE_SEND_MARKER: &str = "REPORT draft-send binary verdict: PASS";
+pub const CITE_SEEN_MARKER: &str = "seen-both-ways: PASS";
+
+/// First prior-log line containing `marker` (the cited REPORT evidence),
+/// trimmed to 160 chars (STEP lines carry UIDs/counts, never secrets —
+/// the secret scan gates both the 21/22 wrappers and this one). `None`
+/// when the leg never passed there; empty markers never match.
+pub fn citation_evidence(log_text: &str, marker: &str) -> Option<String> {
+    if marker.trim().is_empty() {
+        return None;
+    }
+    log_text.lines().find(|l| l.contains(marker)).map(|l| {
+        let t = l.trim();
+        if t.len() > 160 {
+            t[..160].to_string()
+        } else {
+            t.to_string()
+        }
+    })
+}
+
+/// Reasoned deferral evidence (D-47): `reason=<concrete> resume=<pointer>`.
+/// A bare "deferred" with no reason is a FAIL, not a deferral — enforced
+/// by [`is_reasoned_deferral`], unit-tested below and doubled offline.
+pub fn deferral_evidence(reason: &str, resume: &str) -> String {
+    format!("reason={reason} resume={resume}")
+}
+
+/// True only when both deferral halves are present, in canonical order,
+/// and non-empty. Rejects bare `deferred`, either half missing, either
+/// half blank.
+pub fn is_reasoned_deferral(evidence: &str) -> bool {
+    let rpos = match evidence.find("reason=") {
+        Some(p) => p,
+        None => return false,
+    };
+    let spos = match evidence.find("resume=") {
+        Some(p) => p,
+        None => return false,
+    };
+    if spos < rpos {
+        return false;
+    }
+    let reason = evidence[rpos + "reason=".len()..spos].trim();
+    let resume = evidence[spos + "resume=".len()..].trim();
+    !reason.is_empty() && !resume.is_empty()
 }
 
 /// SQLite dump writer: renders every user table of the run's temp Store as
@@ -681,6 +742,13 @@ fn step(n: usize, name: &str, ok: bool, detail: &str) -> bool {
         if ok { "PASS" } else { "FAIL" }
     );
     ok
+}
+
+/// SKIP verdict line for reasoned deferrals (D-47): the gate ran far
+/// enough to know WHY it cannot pass yet. Always paired with a
+/// `verdict=SKIP` REPORT row carrying `reason=` + `resume=`.
+fn step_skip(n: usize, name: &str, detail: &str) {
+    println!("STEP {n}/{TOTAL_STEPS} {name}: SKIP {detail}");
 }
 
 /// Mandatory per-leg REPORT row (D-46): gate, verdict, evidence pointer. A
@@ -1125,6 +1193,49 @@ async fn live_reconnect_recovery(
         uids_before.len(),
         uids_after.len()
     ))
+}
+
+/// Outcome of a 12/13 citation STEP: a PASS cite (prior REPORT line
+/// found) or a reasoned SKIP deferral (reason + resume pointer).
+pub enum CiteOutcome {
+    Pass(String),
+    Skip(String, String),
+}
+
+/// One 12/13-derived citation STEP (D-30, T-26-10): cite the locked 21/22
+/// runner's REPORT line from a prior-run log when the human points at one
+/// via `SGE_LIVE21_LOG`/`SGE_LIVE22_LOG`, else a reasoned SKIP deferral —
+/// never a re-implementation (duplicating the leg risks divergence from
+/// the locked STEP semantics) and never a duplicate send (SMTP re-runs
+/// would mail the user twice for one validation).
+async fn live_cite_prior(
+    _gate: &str,
+    marker: &str,
+    log_env: &str,
+    resume_cmd: &str,
+) -> CiteOutcome {
+    let path = std::env::var(log_env)
+        .map(|v| v.trim().to_string())
+        .unwrap_or_default();
+    if path.is_empty() {
+        return CiteOutcome::Skip(
+            format!("no prior-run log at ${log_env} (locked 21/22 live run still pending creds)"),
+            resume_cmd.to_string(),
+        );
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(text) => match citation_evidence(&text, marker) {
+            Some(line) => CiteOutcome::Pass(format!("cite={path} line={line}")),
+            None => CiteOutcome::Skip(
+                format!("prior log {path} lacks {marker:?} (that leg never passed there)"),
+                resume_cmd.to_string(),
+            ),
+        },
+        Err(e) => CiteOutcome::Skip(
+            format!("prior-run log {path} unreadable: {e}"),
+            resume_cmd.to_string(),
+        ),
+    }
 }
 
 /// STEP 9, v1.3 confirm→MOVE→undo (T-26-07): seed a classified suggestion
@@ -2052,7 +2163,34 @@ async fn run() -> i32 {
         }
     }
 
-    // 12. cleanup — ALWAYS runs: SQLite dump for the secret scan, in-bin
+    // 12-14. 12/13-derived citation rows (D-30, T-26-10): cite the locked
+    // 21/22 runners, never re-implement, never duplicate-send. SKIP (not
+    // FAIL) while the 21/22 live runs are still pending — always with a
+    // reason + resume pointer, never a silent drop.
+    for (n, gate, marker, log_env, resume) in [
+        (12, "cite-draft-onecopy", CITE_DRAFT_MARKER, CITE_ENV_22, "scripts/live-22.sh"),
+        (13, "cite-smtp-send", CITE_SEND_MARKER, CITE_ENV_21, "scripts/live-21.sh"),
+        (14, "cite-seen-22", CITE_SEEN_MARKER, CITE_ENV_22, "scripts/live-22.sh"),
+    ] {
+        if let Err(e) = guard_list_clean(&manager, &before, &sandbox, &extras_str(&extras)).await {
+            step(n, gate, false, &e);
+            report(gate, "FAIL", &e);
+            return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
+        }
+        match live_cite_prior(gate, marker, log_env, resume).await {
+            CiteOutcome::Pass(detail) => {
+                step(n, gate, true, &detail);
+                report(gate, "PASS", &detail);
+            }
+            CiteOutcome::Skip(reason, resume_ptr) => {
+                let evidence = deferral_evidence(&reason, &resume_ptr);
+                step_skip(n, gate, &reason);
+                report(gate, "SKIP", &evidence);
+            }
+        }
+    }
+
+    // 15. cleanup — ALWAYS runs: SQLite dump for the secret scan, in-bin
     // dump scan (SCAN-DB line), expunge leftovers (sandbox + extras),
     // DELETE the sandbox + extras with backoff (D-37), re-LIST must equal
     // the pre-run snapshot.
@@ -2239,7 +2377,7 @@ async fn cleanup(
     code
 }
 
-const USAGE: &str = r#"live_gate_26 — Phase 26 sandboxed live gate (STEP 1-12, gates 6/7/8 + v1.3 legs + cleanup)
+const USAGE: &str = r#"live_gate_26 — Phase 26 sandboxed live gate (STEP 1-15, gates 6/7/8 + v1.3 legs + 12/13 citations + cleanup)
 
 USAGE:
     live_gate_26 [--seed-only]
@@ -2430,5 +2568,32 @@ mod live_gate_26_preflight_tests {
         assert!(assert_folder_delete_allowed("SGE-Test-1-Renamed", 1).is_err());
         // Emptied sandbox folder proceeds.
         assert!(assert_folder_delete_allowed("SGE-Test-1-Renamed", 0).is_ok());
+    }
+
+    #[test]
+    fn live_gate_26_citation_finds_marker_line() {
+        let log = "noise\nSTEP 5/13 one-copy: PASS exactly-one-copy uid=42\ntail\n";
+        assert_eq!(
+            citation_evidence(log, "one-copy: PASS"),
+            Some("STEP 5/13 one-copy: PASS exactly-one-copy uid=42".to_string())
+        );
+        assert_eq!(citation_evidence(log, "smtp: PASS"), None);
+        assert_eq!(citation_evidence(log, "   "), None);
+        assert_eq!(citation_evidence("", "one-copy: PASS"), None);
+    }
+
+    #[test]
+    fn live_gate_26_deferral_rows_carry_reason_and_pointer() {
+        let ev = deferral_evidence(
+            "no prior-run log (21 live pending creds)",
+            "scripts/live-21.sh",
+        );
+        assert!(is_reasoned_deferral(&ev));
+        // Bare or half-filled deferrals are FAILs, not deferrals (D-47).
+        assert!(!is_reasoned_deferral("reason= resume=scripts/live-21.sh"));
+        assert!(!is_reasoned_deferral("reason=no creds resume="));
+        assert!(!is_reasoned_deferral("reason=no creds"));
+        assert!(!is_reasoned_deferral("deferred"));
+        assert!(!is_reasoned_deferral(""));
     }
 }
