@@ -230,10 +230,25 @@ impl SyncSession for FakeSession {
 
     fn uid_move_to(
         &mut self,
-        _uid_set: &str,
-        _dest: &str,
+        uid_set: &str,
+        dest: &str,
     ) -> sge_lib::imap::PinBox<'_, Result<(), SyncError>> {
-        Box::pin(async move { Ok(()) })
+        let (uid_set, dest) = (uid_set.to_string(), dest.to_string());
+        Box::pin(async move {
+            // Model UID MOVE: retarget the mailbox tag, keep the UID (the
+            // double proves homing shapes, not server UID assignment).
+            if !self.mailboxes.contains(&dest) {
+                return Err(SyncError::Protocol(format!("no such mailbox {dest}")));
+            }
+            for part in uid_set.split(',') {
+                if let Ok(uid) = part.trim().parse::<u32>() {
+                    if let Some(entry) = self.messages.get_mut(&uid) {
+                        entry.0 = dest.clone();
+                    }
+                }
+            }
+            Ok(())
+        })
     }
 
     fn capabilities(&mut self) -> sge_lib::imap::PinBox<'_, Result<Vec<String>, SyncError>> {
@@ -250,10 +265,28 @@ impl SyncSession for FakeSession {
 
     fn rename_mailbox(
         &mut self,
-        _old: &str,
-        _new: &str,
+        old: &str,
+        new: &str,
     ) -> sge_lib::imap::PinBox<'_, Result<(), SyncError>> {
-        Box::pin(async move { Ok(()) })
+        let (old, new) = (old.to_string(), new.to_string());
+        Box::pin(async move {
+            // Model RENAME: folder set entry moves, homed messages retag,
+            // SELECT follows — UIDs survive (server RENAME semantics).
+            if !self.mailboxes.contains(&old) {
+                return Err(SyncError::Protocol(format!("no such mailbox {old}")));
+            }
+            self.mailboxes.remove(&old);
+            self.mailboxes.insert(new.clone());
+            for (_, (mb, _, _, _)) in self.messages.iter_mut() {
+                if *mb == old {
+                    *mb = new.clone();
+                }
+            }
+            if self.selected.as_deref() == Some(old.as_str()) {
+                self.selected = Some(new.clone());
+            }
+            Ok(())
+        })
     }
 
     fn delete_mailbox(&mut self, name: &str) -> sge_lib::imap::PinBox<'_, Result<(), SyncError>> {
@@ -677,5 +710,262 @@ pub mod live_gate_26_cleanup {
         assert!(harness::assert_sandbox_prefix("SGE-Test-").is_ok());
         assert!(harness::assert_sandbox_prefix("SGE-Test").is_err());
         assert!(harness::assert_sandbox_prefix("SGE-Test-ok-1").is_ok());
+    }
+}
+
+/// v1.3 confirm→MOVE→undo leg shapes (Task 1): sandbox Auto/ derivation,
+/// MOVE homing through the REAL harness guards, undo-restore, override log.
+pub mod live_gate_26_filing {
+    use super::*;
+
+    #[test]
+    fn filing_auto_wire_never_real_tree() {
+        let wire = harness::sandbox_auto_wire("SGE-Test-9-9", "Acadêmico");
+        assert_eq!(wire, "SGE-Test-9-9-Auto-Acadêmico");
+        assert!(harness::assert_sandbox_prefix(&wire).is_ok());
+        assert!(harness::assert_never_real_auto(&wire).is_ok());
+        for real in ["Auto", "Auto/Acadêmico", "Auto.Financeiro"] {
+            assert!(harness::assert_never_real_auto(real).is_err());
+        }
+        // A non-Auto real folder passes the Auto guard but fails prefix.
+        assert!(harness::assert_never_real_auto("INBOX").is_ok());
+        assert!(harness::assert_sandbox_prefix("INBOX").is_err());
+    }
+
+    #[test]
+    fn filing_confirm_move_undo_shape() {
+        // suggest→confirm→MOVE→undo homing: origin → sandbox Auto → origin,
+        // every verb gated by the real prefix asserts first.
+        let origin = "SGE-Test-filing-1";
+        let dest = harness::sandbox_auto_wire(origin, "Acadêmico");
+        harness::assert_sandbox_prefix(origin).unwrap();
+        harness::assert_never_real_auto(&dest).unwrap();
+        harness::assert_sandbox_prefix(&dest).unwrap();
+        let mut s = FakeSession::with_sandbox(origin);
+        block_on(s.create_mailbox(&dest)).unwrap();
+        block_on(s.append_message(origin, "", b"Subject: SGE-TEST-filing-confirm\r\n\r\nx"))
+            .unwrap();
+        let uid = block_on(s.search_uids()).unwrap()[0];
+        // Confirm MOVE (uid_move_to models the server verb).
+        block_on(s.uid_move_to(&uid.to_string(), &dest)).unwrap();
+        block_on(s.select_mailbox(origin)).unwrap();
+        assert!(block_on(s.search_uids()).unwrap().is_empty(), "origin must be empty after MOVE");
+        block_on(s.select_mailbox(&dest)).unwrap();
+        assert_eq!(block_on(s.search_uids()).unwrap(), vec![uid], "dest must hold the moved UID");
+        // Undo: MOVE back, restored to origin.
+        block_on(s.uid_move_to(&uid.to_string(), origin)).unwrap();
+        block_on(s.select_mailbox(origin)).unwrap();
+        assert_eq!(block_on(s.search_uids()).unwrap(), vec![uid], "undo must restore the UID");
+        block_on(s.select_mailbox(&dest)).unwrap();
+        assert!(block_on(s.search_uids()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn filing_undo_logs_override_shape() {
+        // The undo decision lands in label_overrides via the same prod
+        // entries the override_label IPC uses; latest_override pins it.
+        let dir = std::env::temp_dir().join(format!("sge-26-filing-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db = dir.join("filing.sqlite");
+        let store = sge_lib::store::Store::open(&db).unwrap();
+        let mb = sge_lib::store::queries::ensure_mailbox(store.conn(), "SGE-Test-filing-2").unwrap();
+        sge_lib::store::queries::upsert_message(
+            store.conn(), mb, 11, Some("<filing-1@example.com>"), "SGE-TEST-filing-confirm",
+            "me@example.com", "[\"me@example.com\"]", "[]", "2026-10-13T12:00:00Z", "[]", false, "",
+        )
+        .unwrap();
+        let mid: u64 = store
+            .conn()
+            .query_row(
+                "SELECT id FROM messages WHERE mailbox_id = ?1 AND message_id = ?2",
+                rusqlite::params![mb, "<filing-1@example.com>"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        sge_lib::store::queries::upsert_label(store.conn(), mid, "academico", None, 0.9, 0.5, false)
+            .unwrap();
+        assert!(sge_lib::store::queries::get_label(store.conn(), mid).unwrap().is_some());
+        // Undo of the filing: from the filed category back to the origin.
+        sge_lib::store::queries::log_override(store.conn(), mid, "academico", "SGE-Test-filing-2")
+            .unwrap();
+        assert_eq!(
+            sge_lib::store::queries::latest_override(store.conn(), mid).unwrap(),
+            Some("SGE-Test-filing-2".to_string())
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+}
+
+/// v1.3 RENAME/DELETE leg shapes (Task 1): rename lifecycle on the double,
+/// backend-side guard order, prod cache-migrate entries.
+pub mod live_gate_26_folders {
+    use super::*;
+
+    #[test]
+    fn folders_rename_uids_survive_shape() {
+        let old = "SGE-Test-folders-1-Rename";
+        let new = "SGE-Test-folders-1-Renamed";
+        harness::assert_sandbox_prefix(old).unwrap();
+        harness::assert_sandbox_prefix(new).unwrap();
+        let mut s = FakeSession::new();
+        s.mailboxes.insert("INBOX".to_string());
+        block_on(s.create_mailbox(old)).unwrap();
+        block_on(s.select_mailbox(old)).unwrap();
+        block_on(s.append_message(old, "", b"Subject: SGE-TEST-rename-folder\r\n\r\nx")).unwrap();
+        let uid = block_on(s.search_uids()).unwrap()[0];
+        block_on(s.rename_mailbox(old, new)).unwrap();
+        // LIST: old gone, new present.
+        let infos = block_on(s.list_mailboxes()).unwrap();
+        let names: Vec<&str> = infos.iter().map(|i| i.name.as_str()).collect();
+        assert!(!names.contains(&old));
+        assert!(names.contains(&new));
+        // UIDs survive under the new name.
+        block_on(s.select_mailbox(new)).unwrap();
+        assert_eq!(block_on(s.search_uids()).unwrap(), vec![uid]);
+    }
+
+    #[test]
+    fn folders_guards_refuse_inbox_and_nonempty() {
+        // Backend-side guard order (mirrors the Phase 11 command rule):
+        // INBOX first, then non-empty — both before any verb.
+        assert!(harness::assert_folder_delete_allowed("INBOX", 0).is_err());
+        assert!(harness::assert_folder_delete_allowed("inbox", 99).is_err());
+        assert!(harness::assert_folder_delete_allowed("SGE-Test-x-Renamed", 3).is_err());
+        assert!(harness::assert_folder_delete_allowed("SGE-Test-x-Renamed", 0).is_ok());
+        // The prefix guard is the outer ring: INBOX never reaches a verb.
+        assert!(harness::assert_sandbox_prefix("INBOX").is_err());
+    }
+
+    #[test]
+    fn folders_cache_migrate_shapes() {
+        // rename_mailbox_cache migrates the row (prod rename-IPC entry);
+        // delete_mailbox_cache drops it (prod delete-IPC entry).
+        let dir = std::env::temp_dir().join(format!("sge-26-folders-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db = dir.join("folders.sqlite");
+        let store = sge_lib::store::Store::open(&db).unwrap();
+        sge_lib::store::queries::ensure_mailbox(store.conn(), "SGE-Test-folders-2-Rename").unwrap();
+        let touched = sge_lib::store::queries::rename_mailbox_cache(
+            store.conn(),
+            "SGE-Test-folders-2-Rename",
+            "SGE-Test-folders-2-Renamed",
+            "/",
+        )
+        .unwrap();
+        assert_eq!(touched, 1);
+        let rows = sge_lib::store::queries::list_mailboxes(store.conn()).unwrap();
+        assert!(!rows.iter().any(|r| r.name == "SGE-Test-folders-2-Rename"));
+        assert!(rows.iter().any(|r| r.name == "SGE-Test-folders-2-Renamed"));
+        sge_lib::store::queries::delete_mailbox_cache(store.conn(), "SGE-Test-folders-2-Renamed")
+            .unwrap();
+        let rows = sge_lib::store::queries::list_mailboxes(store.conn()).unwrap();
+        assert!(!rows.iter().any(|r| r.name == "SGE-Test-folders-2-Renamed"));
+        let _ = std::fs::remove_file(&db);
+    }
+}
+
+/// v1.3 batch/chunk probe leg shapes (Task 1): chunk ranges, journal
+/// resume (zero dupes/skips), candidate scoping with pin respect.
+pub mod live_gate_26_batch {
+    use super::*;
+
+    #[test]
+    fn batch_plan_chunks_ranges_with_tail() {
+        // 7 seeds at chunk 3: three chunks, partial tail exercised.
+        assert_eq!(
+            harness::plan_chunks(harness::BATCH_PROBE_SEEDS, harness::BATCH_PROBE_CHUNK),
+            vec![(0, 3), (3, 6), (6, 7)]
+        );
+        assert!(harness::plan_chunks(harness::BATCH_PROBE_SEEDS, harness::BATCH_PROBE_CHUNK).len() >= 2);
+        assert_eq!(harness::plan_chunks(0, 3), Vec::<(usize, usize)>::new());
+    }
+
+    #[test]
+    fn batch_journal_resume_zero_dupe_skip_shape() {
+        // intent-before-verb journaling: every scoped candidate journaled
+        // (resume skips all → zero dupes), none unjournaled (zero skips).
+        let dir = std::env::temp_dir().join(format!("sge-26-batch-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db = dir.join("batch.sqlite");
+        let store = sge_lib::store::Store::open(&db).unwrap();
+        let scope = "SGE-Test-batch-1";
+        let mb = sge_lib::store::queries::ensure_mailbox(store.conn(), scope).unwrap();
+        for (i, uid) in [21u32, 22, 23].iter().enumerate() {
+            sge_lib::store::queries::upsert_message(
+                store.conn(), mb, *uid, Some(&format!("<batch-{i}@example.com>")),
+                &format!("SGE-TEST-batch-probe-{i}"), "me@example.com", "[\"me@example.com\"]",
+                "[]", "2026-10-13T12:00:00Z", "[]", false, "",
+            )
+            .unwrap();
+        }
+        let run = sge_lib::store::queries::create_batch_run(store.conn()).unwrap();
+        let cands =
+            sge_lib::classify::batch::collect_candidates(store.conn(), Some(scope)).unwrap();
+        assert_eq!(cands.len(), 3);
+        // Chunked journal: chunk size 2 → (2,1), one intent per item, moved
+        // after the (fake) verb.
+        for (ci, (s, e)) in harness::plan_chunks(cands.len(), 2).iter().enumerate() {
+            for (mid, from, _uid) in &cands[*s..*e] {
+                sge_lib::classify::batch::journal_intent(
+                    store.conn(), run, *mid, from, "SGE-Test-batch-1-Auto", "batch-probe", ci,
+                )
+                .unwrap();
+                sge_lib::classify::batch::journal_moved(store.conn(), run, *mid).unwrap();
+            }
+        }
+        let done = sge_lib::classify::batch::journaled_ids(store.conn(), run).unwrap();
+        assert_eq!(done.len(), 3);
+        let remaining: Vec<u64> = cands
+            .iter()
+            .filter(|(mid, _, _)| !done.contains(mid))
+            .map(|(mid, _, _)| *mid)
+            .collect();
+        assert!(remaining.is_empty(), "resume must skip everything journaled");
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn batch_candidates_skip_pinned_and_auto_tree() {
+        // collect_candidates: pinned-override mail skipped (corrections
+        // stand), Auto/-tree mail out of scope, excluded folders skipped.
+        let dir = std::env::temp_dir().join(format!("sge-26-batch2-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db = dir.join("batch2.sqlite");
+        let store = sge_lib::store::Store::open(&db).unwrap();
+        let scope = "SGE-Test-batch-2";
+        let mb = sge_lib::store::queries::ensure_mailbox(store.conn(), scope).unwrap();
+        sge_lib::store::queries::upsert_message(
+            store.conn(), mb, 31, Some("<plain@example.com>"), "SGE-TEST-plain",
+            "me@example.com", "[\"me@example.com\"]", "[]", "2026-10-13T12:00:00Z", "[]", false, "",
+        )
+        .unwrap();
+        sge_lib::store::queries::upsert_message(
+            store.conn(), mb, 32, Some("<pinned@example.com>"), "SGE-TEST-pinned",
+            "me@example.com", "[\"me@example.com\"]", "[]", "2026-10-13T12:00:00Z", "[]", false, "",
+        )
+        .unwrap();
+        let pinned_mid: u64 = store
+            .conn()
+            .query_row(
+                "SELECT id FROM messages WHERE mailbox_id = ?1 AND uid = 32",
+                rusqlite::params![mb],
+                |r| r.get(0),
+            )
+            .unwrap();
+        sge_lib::store::queries::log_override(store.conn(), pinned_mid, "academico", scope).unwrap();
+        let auto_mb = sge_lib::store::queries::ensure_mailbox(store.conn(), "Auto/Acadêmico").unwrap();
+        sge_lib::store::queries::upsert_message(
+            store.conn(), auto_mb, 1, Some("<filed@example.com>"), "filed",
+            "me@example.com", "[\"me@example.com\"]", "[]", "2026-10-13T12:00:00Z", "[]", false, "",
+        )
+        .unwrap();
+        let cands =
+            sge_lib::classify::batch::collect_candidates(store.conn(), Some(scope)).unwrap();
+        assert_eq!(cands.len(), 1, "only the unpinned in-scope message is a candidate");
+        assert_eq!(cands[0].2, 31);
+        // Unscoped collect still excludes the Auto/ tree.
+        let all = sge_lib::classify::batch::collect_candidates(store.conn(), None).unwrap();
+        assert!(all.iter().all(|(_, mb, _)| mb != "Auto/Acadêmico"));
+        let _ = std::fs::remove_file(&db);
     }
 }

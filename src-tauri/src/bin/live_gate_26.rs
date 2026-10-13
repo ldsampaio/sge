@@ -1,6 +1,8 @@
-//! `live_gate_26` — Phase 26 tracer: sandboxed live proof of the v1.1
-//! read-side deferred gates (Seen round-trip, folder tree/browse/badges,
-//! arrival tick + reconnect) against the real server.
+//! `live_gate_26` — Phase 26 bundle: sandboxed live proof of the deferred
+//! gates (v1.1 read-side 6/7/8, v1.3 confirm→MOVE→undo + RENAME/DELETE +
+//! batch/chunk probe, v1.2 12/13-derived rows by citation of the locked
+//! 21/22 runners) against the real server, closed by one combined bundle
+//! REPORT with reasoned deferral rows.
 //!
 //! Structural clone of `live_gate_22` (per 26-CONTEXT D-31): the bin owns ONE
 //! [`SessionManager`] plus one temp-file [`Store`] for the whole run — never
@@ -31,8 +33,7 @@ use std::sync::{
 };
 
 use sge_lib::creds::{CredentialStore, KeyringStore, SavedCredentials, ServerConfig};
-use sge_lib::drafts::{new_message_id, render_draft_rfc5322, DraftFields};
-use sge_lib::imap::headers::MessageHeader;
+use sge_lib::drafts::{new_message_id, render_draft_rfc5322, DraftFields};use sge_lib::imap::headers::MessageHeader;
 use sge_lib::imap::manager::SessionManager;
 use sge_lib::imap::{
     normalize_host, AccountConfig, MailboxInfo, MailboxStatus, MailboxSummary, PinBox,
@@ -49,8 +50,9 @@ pub const SANDBOX_PREFIX: &str = "SGE-Test-";
 /// Subject prefix marking every test message (only-self test mail).
 pub const SUBJECT_PREFIX: &str = "SGE-TEST-";
 
-/// Step count for the full live run (gates 6/7/8 + audit + cleanup).
-pub const TOTAL_STEPS: usize = 9;
+/// Step count for the full live run (gates 6/7/8 + audit + v1.3 legs +
+/// 12/13 citation rows + cleanup).
+pub const TOTAL_STEPS: usize = 12;
 
 /// Cleanup discipline (D-37): 3 retries with backoff, then exact manual
 /// steps — never an unbounded destructive loop.
@@ -199,6 +201,68 @@ pub fn audit_test_mail(
 /// Cleanup retry schedule (D-37): 3 attempts, 5s/15s/45s.
 pub fn cleanup_backoff_secs() -> [u64; 3] {
     CLEANUP_BACKOFF_SECS
+}
+
+/// Probe chunk size for the v1.3 batch leg (T-26-09): deliberately small —
+/// the PROVEN batch path chunks 25 (Phase 20), but this live probe only
+/// needs ≥2 chunks to prove per-chunk UIDVALIDITY re-check + resume.
+/// Small probe, never a full-account sweep (server-throttle etiquette).
+pub const BATCH_PROBE_CHUNK: usize = 3;
+
+/// Seed count for the batch probe: 7 messages at chunk 3 → ranges
+/// (0,3),(3,6),(6,7): three chunks with a partial tail (exercises it).
+pub const BATCH_PROBE_SEEDS: usize = 7;
+
+/// Sandbox-scoped Auto/ subtree wire name (T-26-07): the v1.3 filing legs
+/// file into `{sandbox}-Auto-{top}`, NEVER the real `Auto/` tree. The
+/// derived name keeps the sandbox prefix (the prefix guard accepts it)
+/// while [`assert_never_real_auto`] refuses anything under the real tree.
+pub fn sandbox_auto_wire(sandbox: &str, top: &str) -> String {
+    format!("{sandbox}-Auto-{top}")
+}
+
+/// Refuse the real Auto/ tree (T-26-07): `Auto`, `Auto/` children, and the
+/// legacy `.`-delimited form. The filing legs call this on every dest wire
+/// BEFORE the prefix assert — both must pass.
+pub fn assert_never_real_auto(wire: &str) -> Result<(), String> {
+    if wire == "Auto" || wire.starts_with("Auto/") || wire.starts_with("Auto.") {
+        return Err(format!(
+            "live-gate: refusing real Auto/ tree target {wire:?} (sandbox-scoped Auto only)"
+        ));
+    }
+    Ok(())
+}
+
+/// Chunk plan for the batch probe: (start,end) index ranges over `total`
+/// items at `size` per chunk. Pure so the offline doubles pin the exact
+/// ranges (including the partial tail).
+pub fn plan_chunks(total: usize, size: usize) -> Vec<(usize, usize)> {
+    let size = size.max(1);
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < total {
+        let end = (start + size).min(total);
+        out.push((start, end));
+        start = end;
+    }
+    out
+}
+
+/// Backend-side folder-delete guard order (Phase 11 command-layer rule,
+/// mirrored in-harness because `guard_delete` is `pub(crate)` to the
+/// command module): INBOX refusal → non-empty refusal until emptied. The
+/// RENAME/DELETE leg proves both refusals live before any DELETE verb
+/// fires — guards backend-side, never UI-only (T-26-08).
+pub fn assert_folder_delete_allowed(wire: &str, messages: u32) -> Result<(), String> {
+    if wire.eq_ignore_ascii_case("inbox") {
+        return Err("live-gate: INBOX is server-fixed — never renamed or deleted".to_string());
+    }
+    if messages > 0 {
+        return Err(format!(
+            "live-gate: folder holds {messages} messages — empty (scoped expunge) before DELETE"
+        ));
+    }
+    Ok(())
 }
 
 /// SQLite dump writer: renders every user table of the run's temp Store as
@@ -647,9 +711,21 @@ const SFX_SEEN: &str = "seen-roundtrip";
 const BODY_SEEN: &str = "seen leg body";
 const SFX_ARRIVAL: &str = "arrival-tick";
 const BODY_ARRIVAL: &str = "arrival leg body";
+const SFX_FILING: &str = "filing-confirm";
+const BODY_FILING: &str = "filing leg body";
+const SFX_RENAME: &str = "rename-folder";
+const BODY_RENAME: &str = "rename leg body";
+const SFX_BATCH: &str = "batch-probe";
+const BODY_BATCH: &str = "batch probe body";
 
 fn noop_cb() -> SyncCallback {
     Arc::new(|_| {})
+}
+
+/// Borrow `extras` as `&[&str]` for the LIST-delta allow-list: the v1.3
+/// legs' sandbox-scoped folders are expected mid-run names, not drift.
+fn extras_str(extras: &[String]) -> Vec<&str> {
+    extras.iter().map(|s| s.as_str()).collect()
 }
 
 async fn guard_list_clean(
@@ -677,6 +753,23 @@ async fn search_msg_uids(
 ) -> Result<Vec<u32>, SyncError> {
     let mut lease = mgr.lease_for(wire).await?;
     lease.session().uid_search_header("Message-ID", msg_id).await
+}
+
+/// Local row resolver: (messages.id, uid) for one RFC Message-ID in one
+/// mailbox. Sync passes may delete+re-insert rows when a MOVE re-homes a
+/// message (new UID, possibly new row id), so legs re-resolve by RFC
+/// Message-ID after every sync — never thread a stale local id.
+fn resolve_local(
+    conn: &rusqlite::Connection,
+    mailbox_id: u64,
+    rfc_msg_id: &str,
+) -> Result<(u64, u32), String> {
+    conn.query_row(
+        "SELECT id, uid FROM messages WHERE mailbox_id = ?1 AND message_id = ?2",
+        rusqlite::params![mailbox_id, rfc_msg_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .map_err(|e| format!("local row missing for Message-ID {rfc_msg_id}: {e}"))
 }
 
 fn draft_bytes(self_addr: &str, suffix: &str, body: &str, msg_id: &str) -> Vec<u8> {
@@ -1034,6 +1127,564 @@ async fn live_reconnect_recovery(
     ))
 }
 
+/// STEP 9, v1.3 confirm→MOVE→undo (T-26-07): seed a classified suggestion
+/// against a sandbox message via the existing filing entries, confirm
+/// through the production confirm verb (`execute_filing_move` — the same
+/// entry the `confirm_suggestion` IPC command drives; `plan_filing`
+/// refuses missing/stale suggestions backend-side, so a direct-IPC bypass
+/// cannot smuggle an unplanned move), assert the MOVE lands in the
+/// sandbox-scoped Auto/ subtree (never the real Auto/ tree), journal the
+/// move on the proven batch path, run `undo_run`, and assert the message is
+/// restored to its origin with the undo logged as an override row (same
+/// `log_override`/`latest_override` entries the `override_label` IPC uses).
+///
+/// Returns the PASS detail plus the rendered subject (for the step-8 audit,
+/// which checks exactly what the legs rendered).
+async fn live_confirm_move_undo(
+    mgr: &Arc<SessionManager>,
+    store: &StoreRef,
+    origin_wire: &str,
+    epoch: u32,
+    self_addr: &str,
+    msg_id: &str,
+) -> Result<(String, String), String> {
+    use sge_lib::classify::taxonomy::load_default;
+    assert_sandbox_prefix(origin_wire).map_err(|e| e.to_string())?;
+    check_epoch(mgr, origin_wire, epoch).await?;
+    // Sandbox-scoped Auto/ subtree: derived from the sandbox name, both
+    // guards armed before any verb fires.
+    let tax = load_default().map_err(|e| format!("taxonomy: {e}"))?;
+    let (top_id, top_name) = tax
+        .categories
+        .iter()
+        .find(|c| c.parent.is_none())
+        .map(|c| (c.id.clone(), c.name.clone()))
+        .ok_or_else(|| "taxonomy has no top-level category".to_string())?;
+    let auto_wire = sandbox_auto_wire(origin_wire, &top_name);
+    assert_never_real_auto(&auto_wire)?;
+    assert_sandbox_prefix(&auto_wire).map_err(|e| e.to_string())?;
+    // Seed the origin message via the prod save verb (same as gate 6).
+    let subject = format!("{SUBJECT_PREFIX}{SFX_FILING}");
+    audit_test_mail(&[subject.as_str()], &[self_addr], self_addr)?;
+    let bytes = draft_bytes(self_addr, SFX_FILING, BODY_FILING, msg_id);
+    let seed_uid = mgr
+        .save_draft_copy_in(origin_wire, msg_id, &bytes, None, Some(epoch))
+        .await
+        .map_err(|e| format!("filing seed APPEND failed: {e}"))?;
+    // CREATE the sandbox Auto/ subtree folder via the Phase 11 verb.
+    // `ensure_auto_tree` is deliberately NOT called — it builds the REAL
+    // Auto/ tree (a scope-creep signal per D-32); the sandbox folder is the
+    // in-scope substitute and the never-real-Auto assert above proves it.
+    mgr.create_mailbox_in(&auto_wire)
+        .await
+        .map_err(|e| format!("sandbox Auto CREATE failed: {e}"))?;
+    // Mailbox rows + epochs for both wires (what sync Step 1 does).
+    let (origin_id, auto_id) = {
+        let guard = store.lock().unwrap();
+        let origin_id =
+            queries::ensure_mailbox(guard.conn(), origin_wire).map_err(|e| e.to_string())?;
+        let origin_v = current_validity(mgr, origin_wire)
+            .await
+            .map_err(|e| format!("validity {origin_wire}: {e}"))?;
+        queries::set_sync_state(guard.conn(), origin_wire, origin_v, 0)
+            .map_err(|e| e.to_string())?;
+        let auto_id =
+            queries::ensure_mailbox(guard.conn(), &auto_wire).map_err(|e| e.to_string())?;
+        let auto_v = current_validity(mgr, &auto_wire)
+            .await
+            .map_err(|e| format!("validity {auto_wire}: {e}"))?;
+        queries::set_sync_state(guard.conn(), &auto_wire, auto_v, 0)
+            .map_err(|e| e.to_string())?;
+        (origin_id, auto_id)
+    };
+    // Sync pass over the origin so the local rows (location, classify
+    // fields) exist for the suggest→plan entry.
+    {
+        let worker = SyncWorker::new(store.clone());
+        let mut lease = mgr.lease_for(origin_wire).await.map_err(|e| e.to_string())?;
+        worker
+            .sync_with_borrowed(lease.session(), origin_wire, noop_cb())
+            .await
+            .map_err(|e| format!("filing sync pass failed: {e}"))?;
+    }
+    // Seed the suggestion row (same row shape the suggest engine writes),
+    // then suggest→confirm through the production entries.
+    let local_id: u64 = {
+        let guard = store.lock().unwrap();
+        let (id, uid) = resolve_local(guard.conn(), origin_id, msg_id)?;
+        if uid != seed_uid {
+            return Err(format!(
+                "filing seed UID drift: APPEND→{seed_uid} but sync row→{uid}"
+            ));
+        }
+        queries::upsert_label(guard.conn(), id, &top_id, None, 0.9, 0.5, false)
+            .map_err(|e| e.to_string())?;
+        id
+    };
+    let plan = {
+        let guard = store.lock().unwrap();
+        sge_lib::classify::filing::plan_filing(guard.conn(), local_id, &tax)
+            .map_err(|e| format!("suggest plan refused: {e}"))?
+    };
+    let confirmed =
+        sge_lib::classify::filing::execute_filing_move(mgr, store, &plan, &auto_wire)
+            .await
+            .map_err(|e| format!("confirm MOVE failed: {e}"))?;
+    if !confirmed.acked {
+        return Err(format!(
+            "confirm MOVE stayed pending (offline?): {}",
+            confirmed.detail
+        ));
+    }
+    // Assert the MOVE landed in the sandbox Auto/ subtree: exactly one
+    // Message-ID hit there, zero in the origin (wire SEARCH is ground
+    // truth; local rows refresh below for the journal entries).
+    for wire in [origin_wire, auto_wire.as_str()] {
+        let worker = SyncWorker::new(store.clone());
+        let mut lease = mgr.lease_for(wire).await.map_err(|e| e.to_string())?;
+        worker
+            .sync_with_borrowed(lease.session(), wire, noop_cb())
+            .await
+            .map_err(|e| format!("post-move sync {wire} failed: {e}"))?;
+    }
+    let origin_hits = search_msg_uids(mgr, origin_wire, msg_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let auto_hits = search_msg_uids(mgr, &auto_wire, msg_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !origin_hits.is_empty() || auto_hits.len() != 1 {
+        return Err(format!(
+            "confirm MOVE mis-homed: origin {origin_hits:?} (want []), auto {auto_hits:?} (want 1)"
+        ));
+    }
+    // Journal the confirmed move on the proven batch path, then undo.
+    let run_id = {
+        let guard = store.lock().unwrap();
+        let run_id =
+            queries::create_batch_run(guard.conn()).map_err(|e| e.to_string())?;
+        let (fresh_id, _) = resolve_local(guard.conn(), auto_id, msg_id)?;
+        sge_lib::classify::batch::journal_intent(
+            guard.conn(),
+            run_id,
+            fresh_id,
+            origin_wire,
+            &auto_wire,
+            &top_id,
+            0,
+        )
+        .map_err(|e| format!("journal intent: {e}"))?;
+        sge_lib::classify::batch::journal_moved(guard.conn(), run_id, fresh_id)
+            .map_err(|e| format!("journal moved: {e}"))?;
+        run_id
+    };
+    let restored = sge_lib::classify::batch::undo_run(mgr, store, run_id)
+        .await
+        .map_err(|e| format!("undo failed: {e}"))?;
+    if restored != 1 {
+        return Err(format!("undo restored {restored} (want 1)"));
+    }
+    // Restored to origin (wire truth + refreshed local row), with the undo
+    // decision logged as an override row — the correction targets the
+    // origin folder rather than a taxonomy category, so `to_id` carries
+    // the origin wire (table is free-form TEXT; temp store is deleted).
+    for wire in [origin_wire, auto_wire.as_str()] {
+        let worker = SyncWorker::new(store.clone());
+        let mut lease = mgr.lease_for(wire).await.map_err(|e| e.to_string())?;
+        worker
+            .sync_with_borrowed(lease.session(), wire, noop_cb())
+            .await
+            .map_err(|e| format!("post-undo sync {wire} failed: {e}"))?;
+    }
+    let origin_hits = search_msg_uids(mgr, origin_wire, msg_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let auto_hits = search_msg_uids(mgr, &auto_wire, msg_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    if origin_hits.len() != 1 || !auto_hits.is_empty() {
+        return Err(format!(
+            "undo mis-restored: origin {origin_hits:?} (want 1), auto {auto_hits:?} (want [])"
+        ));
+    }
+    {
+        let guard = store.lock().unwrap();
+        let (final_id, _) = resolve_local(guard.conn(), origin_id, msg_id)?;
+        queries::log_override(guard.conn(), final_id, &top_id, origin_wire)
+            .map_err(|e| e.to_string())?;
+        let pinned = queries::latest_override(guard.conn(), final_id)
+            .map_err(|e| e.to_string())?;
+        if pinned.as_deref() != Some(origin_wire) {
+            return Err(format!("override not logged (want {origin_wire:?}, got {pinned:?})"));
+        }
+    }
+    Ok((
+        format!(
+            "confirm→MOVE uid {seed_uid}→{} in {auto_wire} + undo restored 1 to origin (override logged)",
+            auto_hits.len()
+        ),
+        subject,
+    ))
+}
+
+/// STEP 10, v1.3 RENAME/DELETE (T-26-08): CREATE a sandbox-scoped folder via
+/// the Phase 11 verb, RENAME it within the `SGE-Test-` prefix via
+/// `rename_mailbox_in`, assert caches invalidate (server LIST + migrated
+/// local row) and UIDs survive, then prove the backend-side guards live —
+/// INBOX refusal plus non-empty refusal — empty via scoped expunge, DELETE,
+/// and assert LIST clean.
+///
+/// Returns the PASS detail plus the rendered seed subject (step-8 audit).
+async fn live_rename_delete(
+    mgr: &Arc<SessionManager>,
+    store: &StoreRef,
+    sandbox: &str,
+    epoch: u32,
+    self_addr: &str,
+    msg_id: &str,
+) -> Result<(String, String), String> {
+    assert_sandbox_prefix(sandbox).map_err(|e| e.to_string())?;
+    check_epoch(mgr, sandbox, epoch).await?;
+    let old_wire = format!("{sandbox}-Rename");
+    let new_wire = format!("{sandbox}-Renamed");
+    for wire in [&old_wire, &new_wire] {
+        assert_sandbox_prefix(wire).map_err(|e| e.to_string())?;
+        assert_never_real_auto(wire)?;
+    }
+    // Backend-side guard evidence, before any verb fires: INBOX refusal
+    // (prefix guard + delete guard both refuse it) and non-empty refusal.
+    if assert_sandbox_prefix("INBOX").is_ok() {
+        return Err("prefix guard accepted INBOX".to_string());
+    }
+    if assert_folder_delete_allowed("INBOX", 0).is_ok() {
+        return Err("delete guard accepted INBOX".to_string());
+    }
+    // CREATE the probe folder (Phase 11 verb), seed one message, sync so
+    // local rows exist for the cache-migrate asserts below.
+    mgr.create_mailbox_in(&old_wire)
+        .await
+        .map_err(|e| format!("probe CREATE failed: {e}"))?;
+    let subject = format!("{SUBJECT_PREFIX}{SFX_RENAME}");
+    audit_test_mail(&[subject.as_str()], &[self_addr], self_addr)?;
+    let bytes = draft_bytes(self_addr, SFX_RENAME, BODY_RENAME, msg_id);
+    mgr.save_draft_copy_in(&old_wire, msg_id, &bytes, None, None)
+        .await
+        .map_err(|e| format!("probe seed APPEND failed: {e}"))?;
+    let old_id = {
+        let guard = store.lock().unwrap();
+        let id = queries::ensure_mailbox(guard.conn(), &old_wire).map_err(|e| e.to_string())?;
+        let v = current_validity(mgr, &old_wire)
+            .await
+            .map_err(|e| format!("validity {old_wire}: {e}"))?;
+        queries::set_sync_state(guard.conn(), &old_wire, v, 0).map_err(|e| e.to_string())?;
+        let worker = SyncWorker::new(store.clone());
+        let mut lease = mgr.lease_for(&old_wire).await.map_err(|e| e.to_string())?;
+        worker
+            .sync_with_borrowed(lease.session(), &old_wire, noop_cb())
+            .await
+            .map_err(|e| format!("probe sync pass failed: {e}"))?;
+        id
+    };
+    // RENAME within the prefix (Phase 11 verb; UIDVALIDITY bump surfaces as
+    // a loud State error, never a silent accept).
+    mgr.rename_mailbox_in(&old_wire, &new_wire)
+        .await
+        .map_err(|e| format!("RENAME failed: {e}"))?;
+    // Caches invalidate: server LIST shows new/old-gone AND the local row
+    // migrates through the existing prod entry (same one the rename IPC
+    // command drives).
+    let after_rename = list_snapshot(mgr)
+        .await
+        .map_err(|e| format!("re-LIST failed: {e}"))?;
+    if after_rename.iter().any(|n| n == &old_wire) || !after_rename.iter().any(|n| n == &new_wire) {
+        return Err("RENAME LIST mismatch: old still present or new absent".to_string());
+    }
+    {
+        let guard = store.lock().unwrap();
+        let delimiter = mgr
+            .list_mailboxes()
+            .await
+            .map_err(|e| e.to_string())?
+            .iter()
+            .find(|i| i.name == new_wire)
+            .map(|i| i.delimiter.clone())
+            .unwrap_or_default();
+        let touched = queries::rename_mailbox_cache(guard.conn(), &old_wire, &new_wire, &delimiter)
+            .map_err(|e| e.to_string())?;
+        if touched == 0 {
+            return Err("cache migrate touched 0 rows (old row missing)".to_string());
+        }
+        let rows = queries::list_mailboxes(guard.conn()).map_err(|e| e.to_string())?;
+        if rows.iter().any(|r| r.name == old_wire) || !rows.iter().any(|r| r.name == new_wire) {
+            return Err("cache migrate mismatch: old row present or new row absent".to_string());
+        }
+        let _ = old_id;
+    }
+    // UIDs survive: the seeded Message-ID resolves under the new name.
+    // Re-derive the epoch on the new wire first (rename may bump it — the
+    // verb already errors loud on that; here we just track current).
+    let seed_hits = search_msg_uids(mgr, &new_wire, msg_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    if seed_hits.len() != 1 {
+        return Err(format!("UIDs did not survive RENAME: {seed_hits:?} (want 1)"));
+    }
+    let seed_uid = seed_hits[0];
+    // Non-empty guard armed: the folder holds 1 message, so the guard must
+    // refuse DELETE until a scoped expunge empties it.
+    let status = mgr
+        .mailbox_status(&new_wire)
+        .await
+        .map_err(|e| format!("STATUS failed: {e}"))?;
+    if assert_folder_delete_allowed(&new_wire, status.messages).is_ok() {
+        return Err("delete guard allowed a non-empty folder".to_string());
+    }
+    mgr.discard_server_copy_in(&new_wire, seed_uid, None)
+        .await
+        .map_err(|e| format!("scoped expunge failed: {e}"))?;
+    let status = mgr
+        .mailbox_status(&new_wire)
+        .await
+        .map_err(|e| format!("post-expunge STATUS failed: {e}"))?;
+    assert_folder_delete_allowed(&new_wire, status.messages)
+        .map_err(|e| format!("guard still refuses emptied folder: {e}"))?;
+    // DELETE + cache invalidate + LIST clean (old and new both gone).
+    mgr.delete_mailbox_in(&new_wire)
+        .await
+        .map_err(|e| format!("DELETE failed: {e}"))?;
+    {
+        let guard = store.lock().unwrap();
+        queries::delete_mailbox_cache(guard.conn(), &new_wire).map_err(|e| e.to_string())?;
+        let rows = queries::list_mailboxes(guard.conn()).map_err(|e| e.to_string())?;
+        if rows.iter().any(|r| r.name == old_wire || r.name == new_wire) {
+            return Err("cache delete mismatch: probe rows linger".to_string());
+        }
+    }
+    let after_delete = list_snapshot(mgr)
+        .await
+        .map_err(|e| format!("post-DELETE LIST failed: {e}"))?;
+    if after_delete.iter().any(|n| n == &old_wire || n == &new_wire) {
+        return Err("DELETE LIST mismatch: probe folder still present".to_string());
+    }
+    Ok((
+        format!(
+            "RENAME {old_wire}→{new_wire} (uid {seed_uid} survived, caches migrated) + guarded DELETE (INBOX/non-empty refusals proven)"
+        ),
+        subject,
+    ))
+}
+
+/// STEP 11, v1.3 batch/chunk probe (T-26-09): bounded batch over sandbox
+/// messages through the proven batch journal path — per-chunk UIDVALIDITY
+/// re-check, journal-intent-before-verb, progress lines, persisted run/item
+/// rows, resume-safe with zero dupes or skips — then full `undo_run`
+/// restore so cleanup stays trivial.
+///
+/// The probe runs in its own `{sandbox}-Batch` origin (candidate scoping
+/// stays exact: gate-6/8 messages live in the shared sandbox, never in
+/// scope here). Filing into the shared sandbox Auto/ subtree created by
+/// STEP 9 (created if a prior leg never ran).
+///
+/// Returns the PASS detail plus rendered subjects (step-8 audit).
+async fn live_batch_probe(
+    mgr: &Arc<SessionManager>,
+    store: &StoreRef,
+    sandbox: &str,
+    epoch: u32,
+    self_addr: &str,
+    run_tag: &str,
+) -> Result<(String, Vec<String>), String> {
+    assert_sandbox_prefix(sandbox).map_err(|e| e.to_string())?;
+    check_epoch(mgr, sandbox, epoch).await?;
+    let origin_wire = format!("{sandbox}-Batch");
+    assert_sandbox_prefix(&origin_wire).map_err(|e| e.to_string())?;
+    assert_never_real_auto(&origin_wire)?;
+    // Sandbox Auto/ dest: shared with STEP 9; CREATE only when absent (a
+    // blind re-CREATE would NO the run when STEP 9 already built it).
+    let tax = sge_lib::classify::taxonomy::load_default()
+        .map_err(|e| format!("taxonomy: {e}"))?;
+    let top_name = tax
+        .categories
+        .iter()
+        .find(|c| c.parent.is_none())
+        .map(|c| c.name.clone())
+        .ok_or_else(|| "taxonomy has no top-level category".to_string())?;
+    let auto_wire = sandbox_auto_wire(sandbox, &top_name);
+    assert_never_real_auto(&auto_wire)?;
+    assert_sandbox_prefix(&auto_wire).map_err(|e| e.to_string())?;
+    mgr.create_mailbox_in(&origin_wire)
+        .await
+        .map_err(|e| format!("batch origin CREATE failed: {e}"))?;
+    let listed = list_snapshot(mgr)
+        .await
+        .map_err(|e| format!("LIST failed: {e}"))?;
+    if !listed.iter().any(|n| n == &auto_wire) {
+        mgr.create_mailbox_in(&auto_wire)
+            .await
+            .map_err(|e| format!("sandbox Auto CREATE failed: {e}"))?;
+    }
+    // Seed the bounded probe set (distinct Message-IDs, self-only audit
+    // before every transport call).
+    let mut msg_ids: Vec<String> = Vec::new();
+    let mut subjects: Vec<String> = Vec::new();
+    for i in 0..BATCH_PROBE_SEEDS {
+        let mid = run_message_id(&format!("{run_tag}-batch-{i}"));
+        let subject = format!("{SUBJECT_PREFIX}{SFX_BATCH}-{i}");
+        audit_test_mail(&[subject.as_str()], &[self_addr], self_addr)?;
+        let bytes = draft_bytes(self_addr, &format!("{SFX_BATCH}-{i}"), BODY_BATCH, &mid);
+        mgr.save_draft_copy_in(&origin_wire, &mid, &bytes, None, None)
+            .await
+            .map_err(|e| format!("batch seed {i} APPEND failed: {e}"))?;
+        msg_ids.push(mid);
+        subjects.push(subject);
+    }
+    // Mailbox rows + sync pass so candidate collection sees local rows.
+    let origin_id = {
+        let guard = store.lock().unwrap();
+        let id =
+            queries::ensure_mailbox(guard.conn(), &origin_wire).map_err(|e| e.to_string())?;
+        let v = current_validity(mgr, &origin_wire)
+            .await
+            .map_err(|e| format!("validity {origin_wire}: {e}"))?;
+        queries::set_sync_state(guard.conn(), &origin_wire, v, 0).map_err(|e| e.to_string())?;
+        let auto_v = current_validity(mgr, &auto_wire)
+            .await
+            .map_err(|e| format!("validity {auto_wire}: {e}"))?;
+        let _ = queries::ensure_mailbox(guard.conn(), &auto_wire).map_err(|e| e.to_string())?;
+        queries::set_sync_state(guard.conn(), &auto_wire, auto_v, 0).map_err(|e| e.to_string())?;
+        let worker = SyncWorker::new(store.clone());
+        let mut lease = mgr.lease_for(&origin_wire).await.map_err(|e| e.to_string())?;
+        worker
+            .sync_with_borrowed(lease.session(), &origin_wire, noop_cb())
+            .await
+            .map_err(|e| format!("batch sync pass failed: {e}"))?;
+        id
+    };
+    // Resolve (local id, uid) per seed by RFC Message-ID — UID-only
+    // addressing, freshly derived, never threaded as stale state.
+    let mut items: Vec<(u64, u32)> = Vec::new();
+    {
+        let guard = store.lock().unwrap();
+        for mid in &msg_ids {
+            items.push(resolve_local(guard.conn(), origin_id, mid)?);
+        }
+    }
+    // Chunked moves with per-chunk epoch re-check + journal-intent-before-
+    // verb (crash safety) + progress lines (persisted report rows land in
+    // batch_runs/batch_items via the proven entries below).
+    let run_id = {
+        let guard = store.lock().unwrap();
+        queries::create_batch_run(guard.conn()).map_err(|e| e.to_string())?
+    };
+    let chunks = plan_chunks(items.len(), BATCH_PROBE_CHUNK);
+    if chunks.len() < 2 {
+        return Err(format!(
+            "probe needs ≥2 chunks (got {} for {} items)",
+            chunks.len(),
+            items.len()
+        ));
+    }
+    let mut moved = 0usize;
+    for (ci, (s, e)) in chunks.iter().enumerate() {
+        check_epoch(mgr, &origin_wire, epoch)
+            .await
+            .map_err(|err| format!("chunk {ci}: {err}"))?;
+        // NOTE: the origin wire keeps its epoch across APPENDs (no folder
+        // recreate); the per-chunk re-check above is the T-26-09 proof.
+        for (local, uid) in &items[*s..*e] {
+            {
+                let guard = store.lock().unwrap();
+                sge_lib::classify::batch::journal_intent(
+                    guard.conn(),
+                    run_id,
+                    *local,
+                    &origin_wire,
+                    &auto_wire,
+                    "batch-probe",
+                    ci,
+                )
+                .map_err(|e| format!("chunk {ci} journal intent: {e}"))?;
+            }
+            let res = sge_lib::classify::filing::move_one_uid(
+                mgr,
+                store,
+                &origin_wire,
+                *uid,
+                &auto_wire,
+                "batch probe",
+            )
+            .await
+            .map_err(|e| format!("chunk {ci} move uid {uid} failed: {e}"))?;
+            if !res.acked {
+                return Err(format!("chunk {ci} move uid {uid} stayed pending: {}", res.detail));
+            }
+            // move_one_uid lives in filing (shared by confirm/override/
+            // merge/delete) — the exact prod verb, journaled above.
+            {
+                let guard = store.lock().unwrap();
+                sge_lib::classify::batch::journal_moved(guard.conn(), run_id, *local)
+                    .map_err(|e| format!("chunk {ci} journal moved: {e}"))?;
+            }
+            moved += 1;
+        }
+        println!("BATCH-PROGRESS run={run_id} chunk={}/{} moved={moved}", ci + 1, chunks.len());
+    }
+    // Resume-safe: every scoped candidate is journaled (zero dupes), and no
+    // unjournaled candidate remains (zero skips). Local rows are still
+    // pre-move here, so the journal — not a vacuous post-sync scope — does
+    // the skipping.
+    {
+        let guard = store.lock().unwrap();
+        let cands = sge_lib::classify::batch::collect_candidates(guard.conn(), Some(&origin_wire))
+            .map_err(|e| format!("candidates: {e}"))?;
+        let done =
+            sge_lib::classify::batch::journaled_ids(guard.conn(), run_id).map_err(|e| e.to_string())?;
+        let remaining: Vec<u64> = cands
+            .iter()
+            .filter(|(mid, _, _)| !done.contains(mid))
+            .map(|(mid, _, _)| *mid)
+            .collect();
+        if !remaining.is_empty() {
+            return Err(format!("resume would skip {remaining:?} (zero-skip rule)"));
+        }
+        if done.len() != moved {
+            return Err(format!(
+                "journal covers {} but moved={moved} (zero-dupe rule)",
+                done.len()
+            ));
+        }
+    }
+    // Restore everything via the proven undo (leaves cleanup trivial) and
+    // assert wire truth: all seeds home, dest empty.
+    let restored = sge_lib::classify::batch::undo_run(mgr, store, run_id)
+        .await
+        .map_err(|e| format!("probe undo failed: {e}"))?;
+    if restored != moved {
+        return Err(format!("probe undo restored {restored} (want {moved})"));
+    }
+    for wire in [&origin_wire, &auto_wire] {
+        let worker = SyncWorker::new(store.clone());
+        let mut lease = mgr.lease_for(wire).await.map_err(|e| e.to_string())?;
+        worker
+            .sync_with_borrowed(lease.session(), wire, noop_cb())
+            .await
+            .map_err(|e| format!("post-undo sync {wire} failed: {e}"))?;
+    }
+    for mid in &msg_ids {
+        let home = search_msg_uids(mgr, &origin_wire, mid).await.map_err(|e| e.to_string())?;
+        let away = search_msg_uids(mgr, &auto_wire, mid).await.map_err(|e| e.to_string())?;
+        if home.len() != 1 || !away.is_empty() {
+            return Err(format!("probe undo mis-restored {mid}: home {home:?}, away {away:?}"));
+        }
+    }
+    Ok((
+        format!(
+            "batch probe: {moved} moves in {} chunks (epoch re-checked per chunk), resume 0-dupe/0-skip, undo restored {restored}",
+            chunks.len()
+        ),
+        subjects,
+    ))
+}
 /// STEP 8: no-unprefixed-send audit over the temp drafts table plus every
 /// subject rendered in-run. This phase sends no SMTP; any queued row must
 /// still be self-only, and every subject must carry the `SGE-TEST-` prefix.
@@ -1111,8 +1762,21 @@ async fn run() -> i32 {
         step(1, "preflight", false, &e.to_string());
         return 1;
     }
+    // Sandbox-scoped extra folders the v1.3 legs own (STEP 9 Auto/ subtree
+    // + STEP 11 batch origin): derived here — not from leg results — so
+    // cleanup deletes them even when a leg FAILs midway after CREATEing.
+    let extras: Vec<String> = match sge_lib::classify::taxonomy::load_default() {
+        Ok(tax) => match tax.categories.iter().find(|c| c.parent.is_none()) {
+            Some(top) => vec![
+                sandbox_auto_wire(&sandbox, &top.name),
+                format!("{sandbox}-Batch"),
+            ],
+            None => vec![format!("{sandbox}-Batch")],
+        },
+        Err(_) => vec![format!("{sandbox}-Batch")],
+    };
 
-    let manager = SessionManager::new(account_config(&cfg));
+    let manager = std::sync::Arc::new(SessionManager::new(account_config(&cfg)));
     let db_path = std::env::temp_dir().join(format!(
         "sge-live26-{}-{}.sqlite",
         std::process::id(),
@@ -1159,17 +1823,17 @@ async fn run() -> i32 {
     // one delta: the sandbox.
     if let Err(e) = assert_sandbox_prefix(&sandbox) {
         step(2, "create", false, &e.to_string());
-        return cleanup(&manager, &db_path, &sandbox, &before, &cfg.password).await;
+        return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
     }
     if let Err(e) = manager.create_mailbox_in(&sandbox).await {
         step(2, "create", false, &format!("CREATE failed: {e}"));
-        return cleanup(&manager, &db_path, &sandbox, &before, &cfg.password).await;
+        return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
     }
     let after_create = match list_snapshot(&manager).await {
         Ok(names) => names,
         Err(e) => {
             step(2, "create", false, &format!("re-LIST failed: {e}"));
-            return cleanup(&manager, &db_path, &sandbox, &before, &cfg.password).await;
+            return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
         }
     };
     let delta = unexpected_list_delta(&before, &after_create, &sandbox);
@@ -1181,7 +1845,7 @@ async fn run() -> i32 {
         created_ok,
         &format!("sandbox created, unexpected deltas: {delta:?}"),
     ) {
-        return cleanup(&manager, &db_path, &sandbox, &before, &cfg.password).await;
+        return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
     }
     // Seed the temp store's mailbox row + epoch (what sync Step 1 does) so
     // later replay entries find their rows.
@@ -1189,7 +1853,7 @@ async fn run() -> i32 {
         Ok(v) => v,
         Err(e) => {
             step(2, "create", false, &format!("validity read failed: {e}"));
-            return cleanup(&manager, &db_path, &sandbox, &before, &cfg.password).await;
+            return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
         }
     };
     let mb_id: u64 = {
@@ -1203,7 +1867,7 @@ async fn run() -> i32 {
             Ok(id) => id,
             Err(e) => {
                 step(2, "create", false, &format!("store seed failed: {e}"));
-                return cleanup(&manager, &db_path, &sandbox, &before, &cfg.password).await;
+                return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
             }
         }
     };
@@ -1213,7 +1877,7 @@ async fn run() -> i32 {
         Ok(uids) => uids,
         Err(e) => {
             step(3, "guard-empty", false, &format!("SEARCH failed: {e}"));
-            return cleanup(&manager, &db_path, &sandbox, &before, &cfg.password).await;
+            return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
         }
     };
     if !step(
@@ -1222,7 +1886,7 @@ async fn run() -> i32 {
         empty.is_empty(),
         &format!("sandbox holds {} uids (want 0)", empty.len()),
     ) {
-        return cleanup(&manager, &db_path, &sandbox, &before, &cfg.password).await;
+        return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
     }
 
     // In-run subjects for the audit — pushed from the same constants the
@@ -1243,7 +1907,7 @@ async fn run() -> i32 {
                 Err(reason) => {
                     step($n, $gate, false, &reason);
                     report($gate, "FAIL", &reason);
-                    return cleanup(&manager, &db_path, &sandbox, &before, &cfg.password).await;
+                    return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
                 }
             }
         };
@@ -1253,7 +1917,7 @@ async fn run() -> i32 {
     if let Err(e) = guard_list_clean(&manager, &before, &sandbox, &[]).await {
         step(4, "seen-roundtrip", false, &e);
         report("seen-roundtrip", "FAIL", &e);
-        return cleanup(&manager, &db_path, &sandbox, &before, &cfg.password).await;
+        return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
     }
     live_step!(
         4,
@@ -1266,7 +1930,7 @@ async fn run() -> i32 {
     if let Err(e) = guard_list_clean(&manager, &before, &sandbox, &[]).await {
         step(5, "tree-browse-badges", false, &e);
         report("tree-browse-badges", "FAIL", &e);
-        return cleanup(&manager, &db_path, &sandbox, &before, &cfg.password).await;
+        return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
     }
     live_step!(
         5,
@@ -1278,7 +1942,7 @@ async fn run() -> i32 {
     if let Err(e) = guard_list_clean(&manager, &before, &sandbox, &[]).await {
         step(6, "arrival-tick", false, &e);
         report("arrival-tick", "FAIL", &e);
-        return cleanup(&manager, &db_path, &sandbox, &before, &cfg.password).await;
+        return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
     }
     live_step!(
         6,
@@ -1292,7 +1956,7 @@ async fn run() -> i32 {
     if let Err(e) = guard_list_clean(&manager, &before, &sandbox, &[]).await {
         step(7, "reconnect-recovery", false, &e);
         report("reconnect-recovery", "FAIL", &e);
-        return cleanup(&manager, &db_path, &sandbox, &before, &cfg.password).await;
+        return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
     }
     let arrival_uid = match search_msg_uids(&manager, &sandbox, &msg_arrival).await {
         Ok(hits) if hits.len() == 1 => hits[0],
@@ -1300,13 +1964,13 @@ async fn run() -> i32 {
             let reason = format!("arrival anchor: want 1 UID, got {hits:?}");
             step(7, "reconnect-recovery", false, &reason);
             report("reconnect-recovery", "FAIL", &reason);
-            return cleanup(&manager, &db_path, &sandbox, &before, &cfg.password).await;
+            return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
         }
         Err(e) => {
             let reason = format!("arrival anchor SEARCH failed: {e}");
             step(7, "reconnect-recovery", false, &reason);
             report("reconnect-recovery", "FAIL", &reason);
-            return cleanup(&manager, &db_path, &sandbox, &before, &cfg.password).await;
+            return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
         }
     };
     live_step!(
@@ -1322,14 +1986,77 @@ async fn run() -> i32 {
         }
         Err(reason) => {
             step(8, "no-unprefixed-send", false, &reason);
-            return cleanup(&manager, &db_path, &sandbox, &before, &cfg.password).await;
+            return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
         }
     }
 
-    // 9. cleanup — ALWAYS runs: SQLite dump for the secret scan, in-bin
-    // dump scan (SCAN-DB line), expunge leftovers, DELETE the sandbox with
-    // backoff (D-37), re-LIST must equal the pre-run snapshot.
-    cleanup(&manager, &db_path, &sandbox, &before, &cfg.password).await
+    // 9. confirm-move-undo — v1.3 filing leg (D-29). The sandbox Auto/
+    // subtree + batch origin in `extras` are cleaned by step 12 even when
+    // this leg FAILs midway.
+    if let Err(e) = guard_list_clean(&manager, &before, &sandbox, &extras_str(&extras)).await {
+        step(9, "confirm-move-undo", false, &e);
+        report("confirm-move-undo", "FAIL", &e);
+        return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
+    }
+    let msg_filing = run_message_id("filing");
+    match live_confirm_move_undo(&manager, &store, &sandbox, epoch, &cfg.self_addr, &msg_filing).await {
+        Ok((detail, subject)) => {
+            step(9, "confirm-move-undo", true, &detail);
+            report("confirm-move-undo", "PASS", &detail);
+            subjects.push(subject);
+        }
+        Err(reason) => {
+            step(9, "confirm-move-undo", false, &reason);
+            report("confirm-move-undo", "FAIL", &reason);
+            return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
+        }
+    }
+
+    // 10. rename-delete — v1.3 folder leg (D-29). The probe folder is
+    // deleted in-leg; the run-level LIST guard re-verifies after.
+    if let Err(e) = guard_list_clean(&manager, &before, &sandbox, &extras_str(&extras)).await {
+        step(10, "rename-delete", false, &e);
+        report("rename-delete", "FAIL", &e);
+        return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
+    }
+    let msg_rename = run_message_id("rename");
+    match live_rename_delete(&manager, &store, &sandbox, epoch, &cfg.self_addr, &msg_rename).await {
+        Ok((detail, subject)) => {
+            step(10, "rename-delete", true, &detail);
+            report("rename-delete", "PASS", &detail);
+            subjects.push(subject);
+        }
+        Err(reason) => {
+            step(10, "rename-delete", false, &reason);
+            report("rename-delete", "FAIL", &reason);
+            return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
+        }
+    }
+
+    // 11. batch-probe — v1.3 chunked batch leg (D-29, T-26-09).
+    if let Err(e) = guard_list_clean(&manager, &before, &sandbox, &extras_str(&extras)).await {
+        step(11, "batch-probe", false, &e);
+        report("batch-probe", "FAIL", &e);
+        return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
+    }
+    match live_batch_probe(&manager, &store, &sandbox, epoch, &cfg.self_addr, "probe").await {
+        Ok((detail, mut leg_subjects)) => {
+            step(11, "batch-probe", true, &detail);
+            report("batch-probe", "PASS", &detail);
+            subjects.append(&mut leg_subjects);
+        }
+        Err(reason) => {
+            step(11, "batch-probe", false, &reason);
+            report("batch-probe", "FAIL", &reason);
+            return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
+        }
+    }
+
+    // 12. cleanup — ALWAYS runs: SQLite dump for the secret scan, in-bin
+    // dump scan (SCAN-DB line), expunge leftovers (sandbox + extras),
+    // DELETE the sandbox + extras with backoff (D-37), re-LIST must equal
+    // the pre-run snapshot.
+    cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await
 }
 
 /// DELETE-with-backoff shared by `cleanup` and `--cleanup-only` (D-37):
@@ -1374,7 +2101,7 @@ async fn cleanup_only(sandbox: &str) -> i32 {
             return 2;
         }
     };
-    let manager = SessionManager::new(account_config(&cfg));
+    let manager = std::sync::Arc::new(SessionManager::new(account_config(&cfg)));
     if delete_with_backoff(&manager, sandbox).await {
         let after = list_snapshot(&manager).await.unwrap_or_default();
         if !after.iter().any(|n| n == sandbox) {
@@ -1387,14 +2114,16 @@ async fn cleanup_only(sandbox: &str) -> i32 {
 }
 
 /// Cleanup (D-37): SQLite dump for the secret scan, in-bin dump scan
-/// (SCAN-DB line), expunge-all-in-sandbox reusing `discard_server_copy_in`,
-/// then DELETE with retry; post-LIST must equal the pre-run snapshot.
+/// (SCAN-DB line), expunge-all in the sandbox AND the v1.3 extras reusing
+/// `discard_server_copy_in`, then DELETE sandbox + extras with retry;
+/// post-LIST must equal the pre-run snapshot.
 /// Prints the run REPORT (per-step verdicts live on stdout above; REPORT
 /// condenses gates/list/scan-surface/cleanup).
 async fn cleanup(
     mgr: &SessionManager,
     db_path: &std::path::Path,
     sandbox: &str,
+    extras: &[String],
     before: &[String],
     password: &str,
 ) -> i32 {
@@ -1443,6 +2172,31 @@ async fn cleanup(
             eprintln!("[live-gate] cleanup expunge uid {uid} failed ({e}) — continuing");
         }
     }
+    // v1.3 extras (STEP 9 Auto/ subtree + STEP 11 batch origin): expunge
+    // leftovers a leg FAIL may have stranded, then DELETE with the same
+    // backoff. Absent extras are skipped WITHOUT backoff (a leg that never
+    // ran must not cost 65s of retries).
+    let listed_now = list_snapshot(mgr).await.unwrap_or_default();
+    for extra in extras {
+        if assert_sandbox_prefix(extra).is_err() {
+            ok = false;
+            continue;
+        }
+        if !listed_now.iter().any(|n| n == extra) {
+            println!("CLEANUP-SKIP extra={extra} (absent — owning leg never created it)");
+            continue;
+        }
+        let extra_left = search_uids_in(mgr, extra).await.unwrap_or_default();
+        for uid in extra_left {
+            if let Err(e) = mgr.discard_server_copy_in(extra, uid, None).await {
+                eprintln!("[live-gate] cleanup expunge extra {extra} uid {uid} failed ({e}) — continuing");
+            }
+        }
+        if !delete_with_backoff(mgr, extra).await {
+            eprintln!("[live-gate] cleanup DELETE extra {extra} failed — manual steps may be needed");
+            ok = false;
+        }
+    }
     let mut deleted = delete_with_backoff(mgr, sandbox).await;
     if !deleted {
         ok = false;
@@ -1485,7 +2239,7 @@ async fn cleanup(
     code
 }
 
-const USAGE: &str = r#"live_gate_26 — Phase 26 sandboxed live gate (STEP 1-9, gates 6/7/8)
+const USAGE: &str = r#"live_gate_26 — Phase 26 sandboxed live gate (STEP 1-12, gates 6/7/8 + v1.3 legs + cleanup)
 
 USAGE:
     live_gate_26 [--seed-only]
@@ -1622,8 +2376,7 @@ mod live_gate_26_preflight_tests {
     }
 
     #[test]
-    fn live_gate_26_rendered_draft_carries_prefix_and_parses() {
-        let msg_id = run_message_id("unittest");
+    fn live_gate_26_rendered_draft_carries_prefix_and_parses() {        let msg_id = run_message_id("unittest");
         let bytes = render_test_draft(
             "me@example.com",
             "me@example.com",
@@ -1641,5 +2394,41 @@ mod live_gate_26_preflight_tests {
         assert_eq!(parsed.subject(), Some(format!("{SUBJECT_PREFIX}round-trip").as_str()));
         assert_eq!(parsed.body_text(0).unwrap().to_string(), "hello body");
         assert_eq!(parsed.message_id(), Some(msg_id.trim_matches(&['<', '>'][..])));
+    }
+
+    #[test]
+    fn live_gate_26_auto_wire_stays_in_sandbox_never_real_auto() {
+        let wire = sandbox_auto_wire("SGE-Test-1-2", "Acadêmico");
+        assert_eq!(wire, "SGE-Test-1-2-Auto-Acadêmico");
+        // Both guards pass on the derived wire …
+        assert!(assert_never_real_auto(&wire).is_ok());
+        assert!(assert_sandbox_prefix(&wire).is_ok());
+        // … while the real Auto/ tree is refused by the first guard.
+        for real in ["Auto", "Auto/Financeiro", "Auto.Financeiro"] {
+            assert!(
+                assert_never_real_auto(real).is_err(),
+                "must refuse real tree {real:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_gate_26_plan_chunks_covers_tail() {
+        assert_eq!(plan_chunks(7, 3), vec![(0, 3), (3, 6), (6, 7)]);
+        assert_eq!(plan_chunks(6, 3), vec![(0, 3), (3, 6)]);
+        assert_eq!(plan_chunks(0, 3), vec![]);
+        // Degenerate size clamps to 1 (never an infinite loop, never empty).
+        assert_eq!(plan_chunks(2, 0), vec![(0, 1), (1, 2)]);
+    }
+
+    #[test]
+    fn live_gate_26_folder_delete_guard_order() {
+        // INBOX refused regardless of count (first rule).
+        assert!(assert_folder_delete_allowed("INBOX", 0).is_err());
+        assert!(assert_folder_delete_allowed("inbox", 5).is_err());
+        // Non-empty refused until emptied (second rule).
+        assert!(assert_folder_delete_allowed("SGE-Test-1-Renamed", 1).is_err());
+        // Emptied sandbox folder proceeds.
+        assert!(assert_folder_delete_allowed("SGE-Test-1-Renamed", 0).is_ok());
     }
 }
