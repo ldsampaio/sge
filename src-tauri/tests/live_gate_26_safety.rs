@@ -1042,3 +1042,70 @@ pub mod live_gate_26_cite {
         )));
     }
 }
+
+/// Single combined bundle REPORT shapes (Task 3): per-gate row emission,
+/// deferral-row validation (reason + pointer present, empty refused),
+/// NOT-RUN fill for unrun gates, and zero secret substrings in any
+/// committed verdict text (T-26-11).
+pub mod live_gate_26_report {
+    use super::*;
+
+    fn row(gate: &str, verdict: &str, evidence: &str) -> String {
+        format!("REPORT gate={gate} verdict={verdict} evidence={evidence}")
+    }
+
+    #[test]
+    fn report_rows_carry_gate_verdict_evidence() {
+        let pass = row("confirm-move-undo", "PASS", "confirm→MOVE uid 9 in auto + undo restored 1");
+        assert!(pass.starts_with("REPORT gate=confirm-move-undo verdict=PASS evidence="));
+        let fail = row("rename-delete", "FAIL", "RENAME failed: timeout");
+        assert!(fail.contains("verdict=FAIL"));
+        let skip = row(
+            "cite-smtp-send",
+            "SKIP",
+            &harness::deferral_evidence("no prior-run log (21 live pending)", "scripts/live-21.sh"),
+        );
+        assert!(skip.contains("verdict=SKIP"));
+        assert!(harness::is_reasoned_deferral(skip.split_once("evidence=").unwrap().1));
+    }
+
+    #[test]
+    fn report_bundle_covers_deferred_set_with_not_run_fill() {
+        // The bundle covers exactly the full deferred set; anything
+        // collected short of it surfaces as NOT-RUN (never silent).
+        assert_eq!(harness::ALL_GATES.len(), 10);
+        let partial = vec![("seen-roundtrip".to_string(), "PASS".to_string(), "d".to_string())];
+        let missing = harness::missing_gates(&partial, harness::ALL_GATES);
+        assert_eq!(missing.len(), 9);
+        assert!(missing.contains(&"cite-smtp-send"));
+        for gate in missing {
+            let fill = format!("BUNDLE-ROW gate={gate} verdict=NOT-RUN evidence=leg-never-ran");
+            assert!(fill.contains("verdict=NOT-RUN"));
+        }
+    }
+
+    #[test]
+    fn report_verdict_text_carries_no_secrets() {
+        // Committed verdict text is reasons + pointers only (T-26-11):
+        // the scan the wrapper runs would fire on any leak here.
+        let secrets = ["hunter2-imap-pass", "smtp-secret-9"];
+        let verdicts = [
+            row("batch-probe", "PASS", "7 moves in 3 chunks, resume 0-dupe/0-skip"),
+            row(
+                "cite-draft-onecopy",
+                "SKIP",
+                &harness::deferral_evidence(
+                    "no prior-run log at $SGE_LIVE22_LOG (locked run pending creds)",
+                    "scripts/live-22.sh",
+                ),
+            ),
+            "BUNDLE-ROW gate=starttls-live verdict=SKIP evidence=reason=server is 993-only resume=re-run".to_string(),
+        ];
+        for v in &verdicts {
+            assert_eq!(harness::scan_text_for_secrets(v, &secrets), None);
+        }
+        // And the scan itself is proven armed: a leaked row IS caught.
+        let leaked = row("seen-roundtrip", "PASS", "uid 3 with hunter2-imap-pass inside");
+        assert_eq!(harness::scan_text_for_secrets(&leaked, &secrets), Some(0));
+    }
+}

@@ -2,10 +2,13 @@
 # live-26.sh — Phase 26 sandboxed live-gate wrapper (D-36/D-37/D-44/D-50).
 #
 # Sources the git-ignored env file as env vars (never CLI args), optionally
-# seeds the OS keyring once, runs the live_gate_26 bin capturing a /tmp log,
-# scans the log + SQLite dump for credential substrings, verifies the
-# replay-before-sweep order evidence plus the per-gate REPORT rows, retries
-# bin cleanup on the same backoff schedule, and propagates the bin exit code.
+# seeds the OS keyring once, runs the live_gate_26 bin (STEP 1-15: gates
+# 6/7/8 + v1.3 confirm→MOVE→undo/RENAME-DELETE/batch-probe + 12/13 citation
+# rows + cleanup) capturing a /tmp log, scans the log + SQLite dump for
+# credential substrings, verifies the replay-before-sweep order evidence
+# plus the per-gate REPORT rows (PASS and reasoned SKIP alike) plus the
+# closing BUNDLE-REPORT block, retries bin cleanup on the same backoff
+# schedule, and propagates the bin exit code.
 #
 # EXIT: 0 all-pass · 1 assertion FAIL or secret-leak · 2 pre-flight skip.
 set -uo pipefail
@@ -69,7 +72,7 @@ unset SGE_LIVE_IMAP_PASS SGE_LIVE_SMTP_PASS || true
 # log must contain the worker's own `imap replay:` line (emitted at Step 4b,
 # structurally before the sweep code runs) — file order is the evidence.
 for N in 4 7; do
-    if grep -q "STEP $N/9 .*: PASS" "$LOG" 2>/dev/null; then
+    if grep -q "STEP $N/15 .*: PASS" "$LOG" 2>/dev/null; then
         if ! grep -q "imap replay:" "$LOG" 2>/dev/null; then
             echo "ORDER-FAIL: STEP $N passed but no 'imap replay:' line in $LOG (pre-sweep evidence missing)"
             CODE=1
@@ -90,16 +93,45 @@ if grep -q "^STEP " "$LOG" 2>/dev/null; then
     fi
 fi
 
-# D-46 REPORT rows: every live leg (gates 6/7/8 = STEPs 4-7) must emit its
-# one-line REPORT row. A gate without a row is an incomplete run.
-for GATE in seen-roundtrip tree-browse-badges arrival-tick reconnect-recovery; do
-    if grep -q "STEP .*/9 $GATE: PASS" "$LOG" 2>/dev/null; then
+# D-46 REPORT rows: every live leg (gates 6/7/8 = STEPs 4-7, v1.3 legs =
+# STEPs 9-11, 12/13 citations = STEPs 12-14) must emit its one-line REPORT
+# row. A gate without a row is an incomplete run. PASS rows pair with
+# verdict=PASS; SKIP rows (citations while 21/22 live runs are pending)
+# must carry a reasoned deferral (D-47: reason + resume pointer present
+# and non-empty) — a bare skip is a FAIL, not a deferral.
+for GATE in seen-roundtrip tree-browse-badges arrival-tick reconnect-recovery confirm-move-undo rename-delete batch-probe cite-draft-onecopy cite-smtp-send cite-seen-22; do
+    if grep -q "STEP .*/15 $GATE: PASS" "$LOG" 2>/dev/null; then
         if ! grep -q "^REPORT gate=$GATE verdict=PASS" "$LOG" 2>/dev/null; then
             echo "REPORT-FAIL: STEP $GATE passed but its REPORT row is missing"
             CODE=1
         fi
     fi
+    if grep -q "STEP .*/15 $GATE: SKIP" "$LOG" 2>/dev/null; then
+        if ! grep -E "^REPORT gate=$GATE verdict=SKIP.*reason=.+resume=.+" "$LOG" 2>/dev/null; then
+            echo "REPORT-FAIL: STEP $GATE skipped without a reasoned (reason+resume) SKIP row"
+            CODE=1
+        fi
+    fi
 done
+
+# D-38/D-46 bundle REPORT: when live STEPs ran, the log must close with
+# the single combined bundle block covering every deferred gate — no
+# NOT-RUN rows (incomplete run, never a silent pass), and the STARTTLS
+# documented-deferral row present.
+if grep -q "^STEP " "$LOG" 2>/dev/null; then
+    if ! grep -q "^BUNDLE-REPORT end" "$LOG" 2>/dev/null; then
+        echo "REPORT-FAIL: BUNDLE-REPORT end missing (combined bundle report is mandatory)"
+        CODE=1
+    fi
+    if grep -q "^BUNDLE-ROW .* verdict=NOT-RUN" "$LOG" 2>/dev/null; then
+        echo "REPORT-FAIL: bundle has NOT-RUN gates (incomplete run, never a silent pass)"
+        CODE=1
+    fi
+    if ! grep -q "^BUNDLE-ROW gate=starttls-live verdict=SKIP" "$LOG" 2>/dev/null; then
+        echo "REPORT-FAIL: STARTTLS documented-deferral row missing from bundle"
+        CODE=1
+    fi
+fi
 
 # T-26-06 PEEK gate: no non-PEEK BODY section may appear in the transcript.
 # The harness only ever FETCHes via BODY.PEEK[]; any other BODY[ section

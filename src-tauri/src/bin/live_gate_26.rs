@@ -326,6 +326,42 @@ pub fn is_reasoned_deferral(evidence: &str) -> bool {
     !reason.is_empty() && !resume.is_empty()
 }
 
+/// Full deferred set the bundle REPORT must cover (D-28/D-46): v1.1 6/7/8
+/// legs, v1.3 legs, 12/13 citation rows. `cleanup` fills any gate without
+/// a collected row as NOT-RUN — no silent drops, structurally enforced.
+pub const ALL_GATES: &[&str] = &[
+    "seen-roundtrip",
+    "tree-browse-badges",
+    "arrival-tick",
+    "reconnect-recovery",
+    "confirm-move-undo",
+    "rename-delete",
+    "batch-probe",
+    "cite-draft-onecopy",
+    "cite-smtp-send",
+    "cite-seen-22",
+];
+
+/// Gates in ALL_GATES with no collected row (incomplete run — never a
+/// silent pass). Pure so the offline doubles pin the fill shape.
+pub fn missing_gates<'a>(
+    collected: &[(String, String, String)],
+    all: &'a [&str],
+) -> Vec<&'a str> {
+    all.iter()
+        .copied()
+        .filter(|g| !collected.iter().any(|(gate, _, _)| gate == g))
+        .collect()
+}
+
+/// Documented STARTTLS deferral (deferred idea, carried from 26-CONTEXT):
+/// the account's server is 993-only, so a live STARTTLS proof against a
+/// 143 server is impossible here — stub plus unit coverage stand.
+pub const STARTTLS_DEFER_REASON: &str =
+    "server is 993-only (no 143 STARTTLS endpoint); stub plus unit coverage stand";
+pub const STARTTLS_DEFER_RESUME: &str =
+    "re-run against a 143 STARTTLS server, else accept stub coverage";
+
 /// SQLite dump writer: renders every user table of the run's temp Store as
 /// text so the wrapper can grep the dump for credential substrings.
 /// Read-only open — the live Store keeps its own connection. FTS5 virtual
@@ -1886,6 +1922,10 @@ async fn run() -> i32 {
         },
         Err(_) => vec![format!("{sandbox}-Batch")],
     };
+    // Collected per-gate rows for the single combined bundle REPORT
+    // (D-38): (gate, verdict, evidence). `cleanup` prints them plus
+    // NOT-RUN fill for anything missing — no silent drops.
+    let mut rows: Vec<(String, String, String)> = Vec::new();
 
     let manager = std::sync::Arc::new(SessionManager::new(account_config(&cfg)));
     let db_path = std::env::temp_dir().join(format!(
@@ -1934,17 +1974,17 @@ async fn run() -> i32 {
     // one delta: the sandbox.
     if let Err(e) = assert_sandbox_prefix(&sandbox) {
         step(2, "create", false, &e.to_string());
-        return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
+        return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password, &rows).await;
     }
     if let Err(e) = manager.create_mailbox_in(&sandbox).await {
         step(2, "create", false, &format!("CREATE failed: {e}"));
-        return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
+        return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password, &rows).await;
     }
     let after_create = match list_snapshot(&manager).await {
         Ok(names) => names,
         Err(e) => {
             step(2, "create", false, &format!("re-LIST failed: {e}"));
-            return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
+            return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password, &rows).await;
         }
     };
     let delta = unexpected_list_delta(&before, &after_create, &sandbox);
@@ -1956,7 +1996,7 @@ async fn run() -> i32 {
         created_ok,
         &format!("sandbox created, unexpected deltas: {delta:?}"),
     ) {
-        return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
+        return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password, &rows).await;
     }
     // Seed the temp store's mailbox row + epoch (what sync Step 1 does) so
     // later replay entries find their rows.
@@ -1964,7 +2004,7 @@ async fn run() -> i32 {
         Ok(v) => v,
         Err(e) => {
             step(2, "create", false, &format!("validity read failed: {e}"));
-            return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
+            return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password, &rows).await;
         }
     };
     let mb_id: u64 = {
@@ -1978,7 +2018,7 @@ async fn run() -> i32 {
             Ok(id) => id,
             Err(e) => {
                 step(2, "create", false, &format!("store seed failed: {e}"));
-                return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
+                return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password, &rows).await;
             }
         }
     };
@@ -1988,7 +2028,7 @@ async fn run() -> i32 {
         Ok(uids) => uids,
         Err(e) => {
             step(3, "guard-empty", false, &format!("SEARCH failed: {e}"));
-            return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
+            return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password, &rows).await;
         }
     };
     if !step(
@@ -1997,7 +2037,7 @@ async fn run() -> i32 {
         empty.is_empty(),
         &format!("sandbox holds {} uids (want 0)", empty.len()),
     ) {
-        return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
+        return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password, &rows).await;
     }
 
     // In-run subjects for the audit — pushed from the same constants the
@@ -2014,11 +2054,13 @@ async fn run() -> i32 {
                 Ok(detail) => {
                     step($n, $gate, true, &detail);
                     report($gate, "PASS", &detail);
+                    rows.push(($gate.to_string(), "PASS".to_string(), detail));
                 }
                 Err(reason) => {
                     step($n, $gate, false, &reason);
                     report($gate, "FAIL", &reason);
-                    return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
+                    rows.push(($gate.to_string(), "FAIL".to_string(), reason));
+                    return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password, &rows).await;
                 }
             }
         };
@@ -2028,7 +2070,8 @@ async fn run() -> i32 {
     if let Err(e) = guard_list_clean(&manager, &before, &sandbox, &[]).await {
         step(4, "seen-roundtrip", false, &e);
         report("seen-roundtrip", "FAIL", &e);
-        return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
+        rows.push(("seen-roundtrip".to_string(), "FAIL".to_string(), e));
+        return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password, &rows).await;
     }
     live_step!(
         4,
@@ -2041,7 +2084,8 @@ async fn run() -> i32 {
     if let Err(e) = guard_list_clean(&manager, &before, &sandbox, &[]).await {
         step(5, "tree-browse-badges", false, &e);
         report("tree-browse-badges", "FAIL", &e);
-        return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
+        rows.push(("tree-browse-badges".to_string(), "FAIL".to_string(), e));
+        return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password, &rows).await;
     }
     live_step!(
         5,
@@ -2053,7 +2097,8 @@ async fn run() -> i32 {
     if let Err(e) = guard_list_clean(&manager, &before, &sandbox, &[]).await {
         step(6, "arrival-tick", false, &e);
         report("arrival-tick", "FAIL", &e);
-        return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
+        rows.push(("arrival-tick".to_string(), "FAIL".to_string(), e));
+        return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password, &rows).await;
     }
     live_step!(
         6,
@@ -2067,7 +2112,8 @@ async fn run() -> i32 {
     if let Err(e) = guard_list_clean(&manager, &before, &sandbox, &[]).await {
         step(7, "reconnect-recovery", false, &e);
         report("reconnect-recovery", "FAIL", &e);
-        return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
+        rows.push(("reconnect-recovery".to_string(), "FAIL".to_string(), e));
+        return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password, &rows).await;
     }
     let arrival_uid = match search_msg_uids(&manager, &sandbox, &msg_arrival).await {
         Ok(hits) if hits.len() == 1 => hits[0],
@@ -2075,13 +2121,15 @@ async fn run() -> i32 {
             let reason = format!("arrival anchor: want 1 UID, got {hits:?}");
             step(7, "reconnect-recovery", false, &reason);
             report("reconnect-recovery", "FAIL", &reason);
-            return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
+            rows.push(("reconnect-recovery".to_string(), "FAIL".to_string(), reason));
+            return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password, &rows).await;
         }
         Err(e) => {
             let reason = format!("arrival anchor SEARCH failed: {e}");
             step(7, "reconnect-recovery", false, &reason);
             report("reconnect-recovery", "FAIL", &reason);
-            return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
+            rows.push(("reconnect-recovery".to_string(), "FAIL".to_string(), reason));
+            return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password, &rows).await;
         }
     };
     live_step!(
@@ -2097,7 +2145,7 @@ async fn run() -> i32 {
         }
         Err(reason) => {
             step(8, "no-unprefixed-send", false, &reason);
-            return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
+            return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password, &rows).await;
         }
     }
 
@@ -2107,19 +2155,22 @@ async fn run() -> i32 {
     if let Err(e) = guard_list_clean(&manager, &before, &sandbox, &extras_str(&extras)).await {
         step(9, "confirm-move-undo", false, &e);
         report("confirm-move-undo", "FAIL", &e);
-        return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
+        rows.push(("confirm-move-undo".to_string(), "FAIL".to_string(), e));
+        return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password, &rows).await;
     }
     let msg_filing = run_message_id("filing");
     match live_confirm_move_undo(&manager, &store, &sandbox, epoch, &cfg.self_addr, &msg_filing).await {
         Ok((detail, subject)) => {
             step(9, "confirm-move-undo", true, &detail);
             report("confirm-move-undo", "PASS", &detail);
+            rows.push(("confirm-move-undo".to_string(), "PASS".to_string(), detail));
             subjects.push(subject);
         }
         Err(reason) => {
             step(9, "confirm-move-undo", false, &reason);
             report("confirm-move-undo", "FAIL", &reason);
-            return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
+            rows.push(("confirm-move-undo".to_string(), "FAIL".to_string(), reason));
+            return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password, &rows).await;
         }
     }
 
@@ -2128,19 +2179,22 @@ async fn run() -> i32 {
     if let Err(e) = guard_list_clean(&manager, &before, &sandbox, &extras_str(&extras)).await {
         step(10, "rename-delete", false, &e);
         report("rename-delete", "FAIL", &e);
-        return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
+        rows.push(("rename-delete".to_string(), "FAIL".to_string(), e));
+        return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password, &rows).await;
     }
     let msg_rename = run_message_id("rename");
     match live_rename_delete(&manager, &store, &sandbox, epoch, &cfg.self_addr, &msg_rename).await {
         Ok((detail, subject)) => {
             step(10, "rename-delete", true, &detail);
             report("rename-delete", "PASS", &detail);
+            rows.push(("rename-delete".to_string(), "PASS".to_string(), detail));
             subjects.push(subject);
         }
         Err(reason) => {
             step(10, "rename-delete", false, &reason);
             report("rename-delete", "FAIL", &reason);
-            return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
+            rows.push(("rename-delete".to_string(), "FAIL".to_string(), reason));
+            return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password, &rows).await;
         }
     }
 
@@ -2148,18 +2202,21 @@ async fn run() -> i32 {
     if let Err(e) = guard_list_clean(&manager, &before, &sandbox, &extras_str(&extras)).await {
         step(11, "batch-probe", false, &e);
         report("batch-probe", "FAIL", &e);
-        return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
+        rows.push(("batch-probe".to_string(), "FAIL".to_string(), e));
+        return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password, &rows).await;
     }
     match live_batch_probe(&manager, &store, &sandbox, epoch, &cfg.self_addr, "probe").await {
         Ok((detail, mut leg_subjects)) => {
             step(11, "batch-probe", true, &detail);
             report("batch-probe", "PASS", &detail);
+            rows.push(("batch-probe".to_string(), "PASS".to_string(), detail));
             subjects.append(&mut leg_subjects);
         }
         Err(reason) => {
             step(11, "batch-probe", false, &reason);
             report("batch-probe", "FAIL", &reason);
-            return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
+            rows.push(("batch-probe".to_string(), "FAIL".to_string(), reason));
+            return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password, &rows).await;
         }
     }
 
@@ -2175,17 +2232,19 @@ async fn run() -> i32 {
         if let Err(e) = guard_list_clean(&manager, &before, &sandbox, &extras_str(&extras)).await {
             step(n, gate, false, &e);
             report(gate, "FAIL", &e);
-            return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await;
+            return cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password, &rows).await;
         }
         match live_cite_prior(gate, marker, log_env, resume).await {
             CiteOutcome::Pass(detail) => {
                 step(n, gate, true, &detail);
                 report(gate, "PASS", &detail);
+                rows.push((gate.to_string(), "PASS".to_string(), detail));
             }
             CiteOutcome::Skip(reason, resume_ptr) => {
                 let evidence = deferral_evidence(&reason, &resume_ptr);
                 step_skip(n, gate, &reason);
                 report(gate, "SKIP", &evidence);
+                rows.push((gate.to_string(), "SKIP".to_string(), evidence));
             }
         }
     }
@@ -2194,7 +2253,7 @@ async fn run() -> i32 {
     // dump scan (SCAN-DB line), expunge leftovers (sandbox + extras),
     // DELETE the sandbox + extras with backoff (D-37), re-LIST must equal
     // the pre-run snapshot.
-    cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password).await
+    cleanup(&manager, &db_path, &sandbox, &extras, &before, &cfg.password, &rows).await
 }
 
 /// DELETE-with-backoff shared by `cleanup` and `--cleanup-only` (D-37):
@@ -2264,6 +2323,7 @@ async fn cleanup(
     extras: &[String],
     before: &[String],
     password: &str,
+    rows: &[(String, String, String)],
 ) -> i32 {
     let mut ok = true;
     // Dump BEFORE expunge/DELETE so the scan sees the full run state
@@ -2372,6 +2432,28 @@ async fn cleanup(
         } else {
             "MANUAL"
         },
+        dump_path.display()
+    );
+    // Single combined bundle REPORT (D-38, D-48): one row per deferred
+    // gate — collected PASS/FAIL/SKIP verdicts, NOT-RUN fill for legs that
+    // never ran (incomplete run, never a silent pass), plus the STARTTLS
+    // documented deferral. Verdict table only: reasons plus pointers,
+    // never secrets, never transcripts (T-26-11 — the wrapper greps the
+    // log + dump for credential substrings and FAILs on any hit).
+    println!("BUNDLE-REPORT begin gates={}", ALL_GATES.len());
+    for (gate, verdict, evidence) in rows {
+        println!("BUNDLE-ROW gate={gate} verdict={verdict} evidence={evidence}");
+    }
+    for gate in missing_gates(rows, ALL_GATES) {
+        println!("BUNDLE-ROW gate={gate} verdict=NOT-RUN evidence=leg-never-ran");
+    }
+    println!(
+        "BUNDLE-ROW gate=starttls-live verdict=SKIP evidence={}",
+        deferral_evidence(STARTTLS_DEFER_REASON, STARTTLS_DEFER_RESUME)
+    );
+    println!(
+        "BUNDLE-REPORT end list_restored={} dump={}",
+        if clean { "yes" } else { "no" },
         dump_path.display()
     );
     code
@@ -2595,5 +2677,53 @@ mod live_gate_26_preflight_tests {
         assert!(!is_reasoned_deferral("reason=no creds"));
         assert!(!is_reasoned_deferral("deferred"));
         assert!(!is_reasoned_deferral(""));
+    }
+
+    #[test]
+    fn live_gate_26_bundle_covers_full_deferred_set() {
+        // ALL_GATES is exactly the full deferred set (v1.1 6/7/8, v1.2
+        // 12/13, v1.3 confirm→MOVE + RENAME/DELETE + batch) — no dupes,
+        // no silent drops.
+        let mut sorted = ALL_GATES.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ALL_GATES.len(), "bundle gate list has dupes");
+        for gate in [
+            "seen-roundtrip",
+            "tree-browse-badges",
+            "arrival-tick",
+            "reconnect-recovery",
+            "confirm-move-undo",
+            "rename-delete",
+            "batch-probe",
+            "cite-draft-onecopy",
+            "cite-smtp-send",
+            "cite-seen-22",
+        ] {
+            assert!(ALL_GATES.contains(&gate), "bundle drops {gate}");
+        }
+    }
+
+    #[test]
+    fn live_gate_26_missing_gates_flags_unrun() {
+        let collected = vec![("seen-roundtrip".to_string(), "PASS".to_string(), "d".to_string())];
+        let missing = missing_gates(&collected, ALL_GATES);
+        assert!(missing.contains(&"batch-probe"));
+        assert!(!missing.contains(&"seen-roundtrip"));
+        assert_eq!(missing_gates(&[], ALL_GATES).len(), ALL_GATES.len());
+        // Fully collected → nothing missing (complete run).
+        let full: Vec<(String, String, String)> = ALL_GATES
+            .iter()
+            .map(|g| (g.to_string(), "PASS".to_string(), "d".to_string()))
+            .collect();
+        assert!(missing_gates(&full, ALL_GATES).is_empty());
+    }
+
+    #[test]
+    fn live_gate_26_starttls_deferral_is_reasoned() {
+        assert!(is_reasoned_deferral(&deferral_evidence(
+            STARTTLS_DEFER_REASON,
+            STARTTLS_DEFER_RESUME
+        )));
     }
 }
