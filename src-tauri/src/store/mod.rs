@@ -97,6 +97,7 @@ impl Store {
             M::up(M15_DISMISSED_SQL),
             M::up(M16_BATCH_ITEMS_SQL),
             M::up(M17_FTS_BODY_SQL),
+            M::up(M18_FILTERS_SQL),
         ]);
         migrations.to_latest(conn)?;
         Ok(())
@@ -605,6 +606,32 @@ const M17_FTS_BODY_SQL: &str = concat!(
     "WHERE a.message_id = m.id), '') ",
     "FROM messages m WHERE m.id = new.message_id; ",
     "END;",
+);
+
+/// M18 forward migration: saved filters + search UI state (Phase 23,
+/// Plan 23-02, SRCH-02/03 backend).
+///
+/// `saved_filters` holds named stored queries (query text + folder-scope
+/// JSON + sort); filters apply at QUERY time only — the sync path never
+/// reads this table. `ui_state` is a key-value row store for the search
+/// view (`search_state` key: query + folder scope + sort + active filter
+/// id); it holds no credentials and no mail bodies (T-23-07). Filter
+/// delete removes the filter row only — never mail rows (enforced by the
+/// delete path + tracer test, not by schema).
+const M18_FILTERS_SQL: &str = concat!(
+    "CREATE TABLE saved_filters (",
+    "  id           INTEGER PRIMARY KEY,",
+    "  name         TEXT NOT NULL UNIQUE,",
+    "  query        TEXT NOT NULL DEFAULT '',",
+    "  folder_scope TEXT NOT NULL DEFAULT '[]',",
+    "  sort         TEXT NOT NULL DEFAULT 'rank',",
+    "  created_at   TEXT NOT NULL DEFAULT (datetime('now')),",
+    "  updated_at   TEXT NOT NULL DEFAULT (datetime('now'))",
+    ");",
+    "CREATE TABLE ui_state (",
+    "  key          TEXT PRIMARY KEY,",
+    "  value        TEXT NOT NULL DEFAULT ''",
+    ");",
 );
 
 /// Returns the app-data attachment directory for a given mailbox UID.
@@ -1508,5 +1535,105 @@ mod tests {
             )
             .unwrap();
         assert_eq!(by_subj, 1);
+    }
+}
+
+#[cfg(test)]
+mod m18_tests {
+    use super::*;
+    use rusqlite_migration::{M, Migrations};
+
+    #[test]
+    fn m18_adds_filters_and_ui_state_preserving_rows() {
+        // Simulate a v17 database (through M17, as shipped after Plan 23-01).
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        Migrations::new(vec![
+            M::up(include_str!("schema.sql")),
+            M::up(M2_FLAG_OUTBOX_SQL),
+            M::up(M3_UNSEEN_COUNT_SQL),
+            M::up(M4_BACKFILL_SQL),
+            M::up(M5_STATUS_TS_SQL),
+            M::up(M6_DELIMITER_SQL),
+            M::up(M7_IMAP_OUTBOX_SQL),
+            M::up(M8_ROLES_SQL),
+            M::up(M9_DRAFTS_SQL),
+            M::up(M10_SEND_QUEUE_SQL),
+            M::up(M11_SENT_UNFILED_SQL),
+            M::up(M12_CLASSIFY_SQL),
+            M::up(M13_EXCLUSIONS_SQL),
+            M::up(M14_REVIEW_SETTINGS_SQL),
+            M::up(M15_DISMISSED_SQL),
+            M::up(M16_BATCH_ITEMS_SQL),
+            M::up(M17_FTS_BODY_SQL),
+        ])
+        .to_latest(&mut conn)
+        .unwrap();
+        // Seed v17 rows: cached message + body + send_queue row. (Filter and
+        // state rows cannot predate their tables — they are written after the
+        // upgrade below; the preserve contract covers all pre-existing rows.)
+        conn.execute(
+            "INSERT INTO mailboxes (name, uid_validity, uid_next) VALUES ('INBOX', 100, 4)",
+            [],
+        )
+        .unwrap();
+        let mb: i64 = conn
+            .query_row("SELECT id FROM mailboxes WHERE name = 'INBOX'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO messages (mailbox_id, uid, subject, from_addr, date_utc, flags, preview) \
+             VALUES (?1, 1, 'Old', 'a@x.com', '2024-01-01T00:00:00Z', '[]', 'p')",
+            rusqlite::params![mb],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO send_queue (id, message_id, from_addr, eml_path) \
+             VALUES ('q-1', '<q@sge.local>', 'a@x.com', '/tmp/x.eml')",
+            [],
+        )
+        .unwrap();
+
+        // Forward-upgrade with the production set — only M18 applies.
+        Store::apply_migrations(&mut conn).unwrap();
+
+        // v17 rows survive the upgrade.
+        for (table, want) in [("messages", 1), ("send_queue", 1)] {
+            let n: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, want, "forward migration must preserve {table} rows");
+        }
+        // M18 surface exists.
+        for (kind, name) in [("table", "saved_filters"), ("table", "ui_state")] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = ?1 AND name = ?2",
+                    rusqlite::params![kind, name],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{kind} {name} should exist at schema v18");
+        }
+        // Fresh tables accept writes and start empty before first write.
+        let filters: i64 = conn
+            .query_row("SELECT COUNT(*) FROM saved_filters", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(filters, 0);
+        crate::store::queries::create_filter(&conn, "Pós-migração", "old", None, "rank")
+            .unwrap();
+        crate::store::queries::save_search_state(
+            &conn,
+            &crate::store::queries::SearchState {
+                query: "old".to_string(),
+                folders: None,
+                sort: "rank".to_string(),
+                active_filter_id: None,
+            },
+        )
+        .unwrap();
+        let back = crate::store::queries::load_search_state(&conn).unwrap().unwrap();
+        assert_eq!(back.query, "old");
     }
 }

@@ -3633,3 +3633,652 @@ mod taxroundtrip_tests {
         assert_eq!(l.primary_id, "financeiro.cobrancas");
     }
 }
+
+// ── saved filters + search state (Phase 23, Plan 23-02) ──────────
+
+/// Maximum filter-name length in chars (backend-enforced, T-23-06).
+pub const FILTER_NAME_MAX_CHARS: usize = 80;
+
+/// Sort orders accepted for saved filters and search state.
+pub const SORT_RANK: &str = "rank";
+pub const SORT_DATE: &str = "date";
+
+/// `ui_state` key holding the persisted search view (SRCH-03 backend).
+pub const SEARCH_STATE_KEY: &str = "search_state";
+
+/// Plain-language filter/state errors (Phase 16/19 style: the UI shows
+/// these verbatim — never invents success, never exposes SQL text).
+#[derive(Debug)]
+pub enum FilterError {
+    Store(StoreError),
+    EmptyName,
+    NameTooLong,
+    DuplicateName,
+    UnknownFilter,
+    BadScope,
+    BadSort,
+    CorruptFilter,
+}
+
+impl std::fmt::Display for FilterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FilterError::Store(e) => write!(f, "Não foi possível concluir a operação: {e}"),
+            FilterError::EmptyName => write!(f, "O nome do filtro não pode ficar vazio."),
+            FilterError::NameTooLong => write!(
+                f,
+                "O nome do filtro pode ter no máximo {FILTER_NAME_MAX_CHARS} letras."
+            ),
+            FilterError::DuplicateName => {
+                write!(f, "Já existe um filtro com esse nome — escolha outro.")
+            }
+            FilterError::UnknownFilter => {
+                write!(f, "Esse filtro não existe mais — atualize a lista.")
+            }
+            FilterError::BadScope => {
+                write!(f, "As pastas desse filtro são inválidas — edite o filtro.")
+            }
+            FilterError::BadSort => write!(f, "A ordenação desse filtro é inválida."),
+            FilterError::CorruptFilter => write!(
+                f,
+                "Esse filtro salvo está ilegível — apague e crie de novo."
+            ),
+        }
+    }
+}
+
+impl From<StoreError> for FilterError {
+    fn from(e: StoreError) -> Self {
+        FilterError::Store(e)
+    }
+}
+
+/// One saved filter row: a named stored query (SRCH-02).
+///
+/// `folders = None` means whole-account; `Some(set)` narrows to those
+/// folders. Stored as JSON in `folder_scope` (`[]` = whole account).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SavedFilter {
+    pub id: i64,
+    pub name: String,
+    pub query: String,
+    pub folders: Option<Vec<String>>,
+    pub sort: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Persisted search view (SRCH-03 backend): query + folder scope + sort +
+/// active filter id. An empty `query` means the normal folder list view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct SearchState {
+    pub query: String,
+    pub folders: Option<Vec<String>>,
+    pub sort: String,
+    pub active_filter_id: Option<i64>,
+}
+
+/// One search hit: the message row plus its sanitized match snippet.
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchHit {
+    pub uid: u32,
+    pub mailbox: String,
+    pub subject: String,
+    pub from_addr: String,
+    pub to_addrs: String,
+    pub date_utc: String,
+    pub flags: String,
+    pub has_attachments: bool,
+    pub preview: String,
+    pub snippet: String,
+}
+
+fn validate_filter_name(name: &str) -> Result<String, FilterError> {
+    let trimmed = name.trim().to_string();
+    if trimmed.is_empty() {
+        return Err(FilterError::EmptyName);
+    }
+    if trimmed.chars().count() > FILTER_NAME_MAX_CHARS {
+        return Err(FilterError::NameTooLong);
+    }
+    Ok(trimmed)
+}
+
+fn validate_sort(sort: &str) -> Result<String, FilterError> {
+    if sort == SORT_RANK || sort == SORT_DATE {
+        Ok(sort.to_string())
+    } else {
+        Err(FilterError::BadSort)
+    }
+}
+
+/// Strict folder-scope schema (T-23-05): `None` (whole account) encodes as
+/// `[]`; `Some(set)` encodes as a JSON string array. Every entry must be
+/// a non-empty string; anything else is rejected plainly — never passed
+/// to SQL unchecked.
+fn encode_scope(folders: Option<&[String]>) -> Result<String, FilterError> {
+    match folders {
+        None => Ok("[]".to_string()),
+        Some(set) => {
+            for name in set {
+                if name.trim().is_empty() {
+                    return Err(FilterError::BadScope);
+                }
+            }
+            serde_json::to_string(set).map_err(|_| FilterError::BadScope)
+        }
+    }
+}
+
+/// Decode a stored `folder_scope`: `[]` (or blank) = whole account
+/// (`None`); otherwise a strict `Vec<String>`. Malformed JSON is rejected
+/// plainly at the boundary (T-23-05).
+fn decode_scope(raw: &str) -> Result<Option<Vec<String>>, FilterError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "[]" {
+        return Ok(None);
+    }
+    let names: Vec<String> =
+        serde_json::from_str(trimmed).map_err(|_| FilterError::CorruptFilter)?;
+    if names.iter().any(|n| n.trim().is_empty()) {
+        return Err(FilterError::CorruptFilter);
+    }
+    Ok(Some(names))
+}
+
+fn filter_from_row(row: &rusqlite::Row<'_>) -> Result<SavedFilter, rusqlite::Error> {
+    let scope_raw: String = row.get(3)?;
+    // Row mapping never fails the list: validated at write time, so a
+    // corrupt row here means manual DB edits — surface plainly.
+    let folders = decode_scope(&scope_raw).map_err(|_| rusqlite::Error::InvalidColumnType(
+        3,
+        "folder_scope".to_string(),
+        rusqlite::types::Type::Text,
+    ))?;
+    Ok(SavedFilter {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        query: row.get(2)?,
+        folders,
+        sort: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+    })
+}
+
+/// Save a named filter query (immediate — filters hold no mail, so no
+/// confirm step). Name rules enforced backend-side (T-23-06): non-empty,
+/// 80 chars max, unique.
+pub fn create_filter(
+    conn: &Connection,
+    name: &str,
+    query: &str,
+    folders: Option<&[String]>,
+    sort: &str,
+) -> Result<SavedFilter, FilterError> {
+    let name = validate_filter_name(name)?;
+    let sort = validate_sort(sort)?;
+    let scope = encode_scope(folders)?;
+    let exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM saved_filters WHERE name = ?1",
+        rusqlite::params![name],
+        |r| r.get(0),
+    )?;
+    if exists > 0 {
+        return Err(FilterError::DuplicateName);
+    }
+    conn.execute(
+        "INSERT INTO saved_filters (name, query, folder_scope, sort, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+        rusqlite::params![name, query, scope, sort],
+    )?;
+    get_filter(conn, conn.last_insert_rowid())
+}
+
+/// Read one filter by id. Unknown ids error plainly (never SQL text).
+pub fn get_filter(conn: &Connection, id: i64) -> Result<SavedFilter, FilterError> {
+    match conn.query_row(
+        "SELECT id, name, query, folder_scope, sort, created_at, updated_at \
+         FROM saved_filters WHERE id = ?1",
+        rusqlite::params![id],
+        filter_from_row,
+    ) {
+        Ok(f) => Ok(f),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Err(FilterError::UnknownFilter),
+        Err(rusqlite::Error::InvalidColumnType(_, _, _)) => Err(FilterError::CorruptFilter),
+        Err(e) => Err(FilterError::Store(StoreError::Sql(e))),
+    }
+}
+
+/// List all saved filters ordered by name. Corrupt rows (only possible via
+/// manual DB edits — writes are validated) are skipped so one bad row
+/// never blanks the whole panel; `get_filter` still reports them plainly.
+pub fn list_filters(conn: &Connection) -> Result<Vec<SavedFilter>, FilterError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, query, folder_scope, sort, created_at, updated_at \
+         FROM saved_filters ORDER BY name",
+    )?;
+    let rows = stmt.query_map([], filter_from_row)?;
+    let mut out = Vec::new();
+    for row in rows {
+        match row {
+            Ok(f) => out.push(f),
+            Err(rusqlite::Error::InvalidColumnType(_, _, _)) => continue,
+            Err(e) => return Err(FilterError::Store(StoreError::Sql(e))),
+        }
+    }
+    Ok(out)
+}
+
+/// Rename a filter (same backend name rules as create; renaming onto an
+/// existing sibling name is rejected). Unknown ids error plainly.
+pub fn rename_filter(
+    conn: &Connection,
+    id: i64,
+    new_name: &str,
+) -> Result<SavedFilter, FilterError> {
+    let name = validate_filter_name(new_name)?;
+    get_filter(conn, id)?;
+    let clash: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM saved_filters WHERE name = ?1 AND id != ?2",
+        rusqlite::params![name, id],
+        |r| r.get(0),
+    )?;
+    if clash > 0 {
+        return Err(FilterError::DuplicateName);
+    }
+    conn.execute(
+        "UPDATE saved_filters SET name = ?1, updated_at = datetime('now') WHERE id = ?2",
+        rusqlite::params![name, id],
+    )?;
+    get_filter(conn, id)
+}
+
+/// Delete a filter row. Immediate with no confirm (filters hold no mail).
+/// Deletes ONLY the filter row — mail rows are never touched (tracer
+/// asserts the message count is unchanged). Unknown ids error plainly.
+pub fn delete_filter(conn: &Connection, id: i64) -> Result<(), FilterError> {
+    get_filter(conn, id)?;
+    conn.execute(
+        "DELETE FROM saved_filters WHERE id = ?1",
+        rusqlite::params![id],
+    )?;
+    Ok(())
+}
+
+/// Scoped search with per-hit snippets (shared by the `search_scoped` and
+/// `apply_filter` commands). `sort = "date"` re-orders newest-first;
+/// anything else keeps BM25 + date tie-break.
+pub fn search_scoped_with_snippets(
+    conn: &Connection,
+    folders: Option<&[&str]>,
+    query: &str,
+    sort: &str,
+) -> StoreResult<Vec<SearchHit>> {
+    let rows = fts_search_scoped(conn, folders, query)?;
+    let mut hits: Vec<SearchHit> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let msg_id = find_message_id(
+            conn,
+            mailbox_id(conn, &row.mailbox)?.unwrap_or(0),
+            row.uid,
+        )?
+        .unwrap_or(0);
+        let snippet = if msg_id == 0 {
+            String::new()
+        } else {
+            search_snippet(conn, msg_id, query)?
+        };
+        hits.push(SearchHit {
+            uid: row.uid,
+            mailbox: row.mailbox,
+            subject: row.subject,
+            from_addr: row.from_addr,
+            to_addrs: row.to_addrs,
+            date_utc: row.date_utc,
+            flags: row.flags,
+            has_attachments: row.has_attachments,
+            preview: row.preview,
+            snippet,
+        });
+    }
+    if sort == SORT_DATE {
+        hits.sort_by(|a, b| {
+            b.date_utc
+                .cmp(&a.date_utc)
+                .then_with(|| b.uid.cmp(&a.uid))
+        });
+    }
+    Ok(hits)
+}
+
+/// Re-execute a saved filter's stored query against FTS on demand
+/// (query time, never sync time — T-23-08). The stored query travels the
+/// same parameter-bound MATCH path as a live query (T-23-05); the sync
+/// worker has zero references to this function. Local SQLite only — no
+/// IMAP leg (live-gate: filters are local-only).
+pub fn apply_saved_filter(
+    conn: &Connection,
+    id: i64,
+) -> Result<Vec<SearchHit>, FilterError> {
+    let filter = get_filter(conn, id)?;
+    let folders: Option<Vec<String>> = decode_scope(
+        &encode_scope(filter.folders.as_deref())?,
+    )?;
+    let folder_refs: Option<Vec<&str>> =
+        folders.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+    search_scoped_with_snippets(conn, folder_refs.as_deref(), &filter.query, &filter.sort)
+        .map_err(FilterError::from)
+}
+
+/// Persist the search view on every search/scope/sort/filter change
+/// (SQLite `ui_state`, NOT localStorage — SRCH-03 backend). Shape-only
+/// validation here; stale ids (filter deleted after save) are tolerated
+/// and fall back at restore time (frontend re-validates before apply).
+pub fn save_search_state(conn: &Connection, state: &SearchState) -> Result<(), FilterError> {
+    validate_sort(&state.sort)?;
+    if let Some(folders) = state.folders.as_deref() {
+        encode_scope(Some(folders))?;
+    }
+    let json = serde_json::to_string(state).map_err(|_| FilterError::BadScope)?;
+    conn.execute(
+        "INSERT INTO ui_state (key, value) VALUES (?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![SEARCH_STATE_KEY, json],
+    )?;
+    Ok(())
+}
+
+/// Load the persisted search view (`None` = never searched: the caller
+/// renders the normal folder list). Corrupt JSON falls back to `None`
+/// (safe empty view) rather than failing launch.
+pub fn load_search_state(conn: &Connection) -> Result<Option<SearchState>, FilterError> {
+    let raw: Option<String> = match conn.query_row(
+        "SELECT value FROM ui_state WHERE key = ?1",
+        rusqlite::params![SEARCH_STATE_KEY],
+        |r| r.get(0),
+    ) {
+        Ok(v) => Some(v),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => return Err(FilterError::Store(StoreError::Sql(e))),
+    };
+    match raw {
+        None => Ok(None),
+        Some(json) => match serde_json::from_str(&json) {
+            Ok(state) => Ok(Some(state)),
+            Err(_) => Ok(None),
+        },
+    }
+}
+
+impl From<rusqlite::Error> for FilterError {
+    fn from(e: rusqlite::Error) -> Self {
+        FilterError::Store(StoreError::Sql(e))
+    }
+}
+
+// ── Plan 23-02 tests: saved filters + search state ──────────────
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+    use crate::store::Store;
+
+    fn seed_inbox(conn: &Connection) -> u64 {
+        let mb = ensure_mailbox(conn, "INBOX").unwrap();
+        upsert_message(
+            conn, mb, 1, None, "Boleto mensal", "escola@example.com", "[]", "[]",
+            "2024-01-01T00:00:00Z", "[]", false, "prev",
+        )
+        .unwrap();
+        let mid = find_message_id(conn, mb, 1).unwrap().unwrap();
+        insert_body(conn, mid, Some("boleto da mensalidade de março"), None).unwrap();
+        mb
+    }
+
+    fn temp_db(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("sge_23_02_{name}_{}.db", std::process::id()))
+    }
+
+    fn cleanup(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.to_str().unwrap_or_default()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.to_str().unwrap_or_default()));
+    }
+
+    #[test]
+    fn tracer_save_restart_read_reexecute() {
+        // Tracer: ONE path end-to-end — save, restart-read, re-execute.
+        let path = temp_db("tracer");
+        cleanup(&path);
+        let filter_id: i64;
+        {
+            let store = Store::open(&path).unwrap();
+            let conn = store.conn();
+            seed_inbox(conn);
+            let live = fts_search(conn, None, "boleto").unwrap();
+            assert_eq!(live.len(), 1);
+            let saved = create_filter(conn, "Boletos", "boleto", None, SORT_RANK).unwrap();
+            filter_id = saved.id;
+            assert_eq!((saved.name.as_str(), saved.query.as_str()), ("Boletos", "boleto"));
+            assert_eq!(saved.folders, None);
+        }
+        // Restart analogue: drop + re-open the file database.
+        {
+            let store = Store::open(&path).unwrap();
+            let conn = store.conn();
+            let back = get_filter(conn, filter_id).unwrap();
+            assert_eq!(back.name, "Boletos");
+            // Stored query re-executes to identical hits as the live query.
+            let live = fts_search(conn, None, "boleto").unwrap();
+            let applied = apply_saved_filter(conn, filter_id).unwrap();
+            let live_uids: Vec<u32> = live.iter().map(|m| m.uid).collect();
+            let applied_uids: Vec<u32> = applied.iter().map(|h| h.uid).collect();
+            assert_eq!(live_uids, applied_uids);
+            assert!(!applied[0].snippet.is_empty(), "apply carries snippets");
+            // Filter delete leaves mail untouched (only the filter row goes).
+            let before: i64 = conn
+                .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+                .unwrap();
+            delete_filter(conn, filter_id).unwrap();
+            let after: i64 = conn
+                .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!((before, after), (1, 1));
+            assert!(list_filters(conn).unwrap().is_empty());
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn filter_name_validation_is_backend_side() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        // Empty / blank names rejected.
+        for bad in ["", "   "] {
+            let err = create_filter(conn, bad, "q", None, SORT_RANK).unwrap_err();
+            assert_eq!(err.to_string(), "O nome do filtro não pode ficar vazio.");
+        }
+        // Over-80-char names rejected (chars, not bytes — accents count once).
+        let long = "ã".repeat(81);
+        let err = create_filter(conn, &long, "q", None, SORT_RANK).unwrap_err();
+        assert!(err.to_string().contains("80"), "got: {err}");
+        assert_eq!("ã".repeat(80).chars().count(), 80);
+        create_filter(conn, &"ã".repeat(80), "q", None, SORT_RANK).unwrap();
+        // Duplicates rejected (trimmed names compare).
+        create_filter(conn, "Duplo", "a", None, SORT_RANK).unwrap();
+        let err = create_filter(conn, "  Duplo  ", "b", None, SORT_RANK).unwrap_err();
+        assert_eq!(err.to_string(), "Já existe um filtro com esse nome — escolha outro.");
+        // Rename onto a sibling name rejected.
+        let a = create_filter(conn, "Alfa", "a", None, SORT_RANK).unwrap();
+        let b = create_filter(conn, "Beta", "b", None, SORT_RANK).unwrap();
+        let err = rename_filter(conn, b.id, "Alfa").unwrap_err();
+        assert_eq!(err.to_string(), "Já existe um filtro com esse nome — escolha outro.");
+        // Rename to empty rejected; successful rename round-trips.
+        assert!(rename_filter(conn, b.id, "  ").is_err());
+        let renamed = rename_filter(conn, b.id, "Gama").unwrap();
+        assert_eq!(renamed.name, "Gama");
+        assert_eq!(get_filter(conn, a.id).unwrap().name, "Alfa");
+        // Unknown ids error plainly (never SQL text).
+        assert_eq!(
+            get_filter(conn, 99999).unwrap_err().to_string(),
+            "Esse filtro não existe mais — atualize a lista."
+        );
+        assert_eq!(
+            delete_filter(conn, 99999).unwrap_err().to_string(),
+            "Esse filtro não existe mais — atualize a lista."
+        );
+        assert_eq!(
+            apply_saved_filter(conn, 99999).unwrap_err().to_string(),
+            "Esse filtro não existe mais — atualize a lista."
+        );
+        // Bad sort rejected at the boundary.
+        assert_eq!(
+            create_filter(conn, "Ordem", "q", None, "bogus").unwrap_err().to_string(),
+            "A ordenação desse filtro é inválida."
+        );
+    }
+
+    #[test]
+    fn folder_scope_json_roundtrips_all_vs_set() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        ensure_mailbox(conn, "Sent").unwrap();
+        // All (None) encodes as [] and decodes back to None.
+        let all = create_filter(conn, "Tudo", "q", None, SORT_RANK).unwrap();
+        assert_eq!(all.folders, None);
+        assert_eq!(get_filter(conn, all.id).unwrap().folders, None);
+        // A folder set round-trips exactly.
+        let set = create_filter(
+            conn,
+            "Duas",
+            "q",
+            Some(&["INBOX".to_string(), "Sent".to_string()]),
+            SORT_RANK,
+        )
+        .unwrap();
+        assert_eq!(
+            set.folders,
+            Some(vec!["INBOX".to_string(), "Sent".to_string()])
+        );
+        assert_eq!(get_filter(conn, set.id).unwrap().folders, set.folders);
+        // Blank folder entries rejected plainly (strict schema, T-23-05).
+        let err = create_filter(conn, "Ruim", "q", Some(&[" ".to_string()]), SORT_RANK)
+            .unwrap_err();
+        assert_eq!(err.to_string(), "As pastas desse filtro são inválidas — edite o filtro.");
+        // Malformed stored JSON is rejected plainly at apply time.
+        conn.execute(
+            "INSERT INTO saved_filters (name, query, folder_scope) VALUES ('X', 'q', 'não-json')",
+            [],
+        )
+        .unwrap();
+        let bad_id = conn.last_insert_rowid();
+        assert_eq!(
+            get_filter(conn, bad_id).unwrap_err().to_string(),
+            "Esse filtro salvo está ilegível — apague e crie de novo."
+        );
+    }
+
+    #[test]
+    fn search_state_roundtrips_and_survives_reopen() {
+        let path = temp_db("state");
+        cleanup(&path);
+        let state = SearchState {
+            query: "boleto".to_string(),
+            folders: Some(vec!["INBOX".to_string()]),
+            sort: SORT_RANK.to_string(),
+            active_filter_id: None,
+        };
+        {
+            let store = Store::open(&path).unwrap();
+            // Never saved → None (caller renders the normal folder list).
+            assert_eq!(load_search_state(store.conn()).unwrap(), None);
+            save_search_state(store.conn(), &state).unwrap();
+            assert_eq!(load_search_state(store.conn()).unwrap(), Some(state.clone()));
+            // Reconnect analogue: a second load returns the same view.
+            assert_eq!(load_search_state(store.conn()).unwrap(), Some(state.clone()));
+        }
+        // Restart analogue: state survives store re-open (SQLite, not localStorage).
+        {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(load_search_state(store.conn()).unwrap(), Some(state.clone()));
+            // Empty restored query = normal folder list branch (no stale pane).
+            let empty = SearchState {
+                query: "".to_string(),
+                folders: None,
+                sort: SORT_RANK.to_string(),
+                active_filter_id: None,
+            };
+            save_search_state(store.conn(), &empty).unwrap();
+            let back = load_search_state(store.conn()).unwrap().unwrap();
+            assert!(back.query.is_empty() && back.folders.is_none());
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn search_state_tolerates_stale_filter_and_corruption() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        // Shape-only validation at save: a deleted-later filter id is stored
+        // fine (the frontend re-validates before apply — stale falls back).
+        let stale = SearchState {
+            query: "q".to_string(),
+            folders: None,
+            sort: SORT_DATE.to_string(),
+            active_filter_id: Some(424242),
+        };
+        save_search_state(conn, &stale).unwrap();
+        assert_eq!(load_search_state(conn).unwrap(), Some(stale));
+        // Corrupt JSON degrades to None (safe empty view), never a launch failure.
+        conn.execute(
+            "UPDATE ui_state SET value = '###não-json###' WHERE key = 'search_state'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(load_search_state(conn).unwrap(), None);
+        // Bad sort rejected at save.
+        let bad = SearchState {
+            query: "q".to_string(),
+            folders: None,
+            sort: "bogus".to_string(),
+            active_filter_id: None,
+        };
+        assert!(save_search_state(conn, &bad).is_err());
+    }
+
+    #[test]
+    fn filter_apply_path_is_local_only_and_sorted() {
+        // Live-gate regression: apply re-executes ONE capped local FTS query
+        // — this test builds no SessionManager and the apply path references
+        // no sync/IMAP symbol (verified by grep: sync/worker.rs has zero
+        // filter/state references in plan verification).
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let mb = ensure_mailbox(conn, "INBOX").unwrap();
+        for (uid, date) in [(1u32, "2024-01-01T00:00:00Z"), (2, "2024-06-01T00:00:00Z")] {
+            upsert_message(
+                conn, mb, uid, None, "reunião", "a@x.com", "[]", "[]", date, "[]", false, "p",
+            )
+            .unwrap();
+        }
+        let by_date =
+            create_filter(conn, "Recentes", "reunião", None, SORT_DATE).unwrap();
+        let hits = apply_saved_filter(conn, by_date.id).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits[0].date_utc > hits[1].date_utc, "date sort newest-first");
+        let by_rank = create_filter(conn, "Rank", "reunião", None, SORT_RANK).unwrap();
+        assert_eq!(apply_saved_filter(conn, by_rank.id).unwrap().len(), 2);
+        // Scoped filter only hits its folders.
+        ensure_mailbox(conn, "Sent").unwrap();
+        let scoped = create_filter(
+            conn,
+            "SóSent",
+            "reunião",
+            Some(&["Sent".to_string()]),
+            SORT_RANK,
+        )
+        .unwrap();
+        assert!(apply_saved_filter(conn, scoped.id).unwrap().is_empty());
+    }
+}
