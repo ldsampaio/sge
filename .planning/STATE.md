@@ -3,14 +3,14 @@ gsd_state_version: "1.0"
 milestone: v1.4
 milestone_name: SMTP Send + Search/Filters + Live Validation + Auto-Archive + Smart Folder Rules
 status: starting
-stopped_at: Phase 21 plan 01 executed (tracer committed, offline green)
-last_updated: "2026-10-13T03:54:14.674Z"
-state_head: eddac026c8fd0957ef1dfd21dcf2cef324ef3fc2
+stopped_at: Completed 21-02-PLAN.md (expansion, offline green; live run pending)
+last_updated: "2026-10-13T14:18:40.048Z"
+state_head: 95082b99cf54cf70b1da3b7165f63a8526f320ff
 progress:
   total_phases: 18
   completed_phases: 20
   total_plans: 18
-  completed_plans: 0
+  completed_plans: 2
 last_activity: 2026-10-11
 ship_status: Milestone v1.3 complete (audit passed); v1.4 started — phases 21-27 scoped in ROADMAP.md (not yet planned per-phase)
 current_phase_name: SMTP Send — Live Gate (Live-01, SANDBOXED)
@@ -80,6 +80,8 @@ Decisions are logged in PROJECT.md Key Decisions table. v1.3 structural decision
 - Build order: packaging spike → taxonomy/store → suggestions-without-moves → confirm/MOVE → editor/import → batch.
 - Trust: single-email always user-confirmed (IPC-enforced); batch unconfirmed with journal + undo; worst case `A Classificar`, never delete; secondary label local-only.
 - Privacy: redaction sanitizer designed once in Phase 16, reused everywhere; labels store pointers, never content.
+- [Phase ?]: 21-02: draft-send STEP verdict binary (FAIL BY DESIGN on any orphan, zero harness discard) routing to gap closure
+- [Phase ?]: 21-02: secret scan in-bin over full temp-DB dump before cleanup (SCAN-DB line), wrapper re-checks log + SCAN-DB
 
 ### Pending Todos
 
@@ -110,11 +112,11 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-**Stopped at:** Phase 21 plan 01 executed (tracer committed: fe25e49, d96945a, 4aa907e; 10 bin + 22 safety tests green; full suite 328 green)
+**Stopped at:** Completed 21-02-PLAN.md (expansion, offline green; live run pending)
 
-Last session: 2026-10-13T03:20:36.837Z
+Last session: 2026-10-13T14:18:40.036Z
 Milestone: v1.3 Auto-Classify complete
-Resume file: .planning/phases/21-smtp-send-live-gate-live-01-sandboxed/21-02-PLAN.md
+Resume file: scripts/live-21.sh
 
 ## Operator Next Steps
 

@@ -229,7 +229,7 @@ Decimal phases appear between their surrounding integers in numeric order. v1.2 
 
 Plans:
 - [x] 21-01-PLAN.md — Tracer: harness skeleton + recipient guard + self-send arrival + verbatim Sent copy + double-enqueue single-delivery + sent-unfiled never-resends (offline doubles green, live clean-skip)
-- [ ] 21-02-PLAN.md — Expansion: offline-flush backoff + DATA-timeout uncertain reconcile + kill-mid-sending recovery + draft-send no-orphan + secret scan + send audit + cleanup/report
+- [x] 21-02-PLAN.md — Expansion: offline-flush backoff + DATA-timeout uncertain reconcile + kill-mid-sending recovery + draft-send no-orphan + secret scan + send audit + cleanup/report (offline green, committed 0c6e7c6 + 95082b9; live run pending human via scripts/live-21.sh)
 
 ### Phase 22: Draft & Seen Round-Trip — Live Gate (Live-02, SANDBOXED)
 **Goal:** Draft APPEND 1-copy inside `SGE-Test-<run-id>` sandbox, Seen survives reconnect, `imap_outbox` replay, no silent resurrection — pre-flight guard + post-run cleanup. **Requires:** Phase 12/13 + creds file. **Requirements:** LIVE-02. **UI:** minimal. **Plans:** 2 plans.

@@ -1,7 +1,7 @@
 {
   "contract": "1.0.0",
   "flavor": "core",
-  "milestone": "v1.3",
+  "milestone": "v1.4 — SMTP Send + Search/Filters + Live Validation + Auto-Archive + Smart Folder Rules",
   "phases": [
     {
       "number": "1",
@@ -72,12 +72,42 @@
       "number": "14",
       "name": "Compose UI",
       "status": "complete"
+    },
+    {
+      "number": "15",
+      "name": "Sidecar Packaging Spike",
+      "status": "complete"
+    },
+    {
+      "number": "16",
+      "name": "Taxonomy + Store",
+      "status": "complete"
+    },
+    {
+      "number": "17",
+      "name": "Classify Engine (No Moves)",
+      "status": "complete"
+    },
+    {
+      "number": "18",
+      "name": "Confirm + Trust UX",
+      "status": "complete"
+    },
+    {
+      "number": "19",
+      "name": "Taxonomy Editor + Import",
+      "status": "complete"
+    },
+    {
+      "number": "20",
+      "name": "Batch Reorganization",
+      "status": "complete"
     }
   ],
   "next": {
-    "command": "/gsd:discuss-phase",
-    "label": "Discuss the first phase",
-    "reason": "Project initialized — plan your first phase"
+    "command": "/gsd:progress",
+    "label": "Show progress",
+    "reason": "Unsure of state — showing progress"
   },
-  "updated_at": "2026-10-10T16:43:27.223Z"
+  "updated_at": "2026-10-13T03:54:14.680Z"
 }
