@@ -4,14 +4,24 @@ import { IconSearch } from "./icons";
 interface SearchBarProps {
   onSearch: (query: string) => void;
   disabled?: boolean;
+  /** Seed for the input (search-state restore, clear-search). */
+  initialValue?: string;
+  /** Element rendered adjacent to the input (scope selector, filters). */
+  addon?: React.ReactNode;
 }
 
 const DEBOUNCE_MS = 300;
 
-export default function SearchBar({ onSearch, disabled }: SearchBarProps) {
-  const [value, setValue] = useState("");
+export default function SearchBar({ onSearch, disabled, initialValue, addon }: SearchBarProps) {
+  const [value, setValue] = useState(initialValue ?? "");
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastEmittedRef = useRef<string | null>(null);
+
+  // Restore/clear seed: applied only when the seed itself changes, never
+  // while typing (typing flows child→parent via onSearch, not back down).
+  useEffect(() => {
+    setValue(initialValue ?? "");
+  }, [initialValue]);
 
   useEffect(() => {
     if (debounceRef.current) {
@@ -62,6 +72,7 @@ export default function SearchBar({ onSearch, disabled }: SearchBarProps) {
           ×
         </button>
       )}
+      {addon}
     </div>
   );
 }

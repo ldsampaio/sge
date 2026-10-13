@@ -29,6 +29,29 @@ export interface ListState {
   message: string;
 }
 
+/** Search hit: the message row plus its sanitized match snippet. */
+export interface SearchHit extends MessageRow {
+  snippet: string;
+}
+
+/** Escape a literal for RegExp construction (snippet bolding). */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Render a sanitized snippet with query-token matches bolded. Text nodes
+ * only — never dangerouslySetInnerHTML on backend strings (T-23-09).
+ */
+function renderSnippet(snippet: string, query: string): React.ReactNode {
+  const tokens = query.split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return snippet;
+  const pat = new RegExp(`(${tokens.map(escapeRegExp).join("|")})`, "gi");
+  return snippet.split(pat).map((part, i) =>
+    i % 2 === 1 ? <strong key={i}>{part}</strong> : <span key={i}>{part}</span>,
+  );
+}
+
 interface UndoToastState {
   visible: boolean;
   message: string;
@@ -40,6 +63,14 @@ interface UndoToastState {
 interface MessageListProps {
   mailbox: string;
   searchQuery: string | null;
+  /** Folder-scope for search (`null`/`undefined` = whole account). */
+  searchFolders?: string[] | null;
+  /** Result order: backend BM25 default, or newest-first re-sort. */
+  searchSort?: "rank" | "date";
+  /** pt-BR scope description for the results header / empty state. */
+  scopeLabel?: string;
+  /** Clear-search action (header + empty state). */
+  onClearSearch?: () => void;
   /** Folder rows for the search-result folder chip (raw → display lookup). */
   mailboxes?: MailboxRow[];
   onMessageSelect: (msg: MessageRow) => void;
@@ -79,6 +110,10 @@ function avatarInitial(addr: string): string {
 export default function MessageList({
   mailbox,
   searchQuery,
+  searchFolders,
+  searchSort = "rank",
+  scopeLabel = "todas as pastas",
+  onClearSearch,
   mailboxes = [],
   onMessageSelect,
   selectedUid,
@@ -86,7 +121,7 @@ export default function MessageList({
   onMessageCount,
   refreshKey,
 }: MessageListProps) {
-  const [messages, setMessages] = useState<MessageRow[]>([]);
+  const [messages, setMessages] = useState<SearchHit[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(0);
   const [loading, setLoading] = useState(false);
@@ -95,7 +130,7 @@ export default function MessageList({
   const [pendingUids, setPendingUids] = useState<Set<number>>(new Set());
   /** Phase 18 badges: uid → label (one bulk fetch per mailbox). */
   const [labelByUid, setLabelByUid] = useState<Map<number, MailboxLabel>>(new Map());
-  const searchCache = useRef<{ query: string; rows: MessageRow[] } | null>(null);
+  const searchCache = useRef<{ key: string; rows: SearchHit[] } | null>(null);
   const countRef = useRef(onMessageCount);
   countRef.current = onMessageCount;
 
@@ -146,14 +181,22 @@ export default function MessageList({
 
       try {
         if (searchQuery) {
-          if (!searchCache.current || searchCache.current.query !== searchQuery) {
-            const rows: MessageRow[] = await invoke("search_messages", {
-              mailbox: null,
+          // One local FTS invoke per debounced pause (300 ms upstream):
+          // capped at 200 rows backend-side, snippets attached per hit.
+          const cacheKey = JSON.stringify([searchQuery, searchFolders ?? null, searchSort]);
+          if (!searchCache.current || searchCache.current.key !== cacheKey) {
+            const rows: SearchHit[] = await invoke("search_scoped", {
               query: searchQuery,
+              folders: searchFolders ?? null,
             });
-            searchCache.current = { query: searchQuery, rows };
+            searchCache.current = { key: cacheKey, rows };
           }
-          const all = searchCache.current.rows;
+          let all = searchCache.current.rows;
+          if (searchSort === "date") {
+            all = [...all].sort(
+              (a, b) => b.date_utc.localeCompare(a.date_utc) || b.uid - a.uid,
+            );
+          }
           setMessages(all.slice(p * PAGE_SIZE, p * PAGE_SIZE + PAGE_SIZE));
           setTotal(all.length);
           countRef.current?.(all.length);
@@ -166,7 +209,7 @@ export default function MessageList({
             }),
             invoke<SyncStatusInfo>("sync_status", { mailbox }),
           ]);
-          setMessages(rows);
+          setMessages(rows.map((r) => ({ ...r, snippet: "" })));
           setTotal(status.message_count);
           countRef.current?.(status.message_count);
           // Outbox drained (server acknowledged everything) → clear the wash.
@@ -185,7 +228,7 @@ export default function MessageList({
         setLoading(false);
       }
     },
-    [mailbox, searchQuery, reportState],
+    [mailbox, searchQuery, searchFolders, searchSort, reportState],
   );
 
   /** Raw folder name → display name for the search-result chip. */
@@ -494,7 +537,7 @@ export default function MessageList({
     void loadPage(0);
     // Phase 18: bulk labels for badges (quiet failure keeps the list clean).
     void fetchLabels();
-  }, [mailbox, searchQuery, refreshKey]);
+  }, [mailbox, searchQuery, searchFolders, searchSort, refreshKey]);
 
   const fetchLabels = async () => {
     try {
@@ -571,15 +614,38 @@ export default function MessageList({
           <span className="list-empty-ill" aria-hidden="true">
             <IconInbox size={30} />
           </span>
-          <p>Nada encontrado para “{searchQuery}”</p>
+          <p>
+            Nada encontrado para “{searchQuery}” em {scopeLabel}
+          </p>
           <p>Tente outro remetente ou palavra do assunto.</p>
+          {onClearSearch && (
+            <button type="button" className="btn btn-ghost" onClick={onClearSearch}>
+              Limpar busca
+            </button>
+          )}
         </div>
       </div>
     );
   }
 
+  const atResultCap = searchQuery !== null && total >= 200;
+
   return (
     <div className="message-list-wrap">
+      {searchQuery && (
+        <div className="search-results-header">
+          <p className="pager-info" aria-live="polite">
+            {total} {total === 1 ? "resultado" : "resultados"} para “{searchQuery}” em{" "}
+            {scopeLabel}
+            {atResultCap && " — mostrando os primeiros 200"}
+          </p>
+          {onClearSearch && (
+            <button type="button" className="btn btn-ghost" onClick={onClearSearch}>
+              Limpar busca
+            </button>
+          )}
+        </div>
+      )}
       <div className="message-list" role="listbox" aria-label="Avisos da sala">
         {messages.map((msg) => {
           const unread = isUnread(msg.flags);
@@ -630,8 +696,14 @@ export default function MessageList({
               <span className="message-subject-cell">
                 <span style={{ minWidth: 0, flex: 1 }}>
                   <span className="message-subject">{msg.subject || "(sem assunto)"}</span>
-                  {msg.preview && (
-                    <span className="message-preview">{msg.preview.slice(0, 90)}</span>
+                  {searchQuery && msg.snippet ? (
+                    <span className="message-preview">
+                      {renderSnippet(msg.snippet, searchQuery)}
+                    </span>
+                  ) : (
+                    msg.preview && (
+                      <span className="message-preview">{msg.preview.slice(0, 90)}</span>
+                    )
                   )}
                   {labelByUid.get(msg.uid) && (
                     <span style={{ marginTop: 2, display: "inline-block" }}>

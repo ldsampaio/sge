@@ -8,6 +8,15 @@ import ReadingPane from "./ReadingPane";
 import DraftEditor from "./DraftEditor";
 import SyncStatus from "./SyncStatus";
 import SearchBar from "./SearchBar";
+import SearchScopeSelector, {
+  type SearchScope,
+  scopeToFolders,
+  scopeLabel,
+} from "./SearchScopeSelector";
+import SavedFiltersPanel, {
+  type SavedFilterRow,
+  type SearchSort,
+} from "./SavedFiltersPanel";
 import type {
   MessageRow,
   MessageView,
@@ -38,6 +47,15 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
   const [selectedMailbox, setSelectedMailbox] = useState(mailbox);
   const [selectedMessage, setSelectedMessage] = useState<MessageRow | null>(null);
   const [searchQuery, setSearchQuery] = useState<string | null>(null);
+  // Phase 23: scoped search + saved filters + persisted state.
+  const [searchScope, setSearchScope] = useState<SearchScope>({ kind: "all" });
+  const [searchSort, setSearchSort] = useState<SearchSort>("rank");
+  const [activeFilterId, setActiveFilterId] = useState<number | null>(null);
+  const [showFilters, setShowFilters] = useState(false);
+  /** Seed for the SearchBar input (restore-on-launch, filter apply, clear). */
+  const [searchBoxSeed, setSearchBoxSeed] = useState("");
+  /** Persist guard: no state saves before the launch restore completes. */
+  const restoredRef = useRef(false);
   const [messageCount, setMessageCount] = useState(0);
   const [mailboxes, setMailboxes] = useState<MailboxRow[]>([]);
   const [listState, setListState] = useState<ListState>({
@@ -77,23 +95,88 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
   const sessionDraftsRef = useRef<Map<number, string>>(new Map());
   /** Monotonic mint for per-open editor session keys (MJ-01/MJ-02). */
   const draftSessionRef = useRef(0);
+  /** Live scope/sort for the debounced search handler (stable identity). */
+  const searchScopeRef = useRef<SearchScope>({ kind: "all" });
+  searchScopeRef.current = searchScope;
+  const searchSortRef = useRef<SearchSort>("rank");
+  searchSortRef.current = searchSort;
   function nextDraftKey(): string {
     draftSessionRef.current += 1;
     return `draft-open-${draftSessionRef.current}`;
   }
 
-  // FOLD-01: fetch mailbox list from the local store on mount.
+  // FOLD-01: fetch mailbox list from the local store on mount, then
+  // restore the persisted search view (SRCH-03): query + folder scope +
+  // sort + active filter id. Restored scope/filter ids are re-validated
+  // before apply (T-23-11): unknown folders fall back to whole-account,
+  // a deleted filter id falls back to no active filter.
   useEffect(() => {
     void (async () => {
+      let rows: MailboxRow[] = [];
       try {
-        const rows = await invoke<MailboxRow[]>("list_mailboxes");
+        rows = await invoke<MailboxRow[]>("list_mailboxes");
         setMailboxes(rows ?? []);
       } catch {
         // No stored mailboxes yet — sidebar falls back to the INBOX bootstrap.
         setMailboxes([]);
       }
+      try {
+        const saved = await invoke<{
+          query: string;
+          folders: string[] | null;
+          sort: string;
+          active_filter_id: number | null;
+        } | null>("load_search_state");
+        if (saved && saved.query) {
+          const known = new Set((rows ?? []).map((r) => r.name));
+          let scope: SearchScope = { kind: "all" };
+          if (
+            saved.folders &&
+            saved.folders.length > 0 &&
+            saved.folders.every((f) => known.has(f))
+          ) {
+            scope = { kind: "folders", names: saved.folders };
+          }
+          let filterId: number | null = null;
+          if (saved.active_filter_id !== null && saved.active_filter_id !== undefined) {
+            try {
+              const filters = await invoke<SavedFilterRow[]>("list_filters");
+              if ((filters ?? []).some((f) => f.id === saved.active_filter_id)) {
+                filterId = saved.active_filter_id;
+              }
+            } catch {
+              filterId = null;
+            }
+          }
+          setSearchScope(scope);
+          setSearchSort(saved.sort === "date" ? "date" : "rank");
+          setActiveFilterId(filterId);
+          setSearchQuery(saved.query);
+          setSearchBoxSeed(saved.query);
+        }
+      } catch {
+        // No saved state — defaults stand (whole-account empty query).
+      } finally {
+        restoredRef.current = true;
+      }
     })();
   }, []);
+
+  /** Persist the search view in SQLite on every change (SRCH-03). */
+  const persistSearchState = useCallback(
+    (query: string | null, scope: SearchScope, sort: SearchSort, filterId: number | null) => {
+      if (!restoredRef.current) return;
+      void invoke("save_search_state", {
+        query: query ?? "",
+        folders: scopeToFolders(scope),
+        sort,
+        active_filter_id: filterId,
+      }).catch(() => {
+        // State save is best-effort — the search itself already ran.
+      });
+    },
+    [],
+  );
 
   function handleMessageSelect(msg: MessageRow) {
     // Global search can surface a message from another folder — switch to
@@ -187,9 +270,51 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
   }
 
   const handleSearch = useCallback((query: string) => {
-    setSearchQuery(query.length > 0 ? query : null);
+    // Manual typing detaches the active filter (it no longer describes
+    // the query) and persists the new view.
+    setSearchQuery((prev) => {
+      const next = query.length > 0 ? query : null;
+      if (next !== prev) setSelectedMessage(null);
+      return next;
+    });
+    setActiveFilterId(null);
+    persistSearchState(query.length > 0 ? query : null, searchScopeRef.current, searchSortRef.current, null);
+  }, [persistSearchState]);
+
+  /** Scope change: narrowing re-runs the live search and persists. */
+  function handleScopeChange(scope: SearchScope) {
+    setSearchScope(scope);
     setSelectedMessage(null);
-  }, []);
+    persistSearchState(searchQuery, scope, searchSort, activeFilterId);
+  }
+
+  /** Clear-search: empty query restores the normal folder list view. */
+  function handleClearSearch() {
+    setSearchQuery(null);
+    setActiveFilterId(null);
+    setSearchBoxSeed("");
+    setSelectedMessage(null);
+    persistSearchState(null, searchScope, searchSort, null);
+  }
+
+  /** Apply a saved filter: restore its query + scope + sort + id. */
+  function handleApplyFilter(f: SavedFilterRow) {
+    const known = new Set(mailboxes.map((m) => m.name));
+    const names = (f.folders ?? []).filter((n) => known.has(n));
+    // Stale folders (deleted after save) fall back to whole-account.
+    const scope: SearchScope =
+      f.folders && f.folders.length > 0 && names.length === f.folders.length
+        ? { kind: "folders", names }
+        : { kind: "all" };
+    const sort: SearchSort = f.sort === "date" ? "date" : "rank";
+    setSearchScope(scope);
+    setSearchSort(sort);
+    setActiveFilterId(f.id);
+    setSearchQuery(f.query);
+    setSearchBoxSeed(f.query);
+    setSelectedMessage(null);
+    persistSearchState(f.query, scope, sort, f.id);
+  }
 
   function handleMailboxSelect(m: string) {
     setSelectedMailbox(m);
@@ -200,6 +325,9 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
   }
 
   const handleSyncComplete = useCallback(() => {
+    // Reconnect/sync-complete: the refreshKey bump re-runs the active
+    // search against the fresh local index (SRCH-03 restore-after-reconnect
+    // — the persisted view itself never clears on sync).
     setRefreshKey((k) => k + 1);
     // Refresh mailbox list (unread counts may have changed).
     void (async () => {
@@ -380,13 +508,47 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
         />
         <main className="message-panel" aria-label="Fila de leitura">
           <div className="message-list-header">
-            <SearchBar onSearch={handleSearch} disabled={listState.kind === "loading"} />
+            <SearchBar
+              onSearch={handleSearch}
+              disabled={listState.kind === "loading"}
+              initialValue={searchBoxSeed}
+              addon={
+                <>
+                  <SearchScopeSelector
+                    mailboxes={mailboxes}
+                    currentMailbox={selectedMailbox}
+                    value={searchScope}
+                    onChange={handleScopeChange}
+                    disabled={listState.kind === "loading"}
+                  />
+                  <button
+                    type="button"
+                    className="btn btn-ghost"
+                    onClick={() => setShowFilters((s) => !s)}
+                    aria-expanded={showFilters}
+                    aria-label="Filtros salvos"
+                    title="Salvar, aplicar e gerenciar filtros"
+                  >
+                    Filtros ▾
+                  </button>
+                </>
+              }
+            />
             {listState.kind === "ready" && (
               <span className="message-count" aria-live="polite">
                 {messageCount} {messageCount === 1 ? "mensagem" : "mensagens"}
               </span>
             )}
           </div>
+          {showFilters && (
+            <SavedFiltersPanel
+              currentQuery={searchQuery ?? ""}
+              currentFolders={scopeToFolders(searchScope)}
+              currentSort={searchSort}
+              onApply={handleApplyFilter}
+              onClose={() => setShowFilters(false)}
+            />
+          )}
           {showingDrafts && (
             <button
               type="button"
@@ -411,6 +573,10 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
             mailbox={selectedMailbox}
             mailboxes={mailboxes}
             searchQuery={searchQuery}
+            searchFolders={scopeToFolders(searchScope)}
+            searchSort={searchSort}
+            scopeLabel={scopeLabel(searchScope, mailboxes, selectedMailbox)}
+            onClearSearch={handleClearSearch}
             refreshKey={refreshKey}
             onMessageSelect={handleMessageSelect}
             selectedUid={selectedMessage?.uid ?? null}
