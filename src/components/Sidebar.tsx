@@ -7,7 +7,8 @@ import FolderContextMenu from "./FolderContextMenu";
 import { ReviewPanel } from "./ReviewPanel";
 import { TaxonomyEditor } from "./TaxonomyEditor";
 import { BatchPanel } from "./BatchPanel";
-import { IconBook, IconFolderPlus, IconInbox, IconMail, IconTrash } from "./icons";
+import { ArchivePanel } from "./ArchivePanel";
+import { IconBook, IconFolderPlus, IconInbox, IconMail, IconMove, IconTrash } from "./icons";
 import type { MailboxRow } from "../types";
 
 interface SidebarProps {
@@ -143,6 +144,8 @@ export default function Sidebar({
   const [editorOpen, setEditorOpen] = useState(false);
   /** Phase 20 batch panel modal. */
   const [batchOpen, setBatchOpen] = useState(false);
+  /** Phase 24 archive panel modal (rule editor + manual run). */
+  const [archiveOpen, setArchiveOpen] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -339,6 +342,17 @@ export default function Sidebar({
           </span>
           <span>Reorganizar</span>
         </button>
+        <button
+          type="button"
+          className="sidebar-newfolder"
+          onClick={() => setArchiveOpen(true)}
+          aria-label="Arquivo automático de e-mails antigos"
+        >
+          <span className="sidebar-newfolder-icon" aria-hidden="true">
+            <IconMove size={17} />
+          </span>
+          <span>Arquivo</span>
+        </button>
         <strong>Tudo em dia</strong>
         <p>Nenhuma mensagem nova pendente. Sincronize para buscar avisos recentes.</p>
       </div>
@@ -359,6 +373,7 @@ export default function Sidebar({
       )}
       {editorOpen && <TaxonomyEditor onClose={() => setEditorOpen(false)} />}
       {batchOpen && <BatchPanel onClose={() => setBatchOpen(false)} />}
+      {archiveOpen && <ArchivePanel onClose={() => setArchiveOpen(false)} />}
       {menu !== null &&
         (() => {
           const menuRow = mailboxes.find((m) => m.name === menu.name);
