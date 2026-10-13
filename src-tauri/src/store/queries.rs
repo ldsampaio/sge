@@ -2305,6 +2305,54 @@ pub fn effective_threshold(conn: &Connection) -> f64 {
         .unwrap_or(crate::classify::suggest::DEFAULT_THRESHOLD)
 }
 
+// ── Plan 24-01: auto-archive settings (ARCH-01) ─────────────────────
+// The age rule rides the `classify_settings` key-value table (same table
+// as the `threshold` + `auto_root` precedents) — no new tables/columns,
+// forward-only migration rule untouched. Stored SEPARATELY from the
+// confidence threshold so tuning one never perturbs the other.
+
+/// Default archive age: 90 days (safer than 30 for a first whole-account
+/// op with undo as the backstop). Valid range 7–730, backend-enforced.
+pub const ARCHIVE_THRESHOLD_DEFAULT: i64 = 90;
+pub const ARCHIVE_THRESHOLD_MIN: i64 = 7;
+pub const ARCHIVE_THRESHOLD_MAX: i64 = 730;
+
+/// Stored age threshold in days, or the default when unset/unparseable.
+pub fn get_archive_threshold(conn: &Connection) -> i64 {
+    get_setting(conn, "archive_threshold_days")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| (ARCHIVE_THRESHOLD_MIN..=ARCHIVE_THRESHOLD_MAX).contains(v))
+        .unwrap_or(ARCHIVE_THRESHOLD_DEFAULT)
+}
+
+/// Backend-enforced 7–730 validation with a plain-language error (Phase
+/// 16/19 style). UI restraint is never the only guard.
+pub fn set_archive_threshold(conn: &Connection, days: i64) -> Result<(), String> {
+    if !(ARCHIVE_THRESHOLD_MIN..=ARCHIVE_THRESHOLD_MAX).contains(&days) {
+        return Err("o prazo de arquivamento deve estar entre 7 e 730 dias".to_string());
+    }
+    set_setting(conn, "archive_threshold_days", &days.to_string()).map_err(|e| e.to_string())
+}
+
+/// Raw stored include-list JSON (None when never configured — the caller
+/// resolves the INBOX + Auto-tops default, never this function).
+pub fn get_archive_included_json(conn: &Connection) -> Option<String> {
+    get_setting(conn, "archive_included_folders").ok().flatten()
+}
+
+/// Persist the include list. Rejects empty lists (an empty scope would
+/// make every run a silent no-op) and non-list JSON with plain language.
+pub fn set_archive_included_json(conn: &Connection, json: &str) -> Result<(), String> {
+    let folders: Vec<String> =
+        serde_json::from_str(json).map_err(|_| "lista de pastas inválida".to_string())?;
+    if folders.iter().all(|f| f.trim().is_empty()) {
+        return Err("selecione ao menos uma pasta para arquivar".to_string());
+    }
+    set_setting(conn, "archive_included_folders", json).map_err(|e| e.to_string())
+}
+
 /// Dismiss a suggestion: mail stays where it is; the review list hides it.
 /// Confirm remains possible (user changed mind via the review list).
 pub fn dismiss_label(conn: &Connection, message_id: u64) -> StoreResult<()> {

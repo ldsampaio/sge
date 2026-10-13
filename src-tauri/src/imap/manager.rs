@@ -1486,7 +1486,9 @@ mod tests {
     impl SessionManager {
         /// Test-only constructor with a pre-connected session: `lease_for`
         /// never dials the network, so destructive-lease tests run offline.
-        fn for_test_session(session: Box<dyn SyncSession>) -> Self {
+        /// (`pub(crate)`: Phase 24 archive tracer reuses it from
+        /// `classify::archive` tests — same crate, still test-only.)
+        pub(crate) fn for_test_session(session: Box<dyn SyncSession>) -> Self {
             Self {
                 config: AccountConfig {
                     host: "test.invalid".to_string(),
