@@ -3,15 +3,16 @@ gsd_state_version: "1.0"
 milestone: v1.4
 milestone_name: SMTP Send + Search/Filters + Live Validation + Auto-Archive + Smart Folder Rules
 status: starting
-last_updated: "2026-10-11T00:00:00Z"
+stopped_at: Phase 22 context gathered
+last_updated: "2026-10-13T03:20:36.849Z"
+state_head: 52c984f11be17f8a62e6dddea01c6264f8cb7a5f
+progress:
+  total_phases: 18
+  completed_phases: 20
+  total_plans: 14
+  completed_plans: 0
 last_activity: 2026-10-11
 ship_status: Milestone v1.3 complete (audit passed); v1.4 started — phases 21-27 scoped in ROADMAP.md (not yet planned per-phase)
-progress:
-  total_phases: 7   # 21-27 (scoped, not yet planned per phase)
-  completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
-  percent: 0
 ---
 
 ---
@@ -73,6 +74,7 @@ All 6 phases (15-20) are **complete** as of 2026-10-10:
 ### Decisions
 
 Decisions are logged in PROJECT.md Key Decisions table. v1.3 structural decisions (from research SUMMARY.md, FINAL):
+
 - Sidecar: PyInstaller-frozen `laya[serve]` 0.4.2 speaking `POST /v1/systemone` (+ `/batch`), CPU-only torch, multilingual checkpoint only, weights as Tauri `resources`, binary `sge-laya-<target-triple>` via `externalBin`. Lean ONNX/IPC is a deferred fallback with an explicit trigger (size/RAM blowout), never parallel.
 - Build order: packaging spike → taxonomy/store → suggestions-without-moves → confirm/MOVE → editor/import → batch.
 - Trust: single-email always user-confirmed (IPC-enforced); batch unconfirmed with journal + undo; worst case `A Classificar`, never delete; secondary label local-only.
@@ -107,9 +109,11 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-10
+**Stopped at:** Phase 22 context gathered
+
+Last session: 2026-10-13T03:20:36.837Z
 Milestone: v1.3 Auto-Classify complete
-Resume file: None
+Resume file: .planning/phases/22-draft-seen-round-trip-live-gate-live-02/22-CONTEXT.md
 
 ## Operator Next Steps
 
