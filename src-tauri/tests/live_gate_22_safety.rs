@@ -31,8 +31,12 @@ struct FakeSession {
     next_uid: u32,
     /// uid -> (mailbox, message_id, bytes, deleted)
     messages: HashMap<u32, (String, String, Vec<u8>, bool)>,
+    /// uid -> seen flag (models server-side \Seen for the Seen doubles)
+    seen: HashMap<u32, bool>,
     append_calls: Vec<(String, String, Vec<u8>)>,
     search_calls: Vec<(String, String)>,
+    seen_calls: Vec<(u32, bool)>,
+    moved_calls: Vec<(String, String)>,
 }
 
 impl FakeSession {
@@ -42,8 +46,11 @@ impl FakeSession {
             selected: None,
             next_uid: 1,
             messages: HashMap::new(),
+            seen: HashMap::new(),
             append_calls: Vec::new(),
             search_calls: Vec::new(),
+            seen_calls: Vec::new(),
+            moved_calls: Vec::new(),
         }
     }
 
@@ -67,7 +74,21 @@ impl FakeSession {
 
     fn header_envelope(&self, uid: u32) -> MessageHeader {
         let (_, msg_id, _, deleted) = self.messages.get(&uid).cloned().unwrap_or_default();
-        let flags = if deleted { r#"["\Deleted"]"#.to_string() } else { "[]".to_string() };
+        let mut names: Vec<&str> = Vec::new();
+        if deleted {
+            names.push("\\Deleted");
+        }
+        if self.seen.get(&uid).copied().unwrap_or(false) {
+            names.push("\\Seen");
+        }
+        let flags = format!(
+            "[{}]",
+            names
+                .iter()
+                .map(|f| format!("\"{f}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
         MessageHeader {
             uid,
             message_id: Some(msg_id),
@@ -80,6 +101,11 @@ impl FakeSession {
             has_attachments: false,
             preview: String::new(),
         }
+    }
+    /// Model a server-side expunge (the copy is gone for the next SEARCH).
+    fn remove_message(&mut self, uid: u32) {
+        self.messages.remove(&uid);
+        self.seen.remove(&uid);
     }
 }
 
@@ -136,9 +162,11 @@ impl SyncSession for FakeSession {
         })
     }
 
-    fn set_seen(&mut self, uid: u32, _seen: bool) -> sge_lib::imap::PinBox<'_, Result<(), SyncError>> {
+    fn set_seen(&mut self, uid: u32, seen: bool) -> sge_lib::imap::PinBox<'_, Result<(), SyncError>> {
         Box::pin(async move {
             if self.messages.contains_key(&uid) {
+                self.seen_calls.push((uid, seen));
+                self.seen.insert(uid, seen);
                 Ok(())
             } else {
                 Err(SyncError::Protocol(format!("no such uid {uid}")))
@@ -203,14 +231,18 @@ impl SyncSession for FakeSession {
 
     fn uid_move_to(
         &mut self,
-        _uid_set: &str,
-        _dest: &str,
+        uid_set: &str,
+        dest: &str,
     ) -> sge_lib::imap::PinBox<'_, Result<(), SyncError>> {
-        Box::pin(async move { Ok(()) })
+        let (uid_set, dest) = (uid_set.to_string(), dest.to_string());
+        Box::pin(async move {
+            self.moved_calls.push((uid_set, dest));
+            Ok(())
+        })
     }
 
     fn capabilities(&mut self) -> sge_lib::imap::PinBox<'_, Result<Vec<String>, SyncError>> {
-        Box::pin(async move { Ok(vec!["IMAP4rev1".to_string(), "UIDPLUS".to_string()]) })
+        Box::pin(async move { Ok(vec!["IMAP4rev1".to_string(), "UIDPLUS".to_string(), "MOVE".to_string()]) })
     }
 
     fn create_mailbox(&mut self, name: &str) -> sge_lib::imap::PinBox<'_, Result<(), SyncError>> {
@@ -422,3 +454,329 @@ fn live_gate_22_one_copy_first_save_reconciles() {
     let hits = block_on(session.uid_search_header("Message-ID", &msg_id)).unwrap();
     harness::assert_one_copy(&hits, uid_a).expect("exactly [uid_a]");
 }
+
+// ── 22-02 expansion doubles, grouped so the plan's verify filters match ──
+// verbatim (`live_gate_22::replay`, `live_gate_22::resurrection`,
+// `live_gate_22::seen`, `live_gate_22::safety`, `live_gate_22::cleanup`).
+mod live_gate_22 {
+    pub mod replay {
+        use super::super::{block_on, harness, FakeSession};
+        use sge_lib::store::{queries, Store};
+        use sge_lib::sync::worker::SyncWorker;
+        use std::collections::HashSet;
+        use std::sync::{Arc, Mutex};
+
+        /// Shared seed: one store row + hidden flag + queued delete op.
+        /// Returns the store and mailbox id; asserts pending-visible.
+        pub(super) fn replay_store(uid: u32) -> (Arc<Mutex<Store>>, u64) {
+            let store = Arc::new(Mutex::new(Store::open_in_memory().expect("mem store")));
+            let mb_id = {
+                let guard = store.lock().unwrap();
+                let id = queries::ensure_mailbox(guard.conn(), "SGE-Test-replay-1").unwrap();
+                queries::upsert_message(
+                    guard.conn(),
+                    id,
+                    uid,
+                    Some("<replay-double@x>"),
+                    "SGE-TEST-replay",
+                    "me@example.com",
+                    "me@example.com",
+                    "",
+                    "2026-10-13T12:00:00Z",
+                    "[]",
+                    false,
+                    "replay",
+                )
+                .unwrap();
+                queries::set_pending_delete(guard.conn(), id, uid, true).unwrap();
+                queries::enqueue_imap_outbox(
+                    guard.conn(),
+                    id,
+                    uid,
+                    queries::IMAP_OP_DELETE,
+                    Some("Trash"),
+                    4242,
+                )
+                .unwrap();
+                assert!(
+                    harness::pending_depth(guard.conn(), id) > 0,
+                    "pending indicator visible until acked"
+                );
+                id
+            };
+            (store, mb_id)
+        }
+
+// ── Replay-order + pending-until-acked (D-10, T-22-03, zero network) ───────
+
+#[test]
+fn live_gate_22_replay_order_predicate() {
+    let ordered = [
+        "[SGE sync] SELECT SGE-Test-1: exists=1",
+        "[SGE sync] imap replay: acked=1 dropped=0 failed=0 moved=1",
+        "[SGE sync] FETCH 1:1: 1 headers",
+        "sweep done",
+    ];
+    assert!(harness::replay_logged_before_sweep(&ordered));
+    let reversed = [
+        "sweep done",
+        "[SGE sync] imap replay: acked=1 dropped=0 failed=0 moved=1",
+    ];
+    assert!(!harness::replay_logged_before_sweep(&reversed));
+    let no_replay = ["[SGE sync] SELECT x", "sweep done"];
+    assert!(!harness::replay_logged_before_sweep(&no_replay));
+    let no_sweep = ["[SGE sync] imap replay: acked=0 dropped=0 failed=0 moved=0"];
+    assert!(!harness::replay_logged_before_sweep(&no_sweep));
+}
+
+#[test]
+fn live_gate_22_replay_drains_pending_depth_to_zero() {
+    let (store, mb_id) = replay_store(1);
+    let worker = SyncWorker::new(store.clone());
+    let mut session = FakeSession::with_sandbox("SGE-Test-replay-1");
+    let live: HashSet<u32> = [1].into_iter().collect();
+    let summary = block_on(worker.replay_imap_outbox(
+        &mut session,
+        mb_id,
+        "SGE-Test-replay-1",
+        4242,
+        Some(&live),
+    ))
+    .unwrap();
+    assert_eq!(summary.acked, 1);
+    assert_eq!(summary.moved, 1);
+    assert_eq!(
+        session.moved_calls,
+        vec![("1".to_string(), "Trash".to_string())],
+        "delete replays as a server-side move to the stored dest"
+    );
+    let guard = store.lock().unwrap();
+    assert_eq!(
+        harness::pending_depth(guard.conn(), mb_id),
+        0,
+        "queue depth returns to zero after the ack"
+    );
+    assert!(queries::pending_imap_uids(guard.conn(), mb_id).unwrap().is_empty());
+}
+
+    } // pub mod replay
+
+    pub mod resurrection {
+        use super::super::{block_on, FakeSession};
+        use super::replay::replay_store;
+        use sge_lib::imap::SyncSession;
+        use sge_lib::store::queries;
+        use sge_lib::sync::worker::SyncWorker;
+        use std::collections::HashSet;
+
+// ── Double-sync resurrection (D-11, T-22-03, zero network) ─────────────────
+
+#[test]
+fn live_gate_22_double_sync_uid_stays_gone() {
+    let (store, mb_id) = replay_store(1);
+    let worker = SyncWorker::new(store.clone());
+    let mut session = FakeSession::with_sandbox("SGE-Test-replay-1");
+    // Server holds the copy; the test bytes carry the same Message-ID the
+    // store row tracks (FakeSession assigns uid 1 to its first APPEND).
+    block_on(session.append_message(
+        "SGE-Test-replay-1",
+        "flags",
+        b"Message-ID: <replay-double@x>\r\n\r\nb",
+    ))
+    .unwrap();
+
+    // Pass 1: the queued delete acks (op acked, row hidden for the sweep).
+    let live: HashSet<u32> = [1].into_iter().collect();
+    let summary = block_on(worker.replay_imap_outbox(
+        &mut session,
+        mb_id,
+        "SGE-Test-replay-1",
+        4242,
+        Some(&live),
+    ))
+    .unwrap();
+    assert_eq!(summary.acked, 1);
+
+    // The sweep's expunge-diff removes the local row (server no longer
+    // holds the UID — tombstoned, never re-fetched).
+    session.remove_message(1);
+    {
+        let guard = store.lock().unwrap();
+        let gone = queries::expunge_uids_local(guard.conn(), mb_id, &[1]).unwrap();
+        assert_eq!(gone, vec![1]);
+    }
+
+    // Pass 2: UID absent from SEARCH and no local row left to resurrect.
+    assert!(!block_on(session.search_uids()).unwrap().contains(&1));
+    let guard = store.lock().unwrap();
+    assert!(!queries::all_local_uids(guard.conn(), mb_id).unwrap().contains(&1));
+    assert!(!queries::is_pending_delete(guard.conn(), mb_id, 1).unwrap());
+}
+
+    } // pub mod resurrection
+
+    pub mod seen {
+        use super::super::{block_on, harness, FakeSession};
+        use sge_lib::imap::SyncSession;
+        use sge_lib::store::{queries, Store};
+        use sge_lib::sync::worker::SyncWorker;
+        use std::collections::HashSet;
+        use std::sync::{Arc, Mutex};
+
+// ── Seen both directions through queued replay (D-12, zero network) ────────
+
+#[test]
+fn live_gate_22_seen_round_trips_both_directions_through_replay() {
+    let store = Arc::new(Mutex::new(Store::open_in_memory().expect("mem store")));
+    let mb_id = {
+        let guard = store.lock().unwrap();
+        queries::ensure_mailbox(guard.conn(), "SGE-Test-seen-1").unwrap()
+    };
+    let worker = SyncWorker::new(store.clone());
+    let mut session = FakeSession::with_sandbox("SGE-Test-seen-1");
+    block_on(session.append_message(
+        "SGE-Test-seen-1",
+        "flags",
+        b"Message-ID: <seen-double@x>\r\n\r\nb",
+    ))
+    .unwrap();
+
+    for seen in [true, false] {
+        {
+            let guard = store.lock().unwrap();
+            queries::enqueue_outbox(guard.conn(), mb_id, 1, seen, 4242).unwrap();
+            assert!(
+                harness::pending_depth(guard.conn(), mb_id) > 0,
+                "pending visible until acked (seen={seen})"
+            );
+        }
+        let live: HashSet<u32> = [1].into_iter().collect();
+        let summary =
+            block_on(worker.replay_outbox(&mut session, mb_id, 4242, Some(&live))).unwrap();
+        assert_eq!(summary.acked, 1, "seen={seen} must ack");
+        let guard = store.lock().unwrap();
+        assert_eq!(harness::pending_depth(guard.conn(), mb_id), 0);
+        let flags = block_on(session.fetch_envelopes("1")).unwrap();
+        let has_seen = flags.iter().any(|h| h.uid == 1 && h.flags.contains("\\Seen"));
+        assert_eq!(has_seen, seen, "FLAGS must read seen={seen} after replay");
+    }
+    assert_eq!(session.seen_calls, vec![(1, true), (1, false)]);
+}
+
+#[test]
+fn live_gate_22_seen_replay_honors_epoch_and_absent_drop_rules() {
+    let store = Arc::new(Mutex::new(Store::open_in_memory().expect("mem store")));
+    let mb_id = {
+        let guard = store.lock().unwrap();
+        queries::ensure_mailbox(guard.conn(), "SGE-Test-seen-2").unwrap()
+    };
+    let worker = SyncWorker::new(store.clone());
+    let mut session = FakeSession::with_sandbox("SGE-Test-seen-2");
+
+    // Epoch mismatch: whole-mailbox drop, zero wire writes.
+    {
+        let guard = store.lock().unwrap();
+        queries::enqueue_outbox(guard.conn(), mb_id, 1, true, 4242).unwrap();
+    }
+    let live: HashSet<u32> = [1].into_iter().collect();
+    let summary =
+        block_on(worker.replay_outbox(&mut session, mb_id, 9999, Some(&live))).unwrap();
+    assert_eq!(summary.dropped, 1);
+    assert_eq!(summary.acked, 0);
+    assert!(session.seen_calls.is_empty(), "stale-epoch UIDs never reach the wire");
+
+    // Absent UID: single drop, the live op is untouched.
+    {
+        let guard = store.lock().unwrap();
+        queries::enqueue_outbox(guard.conn(), mb_id, 77, true, 4242).unwrap();
+        queries::enqueue_outbox(guard.conn(), mb_id, 1, true, 4242).unwrap();
+    }
+    let live: HashSet<u32> = [1].into_iter().collect();
+    block_on(session.append_message(
+        "SGE-Test-seen-2",
+        "flags",
+        b"Message-ID: <s@x>\r\n\r\nb",
+    ))
+    .unwrap();
+    let summary =
+        block_on(worker.replay_outbox(&mut session, mb_id, 4242, Some(&live))).unwrap();
+    assert_eq!(summary.dropped, 1, "absent uid drops its single op");
+    assert_eq!(summary.acked, 1, "live op still replays");
+    assert_eq!(session.seen_calls, vec![(1, true)], "only the live UID is written");
+}
+
+    } // pub mod seen
+
+    pub mod safety {
+        use super::super::harness;
+
+// ── Secret scan + prefix audit predicates (D-15/D-16, T-22-04) ─────────────
+
+#[test]
+fn live_gate_22_secret_scan_flags_canary_and_passes_clean() {
+    // Password-shaped fixtures carry regex metachars — the scan is a fixed
+    // substring match, never a regex, so they still hit literally.
+    let secrets = ["hunter2$.*[x]", "smtp-secret", "user@example.com"];
+    assert_eq!(
+        harness::scan_text_for_secrets("log line hunter2$.*[x] here", &secrets),
+        Some(0)
+    );
+    assert_eq!(
+        harness::scan_text_for_secrets("smtp-secret leaked", &secrets),
+        Some(1)
+    );
+    assert_eq!(
+        harness::scan_text_for_secrets("clean log, no creds", &secrets),
+        None
+    );
+    assert_eq!(harness::scan_text_for_secrets("anything", &[""]), None);
+}
+
+#[test]
+fn live_gate_22_prefix_audit_rejects_unprefixed_and_foreign() {
+    let me_ = "me@example.com";
+    assert!(harness::audit_test_mail(&["SGE-TEST-a"], &[me_], me_).is_ok());
+    assert!(harness::audit_test_mail(&["plain subject"], &[me_], me_).is_err());
+    assert!(harness::audit_test_mail(&["SGE-TEST-a"], &["other@example.com"], me_).is_err());
+    assert!(harness::audit_test_mail(&[], &[], me_).is_ok());
+}
+
+    } // pub mod safety
+
+    pub mod cleanup {
+        use super::super::harness;
+        use sge_lib::store::{queries, Store};
+
+// ── Cleanup discipline doubles (D-03, zero network) ────────────────────────
+
+#[test]
+fn live_gate_22_cleanup_backoff_is_three_retries() {
+    assert_eq!(harness::cleanup_backoff_secs(), [5, 15, 45]);
+}
+
+#[test]
+fn live_gate_22_sqlite_dump_covers_all_tables() {
+    let tag = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir();
+    let db_path = dir.join(format!("sge-live22-test-{}-{tag}.sqlite", std::process::id()));
+    let dump_path = dir.join(format!("sge-live22-test-{}-{tag}.dump", std::process::id()));
+    {
+        let store = Store::open(&db_path).expect("temp store");
+        let guard = store;
+        let conn = guard.conn();
+        let mb_id = queries::ensure_mailbox(conn, "SGE-Test-dump-1").unwrap();
+        queries::enqueue_outbox(conn, mb_id, 3, true, 4242).unwrap();
+    }
+    let bytes = harness::write_sqlite_dump_text(&db_path, &dump_path).expect("dump writes");
+    assert!(bytes > 0);
+    let text = std::fs::read_to_string(&dump_path).expect("dump readable");
+    assert!(text.contains("-- table mailboxes"), "dump covers schema tables");
+    assert!(text.contains("-- table flag_outbox"), "dump covers the Seen queue");
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(&dump_path);
+}
+    } // pub mod cleanup
+} // mod live_gate_22
