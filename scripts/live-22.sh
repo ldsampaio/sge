@@ -3,7 +3,9 @@
 #
 # Sources the git-ignored env file as env vars (never CLI args), optionally
 # seeds the OS keyring once, runs the live_gate_22 bin capturing a /tmp log,
-# scans the log for credential substrings, and propagates the bin exit code.
+# scans the log + SQLite dump for credential substrings, verifies the
+# replay-before-sweep order evidence, retries bin cleanup on the same
+# backoff schedule, and propagates the bin exit code.
 #
 # EXIT: 0 all-pass · 1 assertion FAIL or secret-leak · 2 pre-flight skip.
 set -uo pipefail
@@ -21,23 +23,103 @@ set -a
 . "$ENV_FILE"
 set +a
 
+# --seed-only short-circuit: seed the keyring, no IMAP traffic, no scan.
+if [ "${1:-}" = "--seed-only" ]; then
+    cargo run --manifest-path src-tauri/Cargo.toml --bin live_gate_22 --seed-only 2>&1
+    CODE="$?"
+    unset SGE_LIVE_IMAP_PASS SGE_LIVE_SMTP_PASS || true
+    exit "$CODE"
+fi
+
 LOG="/tmp/sge-live22-$$.log"
 cargo run --manifest-path src-tauri/Cargo.toml --bin live_gate_22 "$@" 2>&1 | tee "$LOG"
 CODE="${PIPESTATUS[0]}"
 
-# D-15 (tracer slice): fail the run if the log carries a credential
-# substring. Fixed-substring grep — passwords contain regex metachars.
+# The bin prints `DUMP <path>` for the temp-Store dump it wrote pre-cleanup.
+DUMP="$(grep -E '^DUMP ' "$LOG" | tail -1 | awk '{print $2}' || true)"
+if [ -z "${DUMP:-}" ] || [ ! -r "${DUMP:-}" ]; then
+    # Fall back to the newest dump from this PID family (bin always names
+    # dumps sge-live22-<pid>-<ts>.dump).
+    DUMP="$(ls -t /tmp/sge-live22-*.dump 2>/dev/null | head -1 || true)"
+fi
+
+# D-15: fail the run if the log or dump carries a credential substring.
+# Fixed-substring grep (-F) — passwords contain regex metachars. Secrets are
+# read ONCE into shell vars here, then unset before any further echo.
+# SECRET-LEAK names WHICH artifact matched, never the secret itself.
 LEAKED=""
-for secret in "${SGE_LIVE_IMAP_PASS:-}" "${SGE_LIVE_SMTP_PASS:-}"; do
-    if [ -n "$secret" ] && grep -F -q "$secret" "$LOG"; then
-        LEAKED="log"
+for secret in "${SGE_LIVE_IMAP_PASS:-}" "${SGE_LIVE_SMTP_PASS:-}" "${SGE_LIVE_IMAP_USER:-}"; do
+    if [ -n "$secret" ]; then
+        if grep -F -q "$secret" "$LOG" 2>/dev/null; then
+            LEAKED="log"
+        fi
+        if [ -n "${DUMP:-}" ] && [ -r "$DUMP" ] && grep -F -q "$secret" "$DUMP" 2>/dev/null; then
+            LEAKED="dump"
+        fi
     fi
 done
 if [ -n "$LEAKED" ]; then
-    echo "SECRET-LEAK: credential substring found in $LOG (see which artifact matched, never the secret)"
+    echo "SECRET-LEAK: credential substring found in $LEAKED artifact (see which artifact matched, never the secret)"
+    CODE=1
+fi
+unset SGE_LIVE_IMAP_PASS SGE_LIVE_SMTP_PASS || true
+
+# D-10 order evidence: when STEP 9 passed, the captured log must contain the
+# worker's own `imap replay:` line (emitted at Step 4b, structurally before
+# the sweep code runs) — file order is the evidence.
+if grep -q "STEP 9/13 replay-order: PASS" "$LOG" 2>/dev/null; then
+    if ! grep -q "imap replay:" "$LOG" 2>/dev/null; then
+        echo "ORDER-FAIL: STEP 9 passed but no 'imap replay:' line in $LOG (pre-sweep evidence missing)"
+        CODE=1
+    fi
+fi
+
+# D-08 PEEK gate: no non-PEEK BODY section may appear in the transcript.
+# The harness only ever FETCHes via BODY.PEEK[]; any other BODY[ section
+# would set \Seen as a side effect and corrupt the D-12 asserts.
+if grep -E "BODY\[" "$LOG" 2>/dev/null | grep -v "BODY.PEEK" | grep -q .; then
+    echo "PEEK-FAIL: non-PEEK BODY section in transcript (Seen side-effect risk)"
     CODE=1
 fi
 
-# Scrub secrets from this shell before any further output.
-unset SGE_LIVE_IMAP_PASS SGE_LIVE_SMTP_PASS || true
+# D-03 wrapper retry: on MANUAL-CLEANUP, retry the bin's --cleanup-only for
+# the exact leftover folder on the same 5s/15s/45s schedule before
+# surfacing the manual steps. The folder name is parsed from the bin's
+# `MANUAL-CLEANUP folder=<name>:` line (never re-derived).
+if grep -q "MANUAL-CLEANUP" "$LOG" 2>/dev/null; then
+    LEFTOVER="$(grep -o 'folder=SGE-Test-[^ :]*' "$LOG" | head -1 | cut -d= -f2 || true)"
+    if [ -n "${LEFTOVER:-}" ]; then
+        for WAIT in 5 15 45; do
+            echo "wrapper cleanup-retry: waiting ${WAIT}s then --cleanup-only $LEFTOVER"
+            sleep "$WAIT"
+            # Re-source env for the retry (secrets were unset above).
+            set -a
+            # shellcheck source=/dev/null
+            . "$ENV_FILE"
+            set +a
+            cargo run --manifest-path src-tauri/Cargo.toml --bin live_gate_22 --cleanup-only "$LEFTOVER" 2>&1 | tee -a "$LOG"
+            RETRY_CODE="${PIPESTATUS[0]}"
+            unset SGE_LIVE_IMAP_PASS SGE_LIVE_SMTP_PASS || true
+            if [ "$RETRY_CODE" = 0 ]; then
+                echo "wrapper cleanup-retry: $LEFTOVER removed"
+                # The run itself passed — only cleanup needed a retry.
+                if ! grep -q ": FAIL" "$LOG" 2>/dev/null; then
+                    CODE=0
+                fi
+                break
+            fi
+        done
+    fi
+    if grep -q "MANUAL-CLEANUP" "$LOG" 2>/dev/null && ! grep -q "cleanup-retry: .* removed" "$LOG" 2>/dev/null; then
+        echo "MANUAL STEPS REQUIRED (cleanup retries exhausted):"
+        grep "MANUAL-CLEANUP" "$LOG" | tail -2
+        CODE=1
+    fi
+fi
+
+# Run report tail (the bin prints per-STEP lines + REPORT; the wrapper adds
+# the scan/audit verdicts — all in the /tmp log, never the repo).
+echo "SCAN-VERDICT: $([ "$CODE" = 0 ] && echo PASS || echo CHECK-LOG) log=$LOG dump=${DUMP:-none}"
+
+unset SGE_LIVE_IMAP_USER SGE_LIVE_SELF || true
 exit "$CODE"
