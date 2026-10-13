@@ -958,3 +958,53 @@ fn live_gate_21_safety_dump_covers_all_temp_tables_for_scan() {
     ));
     std::fs::remove_dir_all(&app_data).ok();
 }
+
+// ── REPORT + manual-steps fixtures (D-15 — zero network) ─────────────────
+// The closing REPORT block renders every logged STEP, the autosave branch,
+// the draft-leg binary verdict, per-leg call counts, and the A-01..A-09
+// checklist; manual steps name folders, Message-IDs, UIDs, and the webmail
+// path for the human fallback.
+
+#[test]
+fn live_gate_21_safety_report_covers_steps_and_checklist() {
+    let mut tracked = harness::TrackedMail::empty();
+    tracked.run_tag = "safety-tag".to_string();
+    tracked.probe_detail = "1 INBOX UID + 1 Sent UID per leg".to_string();
+    assert!(harness::log_step(&tracked, 3, "arrival", true, "detail-a"));
+    assert!(!harness::log_step(&tracked, 10, "draft-send", false, "detail-b"));
+    harness::record_calls(&tracked, "arrival", 2, 3);
+    harness::record_calls(&tracked, "uncertain-reconcile", 3, 3);
+    let report = harness::render_report(&tracked);
+    assert!(report.contains("REPORT live_gate_21 run=safety-tag"), "header:\n{report}");
+    assert!(report.contains("REPORT-STEP 3/12 arrival: PASS"), "steps:\n{report}");
+    assert!(report.contains("REPORT-STEP 10/12 draft-send: FAIL"), "steps:\n{report}");
+    assert!(report.contains("REPORT autosave-branch: 1 INBOX UID"), "branch:\n{report}");
+    assert!(
+        report.contains("REPORT draft-send binary verdict: FAIL BY DESIGN"),
+        "draft verdict:\n{report}"
+    );
+    assert!(report.contains("DRAFT-03 GAP"), "gap note:\n{report}");
+    assert!(report.contains("REPORT-CALLS leg=arrival delta=1 expected=1 ok=true"), "calls:\n{report}");
+    for id in ["A-01", "A-02", "A-03", "A-04", "A-05", "A-06", "A-07", "A-08", "A-09"] {
+        assert!(report.contains(id), "checklist {id} missing:\n{report}");
+    }
+    assert!(report.contains("REPORT end:"), "footer:\n{report}");
+}
+
+#[test]
+fn live_gate_21_safety_manual_steps_name_uids_and_webmail() {
+    let mut tracked = harness::TrackedMail::empty();
+    tracked.run_tag = "safety-1".to_string();
+    tracked.message_ids = vec!["<m@sge.local>".to_string()];
+    tracked.inbox_uids = vec![("<m@sge.local>".to_string(), 11)];
+    tracked.sent_uids = vec![("<m@sge.local>".to_string(), 22)];
+    tracked.sent_wire = Some("Sent".to_string());
+    tracked.draft_sandbox = Some("SGE-Test-safety-1-drafts".to_string());
+    tracked.draft_server_uid = Some(33);
+    let steps = harness::manual_cleanup_steps(&tracked);
+    assert!(steps.contains("<m@sge.local>"), "mids:\n{steps}");
+    assert!(steps.contains("11") && steps.contains("22") && steps.contains("33"), "uids:\n{steps}");
+    assert!(steps.contains("INBOX") && steps.contains("Sent"), "folders:\n{steps}");
+    assert!(steps.contains("SGE-Test-safety-1-drafts"), "sandbox:\n{steps}");
+    assert!(steps.contains("webmail"), "webmail path:\n{steps}");
+}

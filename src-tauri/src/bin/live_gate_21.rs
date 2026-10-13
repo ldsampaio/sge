@@ -10,7 +10,8 @@
 //! 12 STEPs: 1 preflight, 2 recipient-guard, 3 arrival, 4 sent-copy,
 //! 5 no-duplicate, 6 sent-unfiled, 7 offline-flush (D-09), 8 uncertain-
 //! reconcile (D-10), 9 crash-recover (D-11), 10 draft-send (D-16, binary
-//! verdict), 11 autosave-probe, 12 cleanup (D-15) + REPORT.
+//! verdict) + send-audit (D-14, five rules), 11 autosave-probe,
+//! 12 secret-scan (D-13, in-bin full-DB dump) + cleanup (D-15) + REPORT.
 //!
 //! Safety contract (D-01..D-04, D-13/D-14):
 //! - Test mail goes ONLY to `SGE_LIVE_SELF` (envelope AND headers).
@@ -1047,11 +1048,152 @@ async fn expunge_tracked(mgr: &SessionManager, wire: &str, uid: u32, mid: &str) 
     false
 }
 
-fn manual_cleanup_steps(mids: &[String]) -> String {
+pub fn manual_cleanup_steps(tracked: &TrackedMail) -> String {
+    let sent_wire = tracked.sent_wire.as_deref().unwrap_or("Sent?");
+    let draft_wire = tracked
+        .draft_sandbox
+        .clone()
+        .or_else(|| tracked.draft_real_drafts_wire.clone());
     format!(
-        "MANUAL-CLEANUP test message-ids {mids:?}: webmail → INBOX + Sent → \
-         SEARCH each Message-ID → delete hits; then re-run preflight (LIST must match snapshot)"
+        "MANUAL-CLEANUP run={} message-ids {:?}: webmail → INBOX + {} → SEARCH each Message-ID → delete hits (INBOX uids {:?}, Sent uids {:?}); draft wire {:?} server uid {:?} → expunge tracked UID{} then DELETE the sandbox folder only; then re-run preflight (LIST must match snapshot)",
+        tracked.run_tag,
+        tracked.message_ids,
+        sent_wire,
+        tracked.inbox_uids,
+        tracked.sent_uids,
+        draft_wire,
+        tracked.draft_server_uid,
+        if tracked.draft_sandbox.is_some() {
+            ""
+        } else {
+            " (no sandbox created — never DELETE)"
+        },
     )
+}
+
+/// Closing run REPORT (D-15): every canonical STEP outcome in print order,
+/// the auto-save branch taken, the draft-leg binary verdict with any
+/// DRAFT-03 GAP note, per-leg transport call counts, and the A-01..A-09
+/// observable-state checklist against the evidence STEPs. Pure over the
+/// tracker snapshot — printed by `cleanup` on the finally path, so it
+/// appears even after a mid-run FAIL. No new UI: checklist copy references
+/// the existing `OutboxBadgeWired` + `SendStatus` surfaces verbatim from
+/// 21-UI-SPEC.md without rewording.
+pub fn render_report(tracked: &TrackedMail) -> String {
+    let steps: Vec<LoggedStep> = tracked
+        .step_log
+        .lock()
+        .map(|log| log.clone())
+        .unwrap_or_default();
+    let calls: Vec<(String, usize, usize)> = tracked
+        .calls_log
+        .lock()
+        .map(|log| log.clone())
+        .unwrap_or_default();
+    let outcome = |n: usize, name: &str| {
+        steps
+            .iter()
+            .find(|s| s.n == n && s.name == name)
+            .map(|s| s.ok)
+    };
+    // A checklist row is PASS only when every evidence STEP passed; None
+    // (leg never ran — early abort) counts as not-pass, never as pass.
+    let all_ok = |legs: &[(usize, &str)]| {
+        legs.iter()
+            .all(|(n, name)| outcome(*n, name) == Some(true))
+    };
+    let pass = steps.iter().filter(|s| s.ok).count();
+    let mut out = String::new();
+    out.push_str(&format!(
+        "REPORT live_gate_21 run={} steps={}/{} pass\n",
+        tracked.run_tag,
+        pass,
+        steps.len()
+    ));
+    for s in &steps {
+        out.push_str(&format!(
+            "REPORT-STEP {}/{} {}: {} {}\n",
+            s.n,
+            TOTAL_STEPS,
+            s.name,
+            if s.ok { "PASS" } else { "FAIL" },
+            s.detail
+        ));
+    }
+    out.push_str(&format!("REPORT autosave-branch: {}\n", tracked.probe_detail));
+    for (mid, sent_uids, is_unfiled) in &tracked.probe_counts {
+        out.push_str(&format!(
+            "REPORT-PROBE mid={} sent_uids={}{}\n",
+            mid,
+            sent_uids,
+            if *is_unfiled { " (unfiled)" } else { "" }
+        ));
+    }
+    match outcome(10, "draft-send") {
+        Some(true) => out.push_str(
+            "REPORT draft-send binary verdict: PASS (flush itself removed the local drafts row AND the server copy, zero harness discard)\n",
+        ),
+        _ => out.push_str(
+            "REPORT draft-send binary verdict: FAIL BY DESIGN (orphan left or leg never ran) — DRAFT-03 GAP: prod flush performs no delete_draft (draft_id arm reuses the Message-ID only); routes to gap closure (delete_draft-in-flush fix or explicit D-16 deferral); no harness discard ran on this path\n",
+        ),
+    }
+    let mut calls_ok = true;
+    for (leg, before, after) in &calls {
+        let delta = after.saturating_sub(*before);
+        let exp = expected_calls_delta(leg);
+        let ok = exp == Some(delta);
+        if !ok {
+            calls_ok = false;
+        }
+        out.push_str(&format!(
+            "REPORT-CALLS leg={} delta={} expected={} ok={}\n",
+            leg,
+            delta,
+            exp.map(|e| e.to_string()).unwrap_or_else(|| "?".to_string()),
+            ok
+        ));
+    }
+    // Observable-state checklist (existing OutboxBadgeWired + SendStatus —
+    // no new UI; A-07 via flush outcomes + call counts given the snapshot
+    // sent_unfiled hard-code 0; A-05 asserted as uncertain post-flush-triage,
+    // superseding the UI-SPEC queued wording).
+    let checklist: [(&str, &str, Vec<(usize, &str)>); 9] = [
+        ("A-01", "pending visible (OutboxBadgeWired `{N} mensagem(s) pendentes`; SendStatus `{N} alteração(ões) aguardando envio`)", vec![(3, "arrival"), (7, "offline-flush")]),
+        ("A-02", "flush sending then badge hidden (OutboxBadge returns null at pending_count 0)", vec![(3, "arrival"), (7, "offline-flush")]),
+        ("A-03", "clean state (pending_count = 0, failed = 0, uncertain = 0; neither pending line nor failed surface)", vec![(3, "arrival"), (7, "offline-flush")]),
+        ("A-04", "uncertain hold (SendStatus `Reconciliando na pasta Enviadas — nenhum novo envio será feito até a próxima verificação.`; no new send while uncertain)", vec![(8, "uncertain-reconcile")]),
+        ("A-05", "crash recovery uncertain post-flush-triage (badge reappears pending, never failed)", vec![(9, "crash-recover")]),
+        ("A-06", "failed surface (`{N} mensagem(ns) com falha` + `Retentar`) only on real failure; crash item never failed", vec![(3, "arrival"), (7, "offline-flush"), (8, "uncertain-reconcile"), (9, "crash-recover")]),
+        ("A-07", "sent-unfiled via flush outcomes + call counts (snapshot sent_unfiled hard-codes 0 — recorded gap; never resend)", vec![(6, "sent-unfiled")]),
+        ("A-08", "pending indicator until acked (badge + pending line clear together, no split-brain)", vec![(3, "arrival"), (7, "offline-flush")]),
+        ("A-09", "test-mail identifiability (`SGE-TEST-` subject prefix; harness audit, no UI change)", vec![(10, "send-audit")]),
+    ];
+    for (id, label, legs) in &checklist {
+        let leg_names: Vec<String> = legs.iter().map(|(_, n)| n.to_string()).collect();
+        out.push_str(&format!(
+            "REPORT-CHECK {} {}: {} (evidence STEPs {})\n",
+            id,
+            label,
+            if *id == "A-07" {
+                if all_ok(legs) && calls_ok { "PASS" } else { "FAIL" }
+            } else if all_ok(legs) {
+                "PASS"
+            } else {
+                "FAIL"
+            },
+            leg_names.join(",")
+        ));
+    }
+    let steps_ok = steps.iter().all(|s| s.ok);
+    out.push_str(&format!(
+        "REPORT end: {}\n",
+        if steps_ok && calls_ok {
+            "ALL-PASS".to_string()
+        } else {
+            "FAILURES PRESENT (see FAIL rows above)".to_string()
+        }
+    ));
+    out
 }
 
 /// Tracked test mail for cleanup: every Message-ID the run sent, with the
@@ -1061,14 +1203,14 @@ fn manual_cleanup_steps(mids: &[String]) -> String {
 /// legs must hold exactly 1 — and no leg may ever hold 2 (twin).
 #[derive(Default)]
 pub struct TrackedMail {
-    message_ids: Vec<String>,
-    inbox_uids: Vec<(String, u32)>,
-    sent_uids: Vec<(String, u32)>,
-    unfiled: Vec<String>,
+    pub message_ids: Vec<String>,
+    pub inbox_uids: Vec<(String, u32)>,
+    pub sent_uids: Vec<(String, u32)>,
+    pub unfiled: Vec<String>,
     /// Sent folder wire, set at preflight — cleanup expunges Sent UIDs via
     /// this wire (UIDs are per-folder; INBOX expunge of a Sent UID would
     /// delete the WRONG mail — T-21-05).
-    sent_wire: Option<String>,
+    pub sent_wire: Option<String>,
     /// Canonical STEP outcomes, in print order (REPORT backbone; cleanup
     /// fails the run when any entry failed).
     pub step_log: Mutex<Vec<LoggedStep>>,
@@ -1088,6 +1230,8 @@ pub struct TrackedMail {
     pub draft_mid: Option<String>,
     pub draft_id: Option<String>,
     pub draft_server_uid: Option<u32>,
+    /// Run tag for the REPORT header.
+    pub run_tag: String,
     /// Credential values for the in-bin secret scan (D-13): cloned from the
     /// keyring/env config at run start, used ONLY as fixed-substring scan
     /// needles over the temp-DB dump — never printed.
@@ -1118,6 +1262,7 @@ async fn run() -> i32 {
     let db_path = std::env::temp_dir().join(format!("sge-live21-{tag}.sqlite"));
     let app_data = std::env::temp_dir().join(format!("sge-live21-{tag}-data"));
     let mut tracked = TrackedMail::default();
+    tracked.run_tag = tag.clone();
     tracked.scan_secrets = vec![cfg.password.clone(), cfg.smtp_password.clone()];
     let store = match Store::open(&db_path) {
         Ok(s) => Arc::new(Mutex::new(s)),
@@ -3080,6 +3225,95 @@ async fn cleanup(
             ok = false;
         }
     }
+    // Draft-leg leftovers (D-16): expunge the draft server copy via its own
+    // wire (tracked UID only), then DELETE the sandbox folder when this run
+    // created one. Real-Drafts fallback: tracked-UID expunge only, never
+    // DELETE someone else's folder.
+    let draft_wire = tracked
+        .draft_sandbox
+        .clone()
+        .or_else(|| tracked.draft_real_drafts_wire.clone());
+    if let (Some(uid), Some(wire)) = (tracked.draft_server_uid, draft_wire.clone()) {
+        let mid = tracked.draft_mid.clone().unwrap_or_else(|| "draft".to_string());
+        if !expunge_tracked(mgr, &wire, uid, &mid).await {
+            ok = false;
+        }
+    }
+    if let Some(folder) = tracked.draft_sandbox.clone() {
+        let mut deleted = false;
+        for (attempt, secs) in CLEANUP_BACKOFF_SECS.iter().enumerate() {
+            match mgr.delete_mailbox_in(&folder).await {
+                Ok(()) => {
+                    deleted = true;
+                    break;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[live-gate] cleanup DELETE {} attempt {} failed ({}) — backoff {}s",
+                        folder,
+                        attempt + 1,
+                        e,
+                        secs
+                    );
+                    std::thread::sleep(std::time::Duration::from_secs(*secs));
+                }
+            }
+        }
+        if !deleted {
+            ok = false;
+        }
+    }
+    // Post-cleanup re-SEARCH (D-15): every test Message-ID must return zero
+    // hits in INBOX and Sent — LIST equality alone cannot catch a leftover
+    // copy inside an existing folder.
+    if !tracked.message_ids.is_empty() {
+        match mgr.lease_for("INBOX").await {
+            Ok(mut lease) => {
+                for mid in tracked.message_ids.iter() {
+                    match lease.session().uid_search_header("Message-ID", mid).await {
+                        Ok(hits) if hits.is_empty() => {}
+                        Ok(hits) => {
+                            eprintln!(
+                                "[live-gate] cleanup re-SEARCH INBOX still holds {:?} for {}",
+                                hits, mid
+                            );
+                            ok = false;
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[live-gate] cleanup re-SEARCH INBOX failed for {} ({})",
+                                mid, e
+                            );
+                            ok = false;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[live-gate] cleanup re-SEARCH INBOX lease failed ({e})");
+                ok = false;
+            }
+        }
+        for mid in tracked.message_ids.iter() {
+            match search_sent_for_mid(mgr, &sent_folder, mid).await {
+                Ok(hits) if hits.is_empty() => {}
+                Ok(hits) => {
+                    eprintln!(
+                        "[live-gate] cleanup re-SEARCH {} still holds {:?} for {}",
+                        sent_folder, hits, mid
+                    );
+                    ok = false;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[live-gate] cleanup re-SEARCH {} failed for {} ({})",
+                        sent_folder, mid, e
+                    );
+                    ok = false;
+                }
+            }
+        }
+    }
     let after = list_snapshot(mgr).await.unwrap_or_default();
     let list_guard = format!("{SANDBOX_PREFIX}never-created");
     let clean = unexpected_list_delta(before, &after, &list_guard).is_empty();
@@ -3099,9 +3333,14 @@ async fn cleanup(
                 tracked.message_ids
             )
         } else {
-            manual_cleanup_steps(&tracked.message_ids)
+            manual_cleanup_steps(tracked)
         },
     );
+    // REPORT (D-15): closing block on the finally path — STEP outcomes,
+    // autosave branch, draft-leg binary verdict, call counts, A-01..A-09.
+    // Printed even after a mid-run FAIL so the human run always ends with
+    // the full picture.
+    println!("{}", render_report(tracked));
     let _ = std::fs::remove_file(db_path);
     let _ = std::fs::remove_dir_all(app_data);
     // Exit-code contract (USAGE: 0 all-pass · 1 assertion FAIL): a mid-run
@@ -3403,5 +3642,66 @@ mod live_gate_21_preflight_tests {
             assert_eq!(expected_calls_delta(leg), Some(0), "leg {leg} must add zero calls");
         }
         assert_eq!(expected_calls_delta("no-such-leg"), None);
+    }
+
+    #[test]
+    fn live_gate_21_report_covers_steps_calls_and_checklist() {
+        let mut tracked = TrackedMail::empty();
+        tracked.run_tag = "test-tag".to_string();
+        tracked.probe_detail =
+            "branch per flush lines (deduped-in-Sent vs APPENDed-to-Sent)".to_string();
+        assert!(log_step(&tracked, 3, "arrival", true, "detail-a"));
+        assert!(!log_step(&tracked, 8, "uncertain-reconcile", false, "detail-b"));
+        record_calls(&tracked, "arrival", 5, 6);
+        record_calls(&tracked, "uncertain-reconcile", 6, 6);
+        let report = render_report(&tracked);
+        assert!(report.contains("REPORT live_gate_21 run=test-tag"), "header:\n{report}");
+        assert!(report.contains("REPORT-STEP 3/12 arrival: PASS detail-a"), "steps:\n{report}");
+        assert!(
+            report.contains("REPORT-STEP 8/12 uncertain-reconcile: FAIL"),
+            "steps:\n{report}"
+        );
+        assert!(
+            report.contains("REPORT autosave-branch: branch per flush lines"),
+            "branch:\n{report}"
+        );
+        assert!(
+            report.contains("REPORT draft-send binary verdict: FAIL BY DESIGN"),
+            "draft verdict:\n{report}"
+        );
+        assert!(report.contains("DRAFT-03 GAP"), "gap note:\n{report}");
+        assert!(
+            report.contains("REPORT-CALLS leg=arrival delta=1 expected=1 ok=true"),
+            "calls:\n{report}"
+        );
+        assert!(
+            report.contains("REPORT-CALLS leg=uncertain-reconcile delta=0 expected=0 ok=true"),
+            "calls:\n{report}"
+        );
+        for id in ["A-01", "A-02", "A-03", "A-04", "A-05", "A-06", "A-07", "A-08", "A-09"] {
+            assert!(report.contains(id), "checklist {id} missing:\n{report}");
+        }
+        // Verbatim existing-component copy is referenced, never reworded.
+        assert!(report.contains("Reconciliando na pasta Enviadas"), "A-04 copy:\n{report}");
+        assert!(report.contains("FAILURES PRESENT"), "footer:\n{report}");
+    }
+
+    #[test]
+    fn live_gate_21_manual_steps_name_uids_folders_and_webmail() {
+        let mut tracked = TrackedMail::empty();
+        tracked.run_tag = "tag-1".to_string();
+        tracked.message_ids = vec!["<a@sge.local>".to_string()];
+        tracked.inbox_uids = vec![("<a@sge.local>".to_string(), 41)];
+        tracked.sent_uids = vec![("<a@sge.local>".to_string(), 7)];
+        tracked.sent_wire = Some("Sent".to_string());
+        tracked.draft_sandbox = Some("SGE-Test-tag-1-drafts".to_string());
+        tracked.draft_server_uid = Some(9);
+        let steps = manual_cleanup_steps(&tracked);
+        assert!(steps.contains("<a@sge.local>"), "mids:\n{steps}");
+        assert!(steps.contains("41"), "inbox uid:\n{steps}");
+        assert!(steps.contains("INBOX") && steps.contains("Sent"), "folders:\n{steps}");
+        assert!(steps.contains("SGE-Test-tag-1-drafts"), "sandbox:\n{steps}");
+        assert!(steps.contains("webmail"), "webmail path:\n{steps}");
+        assert!(steps.contains("DELETE the sandbox folder only"), "delete scope:\n{steps}");
     }
 }
