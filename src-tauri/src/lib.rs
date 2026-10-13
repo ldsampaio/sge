@@ -535,6 +535,9 @@ pub fn run() {
             commands::classify::classify_message_uid,
             commands::classify::set_folder_excluded,
             commands::classify::batch_runs_list,
+            commands::classify::archive_run,
+            commands::classify::get_archive_settings,
+            commands::classify::set_archive_settings,
             sidecar_status,
             load_server_config,
         ])

@@ -1202,7 +1202,7 @@ pub async fn batch_report(
         )
         .map_err(|e| e.to_string())?;
     let _ = totals;
-    Ok(BatchReport { run_id, state: state_s, per_category, remainder: remainder as usize, undone: undone as usize })
+    Ok(BatchReport { run_id, state: state_s, per_category, remainder: remainder as usize, undone: undone as usize, totals_json: totals })
 }
 
 /// Undo-batch: restore originals in reverse journal order.
@@ -1275,4 +1275,254 @@ pub async fn batch_runs_list(state: State<'_, AppState>) -> Result<Vec<BatchRunR
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
     Ok(rows)
+}
+
+// ── Phase 24: auto-archive commands (ARCH-01/02) ───────────────────
+
+use crate::classify::archive;
+
+/// Archive rule settings (SQLite-persisted, survives restart — never
+/// localStorage). Threshold is enforced backend-side (7–730).
+#[derive(Debug, Clone, Serialize)]
+pub struct ArchiveSettings {
+    pub threshold_days: i64,
+    pub included_folders: Vec<String>,
+}
+
+/// Read the archive rule (defaults: 90d, INBOX + Auto tops).
+#[tauri::command]
+pub async fn get_archive_settings(state: State<'_, AppState>) -> Result<ArchiveSettings, String> {
+    let guard = state.store.lock().unwrap();
+    let conn = guard.conn();
+    Ok(ArchiveSettings {
+        threshold_days: crate::store::queries::get_archive_threshold(conn),
+        included_folders: archive::resolve_included_folders(conn),
+    })
+}
+
+/// Persist the archive rule. Backend is the enforcer: out-of-range
+/// thresholds and empty scopes fail here with plain language, never
+/// silently. Hardcoded exclusions (A Classificar/Sent/Drafts/Archive)
+/// stay structural in the selector regardless of this list.
+#[tauri::command]
+pub async fn set_archive_settings(
+    state: State<'_, AppState>,
+    threshold_days: i64,
+    included_folders: Vec<String>,
+) -> Result<ArchiveSettings, String> {
+    let guard = state.store.lock().unwrap();
+    let conn = guard.conn();
+    crate::store::queries::set_archive_threshold(conn, threshold_days)?;
+    let json = serde_json::to_string(&included_folders).map_err(|e| e.to_string())?;
+    crate::store::queries::set_archive_included_json(conn, &json)?;
+    Ok(ArchiveSettings {
+        threshold_days: crate::store::queries::get_archive_threshold(conn),
+        included_folders: archive::resolve_included_folders(conn),
+    })
+}
+
+/// Start (or resume) an age-based archive run. Manual trigger ONLY — no
+/// scheduler, no mount hook, no background poll invokes this command.
+///
+/// Shape mirrors `batch_classify` line-for-line with an archive selector:
+/// reset cancel flag, pre-create the archive subtree, capture folder
+/// epochs, spawn the chunk loop over BATCH_CHUNK=25 with per-chunk
+/// UIDVALIDITY re-check and cooperative cancel, journal_intent BEFORE
+/// each MOVE and journal_moved after, resume via journaled_ids skip, and
+/// finish with `totals_json` carrying `{"kind":"archive",...}` so
+/// report/list surfaces label archive runs distinctly. Moves go ONLY
+/// through `archive_one` (proven `move_one_uid` + `imap_outbox` replay,
+/// UID-only addressing, single session). No classifier call anywhere on
+/// this path; the shared `undo_batch` reverses archive runs in reverse
+/// to→from order. Returns the run id.
+#[tauri::command]
+pub async fn archive_run(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    resume_run: Option<i64>,
+) -> Result<i64, String> {
+    let store = state.store.clone();
+    let account_cfg = load_account_config(state.clone()).await?;
+    let manager = manager_for(&state, &account_cfg);
+    // No sidecar lease: age is the only gate (confidence threshold
+    // irrelevant on this path by design).
+    let cancel = state.batch_cancel.clone();
+    cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+    let now = chrono::Utc::now();
+    // Settings (backend truth).
+    let (threshold, included) = {
+        let guard = store.lock().unwrap();
+        let conn = guard.conn();
+        (
+            crate::store::queries::get_archive_threshold(conn),
+            archive::resolve_included_folders(conn),
+        )
+    };
+    // Candidates + destination per candidate (short locks, no awaits).
+    let mut jobs: Vec<(u64, String, u32, String)> = {
+        let guard = store.lock().unwrap();
+        let cands = archive::collect_archive_candidates(guard.conn(), threshold, &included, now)?;
+        let mut jobs = Vec::with_capacity(cands.len());
+        for (mid, mb, uid) in cands {
+            if let Ok((dest_display, _, _)) = archive::archive_dest_for(guard.conn(), mid, &mb, now) {
+                jobs.push((mid, mb, uid, dest_display));
+            }
+        }
+        jobs
+    };
+    // Run id: fresh or resumed (resume skips journaled rows).
+    let run_id = {
+        let guard = store.lock().unwrap();
+        match resume_run {
+            Some(id) => id,
+            None => crate::store::queries::create_batch_run(guard.conn()).map_err(|e| e.to_string())?,
+        }
+    };
+    if resume_run.is_some() {
+        let guard = store.lock().unwrap();
+        let done = batch::journaled_ids(guard.conn(), run_id)?;
+        jobs.retain(|(mid, _, _, _)| !done.contains(mid));
+    }
+    // Pre-create the archive subtree up front (dialog-off: no mid-run asks).
+    {
+        let mut dests: Vec<String> = jobs.iter().map(|(_, _, _, d)| d.clone()).collect();
+        dests.sort();
+        dests.dedup();
+        archive::ensure_archive_tree(&manager, &store, &dests).await?;
+    }
+    // Folder epochs at run start (per-chunk UIDVALIDITY re-check).
+    let epochs: std::collections::HashMap<String, u32> = {
+        let guard = store.lock().unwrap();
+        let rows: Vec<(String, u32)> = guard
+            .conn()
+            .prepare("SELECT name, uid_validity FROM mailboxes")
+            .map_err(|e| e.to_string())?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())?;
+        rows.into_iter().collect()
+    };
+    let total = jobs.len();
+    let app_h = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut done = 0usize;
+        let mut moved = 0usize;
+        let mut chunk_no = 0usize;
+        for chunk in jobs.chunks(batch::BATCH_CHUNK) {
+            if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            // Per-chunk UIDVALIDITY re-check: skip folders that shifted
+            // (abort-to-resync for that folder, same as batch_classify).
+            let mut live_chunk: Vec<(u64, String, u32, String)> = Vec::new();
+            for (mid, mb, uid, dest) in chunk {
+                let epoch_now: u32 = {
+                    let guard = store.lock().unwrap();
+                    guard
+                        .conn()
+                        .query_row(
+                            "SELECT uid_validity FROM mailboxes WHERE name = ?1",
+                            rusqlite::params![mb],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(0)
+                };
+                if epochs.get(mb).copied().unwrap_or(0) != epoch_now {
+                    continue;
+                }
+                live_chunk.push((*mid, mb.clone(), *uid, dest.clone()));
+            }
+            for (mid, _mb, _uid, dest_display) in live_chunk {
+                if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                // Resolve wire + current location (short lock, no await).
+                let (from_folder, dest_wire) = {
+                    let guard = store.lock().unwrap();
+                    let conn = guard.conn();
+                    let loc = crate::store::queries::message_location(conn, mid).ok().flatten();
+                    let cached = crate::store::queries::list_mailboxes(conn).ok().unwrap_or_default();
+                    match loc {
+                        Some((mb, _)) => {
+                            let delim = cached.first().map(|r| r.delimiter.clone()).unwrap_or_default();
+                            (mb, archive::display_to_wire(&dest_display, &delim))
+                        }
+                        None => {
+                            done += 1;
+                            continue;
+                        }
+                    }
+                };
+                {
+                    let guard = store.lock().unwrap();
+                    let _ = batch::journal_intent(
+                        guard.conn(), run_id, mid, &from_folder, &dest_wire,
+                        archive::ARCHIVE_LABEL_ID, chunk_no,
+                    );
+                }
+                // Current uid may have shifted; re-read location for the verb.
+                let verb_loc = {
+                    let guard = store.lock().unwrap();
+                    crate::store::queries::message_location(guard.conn(), mid).ok().flatten()
+                };
+                if let Some((mb_now, uid_now)) = verb_loc {
+                    if mb_now == dest_wire {
+                        let guard = store.lock().unwrap();
+                        let _ = batch::journal_moved(guard.conn(), run_id, mid);
+                        moved += 1;
+                    } else if archive::archive_one(
+                        &manager, &store, &mb_now, uid_now, &dest_wire, &dest_display,
+                    )
+                    .await
+                    .is_ok()
+                    {
+                        let guard = store.lock().unwrap();
+                        let _ = batch::journal_moved(guard.conn(), run_id, mid);
+                        moved += 1;
+                    }
+                }
+                done += 1;
+            }
+            chunk_no += 1;
+            let _ = app_h.emit(
+                "batch-progress",
+                BatchProgress {
+                    run_id,
+                    done,
+                    total,
+                    moved,
+                    review: 0,
+                    state: "running".to_string(),
+                },
+            );
+        }
+        let interrupted = cancel.load(std::sync::atomic::Ordering::SeqCst);
+        let totals = serde_json::json!({
+            "kind": "archive",
+            "threshold_days": threshold,
+            "done": done,
+            "moved": moved,
+        })
+        .to_string();
+        {
+            let guard = store.lock().unwrap();
+            let _ = crate::store::queries::finish_batch_run(
+                guard.conn(), run_id,
+                if interrupted { "interrupted" } else { "done" }, &totals,
+            );
+        }
+        let _ = app_h.emit(
+            "batch-progress",
+            BatchProgress {
+                run_id,
+                done,
+                total,
+                moved,
+                review: 0,
+                state: if interrupted { "interrupted".to_string() } else { "done".to_string() },
+            },
+        );
+    });
+    Ok(run_id)
 }
