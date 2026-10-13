@@ -31,7 +31,8 @@ struct FakeSession {
     mailboxes: HashSet<String>,
     selected: Option<String>,
     next_uid: u32,
-    messages: HashMap<u32, (String, Vec<u8>, bool)>,
+    /// uid -> (mailbox, message_id, bytes, deleted)
+    messages: HashMap<u32, (String, String, Vec<u8>, bool)>,
 }
 
 impl FakeSession {
@@ -112,7 +113,7 @@ impl SyncSession for FakeSession {
         Box::pin(async move {
             self.messages
                 .get(&uid)
-                .map(|(_, bytes, _)| bytes.clone())
+                .map(|(_, _, bytes, _)| bytes.clone())
                 .ok_or_else(|| SyncError::Protocol(format!("no such uid {uid}")))
         })
     }
@@ -135,7 +136,7 @@ impl SyncSession for FakeSession {
         Box::pin(async move {
             match self.messages.get_mut(&uid) {
                 Some(entry) => {
-                    entry.2 = deleted;
+                    entry.3 = deleted;
                     Ok(())
                 }
                 None => Err(SyncError::Protocol(format!("no such uid {uid}"))),
@@ -148,7 +149,7 @@ impl SyncSession for FakeSession {
             let gone: Vec<u32> = self
                 .messages
                 .iter()
-                .filter(|(_, (_, _, d))| *d)
+                .filter(|(_, (_, _, _, d))| *d)
                 .map(|(u, _)| *u)
                 .collect();
             for u in &gone {
@@ -164,7 +165,7 @@ impl SyncSession for FakeSession {
             let mut gone = Vec::new();
             for part in uid_set.split(',') {
                 if let Ok(uid) = part.trim().parse::<u32>() {
-                    if matches!(self.messages.get(&uid), Some((_, _, true))) {
+                    if matches!(self.messages.get(&uid), Some((_, _, _, true))) {
                         self.messages.remove(&uid);
                         gone.push(uid);
                     }
@@ -230,9 +231,16 @@ impl SyncSession for FakeSession {
             if !self.mailboxes.contains(&mailbox) {
                 return Err(SyncError::Protocol(format!("no such mailbox {mailbox}")));
             }
+            // Record the Message-ID like a server would index it.
+            let text = String::from_utf8_lossy(&bytes);
+            let msg_id = text
+                .lines()
+                .find(|l| l.to_ascii_lowercase().starts_with("message-id:"))
+                .map(|l| l["message-id:".len()..].trim().to_string())
+                .unwrap_or_default();
             let uid = self.next_uid;
             self.next_uid += 1;
-            self.messages.insert(uid, (mailbox, bytes, false));
+            self.messages.insert(uid, (mailbox, msg_id, bytes, false));
             Ok(())
         })
     }
@@ -240,10 +248,16 @@ impl SyncSession for FakeSession {
     fn uid_search_header(
         &mut self,
         _field: &str,
-        _value: &str,
+        value: &str,
     ) -> sge_lib::imap::PinBox<'_, Result<Vec<u32>, SyncError>> {
+        let value = value.to_string();
         Box::pin(async move {
-            let mut uids: Vec<u32> = self.messages.keys().copied().collect();
+            let mut uids: Vec<u32> = self
+                .messages
+                .iter()
+                .filter(|(_, (_, id, _, _))| *id == value)
+                .map(|(u, _)| *u)
+                .collect();
             uids.sort_unstable();
             Ok(uids)
         })
@@ -385,6 +399,87 @@ fn live_gate_21_gate_closed_fails_writes_forwards_reads() {
     assert_eq!(block_on(gate.search_uids()).unwrap(), vec![1]);
 }
 
+// ── Arrival + Sent-copy shapes (D-05/D-06 — zero network) ─────────────────
+// SEARCH-count (exactly 1 UID per Message-ID) + verbatim byte-compare, the
+// same shapes the live legs assert. Plus the offline flush shape: enqueue →
+// snapshot pending → flush (offline transport, no manager) → sent == 1 →
+// snapshot clean.
+
+#[test]
+fn live_gate_21_arrival_shape_search_count_and_verbatim() {
+    let mut session = FakeSession::with_mailbox("INBOX");
+    let mid_a = "<live21-shape-a@sge.local>".to_string();
+    let mid_b = "<live21-shape-b@sge.local>".to_string();
+    let bytes_a = format!("Message-ID: {mid_a}\r\nSubject: {0}shape\r\n\r\nbody-a", harness::SUBJECT_PREFIX).into_bytes();
+    let bytes_b = format!("Message-ID: {mid_b}\r\nSubject: {0}shape\r\n\r\nbody-b", harness::SUBJECT_PREFIX).into_bytes();
+    block_on(session.append_message("INBOX", "", &bytes_a)).unwrap();
+    block_on(session.append_message("INBOX", "", &bytes_b)).unwrap();
+
+    // SEARCH isolates per Message-ID: exactly 1 UID each, never the union.
+    let hits_a = block_on(session.uid_search_header("Message-ID", &mid_a)).unwrap();
+    let uid_a = harness::assert_exactly_one(&hits_a, "arrival-shape").unwrap();
+    let hits_b = block_on(session.uid_search_header("Message-ID", &mid_b)).unwrap();
+    let uid_b = harness::assert_exactly_one(&hits_b, "arrival-shape").unwrap();
+    assert_ne!(uid_a, uid_b);
+
+    // Verbatim byte-compare of the fetched copy against the queued bytes.
+    let fetched = block_on(session.fetch_body(uid_a)).unwrap();
+    assert!(harness::verbatim_equal(&fetched, &bytes_a));
+    assert!(!harness::verbatim_equal(&fetched, &bytes_b));
+
+    // Unknown Message-ID: zero hits → exactly-one refuses.
+    let none = block_on(session.uid_search_header("Message-ID", "<nope@sge.local>")).unwrap();
+    assert!(none.is_empty());
+    assert!(harness::assert_exactly_one(&none, "arrival-shape").is_err());
+}
+
+#[test]
+fn live_gate_21_offline_flush_shape_enqueue_to_sent() {
+    use sge_lib::send_queue::SendGate;
+    use sge_lib::sync::worker::{FlushSummary, SendFlushEnv};
+
+    let store = Arc::new(std::sync::Mutex::new(Store::open_in_memory().unwrap()));
+    let app_data = test_app_data("flush-shape");
+    let mid = {
+        let guard = store.lock().unwrap();
+        let out = send_queue::enqueue_send(guard.conn(), &app_data, self_input("flush")).unwrap();
+        assert!(!out.deduped);
+        // A-01 shape: pending visible before any network.
+        let snap = send_queue::send_status_snapshot(guard.conn()).unwrap();
+        assert!(snap.pending_count >= 1 && snap.queued >= 1);
+        out.message_id
+    };
+    let (transport, calls) = harness::CountingTransport::offline();
+    let transport: Arc<dyn SmtpTransport> = Arc::new(transport);
+    let worker = SyncWorker::new(store.clone());
+    let env = SendFlushEnv {
+        gate: SendGate::default(),
+        transport,
+        account: SmtpAccount {
+            host: "smtp.example".to_string(),
+            port: 587,
+            username: "u".to_string(),
+            password: "p".to_string(),
+        },
+        manager: None,
+        sent_wire: None,
+    };
+    let summary = block_on(worker.flush_send_queue(&env));
+    assert_eq!(summary.sent, 1, "offline flush must send the one queued row");
+    assert_eq!(summary, FlushSummary { sent: 1, ..FlushSummary::default() });
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    // A-02/A-03 shape: clean state after ack.
+    {
+        let guard = store.lock().unwrap();
+        let snap = send_queue::send_status_snapshot(guard.conn()).unwrap();
+        assert_eq!(snap.pending_count, 0);
+        assert_eq!(snap.failed, 0);
+        assert_eq!(snap.uncertain, 0);
+        let row = queries::get_send_row_by_message_id(guard.conn(), &mid).unwrap().unwrap();
+        assert_eq!(row.state, "sent");
+    }
+    std::fs::remove_dir_all(&app_data).ok();
+}
 // ── D-12 doubles (explicit, offline only — never attempted live) ───────────
 // (a) oversize input over the 25 MB cap rejected before any transport call
 // (zero send_raw calls); (b) envelope log of a self-send contains no Bcc:

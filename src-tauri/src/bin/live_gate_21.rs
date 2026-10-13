@@ -36,9 +36,10 @@ use sge_lib::imap::{
     normalize_host, AccountConfig, MailboxInfo, MailboxStatus, MailboxSummary, PinBox,
     SecurityMode, SyncError, SyncSession,
 };
-use sge_lib::smtp::{SmtpAccount, SmtpOutcome, SmtpTransport};
-use sge_lib::store::Store;
-use sge_lib::sync::worker::resolve_sent_wire;
+use sge_lib::send_queue::{self, EnqueueInput, SendGate};
+use sge_lib::smtp::{SmtpAccount, SmtpOutcome, SmtpTransport, SmtpTransporter};
+use sge_lib::store::{queries, Store};
+use sge_lib::sync::worker::{resolve_sent_wire, SendFlushEnv, SyncWorker};
 
 /// Sandbox folder prefix (D-03, mirrored from Phase 22). Every harness-issued
 /// mutating call asserts it in code; Phase 21 creates no sandbox folder (the
@@ -602,6 +603,26 @@ async fn current_validity(mgr: &SessionManager, wire: &str) -> Result<u32, SyncE
         .ok_or_else(|| SyncError::State(format!("no UIDVALIDITY for {wire}")))
 }
 
+/// Re-LIST after a leg and abort on any unexpected delta (D-03): the
+/// harness creates no folders, so every delta is external interference or a
+/// wrong-folder write. Server delivery into INBOX never trips this (LIST
+/// sees folders, not contents).
+async fn check_list_stable(
+    mgr: &SessionManager,
+    before: &[String],
+    guard_marker: &str,
+    n: usize,
+    name: &str,
+) -> bool {
+    match list_snapshot(mgr).await {
+        Ok(after) => {
+            let delta = unexpected_list_delta(before, &after, guard_marker);
+            step(n, name, delta.is_empty(), &format!("LIST deltas: {:?}", delta))
+        }
+        Err(e) => step(n, name, false, &format!("re-LIST failed: {}", e)),
+    }
+}
+
 fn step(n: usize, name: &str, ok: bool, detail: &str) -> bool {
     println!(
         "STEP {n}/{TOTAL_STEPS} {name}: {} {detail}",
@@ -618,12 +639,16 @@ fn manual_cleanup_steps(mids: &[String]) -> String {
 }
 
 /// Tracked test mail for cleanup: every Message-ID the run sent, with the
-/// INBOX/Sent UIDs the asserts observed.
+/// INBOX/Sent UIDs the asserts observed. `unfiled` marks Message-IDs whose
+/// Sent APPEND leg failed (SentUnfiled): the autosave probe tolerates 0 or 1
+/// Sent UIDs for those (0 = no autosave, 1 = server autosaved), while filed
+/// legs must hold exactly 1 — and no leg may ever hold 2 (twin).
 #[derive(Default)]
 struct TrackedMail {
     message_ids: Vec<String>,
     inbox_uids: Vec<(String, u32)>,
     sent_uids: Vec<(String, u32)>,
+    unfiled: Vec<String>,
 }
 
 // ── Run ──────────────────────────────────────────────────────────────────
@@ -718,13 +743,289 @@ async fn run() -> i32 {
         }
     }
 
-    // Middle legs (Tasks 2-3): arrival, sent-copy, no-duplicate,
-    // sent-unfiled, autosave-probe — implemented next; the tracer keeps the
-    // step numbers stable so logs stay comparable across tasks. The SMTP
-    // account constructor is wired here so the credential path type-checks
-    // end to end already (no network: pure struct build, Debug-redacted).
-    let _smtp_probe = smtp_account(&cfg);
-    let _ = (&store, &sent_wire, &tag, &mut tracked);
+    // Middle legs: 3 arrival, 4 sent-copy, 7 autosave-probe (Task 2);
+    // 5 no-duplicate, 6 sent-unfiled (Task 3). Step numbers stay stable so
+    // logs stay comparable across tasks.
+    let list_guard = format!("{}never-created-{}", SANDBOX_PREFIX, tag);
+
+    // 3. arrival — enqueue the self-send, flush through the production path
+    // (enqueue_send -> flush_send_queue, the commands/sync.rs queue_send
+    // order), prove delivery via INBOX SEARCH (D-05 — never SMTP 250 alone).
+    let arrival_subject = format!("{}{}-arrival", SUBJECT_PREFIX, tag);
+    let arrival_mid = {
+        let guard = store.lock().unwrap();
+        match send_queue::enqueue_send(
+            guard.conn(),
+            &app_data,
+            EnqueueInput {
+                from: cfg.self_addr.clone(),
+                to: vec![cfg.self_addr.clone()],
+                cc: vec![],
+                bcc: vec![],
+                subject: arrival_subject.clone(),
+                body: "live gate arrival probe".to_string(),
+                draft_id: None,
+            },
+        ) {
+            Ok(out) => {
+                if out.deduped {
+                    step(3, "arrival", false, "fresh run_tag unexpectedly deduped");
+                    return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+                }
+                out.message_id
+            }
+            Err(e) => {
+                step(3, "arrival", false, &format!("enqueue_send failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        }
+    };
+    // A-01 (observable-state, existing OutboxBadgeWired + SendStatus — no
+    // new UI per 21-UI-SPEC.md): pending visible before any network.
+    {
+        let guard = store.lock().unwrap();
+        match send_queue::send_status_snapshot(guard.conn()) {
+            Ok(snap) => {
+                if !(snap.pending_count >= 1 && snap.queued >= 1) {
+                    step(
+                        3,
+                        "arrival",
+                        false,
+                        &format!(
+                            "A-01 precondition failed: pending={} queued={}",
+                            snap.pending_count, snap.queued
+                        ),
+                    );
+                    return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+                }
+            }
+            Err(e) => {
+                step(3, "arrival", false, &format!("send_status snapshot failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        }
+    }
+    // Production flush: one pooled SmtpTransporter behind the counting
+    // decorator (never a second SMTP client — RESEARCH Pitfall 1), manager
+    // leases for the filing leg.
+    let worker = SyncWorker::new(store.clone());
+    let (counting, send_calls) = CountingTransport::live(Arc::new(SmtpTransporter::new()));
+    let transport: Arc<dyn SmtpTransport> = Arc::new(counting);
+    let flush_env = SendFlushEnv {
+        gate: SendGate::default(),
+        transport,
+        account: smtp_account(&cfg),
+        manager: Some(manager.clone()),
+        sent_wire: Some(sent_wire.clone()),
+    };
+    eprintln!("[live-gate] {} (arrival leg)", envelope_log_line(&cfg.self_addr, &[cfg.self_addr.clone()]));
+    let summary = worker.flush_send_queue(&flush_env).await;
+    eprintln!(
+        "[live-gate] arrival flush done: sent={} deferred={} failed={} uncertain={} unfiled={} transport_calls={}",
+        summary.sent,
+        summary.deferred,
+        summary.failed,
+        summary.uncertain,
+        summary.sent_unfiled,
+        send_calls.load(Ordering::SeqCst)
+    );
+    if summary.sent != 1 {
+        step(
+            3,
+            "arrival",
+            false,
+            &format!(
+                "flush summary sent={} (want 1) deferred={} failed={} uncertain={}",
+                summary.sent, summary.deferred, summary.failed, summary.uncertain
+            ),
+        );
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    // Bounded poll for server-side delivery latency (3x10s, then FAIL).
+    let mut arrival_uid: Option<u32> = None;
+    let mut arrival_detail = String::new();
+    for round in 0..ARRIVAL_POLL_ROUNDS {
+        if round > 0 {
+            async_std::task::sleep(std::time::Duration::from_secs(ARRIVAL_POLL_SECS)).await;
+        }
+        let mut lease = match manager.lease_for("INBOX").await {
+            Ok(l) => l,
+            Err(e) => {
+                arrival_detail = format!("INBOX lease failed: {}", e);
+                break;
+            }
+        };
+        match lease.selected_validity() {
+            Some(v) if v == inbox_validity => {}
+            other => {
+                arrival_detail = format!("INBOX epoch change mid-run (want {:?}, got {:?}) — aborting loud", inbox_validity, other);
+                break;
+            }
+        }
+        match lease.session().uid_search_header("Message-ID", &arrival_mid).await {
+            Ok(hits) => {
+                if hits.len() == 1 {
+                    arrival_uid = Some(hits[0]);
+                    break;
+                }
+                arrival_detail = format!("round {}: {} INBOX hits (want 1)", round + 1, hits.len());
+            }
+            Err(e) => {
+                arrival_detail = format!("INBOX SEARCH failed: {}", e);
+                break;
+            }
+        }
+    }
+    let arrival_uid = match arrival_uid {
+        Some(u) => u,
+        None => {
+            step(3, "arrival", false, &arrival_detail);
+            return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+        }
+    };
+    // PEEK-only header confirm (never BODY[] — RESEARCH Pitfall 3).
+    let header_ok = match manager.lease_for("INBOX").await {
+        Ok(mut lease) => match lease.session().fetch_body(arrival_uid).await {
+            Ok(bytes) => match mail_parser::MessageParser::new().parse(&bytes) {
+                Some(m) => {
+                    let subj_ok = m.subject().map(|s| s.starts_with(SUBJECT_PREFIX)).unwrap_or(false);
+                    let bare = arrival_mid.trim_matches(&['<', '>'][..]);
+                    let mid_ok = m.message_id().map(|id| id == bare).unwrap_or(false);
+                    subj_ok && mid_ok
+                }
+                None => false,
+            },
+            Err(_) => false,
+        },
+        Err(_) => false,
+    };
+    if !header_ok {
+        step(3, "arrival", false, "PEEK header confirm failed (subject prefix / Message-ID)");
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    // A-02/A-03: clean state after ack (badge hidden, no failed surface).
+    let post_ok = {
+        let guard = store.lock().unwrap();
+        match send_queue::send_status_snapshot(guard.conn()) {
+            Ok(snap) => snap.pending_count == 0 && snap.failed == 0 && snap.uncertain == 0,
+            Err(_) => false,
+        }
+    };
+    if !post_ok {
+        step(3, "arrival", false, "A-02/A-03 post-condition failed (pending/failed/uncertain not all 0)");
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    tracked.message_ids.push(arrival_mid.clone());
+    tracked.inbox_uids.push((arrival_mid.clone(), arrival_uid));
+    if !step(3, "arrival", true, &format!("1 INBOX UID + headers confirm (mid {})", arrival_mid)) {
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    if !check_list_stable(&manager, &before, &list_guard, 3, "arrival-list").await {
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+
+    // 4. sent-copy — SEARCH Sent for the same Message-ID: exactly 1 UID +
+    // \Seen + verbatim-bytes compare against the queued .eml (D-06).
+    let sent_uid = {
+        let mut lease = match manager.lease_for(&sent_wire).await {
+            Ok(l) => l,
+            Err(e) => {
+                step(4, "sent-copy", false, &format!("Sent lease failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        };
+        match lease.selected_validity() {
+            Some(v) if v == sent_validity => {}
+            other => {
+                step(4, "sent-copy", false, &format!("Sent epoch change mid-run (want {:?}, got {:?})", sent_validity, other));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        }
+        let hits = match lease.session().uid_search_header("Message-ID", &arrival_mid).await {
+            Ok(h) => h,
+            Err(e) => {
+                step(4, "sent-copy", false, &format!("Sent SEARCH failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        };
+        let uid = match assert_exactly_one(&hits, "sent-copy") {
+            Ok(u) => u,
+            Err(e) => {
+                step(4, "sent-copy", false, &e);
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        };
+        // \Seen via the envelope/flags read path (never a non-PEEK fetch).
+        let seen_ok = match lease.session().fetch_envelopes(&uid.to_string()).await {
+            Ok(envs) => envs.iter().any(|h| h.uid == uid && flags_contain_seen(&h.flags)),
+            Err(_) => false,
+        };
+        if !seen_ok {
+            step(4, "sent-copy", false, "\\Seen not set on the Sent copy");
+            return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+        }
+        let server_bytes = match lease.session().fetch_body(uid).await {
+            Ok(b) => b,
+            Err(e) => {
+                step(4, "sent-copy", false, &format!("Sent PEEK fetch failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        };
+        let queued_bytes = {
+            let guard = store.lock().unwrap();
+            match queries::get_send_row_by_message_id(guard.conn(), &arrival_mid) {
+                Ok(Some(row)) => std::fs::read(&row.eml_path).unwrap_or_default(),
+                _ => Vec::new(),
+            }
+        };
+        if queued_bytes.is_empty() || !verbatim_equal(&server_bytes, &queued_bytes) {
+            step(4, "sent-copy", false, "Sent copy bytes differ from the queued .eml (not verbatim)");
+            return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+        }
+        uid
+    };
+    tracked.sent_uids.push((arrival_mid.clone(), sent_uid));
+    if !step(4, "sent-copy", true, &format!("1 Sent UID + \\Seen + verbatim bytes (uid {})", sent_uid)) {
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    if !check_list_stable(&manager, &before, &list_guard, 4, "sent-copy-list").await {
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+
+    // 5. no-duplicate + 6. sent-unfiled (Task 3) plug in here.
+
+    // 7. autosave-probe (D-08): the end state must be exactly 1 Sent UID
+    // either way — explicit APPEND or server auto-save deduped by the filing
+    // leg's probe SEARCH (no twin copy). Which branch ran is named by the
+    // flush stderr lines captured in the wrapper log ("deduped in Sent" vs
+    // "APPENDed to Sent"). Unfiled legs tolerate 0|1 (the probe signal).
+    {
+        let mut probe_ok = true;
+        let mut probe_detail = String::new();
+        let mut lease = match manager.lease_for(&sent_wire).await {
+            Ok(l) => l,
+            Err(e) => {
+                step(7, "autosave-probe", false, &format!("Sent lease failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        };
+        for mid in tracked.message_ids.iter() {
+            let count = lease.session().uid_search_header("Message-ID", mid).await.unwrap_or_default().len();
+            let is_unfiled = tracked.unfiled.iter().any(|u| u == mid);
+            let ok = count == 1 || (is_unfiled && count == 0);
+            if !ok {
+                probe_ok = false;
+            }
+            probe_detail.push_str(&format!("{}:sent_uids={}{}; ", mid, count, if is_unfiled { "(unfiled)" } else { "" }));
+        }
+        probe_detail.push_str("branch per [SGE send] flush lines in log (deduped-in-Sent vs APPENDed-to-Sent)");
+        if !step(7, "autosave-probe", probe_ok, &probe_detail) {
+            return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+        }
+    }
+    if !check_list_stable(&manager, &before, &list_guard, 7, "autosave-probe-list").await {
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
 
     // 8. cleanup — ALWAYS runs: expunge tracked UIDs, re-LIST must equal the
     // pre-run snapshot.
