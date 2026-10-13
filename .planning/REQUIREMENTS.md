@@ -80,18 +80,18 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 ---
 
-## v1.4 Requirements (Starting 2026-10-11; revised 2026-10-13 — NO live-server testing)
+## v1.4 Requirements (Starting 2026-10-11; revised 2026-10-13 — LIVE testing vs own account, sandboxed)
 
-**Milestone:** SMTP Send + Search/Filters + Offline Verification + Auto-Archive + Smart Folder Rules
+**Milestone:** SMTP Send + Search/Filters + Live Validation + Auto-Archive + Smart Folder Rules
 **Phases:** 21–27 (continue from 20; to be refined at plan-phase)
-**Status:** Scoped — not yet planned per-phase. Phase 21 planning will split into 21 (SMTP Verification Gate) / 22 (Draft/Seen Verification Gate) / 23 (Search + Filters) / 24 (Auto-Archive) / 25 (Smart Rules) / 26 (Offline Verification Bundle) / 27 (Verification / Audit Update).
+**Status:** Scoped — not yet planned per-phase. Phase 21 planning will split into 21 (SMTP Live Gate) / 22 (Draft/Seen Live Gate) / 23 (Search + Filters) / 24 (Auto-Archive) / 25 (Smart Rules) / 26 (Live Validation Bundle) / 27 (Verification / Audit Update).
 
-> **Hard constraint (2026-10-13): `mail.utfpr.edu.br` / `smtp.utfpr.edu.br` are unreachable from this environment — no live-server testing is possible.** All LIVE-* gates below are verified OFFLINE via the deterministic doubles already in the codebase (`MockSession`/`FakeSession` implementing `SyncSession`, record-and-replay SMTP transport in `smtp.rs` tests, `sync_demo` harness): tests assert wire-level verb sequences (APPEND-new + expunge-old one-copy, UID-only STORE Seen, outbox replay order, no-resurrection across simulated reconnect) instead of real round-trips. Anything that genuinely needs a real server stays explicitly deferred with reason.
+> **Live testing vs own account (2026-10-13): the user provides real credentials** (`src-tauri/.live-test.env`, git-ignored, never committed) so LIVE-* gates run against the real `mail.utfpr.edu.br` / `smtp.utfpr.edu.br:587`. **Sandbox safety contract (structural):** every live test creates one sandbox folder `SGE-Test-<run-id>` at start; ALL APPEND / MOVE / STORE / EXPUNGE ops are scoped to that folder; test mail is sent ONLY to the user's own address (never to other accounts); existing mail and existing folders are never touched (no moves/flags/expunges outside the sandbox, no CREATE/RENAME/DELETE of non-sandbox folders); a pre-flight guard aborts the run if any op targets outside the sandbox; the run ends with cleanup (sandbox folder + test mails removed). Offline doubles (MockSession/FakeSession, record-replay SMTP transport) remain the fallback for CI and for failure-mode coverage too dangerous to run live.
 
-### Verification Gates (close deferred v1.1/v1.2/v1.3 behaviors — OFFLINE via doubles, no live server)
-- [ ] **LIVE-01** (Phase 21): End-to-end SMTP send proven WITHOUT a live server — record-and-replay SMTP transport asserts: message accepted, no duplicate (Message-ID check incl. double-queue + DATA-timeout → `uncertain` reconcile-not-resend), Sent APPEND filed verbatim with `\Seen`, retry/backoff surfaces cleanly, keyring creds reused, no secret leakage in logs. Genuine 587 wire interop stays deferred with reason.
-- [ ] **LIVE-02** (Phase 22): Draft APPEND leaves exactly one server copy per session (`draft_uid` tracked) proven via MockSession verb log; edit offline + simulated-reconnect survives; delete/move replay from `imap_outbox` with no silent resurrection by backfill (tombstoning/convergence asserted across simulated reconnect); Seen-flag round-trip survives simulated reconnect.
-- [ ] **LIVE-03** (Phase 26): All deferred `/gsd-verify-work` behaviors (6/7/8 for v1.1, 12/13 for v1.2, confirm→MOVE for v1.3) executed against offline doubles with real wire-level assertions; results recorded; anything genuinely needing a live server documented as deferred with reason.
+### Live Validation Gates (real server, sandboxed — creds in git-ignored `src-tauri/.live-test.env`)
+- [ ] **LIVE-01** (Phase 21): End-to-end SMTP send against `smtp.utfpr.edu.br:587/STARTTLS` verified — test message sent ONLY to the user's own address, arrives, no duplicate (Message-ID check), Sent copy present, retry/backoff surfaces cleanly, keyring creds reused, no secret leakage in logs. Sandbox contract holds (no other recipient, no existing mail touched).
+- [ ] **LIVE-02** (Phase 22): Draft APPEND inside the `SGE-Test-<run-id>` sandbox leaves exactly one server copy per session (`draft_uid` tracked); edit offline + reconnect survives; delete/move replay from `imap_outbox` scoped to sandbox UIDs with no silent resurrection by backfill; Seen-flag round-trip survives reconnect. Pre-flight guard + post-run cleanup verified.
+- [ ] **LIVE-03** (Phase 26): All deferred `/gsd-verify-work` gates (6/7/8 for v1.1, 12/13 for v1.2, confirm→MOVE for v1.3) executed against the real server under the sandbox contract; results recorded; any remaining deferrals documented with reason.
 
 ### Search + Filters
 - [ ] **SRCH-01** (Phase 23): User searches local SQLite by subject, body snippet, sender, attachment name, folder scope; results ranked; multi-folder selectable.

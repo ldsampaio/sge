@@ -70,7 +70,8 @@ vendor/
 coverage/
 .cache/
 tmp/
-# Phase 15: sidecar weights + venvs are build artifacts (700MB+), never committed.
+# v1.4 live-test credentials (real secrets, per-account sandbox testing) — never committed.
+src-tauri/.live-test.env
 # src-tauri/binaries/ holds the BUILT sidecar (294M frozen or dev shim) —
 # never committed. Fresh clones: `cp sidecar/dev-shim.sh
 # src-tauri/binaries/sge-laya-$(rustc -vV | sed -n 's/host: //p')`

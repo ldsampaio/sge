@@ -1,7 +1,7 @@
 ---
 gsd_state_version: "1.0"
 milestone: v1.4
-milestone_name: SMTP Send + Search/Filters + Offline Verification + Auto-Archive + Smart Folder Rules
+milestone_name: SMTP Send + Search/Filters + Live Validation + Auto-Archive + Smart Folder Rules
 status: starting
 last_updated: "2026-10-11T00:00:00Z"
 last_activity: 2026-10-11
@@ -22,11 +22,11 @@ progress:
 See: .planning/PROJECT.md (updated 2026-10-10 — Milestone v1.3 complete)
 
 **Core value:** Connect to an IMAP server on Linux and read your mail locally in a fast Gmail-like UI.
-**Current focus:** v1.4 SMTP Send + Search/Filters + Offline Verification + Auto-Archive + Smart Folder Rules — phases 21-27 scoped (not yet planned per-phase); NO live-server testing (mail.utfpr.edu.br unreachable, 2026-10-13) — verification gates run OFFLINE via MockSession/FakeSession + record-replay SMTP transport; search/filter, auto-archive, smart rules added.
+**Current focus:** v1.4 SMTP Send + Search/Filters + Live Validation + Auto-Archive + Smart Folder Rules — phases 21-27 scoped (not yet planned per-phase); live gates run vs own account under sandbox contract (creds in git-ignored `src-tauri/.live-test.env`); search/filter, auto-archive, smart rules added.
 
 ## Milestone Status
 
-**v1.4 SMTP Send + ...: STARTED** — 0/7 phases planned; requirements in `.planning/REQUIREMENTS.md`; roadmap phases 21-27 added in `.planning/ROADMAP.md`. Constraint 2026-10-13: NO live-server testing (server unreachable) — LIVE-01/02/03 verify OFFLINE via doubles.
+**v1.4 SMTP Send + ...: STARTED** — 0/7 phases planned; requirements in `.planning/REQUIREMENTS.md`; roadmap phases 21-27 added in `.planning/ROADMAP.md`. Live testing vs own account under sandbox contract (2026-10-13): creds in git-ignored `src-tauri/.live-test.env`, test mail only to self, `SGE-Test-<run-id>` sandbox, post-run cleanup.
 **v1.3 Auto-Classify: PASSED** — 17/17 requirements, 6/6 phases (15-20), audit `.planning/v1.3-MILESTONE-AUDIT.md` (PASSED, deferred live gates documented).
 
 - Milestone audit: `.planning/v1.3-MILESTONE-AUDIT.md` — status: passed, scores: requirements 17/17, phases 6/6, integration 18/18 paths wired (1 blocker found + fixed in-audit)

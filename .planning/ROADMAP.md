@@ -21,7 +21,7 @@ v1.3 Auto-Classify adds one new lane — on-device automatic email classificatio
 - ✅ **v1.1 Triage & Folders** - Phases 6-9 (shipped 2026-10-05, archived under `.planning/milestones/v1.1-ROADMAP.md`, audit `.planning/v1.1-MILESTONE-AUDIT.md`)
 - ✅ **v1.2 Compose & Organize** - Phases 10-14 (shipped 2026-10-08)
 - ✅ **v1.3 Auto-Classify** - Phases 15-20 (shipped 2026-10-10, audit `.planning/v1.3-MILESTONE-AUDIT.md`: PASSED 17/17, 328 tests green, deferred live gates documented)
-- 🚧 **v1.4 SMTP Send + Search/Filters + Offline Verification + Auto-Archive + Smart Folder Rules** - Phases 21-27 (starting 2026-10-11; close deferred behaviors via offline doubles — NO live-server testing, server unreachable — + final capabilities)
+- 🚧 **v1.4 SMTP Send + Search/Filters + Live Validation + Auto-Archive + Smart Folder Rules** - Phases 21-27 (starting 2026-10-11; live gates vs own account under sandbox contract — creds git-ignored — + final capabilities)
 
 ## Phases
 
@@ -224,11 +224,11 @@ Decimal phases appear between their surrounding integers in numeric order. v1.2 
 
 ## Phase Details (v1.4 continuation — phases 21-27)
 
-### Phase 21: SMTP Send — Verification Gate (Live-01, OFFLINE)
-**Goal:** Prove v1.2 send pipeline WITHOUT a live server (unreachable): record-and-replay SMTP transport asserts accept, no-duplicate (Message-ID incl. DATA-timeout → `uncertain` reconcile-not-resend), Sent filing, retry/backoff, no secret leak. **Requires:** Phase 14 + doubles. **Requirements:** LIVE-01. **Success:** transport log shows single DATA per Message-ID, Sent APPEND verbatim + `\Seen`, `sent-unfiled` path covered, keyring creds reused. Genuine 587 wire interop deferred with reason. **UI:** yes. **Plans:** TBD.
+### Phase 21: SMTP Send — Live Gate (Live-01, SANDBOXED)
+**Goal:** Prove v1.2 send pipeline vs `smtp.utfpr.edu.br:587` with user-provided creds (git-ignored): test mail ONLY to own address, arrives, Sent copy, no duplicate (Message-ID), retry/backoff clean, no secret leak. **Requires:** Phase 14 + creds file. **Requirements:** LIVE-01. **Success:** self-addressed mail arrives + Sent copy, no other recipient ever addressed, existing mail untouched. **UI:** yes. **Plans:** TBD.
 
-### Phase 22: Draft & Seen Round-Trip — Verification Gate (Live-02, OFFLINE)
-**Goal:** Draft APPEND 1-copy, Seen survives simulated reconnect, `imap_outbox` replay, no silent resurrection — all asserted via MockSession/FakeSession verb logs. **Requires:** Phase 12/13 + doubles. **Requirements:** LIVE-02. **UI:** minimal. **Plans:** TBD.
+### Phase 22: Draft & Seen Round-Trip — Live Gate (Live-02, SANDBOXED)
+**Goal:** Draft APPEND 1-copy inside `SGE-Test-<run-id>` sandbox, Seen survives reconnect, `imap_outbox` replay, no silent resurrection — pre-flight guard + post-run cleanup. **Requires:** Phase 12/13 + creds file. **Requirements:** LIVE-02. **UI:** minimal. **Plans:** TBD.
 
 ### Phase 23: Search + Filters
 **Goal:** SQLite search (subject/body/attach/sender), saved filters, multi-folder, persisted. **Requires:** Phase 3. **Requirements:** SRCH-01/02/03. **UI:** yes. **Plans:** TBD.
@@ -239,8 +239,8 @@ Decimal phases appear between their surrounding integers in numeric order. v1.2 
 ### Phase 25: Smart Folder Rules
 **Goal:** User-defined rules (keyword/sender/pattern) validated → applies at sync/on-demand; conflict = confirm; SQLite-persisted. **Requires:** Phase 18 + 11. **Requirements:** RULE-01/02/03. **UI:** yes. **Plans:** TBD.
 
-### Phase 26: Offline Verification Bundle (Live-03, OFFLINE)
-**Goal:** Execute all deferred `/gsd-verify-work` behaviors (v1.1 6/7/8, v1.2 12/13, v1.3 confirm→MOVE/batch) against offline doubles with wire-level assertions; document. **Requires:** all phases + doubles. **Requirements:** LIVE-03. **UI:** no. **Plans:** TBD.
+### Phase 26: Live Validation Bundle (Live-03, SANDBOXED)
+**Goal:** Execute all deferred `/gsd-verify-work` behaviors (v1.1 6/7/8, v1.2 12/13, v1.3 confirm→MOVE/batch) vs real server under the sandbox contract; document. **Requires:** all phases + creds file. **Requirements:** LIVE-03. **UI:** no. **Plans:** TBD.
 
 ### Phase 27: Milestone Close — Verification + Audit
 **Goal:** Confirm criteria, write `.planning/v1.4-MILESTONE-AUDIT.md`, update STATE.md. **Requires:** all phases verified. **Plans:** TBD.
