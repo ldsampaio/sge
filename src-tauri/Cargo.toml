@@ -26,6 +26,10 @@ path = "src/bin/sync_demo.rs"
 name = "live_gate_22"
 path = "src/bin/live_gate_22.rs"
 
+[[bin]]
+name = "live_gate_21"
+path = "src/bin/live_gate_21.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
