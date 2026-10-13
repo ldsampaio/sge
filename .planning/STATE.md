@@ -2,15 +2,15 @@
 gsd_state_version: "1.0"
 milestone: v1.5
 milestone_name: Live Validation + Compose Hardening + Deferred Features
-status: planning
-last_updated: "2026-10-13T22:31:45.083Z"
+status: executing
+last_updated: "2026-10-13T23:35:00.000Z"
 last_activity: 2026-10-13
 progress:
   total_phases: 7
-  completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
-  percent: 0
+  completed_phases: 1
+  total_plans: 2
+  completed_plans: 2
+  percent: 14
 ---
 
 ---
@@ -34,10 +34,10 @@ See: .planning/PROJECT.md (updated 2026-10-13 — Milestone v1.5 defined)
 
 ## Current Position
 
-Phase: 27 (Live-Validation Gate + Capability Probes — next to discuss/plan)
+Phase: 28 (Override-Event Log + CONDSTORE Fast Path — next to discuss/plan)
 Plan: —
-Status: Roadmap complete, awaiting planning
-Last activity: 2026-10-13 — v1.5 roadmap created (Phases 27–33)
+Status: Phase 27 complete (2/2 plans, verification PASSED 9/9), awaiting Phase 28 planning
+Last activity: 2026-10-13 — Phase 27 executed (2 plans, verification passed)
 
 ## Performance Metrics
 
@@ -49,11 +49,11 @@ Last activity: 2026-10-13 — v1.5 roadmap created (Phases 27–33)
 - v1.1 shipped 2026-10-05: 4 phases (6-9), 8 plans
 - v1.0 shipped 2026-10-03: 5 phases (1-5)
 
-**By Phase:** (v1.5 not started)
+**By Phase:** (v1.5 in progress — Phase 27 complete)
 
 | Phase | Plans | Status |
 |-------|-------|--------|
-| 27. Live-Validation Gate + Capability Probes | 0/? | Not started |
+| 27. Live-Validation Gate + Capability Probes | 2/2 | ✅ Complete (verified 9/9) |
 | 28. Override-Event Log + CONDSTORE Fast Path | 0/? | Not started |
 | 29. Rule Import/Export + IDLE Watcher | 0/? | Not started |
 | 30. Batch Trust Pair | 0/? | Not started |
@@ -79,8 +79,8 @@ Decisions are logged in PROJECT.md Key Decisions table. v1.5 structural decision
 
 ### Pending Todos
 
-- v1.5: discuss/plan Phase 27 (live-validation gate + capability probes) — entry criteria (scrubber + pre-flight as code) before first credentialed run
-- Validate live when convenient: `/gsd-verify-work 6/7/8` (v1.1) + `/gsd-verify-work 12/13` (v1.2) — standing deferred items, now folded into Phase 27 scope
+- v1.5: discuss/plan Phase 28 (override-event log + CONDSTORE fast path) — probes done, capability profile available
+- Validate live when convenient: `/gsd-verify-work 6/7/8` (v1.1) + `/gsd-verify-work 12/13` (v1.2) — folded into Phase 27 scope, now in UAT-27.md deferred ledger
 
 ### Blockers/Concerns
 
@@ -107,18 +107,18 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-**Stopped at:** v1.5 roadmap created (Phases 27–33) — next: `/gsd-discuss-phase 27` then `/gsd-plan-phase 27` (2026-10-13)
+**Stopped at:** Phase 27 complete (2/2 plans, verification PASSED 9/9) — next: `/gsd-discuss-phase 28` then `/gsd-plan-phase 28` (2026-10-13)
 
 **Operator repairs 2026-10-13 (autonomous run pre-flight):**
 - `38bd940` restored 6 product files wrongly deleted by `04fe8ca` cleanup (`sync.rs` 2773 lines, `filing.rs`, MailboxView, TaxonomyEditor, package.json/lock) — tsc clean after restore
 - `fc2cd74` added `scripts/build-env.sh` (REQUIRED source before any cargo cmd: flatpak-SDK pkg-config + /tmp/opencode stub .pc/.so + host-only linking; never export LD_LIBRARY_PATH globally — segfaults cargo; sidecar binary path holds Phase-15 dev shim, weights dir empty stub, both git-ignored)
 
-Last session: 2026-10-13T14:18:40.036Z
-Milestone: v1.5 Live Validation + Compose Hardening + Deferred Features (roadmap complete)
+Last session: 2026-10-13T23:35:00.000Z
+Milestone: v1.5 Live Validation + Compose Hardening + Deferred Features (Phase 27 complete, Phase 28 next)
 Resume file: scripts/live-21.sh
 
 ## Operator Next Steps
 
-- v1.5 roadmap complete — next agent action: `/gsd-discuss-phase 27` (live-validation gate + capability probes)
+- v1.5 Phase 27 complete — next agent action: `/gsd-discuss-phase 28` (override-event log + CONDSTORE fast path)
 - Phase 32 (compose hardening) parallelizable anytime after Phase 27 sandbox pre-flight is proven
-- Phase 33 executes only if the Phase 27 port-4190/ManageSieve probe succeeds; otherwise export-only stands with documented deferral
+- Phase 33 executes only if the Phase 27 port-4190/ManageSieve probe succeeds; otherwise export-only stands with documented deferral (probe result: filtered/timeout → Phase 33 not armed)
