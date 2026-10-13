@@ -3,16 +3,17 @@ gsd_state_version: "1.0"
 milestone: v1.4
 milestone_name: SMTP Send + Search/Filters + Live Validation + Auto-Archive + Smart Folder Rules
 status: starting
-stopped_at: Phase 22 context gathered
-last_updated: "2026-10-13T03:20:36.849Z"
-state_head: 52c984f11be17f8a62e6dddea01c6264f8cb7a5f
+stopped_at: Phase 21 plan 01 executed (tracer committed, offline green)
+last_updated: "2026-10-13T03:54:14.674Z"
+state_head: eddac026c8fd0957ef1dfd21dcf2cef324ef3fc2
 progress:
   total_phases: 18
   completed_phases: 20
-  total_plans: 14
+  total_plans: 18
   completed_plans: 0
 last_activity: 2026-10-11
 ship_status: Milestone v1.3 complete (audit passed); v1.4 started — phases 21-27 scoped in ROADMAP.md (not yet planned per-phase)
+current_phase_name: SMTP Send — Live Gate (Live-01, SANDBOXED)
 ---
 
 ---
@@ -23,7 +24,7 @@ ship_status: Milestone v1.3 complete (audit passed); v1.4 started — phases 21-
 See: .planning/PROJECT.md (updated 2026-10-10 — Milestone v1.3 complete)
 
 **Core value:** Connect to an IMAP server on Linux and read your mail locally in a fast Gmail-like UI.
-**Current focus:** v1.4 SMTP Send + Search/Filters + Live Validation + Auto-Archive + Smart Folder Rules — phases 21-27 scoped (not yet planned per-phase); live gates run vs own account under sandbox contract (creds in git-ignored `src-tauri/.live-test.env`); search/filter, auto-archive, smart rules added.
+**Current focus:** Phase 21 — SMTP Send — Live Gate (Live-01, SANDBOXED)
 
 ## Milestone Status
 
@@ -109,11 +110,11 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-**Stopped at:** Phase 22 context gathered
+**Stopped at:** Phase 21 plan 01 executed (tracer committed: fe25e49, d96945a, 4aa907e; 10 bin + 22 safety tests green; full suite 328 green)
 
 Last session: 2026-10-13T03:20:36.837Z
 Milestone: v1.3 Auto-Classify complete
-Resume file: .planning/phases/22-draft-seen-round-trip-live-gate-live-02/22-CONTEXT.md
+Resume file: .planning/phases/21-smtp-send-live-gate-live-01-sandboxed/21-02-PLAN.md
 
 ## Operator Next Steps
 

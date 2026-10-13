@@ -228,7 +228,7 @@ Decimal phases appear between their surrounding integers in numeric order. v1.2 
 **Goal:** Prove v1.2 send pipeline vs `smtp.utfpr.edu.br:587` with user-provided creds (git-ignored): test mail ONLY to own address, arrives, Sent copy, no duplicate (Message-ID), retry/backoff clean, no secret leak. **Requires:** Phase 14 + creds file. **Requirements:** LIVE-01. **Success:** self-addressed mail arrives + Sent copy, no other recipient ever addressed, existing mail untouched. **UI:** yes. **Plans:** 2 plans.
 
 Plans:
-- [ ] 21-01-PLAN.md — Tracer: harness skeleton + recipient guard + self-send arrival + verbatim Sent copy + double-enqueue single-delivery + sent-unfiled never-resends (offline doubles green, live clean-skip)
+- [x] 21-01-PLAN.md — Tracer: harness skeleton + recipient guard + self-send arrival + verbatim Sent copy + double-enqueue single-delivery + sent-unfiled never-resends (offline doubles green, live clean-skip)
 - [ ] 21-02-PLAN.md — Expansion: offline-flush backoff + DATA-timeout uncertain reconcile + kill-mid-sending recovery + draft-send no-orphan + secret scan + send audit + cleanup/report
 
 ### Phase 22: Draft & Seen Round-Trip — Live Gate (Live-02, SANDBOXED)
