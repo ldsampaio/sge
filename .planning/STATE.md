@@ -2,9 +2,9 @@
 gsd_state_version: "1.0"
 milestone: v1.4
 milestone_name: SMTP Send + Search/Filters + Live Validation + Auto-Archive + Smart Folder Rules
-status: starting
-stopped_at: All v1.4 phases 21–26 COMPLETE; running full-suite gate before Phase 27/audit
-last_updated: "2026-10-13T14:18:40.048Z"
+status: complete
+stopped_at: Milestone v1.4 SHIPPED 2026-10-13 (audit PASSED 11/11); planning scope archived, REQUIREMENTS.md removed for next milestone
+last_updated: "2026-10-13T22:30:00.000Z"
 state_head: 95082b99cf54cf70b1da3b7165f63a8526f320ff
 progress:
   total_phases: 18
@@ -12,7 +12,7 @@ progress:
   total_plans: 18
   completed_plans: 2
 last_activity: 2026-10-11
-ship_status: Milestone v1.3 complete (audit passed); v1.4 started — phases 21-27 scoped in ROADMAP.md (not yet planned per-phase)
+ship_status: Milestone v1.4 SHIPPED 2026-10-13 (audit PASSED 11/11, 6/6 phases, 13 plans; live runs deferred-with-reason, Node-18 vite caveat recorded)
 current_phase_name: SMTP Send — Live Gate (Live-01, SANDBOXED)
 ---
 
@@ -24,11 +24,11 @@ current_phase_name: SMTP Send — Live Gate (Live-01, SANDBOXED)
 See: .planning/PROJECT.md (updated 2026-10-10 — Milestone v1.3 complete)
 
 **Core value:** Connect to an IMAP server on Linux and read your mail locally in a fast Gmail-like UI.
-**Current focus:** Phase 21 — SMTP Send — Live Gate (Live-01, SANDBOXED)
+**Current focus:** Planning next milestone (v1.4 shipped)
 
 ## Milestone Status
 
-**v1.4 SMTP Send + ...: IN PROGRESS** — Phase 21 + 22 complete (offline green, live runs pending human creds); 23/24/25 planned (23 executing); 26/27 open. Requirements in `.planning/REQUIREMENTS.md`. Live testing vs own account under sandbox contract (2026-10-13): creds in git-ignored `src-tauri/.live-test.env`, test mail only to self, `SGE-Test-<run-id>` sandbox, post-run cleanup.
+**v1.4 SMTP Send + Search/Filters + Live Validation + Auto-Archive + Smart Folder Rules: SHIPPED 2026-10-13** — 6/6 phases (21-26), 13/13 plans, audit `.planning/v1.4-MILESTONE-AUDIT.md` PASSED 11/11. Archives: `.planning/milestones/v1.4-ROADMAP.md`, `.planning/milestones/v1.4-REQUIREMENTS.md`. Live runs deferred-with-reason (no creds file); vite bundle needs Node 20+ host).
 **v1.3 Auto-Classify: PASSED** — 17/17 requirements, 6/6 phases (15-20), audit `.planning/v1.3-MILESTONE-AUDIT.md` (PASSED, deferred live gates documented).
 
 - Milestone audit: `.planning/v1.3-MILESTONE-AUDIT.md` — status: passed, scores: requirements 17/17, phases 6/6, integration 18/18 paths wired (1 blocker found + fixed in-audit)

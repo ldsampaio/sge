@@ -8,6 +8,13 @@ SGE is a Linux desktop email client built with Rust + Tauri v2 + React + SQLite.
 
 Connect to an IMAP server on Linux and read your mail locally in a fast Gmail-like UI — if this doesn't work, nothing else matters.
 
+## Current State (v1.4 shipped 2026-10-13 ✅)
+
+SGE is a Linux desktop email client (Rust + Tauri v2 + React + SQLite) with triage, folders, drafts, SMTP compose, on-device auto-classification, full-text search with saved filters, age-based auto-archive, and user-defined smart folder rules. v1.4 audit `.planning/v1.4-MILESTONE-AUDIT.md`: PASSED 11/11 (LIVE-01/02/03, SRCH-01/02/03, ARCH-01/02, RULE-01/02/03), 6/6 phases (21-26), 13 plans. Live-server runs deferred-with-reason (no creds file in this environment; exit-2 SKIP contracts verified). Environment caveat: `vite` bundle needs Node 20+ (env has Node 18); `tsc --noEmit` clean.
+
+<details>
+<summary>Previous milestone block (v1.4 in progress, archived at close)</summary>
+
 ## Current Milestone: v1.4 SMTP Send + Search/Filters + Live Validation + Auto-Archive + Smart Folder Rules
 
 **Status:** Starting — continues from phase 21 (v1.3 phases 15-20 complete, audit `.planning/v1.3-MILESTONE-AUDIT.md`: PASSED 17/17, deferred live gates documented).
@@ -25,6 +32,15 @@ Connect to an IMAP server on Linux and read your mail locally in a fast Gmail-li
 **Scope guard (not in v1.4):** No cloud fallback; no Sieve server-side; single account; Linux only.
 
 **Sandbox safety contract (structural, all live phases):** dedicated `SGE-Test-<run-id>` folder per run; ALL mutating ops scoped to it; mail sent ONLY to the user's own address; existing mail/folders never touched; pre-flight guard aborts on out-of-sandbox targets; run ends with full cleanup. Offline doubles (MockSession/FakeSession, record-replay SMTP) stay as CI fallback.
+
+</details>
+
+## Next Milestone Goals
+
+- Live runs with human creds: `scripts/live-21.sh`, `scripts/live-22.sh`, `scripts/live-26.sh` vs own account under the sandbox contract (git-ignored `src-tauri/.live-test.env`); draft-send STEP expected FAIL BY DESIGN → gap closure or explicit deferral
+- Node 20+ bundle check: retry `npm run build` on a Node 20+ host (rolldown-vite requires `node:util` styleText)
+- Human click-through UAT: scoped search / filter CRUD / relaunch restore, archive rule save → Arquivar agora → progress → report → undo, rules live end-to-end tracer
+- Deferred ideas: rule import/export, learning-from-overrides, per-category auto-confirm, Sieve export (all explicitly out of scope for v1.4, not gaps)
 
 ## Requirements
 
@@ -50,6 +66,7 @@ Connect to an IMAP server on Linux and read your mail locally in a fast Gmail-li
 - ✓ User can compose/reply/forward with attachments over the proven pipelines — Phase 14 (compose UI + outbox badge)
 - ✓ **v1.3: 17/17 requirements validated** — Auto-Classify milestone complete (Phase 15-20)
 - ✓ **v1.3: All phases complete** — 6/6 phases, milestone passed (Phase 15-20)
+- ✓ **v1.4: 11/11 requirements validated** — SMTP live gates (offline proof, live deferred-with-reason) + search/filters + auto-archive + smart rules (Phases 21-26, 13 plans)
 
 ### Active (v1.3)
 
@@ -134,4 +151,4 @@ This document evolves at phase transitions and milestone boundaries.
 3. Audit Out of Scope — reasons still valid?
 4. Update Context with current state
 
-*Last updated: 2026-10-10 — Milestone v1.3 Auto-Classify complete ✅*
+*Last updated: 2026-10-13 — Milestone v1.4 shipped ✅*

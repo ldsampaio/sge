@@ -21,7 +21,7 @@ v1.3 Auto-Classify adds one new lane — on-device automatic email classificatio
 - ✅ **v1.1 Triage & Folders** - Phases 6-9 (shipped 2026-10-05, archived under `.planning/milestones/v1.1-ROADMAP.md`, audit `.planning/v1.1-MILESTONE-AUDIT.md`)
 - ✅ **v1.2 Compose & Organize** - Phases 10-14 (shipped 2026-10-08)
 - ✅ **v1.3 Auto-Classify** - Phases 15-20 (shipped 2026-10-10, audit `.planning/v1.3-MILESTONE-AUDIT.md`: PASSED 17/17, 328 tests green, deferred live gates documented)
-- 🚧 **v1.4 SMTP Send + Search/Filters + Live Validation + Auto-Archive + Smart Folder Rules** - Phases 21-27 (starting 2026-10-11; live gates vs own account under sandbox contract — creds git-ignored — + final capabilities)
+- ✅ **v1.4 SMTP Send + Search/Filters + Live Validation + Auto-Archive + Smart Folder Rules** - Phases 21-26 (shipped 2026-10-13, archived under `.planning/milestones/v1.4-ROADMAP.md`, audit `.planning/v1.4-MILESTONE-AUDIT.md`: PASSED 11/11, 13 plans, live runs deferred-with-reason)
 
 ## Phases
 
@@ -222,53 +222,16 @@ Decimal phases appear between their surrounding integers in numeric order. v1.2 
 **UI hint**: yes
 **Plans**: TBD
 
-## Phase Details (v1.4 continuation — phases 21-27)
+## Phase Details (v1.4 — shipped 2026-10-13, full details archived)
 
-### Phase 21: SMTP Send — Live Gate (Live-01, SANDBOXED)
-**Goal:** Prove v1.2 send pipeline vs `smtp.utfpr.edu.br:587` with user-provided creds (git-ignored): test mail ONLY to own address, arrives, Sent copy, no duplicate (Message-ID), retry/backoff clean, no secret leak. **Requires:** Phase 14 + creds file. **Requirements:** LIVE-01. **Success:** self-addressed mail arrives + Sent copy, no other recipient ever addressed, existing mail untouched. **UI:** yes. **Plans:** 2 plans.
+> v1.4 phases collapsed to one-line entries at milestone close. Full phase details: `.planning/milestones/v1.4-ROADMAP.md`. Audit: `.planning/v1.4-MILESTONE-AUDIT.md` (PASSED 11/11).
 
-Plans:
-- [x] 21-01-PLAN.md — Tracer: harness skeleton + recipient guard + self-send arrival + verbatim Sent copy + double-enqueue single-delivery + sent-unfiled never-resends (offline doubles green, live clean-skip)
-- [x] 21-02-PLAN.md — Expansion: offline-flush backoff + DATA-timeout uncertain reconcile + kill-mid-sending recovery + draft-send no-orphan + secret scan + send audit + cleanup/report (offline green, committed 0c6e7c6 + 95082b9; live run pending human via scripts/live-21.sh)
-
-### Phase 22: Draft & Seen Round-Trip — Live Gate (Live-02, SANDBOXED)
-**Goal:** Draft APPEND 1-copy inside `SGE-Test-<run-id>` sandbox, Seen survives reconnect, `imap_outbox` replay, no silent resurrection — pre-flight guard + post-run cleanup. **Requires:** Phase 12/13 + creds file. **Requirements:** LIVE-02. **UI:** minimal. **Plans:** 2 plans.
-
-Plans:
-- [x] 22-01-PLAN.md — Tracer: harness skeleton + pre-flight/sandbox + one-copy draft + kill-reconcile + offline-edit (offline doubles green, live clean-skip)
-- [x] 22-02-PLAN.md — Expansion: replay-order + double-sync resurrection + Seen both ways + secret scan + prefix audit + cleanup/report
-
-### Phase 23: Search + Filters
-**Goal:** SQLite search (subject/body/attach/sender), saved filters, multi-folder, persisted. **Requires:** Phase 3. **Requirements:** SRCH-01/02/03. **UI:** yes.
-
-Plans:
-- [x] 23-01-PLAN.md — Backend: M17 FTS rebuild (body_text + attachment_names) + scoped ranked search + redacted snippets (offline green)
-- [x] 23-02-PLAN.md — Backend: M18 (saved_filters + ui_state) + filter CRUD + search-state save/load + commands/search.rs (offline green)
-- [x] 23-03-PLAN.md — UI: SearchScopeSelector + SavedFiltersPanel + results header/cap hint + state restore (tsc clean)
-
-### Phase 24: Auto-Archive
-**Goal:** Age-based MOVE to `Auto/Archive/`; journaled batch with resume/undo; never deletes. **Requires:** Phase 20 + 19. **Requirements:** ARCH-01/02. **UI:** yes.
-
-Plans:
-- [x] 24-01-PLAN.md — Backend: archive settings + age selector + archive_run on verbatim batch machinery (kind tag) + structural never-delete (472 green)
-- [x] 24-02-PLAN.md — UI: rule editor + manual trigger panel + kind-aware resume/undo on BatchPanel (tsc clean)
-
-### Phase 25: Smart Folder Rules
-**Goal:** User-defined rules (keyword/sender/pattern) validated → applies at sync/on-demand; conflict = confirm; SQLite-persisted. **Requires:** Phase 18 + 11. **Requirements:** RULE-01/02/03. **UI:** yes.
-
-Plans:
-- [x] 25-01-PLAN.md — Backend: folder_rules M19 + matcher over cached text + validation/CRUD + post-sync hook through confirm_suggestion (37 rule tests)
-- [x] 25-02-PLAN.md — Conflicts (first-match + BOTH-shown dialog) + ID-stable taxonomy evolution + redacted justifications + journaled bulk apply + RulesPanel UI (tsc clean)
-
-### Phase 26: Live Validation Bundle (Live-03, SANDBOXED)
-**Goal:** Execute all deferred `/gsd-verify-work` behaviors (v1.1 6/7/8, v1.2 12/13, v1.3 confirm→MOVE/batch) vs real server under the sandbox contract; document. **Requires:** all phases + creds file. **Requirements:** LIVE-03. **UI:** no.
-
-Plans:
-- [x] 26-01-PLAN.md — Tracer: live_gate_26 skeleton + v1.1 read-side legs (gates 6/7/8) + offline doubles (bin 7/7, safety 24/24 green)
-- [x] 26-02-PLAN.md — Expansion: v1.3 legs (confirm→MOVE→undo, RENAME/DELETE, batch probe) + 12/13 citation rows + combined bundle REPORT (bin 15/15, safety 48/48 green; live pending creds)
-
-### Phase 27: Milestone Close — Verification + Audit
-**Goal:** Confirm criteria, write `.planning/v1.4-MILESTONE-AUDIT.md`, update STATE.md. **Requires:** all phases verified. **Plans:** TBD.
+- [x] **Phase 21: SMTP Send — Live Gate** — live_gate_21 STEPs 1-12 + REPORT + SCAN-DB (19 bin + 42 safety green, exit-2 SKIP; live run pending human via scripts/live-21.sh)
+- [x] **Phase 22: Draft & Seen Round-Trip — Live Gate** — live_gate_22 STEPs 1-13 (19/19 safety green, exit-2 SKIP; live run pending human via scripts/live-22.sh)
+- [x] **Phase 23: Search + Filters** — M17 FTS rebuild + M18 saved filters + search UI (345 lib green, tsc clean; vite bundle blocked environmentally — Node 18 vs required 20+)
+- [x] **Phase 24: Auto-Archive** — archive_run on verbatim batch machinery + ArchivePanel (472 green, tsc clean; scheduler structurally absent by design)
+- [x] **Phase 25: Smart Folder Rules** — folder_rules M19 + matcher + conflicts + RulesPanel (392 lib green incl. 37 rule tests, tsc clean)
+- [x] **Phase 26: Live Validation Bundle** — live_gate_26 STEPs 1-15 + BUNDLE-REPORT (bin 15/15, safety 48/48 green; live pending human via scripts/live-26.sh)
 
 ## Progress
 

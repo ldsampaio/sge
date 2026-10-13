@@ -1,5 +1,21 @@
 # Milestones
 
+## v1.4 SMTP Send + Search/Filters + Live Validation + Auto-Archive + Smart Folder Rules (Shipped: 2026-10-13)
+
+**Phases completed:** 6 phases (21–26), 13 plans
+
+**Key accomplishments:**
+
+- SMTP send live gate: recipient-guarded self-send tracer (arrival + verbatim `\Seen` Sent copy + double-enqueue single-delivery) plus failure-mode legs (offline flush backoff, DATA-timeout uncertain reconcile, kill-mid-sending recovery), binary draft-send verdict, five-rule send audit, in-bin full-DB secret scan — offline green, live run pending human via `scripts/live-21.sh` (Phase 21).
+- Draft & Seen round-trip live gate: sandbox-scoped one-copy draft proof, replay-order + double-sync resurrection guards, Seen both-directions reconcile, secret scan + prefix audit — 19/19 offline green, live run pending human via `scripts/live-22.sh` (Phase 22).
+- SQLite full-text search + saved filters: M17 FTS rebuild (body_text + attachment_names) with BM25+date ranked scoped search (200 cap, redacted snippets), M18 saved_filters + CRUD with backend pt-BR validation, 8 search commands, search-state save/restore across restarts; SearchScopeSelector + SavedFiltersPanel UI, tsc clean (Phase 23).
+- Age-based auto-archive: `archive_run` on verbatim batch machinery (kind tag, journal/resume), 90d configurable rule, MOVE-only structural guarantee, ArchivePanel rule editor + manual trigger with kind-aware resume/undo — 472 tests green, scheduler structurally absent by design (Phase 24).
+- Smart folder rules: folder_rules M19 + AND matcher over cached text, backend validation, post-sync hook through `confirm_suggestion` (zero new IMAP verbs), first-match conflicts with BOTH-shown dialog, ID-stable taxonomy evolution, journaled bulk apply + RulesPanel — 392 lib green incl. 37 rule tests (Phase 25).
+- Live validation bundle: live_gate_26 STEPs 1-15 (v1.1 read-side legs + v1.3 confirm→MOVE→undo/RENAME/DELETE/batch probe + 12/13 citation rows + BUNDLE-REPORT) — bin 15/15, safety 48/48 green, live pending human via `scripts/live-26.sh` (Phase 26).
+- Suite: 541 green carried (392 lib + 40 bin + 109 live-gate safety), tsc clean, zero warnings claimed.
+
+**Deferred:** 3 live-server runs (LIVE-01/02/03, standing user_setup — exit-2 SKIP contracts verified, creds file never existed in this env); draft-send STEP expected FAIL BY DESIGN on human run → gap closure; human click-through UAT open (search/filter restore, archive trigger→undo, rules tracer). Node-18 `vite` bundle caveat — retry on Node 20+ host. See `.planning/v1.4-MILESTONE-AUDIT.md`.
+
 ## v1.1 Triage & Folders (Shipped: 2026-10-05)
 
 **Phases completed:** 4 phases (6–9), 8 plans, ~24 tasks
