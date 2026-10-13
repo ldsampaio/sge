@@ -69,11 +69,29 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
+| LIVE-04 | Phase 27 | Pending |
+| LIVE-05 | Phase 27 | Pending |
+| UAT-01 | Phase 27 | Pending |
+| UAT-02 | Phase 27 | Pending |
+| SYNC-01 | Phase 28 | Pending |
+| IMP-01 | Phase 29 | Pending |
+| IDLE-01 | Phase 29 | Pending |
+| BATCH-03 | Phase 30 | Pending |
+| BATCH-04 | Phase 30 | Pending |
+| SIEVE-01 | Phase 31 | Pending |
+| HIST-01 | Phase 31 | Pending |
+| LEARN-01 | Phase 31 | Pending |
+| CONF-01 | Phase 31 | Pending |
+| COMP-01 | Phase 32 | Pending |
+| COMP-02 | Phase 32 | Pending |
+| COMP-03 | Phase 32 | Pending |
+| COMP-04 | Phase 32 | Pending |
+| SIEVE-02 | Phase 33 (conditional — only if Phase 27 port-4190 probe succeeds) | Pending |
 
 **Coverage:**
 - v1.5 requirements: 18 total
-- Mapped to phases: 0
-- Unmapped: 18
+- Mapped to phases: 18
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-10-13*
