@@ -1,237 +1,199 @@
 # Project Research Summary
 
-**Project:** SGE v1.3 Auto-Classify (Laya on-device email classification)
-**Domain:** Linux IMAP desktop mail client (Rust + Tauri v2 + React + SQLite) + on-device AI classification lane
-**Researched:** 2026-10-10
-**Confidence:** HIGH-MEDIUM (stack HIGH, architecture HIGH/MEDIUM, pitfalls HIGH, features MEDIUM)
+**Project:** SGE — Linux IMAP Desktop Client (v1.5: sync upgrades, classifier follow-throughs, Sieve export, compose hardening)
+**Domain:** Desktop IMAP email client (Rust + Tauri v2 + React + SQLite)
+**Researched:** 2026-10-13
+**Confidence:** HIGH (architecture/stack vendored-source reads); MEDIUM (protocol wire behavior, competitor UX, crate youth)
 
 ## Executive Summary
 
-SGE v1.3 adds one new lane — automatic email classification and confirm-gated auto-filing — onto a proven IMAP desktop client. Experts build this shape as a **bundled offline sidecar over loopback HTTP**: Laya runs as a Tauri `externalBin` child process, the Rust backend is its only client, the React frontend never touches it, and every physical mail move reuses the already-proven Phase 10/11 MOVE + CREATE + offline-outbox machinery with zero new IMAP verbs. Classification runs **behind sync** (post-pass queue, never inline), suggestions are **confirm-before-move** for single mail and **report-plus-journal** for batch, and low-confidence mail lands in an explicit `A Classificar` review bucket instead of being misfiled.
+SGE v1.5 closes every open thread from v1.1–v1.4 on top of a proven single-session IMAP core (SessionManager lease discipline, SyncGate single-flight, forward-only migrations, durable outboxes, ClassifyGate worker). Experts build this class of upgrade — IDLE push, CONDSTORE/QRESYNC fast resync, server-side rule export, correction-driven learning — as **additive lanes that consume existing machinery, never as parallel engines**. The research converges: IDLE is an advisory wakeup feeding the same sync pass; CONDSTORE is a branch inside the existing pass; Sieve export is an offline pure function; learning is append-only telemetry plus a read-only aggregator. No new sync engine, no second writer, no model fine-tuning.
 
-The dimension researchers disagreed on sidecar shape (PyInstaller+torch vs lean ONNX/IPC+download) and HTTP contract (`/v1/systemone` vs `/predict`). This summary resolves both with a decision matrix below: **v1.3 ships the PyInstaller-frozen `laya[serve]` 0.4.2 sidecar speaking `POST /v1/systemone` on `127.0.0.1`, CPU-only torch, multilingual checkpoint only, weights as Tauri `resources`** — because it is the only path that simultaneously honors the user's bundled-offline decision, uses Laya's official verified serving surface, and satisfies Tauri's `externalBin` single-binary contract. The lean ONNX/IPC shape is deferred as a measured fallback, not a parallel option.
+The recommended approach is **probes first, then headless sync core, then user-visible trust features, with Sieve upload strictly conditional**. Live CAPABILITY (IDLE/CONDSTORE/QRESYNC) + port-4190/ManageSieve probes gate every protocol decision before code; CONDSTORE wiring lands before the IDLE watcher so push wakeups run a cheap pass; the override-event log lands before any learning/auto-confirm consumer; export-text-first Sieve always ships while upload waits on a positive probe. Compose hardening (verify + fix the v1.2 lettre pipelines, never rebuild) runs parallelizable anytime once the sandbox pre-flight is proven.
 
-The key risks are bundle size (~1 GB installed — the honest price of offline ML), cold-start latency (seconds, must be backgrounded), flat-taxonomy accuracy cliffs, silent truncation of long threads, unconfirmed MOVE harm, batch mid-run corruption, and secret leakage into justifications/logs. Every one of these has a structural mitigation (not UI polish) assigned to a specific build phase — the roadmap below orders packaging risk first and moves last.
+The key risks are structural, not speculative: (1) IDLE holding the single manager-owned session hostage — mitigated by a manager-owned IdleWatcher on a **dedicated second connection**, wakeup-only through SyncGate, poll retained as fallback/supervisor; (2) MODSEQ trusted across a UIDVALIDITY epoch change — mitigated by UIDVALIDITY-first gating with stored-modseq discard plus transcript tripwire tests; (3) per-category auto-confirm + learner forming a self-reinforcing misfile loop — mitigated by shipping history → auto-confirm → learner as one unit with opt-in-per-category, pause-on-override, explicit-signals-only training, and digest + one-click undo; (4) real-creds live runs leaking secrets — mitigated by a transcript scrubber + git-ignored pre-flight + post-run secret grep as entry criteria before the first credentialed run.
 
 ## Key Findings
 
 ### Recommended Stack
 
-The Cargo delta is two lines; the config delta is `externalBin` + `resources` + one capability entry. Everything else is build-time tooling, never shipped. See `STACK.md` for the full closure and install commands.
+No new IMAP stack. Everything v1.5 needs except Sieve upload is already pinned: async-imap 0.11.3 IDLE handle + `select_condstore` + `run_command*` escape hatches (verified in vendored source, not web docs), imap-proto 0.16 MODSEQ/HIGHESTMODSEQ parsing, tokio sync/time supervision, rusqlite 0.37 + rusqlite_migration 2.x schema, serde/chrono, lettre 0.11. The single addition is io-managesieve 0.2.0 (`native-tls` feature only) for the Sieve **upload leg only** — and it is added only if the port-4190 probe succeeds. See STACK.md for install/pin records and the 0.12-bump rejection.
 
 **Core technologies:**
-- `laya[serve] == 0.4.2` (Python, Apache-2.0): typed-decision inference + `laya-serve` HTTP server — the milestone's chosen classifier, zero-shot, no fine-tuning toolchain
-- `laya-multilingual` checkpoint only (322M params, 644 MB weights, pinned Hub revision): pt-BR mail routes here by default; English checkpoint is confidently wrong on Portuguese — ship exactly one checkpoint with `LAYA_MAX_LOADED=1`
-- `tauri-plugin-shell = "2"` (stable 2.4.0): the Tauri-blessed sidecar spawn/supervise mechanism from Rust backend
-- `reqwest = "0.12"` (async, plain localhost HTTP): backend → sidecar client; fits the existing tokio runtime, no TLS features needed
-- PyInstaller (≈6.x) + CPU-only torch wheel: freeze `laya[serve]` into one `sge-laya-<target-triple>` binary; CPU-only torch (~200 MB vs ~800 MB+ CUDA) is the single biggest size lever
-- Tauri config: `bundle.externalBin`, `bundle.resources` (weights as resources, NOT inside the binary), `shell:allow-execute` with pinned argv, loopback-only env (`LAYA_HOST=127.0.0.1`, preload, per-boot API key)
+- async-imap 0.11.3 IDLE (`Session::idle` → `Handle::init/wait`, 29-min re-IDLE) — push wakeups, zero new deps.
+- async-imap 0.11.3 `select_condstore` + `run_command*` hatch + imap-proto 0.16 MODSEQ parsing — CONDSTORE fast path as wiring, not protocol work.
+- io-managesieve 0.2.0 (`default-features=false, features=["native-tls"]`, `spawn_blocking`-hosted) — Sieve upload leg only, probe-gated.
+- rusqlite 0.37 + rusqlite_migration 2.x — `override_events` log, per-folder `highestmodseq` (column already exists), rule version/etag.
+- tokio 1 (`rt/sync/time`) + futures 0.3 — IDLE supervision, `watch`/`Notify` fan-in to SyncGate, debounce.
 
 ### Expected Features
 
-See `FEATURES.md`. Competitor pattern (Thunderbird filters, Gmail retroactive-apply, Superhuman auto-labels) converges on: classify on arrival, confirm gate, correction path, fallback bucket, retroactive batch — SGE's differentiator is doing all of it **fully offline with a pt-BR academic taxonomy**.
+SGE v1.5 ships the full close-the-threads set: IDLE push (INBOX-only) + poll supervisor, CONDSTORE deltas (QRESYNC if the spike shows it cheap, else CONDSTORE-only with documented follow-up), batch dry-run + retry-failed over a per-item run record, override history view, versioned JSON rule import/export, learning-from-overrides v1 (keyword-weight + threshold adaptation, logging hooks, no fine-tuning), per-category auto-confirm (earned opt-in, pause-on-override), Sieve export (preview/copy/download; upload conditional), compose hardening verified live, and live-validation closure + bundle/UAT as the proof vehicle. See FEATURES.md for the table-stakes/differentiator/anti-feature analysis and dependency graph.
 
 **Must have (table stakes):**
-- Taxonomy store in SQLite + shipped UTFPR default hierarchy — nothing works without it
-- Laya sidecar serving classifications offline — the milestone's identity
-- Classify-on-sync + manual per-email classify, both with confirm-before-move dialog — the core loop
-- `Auto/` tree auto-created on demand (Phase 11 CREATE reuse)
-- Override UI (one-click correct + log) — trust repair
-- `A Classificar` fallback bucket + review list — safety net
-- Primary + secondary SQLite labels (secondary never moves, clearly badged local-only)
-- Sensitive-data redaction across justifications/logs — non-negotiable privacy constraint
-- Batch whole-account run with progress + persisted report (no per-email confirm) — the reorganization payoff
-- Taxonomy editor UI (add/rename/delete with guards)
+- IDLE push for INBOX with 5-min poll fallback/supervisor — mail feels instant.
+- CONDSTORE flag-delta resync with UID range-diff fallback — large-mailbox speed without a second engine.
+- Batch dry-run + retry-failed — makes whole-account batch trustworthy (one work item, not two).
+- Override history view with per-category counts — visible control + learning dataset.
+- Rule import/export (versioned JSON, validated, conflict-resolving) — portability substrate Sieve also consumes.
+- Compose hardening verified live (send/drafts/reply/reply-all) — verify + fix, not rebuild.
+- Live-validation closure + bundle/UAT — proof vehicle for everything.
 
-**Should have (competitive, v1.3.x if pressure):**
-- Taxonomy JSON import/export with validation (cycles, duplicates, reserved `Auto` root) — differentiator, portable across machines
-- Confidence threshold setting — ship a sensible default first, expose tuning after observing real distributions
-- Override history view — log from day one, build UI once corrections accumulate
-- Batch retry-failed + dry-run — after the happy path proves itself
-- Justification line per classification (redacted at generation, transient UI string, never persisted)
+**Should have (competitive):**
+- Learning-from-overrides v1 (local keyword-weight + threshold adaptation, interpretable + reversible) — compounding local value.
+- Per-category auto-confirm (earned opt-in, precision display, digest + undo) — graduated autonomy.
+- Sieve export-first (preview/copy/download) — webmail parity slice; upload P2-conditional on probe.
+- IDLE-triggered classify-on-arrival — near-free composition once IDLE + classify-on-sync coexist.
 
-**Defer (v2+ / explicit anti-features):**
-- Learning/fine-tuning from overrides — record now, learn later
-- Server-side (Sieve) rule export — second product
-- Cross-device taxonomy sync — no sync story exists yet
-- Cloud AI fallback ("use GPT when unsure") — violates offline constraint, never for mail content
-- Auto-delete/auto-archive via classifier — worst case is `A Classificar`, never delete
-- Unconfirmed single-email moves — always-confirmed is structural, not polish
+**Defer (v2+):**
+- Laya fine-tuning on banked override data — needs dataset volume + eval harness; scope-guarded out.
+- Multi-mailbox IDLE fan-out — after single-mailbox IDLE proves stable (server IDLE limits measured).
+- Full ManageSieve two-way sync (server-script → smart-rule import) — a second product surface.
+- Scheduled batch runs, confidence-threshold setting UI — need stability/rate data from P1s first.
 
 ### Architecture Approach
 
-One new lane (`classify/` module + sidecar + M12 store tables) consuming existing machinery; no existing lane changes shape. The sidecar is a third transport (loopback HTTP) next to IMAP and SMTP. Sync never awaits classification; the classifier never touches IMAP directly — all moves flow through `imap_outbox`. See `ARCHITECTURE.md` for the diagram, M12 schema, and command list.
+Three new lanes plus compose hardening, all consuming proven machinery: `imap/idle.rs` IdleWatcher (own module, own connection, read-only loop), CONDSTORE branch inside `sync/worker.rs` (capability-gated, additive), `classify/{sieve,rules_io,learn,planner}.rs` pure functions (zero IMAP contact), `override_events` append-only telemetry (M20) with fire-and-forget hooks, history/batch UI as read models. Single-session ownership, SyncGate semantics, outbox replay order, UIDVALIDITY epoch gating, BODY.PEEK, keyring-only secrets, and forward-only migrations all stay invariant. See ARCHITECTURE.md for the system diagram, five patterns, data flows, and the explicit new/modified/untouched file list (new deps: none).
 
 **Major components:**
-1. Laya sidecar (`laya[serve]`, `127.0.0.1` loopback HTTP) — typed `choice`/`noul` answers, zero text generation, preloaded multilingual checkpoint
-2. `classify/` Rust module (`taxonomy.rs` + `bridge.rs` + `worker.rs` + `suggest.rs`) — taxonomy load/validate, single-flight sidecar client, queue drain under `ClassifyGate`, answer shaping with confidence gate
-3. Store M12 (`taxonomy` + `labels` + `label_overrides` + `classify_queue` + `batch_runs`) — versioned taxonomy, pointer-only labels (never email content), durable queue with UIDVALIDITY epoch hygiene
-4. Post-sync hook + confirm path (`sync/worker.rs` 3–5 line enqueue, `ensure_auto_tree` + Phase 10 `move_message_in`) — zero new SyncSession verbs
-5. React surfaces (`ClassifyChip` + `TaxonomyEditor` + `BatchProgress`) — all through Tauri commands + `Classification*` channel events; sidecar port never leaves Rust
+1. `imap/idle.rs` IdleWatcher — dedicated second read-only connection, IDLE loop, gate wakeup only.
+2. CONDSTORE fast path (`SyncSession` +2–4 methods, worker step-2 branch, `highestmodseq` persist) — flag-only CHANGEDSINCE refresh.
+3. `classify/sieve.rs` + `rules_io.rs` — offline RFC 5228 generator + versioned JSON envelope.
+4. `override_events` (M20) + `classify/learn.rs` — append-only log, pure read-only aggregator.
+5. `classify/planner.rs` + batch retry — shared matcher with `execute=false` dry-run, failed-only re-enqueue.
 
 ### Critical Pitfalls
 
-Top risks from `PITFALLS.md` (7 critical; condensed to the 5 that shape the roadmap):
+Top risks from PITFALLS.md (8 critical documented; 5 load-bearing below):
 
-1. **Sidecar packaging explodes bundle size / breaks first-run** — wrong triple suffix, PyInstaller missing data files, orphan processes, warmup races, port conflicts. Avoid: packaging spike FIRST proving size, cold-start, lifecycle, and `tauri build` artifact before any UX.
-2. **Flat taxonomy blows the choice-option budget** — accuracy cliff past ~20 options + temperature-0.10 overconfidence bug for `choice:11+`. Avoid: hierarchical routing (top-level ≤8, child keyword-resolved), every `choice` <11 options, confidence threshold + abstain.
-3. **Auto-MOVE files mail wrong with no way back** — zero-shot pt-BR accuracy is ~0.6–0.7, not silent-filing grade. Avoid: backend-enforced confirm gate (IPC-level, not just UI), secondary label never moves, override as first-class path, `A Classificar` for unsure mail.
-4. **Batch corrupts state mid-run** — UIDVALIDITY shifts, throttling, partial moves. Avoid: resumable job (snapshot + chunk 25–50 + per-chunk UIDVALIDITY re-check + per-message move journal + undo-batch), full `Auto/` tree created up front.
-5. **Sensitive data leaks into justifications/logs/labels** — justifications echo secrets; default logging persists bodies. Avoid: defense in depth — redact-before-inference, output regex filter, log IDs/scores only, store label IDs never justification text, backend-enforced.
+1. **IDLE holds the only connection hostage** — never park IDLE on the manager session, never a raw second `Client` beside it. Manager-owned IdleWatcher, DONE-on-all-exits + 29-min re-IDLE, advisory-wakeup-only through SyncGate, poll intact.
+2. **MODSEQ trusted across a UIDVALIDITY epoch change** — UIDVALIDITY-first always; stored modseq discarded with mailbox state on epoch bump; per-connection capability gating; transcript tripwire tests for MODSEQ/VANISHED shapes.
+3. **Auto-confirm trust erosion + silence-as-approval learner poisoning** — per-category opt-in default-off with precision display, N-streak eligibility, auto-disengage on override, journaled MOVEs + digest + one-click undo, explicit-signals-only training.
+4. **Secret leakage in live runs** — transcript scrubber (LOGIN/AUTHENTICATE/env) + `git check-ignore` pre-flight + `/tmp`-only trace sinks + post-run secret grep, all as entry criteria before first real-creds run.
+5. **Sieve second-product trap + replay races + import drift + compose sandbox** — 4190 probe before any uploader code (probe fails → export-text-only); all triggers through SyncGate with row-level outbox claims and dry-run `&`-only purity; versioned schema + round-trip fixpoint test + folder/pattern validation; reply-all recipient allowlist enforced on the *resolved* list + exactly-once via Message-ID dedupe.
 
-Two more load-bearing: silent 1024-token truncation (evidence-selection pipeline: subject + sender + quote-stripped head + signals, never full bodies) and taxonomy edits invalidating labels (stable UUID category IDs + versioned taxonomy + rename/merge/delete migration; overrides pinned).
+## Reconciled Tensions (binding decisions)
 
-## Sidecar Decision Matrix (resolves researcher disagreement)
+Four cross-file tensions surfaced during synthesis. These rulings are binding on the roadmapper and planners — do not re-litigate without new vendored-source or live-probe evidence.
 
-Researchers diverged on two axes. Decision below is FINAL for v1.3; the alternative is a deferred fallback with an explicit trigger, not a build-time option.
+### 1. CONDSTORE support — ARCHITECTURE wins (HIGH vendored-source evidence)
 
-### Axis 1: HTTP contract — `/v1/systemone` vs `/predict`
+ARCHITECTURE verified in vendored source that `select_condstore`, `HIGHESTMODSEQ`/`MODSEQ` parsing, raw-string `uid_fetch`/`uid_search` passthrough, and the `mailboxes.highest_modseq` column **all already exist** — v1.5 work is wiring, not protocol. FEATURES/STACK doubt (MEDIUM/LOW, web-only sources, written before the vendored read) is superseded. **Rule:** CONDSTORE ships as the tier-2 fast path (QRESYNC → CONDSTORE → UID range-diff ladder retained); the plan-time spike **confirms** wiring against a fake-server transcript, it does not re-decide feasibility. **QRESYNC stays deferred** — `* VANISHED` lands in async-imap's `pub(crate)` unsolicited channel invisible to SGE, so full QRESYNC needs owned `run_command`/`read_response` parsing; expunge detection stays SEARCH-diff (correct with CONDSTORE alone). Revisit QRESYNC only as a measured follow-up (v1.5.x), never inside the CONDSTORE phase.
 
-| Criterion | `POST /v1/systemone` (+ `/batch`) — `laya-serve` | `POST /predict` — `examples/server.py` |
-|---|---|---|
-| Official serving surface? | **Yes** — the `serve` extra's Jev-compatible endpoint, entry point `laya-serve` | No — dev playground (serves a GUI + `/predict`), not the integration surface |
-| Batch route? | **Yes** (`/v1/systemone/batch`, capped 64 states, internal token-split) | No |
-| Router parity (routing, `lang_guess`, `max_len`, `min_confidence`)? | **Yes** | Partial |
-| Source confidence | **HIGH** (live `pyproject.toml` 0.4.2 + README read 2026-10-10) | LOW-MEDIUM (older `laya 0.3.20` install + integration-skill doc) |
-| Tauri fit | Same localhost POST either way | Same localhost POST either way |
+### 2. Second connection for IDLE — structural constraint (ARCHITECTURE + PITFALLS agree)
 
-**Decision: `POST /v1/systemone` (+ `/batch` for whole-account).** The `/predict` reference in ARCHITECTURE.md describes the dev example server, which STACK.md §4 explicitly rejects ("Do NOT add `examples/server.py` as the sidecar"). Planners: update the `bridge.rs` sketch to `/v1/systemone`; keep the single-flight mutex, 10 s timeout, and health-probe shape unchanged.
+Both files converge and the synthesis records it as non-negotiable: the IdleWatcher owns a **dedicated second connection** minted via the existing `connect_sync` (same `AccountConfig` clone, same TLS discipline, manager-consistent reconnect/backoff), runs **SELECT + IDLE + DONE + LOGOUT read-only verbs only**, and signals exclusively via `SyncWake::request_sync` → `SyncGate::try_begin` (skip-if-busy, coalesced dirty-flag, never a second sync engine). **It never parks on the manager session** (`Session::idle(self)` consumes the session — parking it would serialize every verb behind a 29-minute block and break the lease state machine). The watcher lives in its own `imap/idle.rs` module with no access to the manager's session so the invariant is structural, not conventional. Poll stays as fallback (unadvertised/broken IDLE) and multi-folder sweeper.
 
-### Axis 2: Sidecar shape — PyInstaller+torch (bundled) vs lean ONNX/IPC+download
+### 3. Sieve upload — export-text-first always ships; upload is a probe-gated slice
 
-| Criterion | **A: PyInstaller + CPU torch, models as `resources` (v1.3 pick)** | B: Lean ONNX / stdin-IPC + first-run model download |
-|---|---|---|
-| Honors user's bundled-offline decision (PROJECT.md)? | **Yes** — installs and classifies with no network, day one | Partial — first run needs a ~650 MB download with progress/resume/checksum; fails on metered/offline installs |
-| Tauri `externalBin` reality | **Native fit** — single self-contained executable + triple suffix, the documented contract | Same binary contract, but adds a download manager + checksum + resume + offline-degraded UX to build |
-| Official / verified path | **Yes** — `laya[serve]` torch path is the numerics-verified reference (`verify/numerics_check.py`) | No — requires reimplementing Router/tokenizer/head-wiring in Rust (`ort`) or living inside the less-mature `laya[onnx]` surface; parity surface is one test file |
-| Bundle size | ~1 GB installed (sidecar ~250–400 MB + weights ~650 MB) — heavy but honest | Lighter binary (onnxruntime ~50–100 MB) + deferred weights — lighter installer, heavier first-run |
-| Latency | ~200 ms CPU single-mail in the short-input band (subject + snippet) | Comparable-or-better per-pass, but cold paths (download, export parity bugs) dominate v1.3 risk |
-| Failure modes | Known Tauri sidecar modes (triple suffix, warmup, orphans, port) — all mitigated by the packaging spike | All of A's process modes PLUS download corruption, checksum drift, Hub re-upload changing weights, ONNX export parity gaps |
-| Work to build | One freeze script + `resources` wiring + supervision | Freeze script + download UX + checksum pinning + IPC framing + Router reimplementation/verification |
+STACK proposes io-managesieve 0.2.0 upload-conditional-on-probe; ARCHITECTURE says offline string-generation only (upload = scope creep). **Rule:** `classify/sieve.rs` export (preview + copy + `.sieve` download, golden-file tested, `fileinto`-only subset, non-expressible predicates as comments + warning count) **always ships** with zero new deps and zero server dependency. The ManageSieve upload leg (port-4190 reachability + greeting + `require`-capability check → `cargo add io-managesieve --no-default-features --features native-tls` → PUTSCRIPT/CHECKSCRIPT/SETACTIVE behind explicit confirm with backup-then-diff, never auto-sync) is a **separate shippable slice added only if the probe succeeds**; probe fails → phase converts to export-text-only with documented deferral, and no uploader code is written. Coexistence badges ("managed by Sieve" mutual exclusion with local auto-file) ride with whichever slice ships.
 
-**Decision: A for v1.3.** Rationale in one line: B trades megabytes of installer for the milestone's two hard constraints (bundled-offline day one; verified classification behavior) — that trade is backwards for this milestone.
+### 4. Build order — ONE recommended order (probes first, compose parallelizable)
 
-**Fallback trigger (B becomes relevant):** if the packaging spike measures installed size or cold-start beyond what the Linux-packaging phase can ship (e.g. `.deb` hosting limits, target-machine RAM < 322M-fp32 residency ~1.3 GB), THEN authorize a v1.3-stretch spike migrating the sidecar interior from torch to `laya[onnx]` **inside the same `externalBin` contract** (same binary name, same `/v1/systemone` surface, weights still as `resources`). Never "solve" size with hosted inference — that trades megabytes for the privacy constraint. Never run A and B in parallel during v1.3.
-
-**Naming note:** STACK uses `sge-laya-<triple>`; ARCH/PITFALLS use `laya-sidecar-<triple>`. Either satisfies Tauri; roadmapper picks one and pins it in CI (assert the triple-suffixed binary exists in the built bundle).
+PITFALLS orders by risk-gating (probes → IDLE → CONDSTORE → classifier → batch → compose → Sieve last); ARCHITECTURE orders by engineering dependency (event log → CONDSTORE → rule io/policy → IDLE → dry-run/retry → Sieve → learn/history → compose anytime); FEATURES orders by data dependency (history → learning/auto-confirm; run-record → dry-run/retry). The conflict that matters is CONDSTORE-vs-IDLE: PITFALLS puts CONDSTORE after IDLE (MODSEQ depends on stable SELECT behavior) while ARCHITECTURE puts CONDSTORE before IDLE (every wakeup runs the pass — a cheap pass makes push cheap). **Ruling: ARCHITECTURE wins**, because the separate-connection decision (#2 above) removes PITFALLS's premise — the watcher never touches the manager's SELECT lifecycle, so IDLE cannot destabilize CONDSTORE semantics. PITFALLS's genuine concern is preserved as in-phase acceptance criteria instead (UIDVALIDITY-first gating + epoch-clears-modseq test + transcript tripwire inside the CONDSTORE phase). The unified order below keeps capability probes/capability-gates first (PITFALLS), telemetry-before-consumers and model-before-generator (ARCHITECTURE/FEATURES), Sieve last and conditional (all three), and compose hardening parallelizable anytime (ARCHITECTURE).
 
 ## Implications for Roadmap
 
-Single ordered build list resolving the four research roadmaps (ARCH §Suggested build order is the backbone; FEATURES dependencies set the floor; PITFALLS gates set the phase exits; STACK constrains the packaging choice). Packaging risk first, store before worker, suggestions before moves, single confirmed moves before batch, editor after the engine it edits.
+Based on research, suggested phase structure (ONE recommended order):
 
-### Phase 1: Sidecar packaging spike
+### Phase 1: Live-validation gate + capability probes
+**Rationale:** Every protocol decision (IDLE-vs-poll, CONDSTORE-vs-baseline, Sieve-upload-vs-export-only) depends on the real server's advertisements, unknown today. Probes-first is the unanimous cross-file demand.
+**Delivers:** Scrubber + sandbox pre-flight as code (entry criteria), recorded `CAPABILITY` (IDLE/CONDSTORE/QRESYNC atoms) + port-4190/ManageSieve probe transcripts, per-account capability profile, `live-21/22/26.sh` green path, secret-grep-clean artifacts.
+**Addresses:** Live-validation closure, compose-hardening unblock, IDLE/CONDSTORE/Sieve entry gates.
+**Avoids:** Secret leakage (Pitfall 4), building uploaders against untestable endpoints (Pitfall 5), assuming capabilities (all tiers).
 
-**Rationale:** The only true unknown — everything else is proven-pattern reuse. PITFALLS P3 mandates proving size, cold-start, and lifecycle before any classification UX exists.
-**Delivers:** Hello-world `laya[serve]` frozen via PyInstaller, `externalBin` + triple suffix, spawn in `setup()` + kill-on-exit, `/health` green in dev AND in a `tauri build` Linux bundle, cold-start seconds measured, weights-placement decided (`resources` default), `LAYA_MAX_LOADED=1` + preload verified.
-**Addresses:** Offline sidecar feature (P1); STACK `tauri-plugin-shell` + `reqwest` pins.
-**Avoids:** P3 (bloated/broken bundle); kills the ONNX-vs-torch debate with numbers.
-**Uses:** `laya[serve]==0.4.2`, PyInstaller, CPU torch, multilingual-only checkpoint (pinned revision + sha256).
-**Exit gate:** "Looks Done" packaging row — sidecar present in `.deb`/AppImage, cold-start timed, no orphans after quit.
+### Phase 2: Override-event log + CONDSTORE fast path (headless sync core)
+**Rationale:** Telemetry before consumers (can't aggregate what isn't logged); cheap-pass before push-wakeup (IDLE multiplies pass cost, CONDSTORE divides it); both headless (`cargo test` only), no UI, no trigger changes.
+**Delivers:** M20 `override_events` + 3-line hooks in confirm/override/dismiss/batch paths; `SyncSession` +2–4 condstore methods, worker step-2 branch, `highestmodseq` persist with UIDVALIDITY-first gating.
+**Uses:** rusqlite_migration forward-only pattern; vendored `select_condstore`/MODSEQ parsing (no new deps).
+**Avoids:** MODSEQ/epoch interplay (Pitfall 2 — epoch-clears-modseq test + transcript tripwire are exit criteria), learning-before-dataset inversion.
 
-### Phase 2: Taxonomy + M12 store
+### Phase 3: Rule import/export + IDLE watcher
+**Rationale:** The versioned rule envelope settles predicate expressiveness the Sieve generator will consume; IDLE lands on top of the now-cheap pass with the structural second-connection design. Both extend proven paths (import mirrors `import_taxonomy`; watcher wakes the same gate).
+**Delivers:** `rules_io.rs` versioned JSON + validate-stage-commit + round-trip fixpoint test; `idle.rs` IdleWatcher + DONE/re-IDLE heartbeat + `idle_status` commands + honest Push/Polling/Offline status UI.
+**Implements:** Shared-schema import/export; manager-owned dedicated-connection IDLE.
+**Avoids:** Connection hijack (Pitfall 1 — mid-IDLE kill test: reconnect, no duplicate sync), import drift (Pitfall 7), IDLE-only-sync anti-feature (poll stays supervisor).
 
-**Rationale:** FEATURES dependency — the SQLite taxonomy table is the foundation classify, editor, import, and batch all stand on. Headless, `cargo test`-only.
-**Delivers:** Shipped UTFPR pt-BR default taxonomy JSON (5 top + children + fallback + rules, stable UUID IDs, versioned), `taxonomy.rs` validation, M12 migration (`taxonomy`, `labels`, `label_overrides`, `classify_queue`, `batch_runs`) + queries + preserve-rows test.
-**Addresses:** Taxonomy store + UTFPR default (P1); primary/secondary label columns.
-**Avoids:** P7 (taxonomy-edit invalidation — IDs + versioning from day one, never names-as-keys); anti-pattern of logging content (pointer-only labels schema).
-**Research flag:** Standard patterns (migration M2–M11 template, single-SQL-module invariant) — skip research-phase.
+### Phase 4: Batch trust pair (dry-run + retry-failed)
+**Rationale:** The per-item-status run record makes both features fall out; dry-run is the planner with writes off, retry is the record with writes re-on for failures. Needs the Phase 3 trigger funnel (all callers through SyncGate) plus row-level claims.
+**Delivers:** `planner.rs` shared matcher (`&`-only purity), dry-run report UI with [Run for real], retry-failed filtered re-enqueue reusing the offline outbox, UID re-resolution at confirm.
+**Addresses:** Batch dry-run, batch retry-failed, stale-preview and double-replay handling.
+**Avoids:** Replay races (Pitfall 6 — burst-EXISTS + double-click-retry stress: each row executes once).
 
-### Phase 3: Bridge + worker + suggestions (no moves)
+### Phase 5: Sieve export-text + history views + learning v1 + auto-confirm
+**Rationale:** Generator reads the Phase 3 rule model; history banks the Phase 2 dataset into visible stats; learning and auto-confirm consume both as one coherent unit with governors — never split the feedback loop from its governor across phases.
+**Delivers:** `sieve.rs` golden-file-tested export (copy/download, warning counts); override/batch history views; `learn.rs` keyword-weight + threshold adaptation (explicit signals only); per-category opt-in auto-confirm with precision display, pause-on-override, digest + one-click undo.
+**Addresses:** Sieve export slice, override history, learning-from-overrides, per-category auto-confirm.
+**Avoids:** Trust erosion + silence-as-approval (Pitfall 3 — override-flips-to-manual test, training-neutrality test), Sieve/local flapping (coexistence badges).
 
-**Rationale:** Trust gate — user sees labels work before anything is allowed to move. Single-pass 3-question shape keeps per-mail cost at one forward pass so classify-on-sync is viable.
-**Delivers:** `bridge.rs` (`/v1/systemone` single-flight client + health probe + ephemeral-port + per-boot API key), `worker.rs` (queue drain under `ClassifyGate`, fire-and-forget post-sync hook), `suggest.rs` (confidence gate → `A Classificar`, runner-up → secondary, child keyword-resolved), `labels` writes, `ClassificationReady` events, `classify_message` + `classify_status` commands, evidence-selection pipeline (quote-strip → signal-extract → budget-fit; subject ≤200, snippet ≤1000), redaction-before-inference + output filter + log hygiene.
-**Delivers (verified):** Sync a folder → sane pt-BR labels appear; sidecar down → `pending`, sync unaffected; password-reset mail → no secret in DB/logs/UI.
-**Addresses:** Classify-on-sync + manual classify (minus confirm), confidence display, secondary label, justification (transient, redacted), sensitive-data rule.
-**Avoids:** P1 (hierarchical questions, every `choice` <11 options, threshold + abstain tuned on pt-BR sample), P2 (truncation unit tests + length-stratified accuracy), P6 (privacy pipeline test), anti-patterns 1/3/4 (no inline calls, no content storage, no frontend-to-sidecar).
-**Research flag:** Needs `/gsd-plan-phase --research-phase` — Laya question-shaping (hierarchical `choice` + `noul` sensitive + optional coarse `score`) and evidence-selection budgets must be validated against pinned 0.4.2 docs at plan time, since ARCH sketched the older `/predict` shape.
+### Phase 6: Compose hardening (parallelizable anytime after Phase 1)
+**Rationale:** Disjoint files (`drafts.rs`, `send_queue.rs`, reply path), verify + fix only over v1.2 pipelines — no ordering dependency on sync/classifier work beyond the Phase 1 sandbox pre-flight. Run alongside Phases 2–5 to keep the critical path short.
+**Delivers:** Reply/reply-all threading + attribution, one-copy draft invariant, exactly-once Sent filing via Message-ID dedupe, offline-queue backoff, expanded-recipient allowlist (resolved To+Cc+Bcc) with foreign-Cc abort test, synthetic fixtures only.
+**Avoids:** Sandbox violations + duplicate sends (Pitfall 8), secret-bearing fixtures in logs.
 
-### Phase 4: Confirm / override → MOVE (the Phase 10/11 payoff)
-
-**Rationale:** Smallest IMAP blast radius — `ensure_auto_tree` + existing `move_message_in` + `imap_outbox`; zero new verbs. Single confirmed moves must prove themselves before batch multiplies them.
-**Delivers:** `confirm_suggestion` / `override_label` commands, suggestion chip UI (destination + confidence + redacted justification + Move/Change/Dismiss), `A Classificar` review list, override log writes, queue-depth badges, `classifying` list states.
-**Delivers (verified):** Confirm moves to `Auto/<Top>/<Child>`; offline confirm replays; override MOVE-backs + pins + survives next sync; `A Classificar` never moves; direct-IPC confirm-bypass refused (backend enforcement); secondary label produces zero IMAP traffic.
-**Addresses:** Confirm dialog, override + log, fallback bucket, primary/secondary model.
-**Avoids:** P4 (confirm-gate + override + move-report as success criteria), UX pitfalls (silent filing, fatigue-by-design-avoidance, "what did it do" surface).
-**Research flag:** Standard patterns (Phase 10 optimistic+durable template, Phase 11 CREATE guards) — skip research-phase.
-
-### Phase 5: Taxonomy editor + JSON import
-
-**Rationale:** UI after the engine it edits; taxonomy edits are folder-rename + label-remapping problems that need the Phase 4 move path to exist first.
-**Delivers:** `TaxonomyEditor` UI + `import_taxonomy` (validate → version++ → stale-flag old labels), rename/merge/delete migration (RENAME folder + relabel / MOVE + remap / orphan + prompt), `Auto`-root reservation + import sanitization (charset, depth, delimiter/encoding rules).
-**Addresses:** Taxonomy editor (P1); JSON import/export (P2 — import now, export when users ask).
-**Avoids:** P7 verification (rename/merge/delete migration tests + override survival); security (malicious taxonomy sanitization).
-**Research flag:** Standard patterns — skip research-phase.
-
-### Phase 6: Batch whole-account classify
-
-**Rationale:** Batch is a loop over the proven confirm path (dialog off, progress on) — building it before Phase 4 is how mail ends up in the wrong tree. Explicit + unconfirmed-by-design with report + undo, never 3,000 dialogs.
-**Delivers:** `batch_classify` + `batch_runs` (bulk enqueue, auto-confirm ≥ threshold, chunked 25–50 with per-chunk UIDVALIDITY re-check), full `Auto/` tree pre-created up front, per-message move journal (enables resume + undo-batch), `BatchProgress` UI + persisted per-category report + review list + retry-failed.
-**Delivers (verified):** Kill-mid-batch → journal resume without dupes/skips; UIDVALIDITY-change → abort-to-resync; undo-batch restores originals; live large-folder gate against the real throttling server.
-**Addresses:** Batch run + report (P1); retry/dry-run (P2 stretch).
-**Avoids:** P5 (journal + resume + undo as success criteria, not stretch); confirmation-fatigue UX.
-**Research flag:** Needs `/gsd-plan-phase --research-phase` — chunk sizing, journal schema vs `imap_outbox` interplay, and live-server throttling behavior need verification against the real UTFPR server at plan time.
+### Phase 7 (conditional): ManageSieve upload slice
+**Rationale:** Only if the Phase 1 port-4190 probe succeeded. Separate slice, separate confirmation, never auto-sync.
+**Delivers:** io-managesieve (`native-tls` only, `spawn_blocking`-hosted) PUTSCRIPT/CHECKSCRIPT/SETACTIVE behind backup-then-diff + explicit append/replace choice + `fileinto`-target validation against the folder tree. Probe failed → this phase does not exist; export-text-only stands as the shipped scope.
+**Avoids:** Second-product trap (Pitfall 5 — no uploader code before recorded probe, no round-trip import, `fileinto`-only subset).
 
 ### Phase Ordering Rationale
 
-- **Dependencies:** Taxonomy store (Phase 2) precedes everything that reads it; suggestions (Phase 3) precede moves (Phase 4); confirmed moves precede batch (Phase 6); engine precedes editor (Phase 5). Batch and editor are order-independent of each other — sequence editor first only because its blast radius is smaller.
-- **Risk-front-loading:** Packaging (the sole unknown) goes first so a size/latency surprise redirects the milestone before UX code exists; privacy (P6) lands inside Phase 3 before any justification is displayed or logged.
-- **Pitfall gating:** Each phase exits through its PITFALLS "Looks Done" row (packaging → accuracy/truncation → confirm-gate → taxonomy migration → batch resume/undo), so verification compounds instead of arriving at the end.
+- **Probes gate protocol work** (PITFALLS/STACK/FEATURES unanimous): no IDLE/CONDSTORE/upload code before recorded capability evidence; each tier degrades silently to its baseline, never hard-fails.
+- **Telemetry → model → consumers** (ARCHITECTURE/FEATURES): event log (Ph.2) → rule envelope (Ph.3) → planner/history/learn (Ph.4–5); Sieve generator reads the portable model, never SQLite rows directly.
+- **Cheap pass before push** (ARCHITECTURE, premise secured by #2): CONDSTORE (Ph.2) before IDLE wakeups (Ph.3) so push traffic runs the fast path; all triggers funnel through the one SyncGate engine.
+- **Feedback loop ships with its governor** (PITFALLS/FEATURES): history + auto-confirm + learner are one phase (Ph.5); trust features never land without precision display, circuit breaker, and digest/undo.
+- **Sieve last and splittable** (all three): export-text (Ph.5) unconditional, upload (Ph.7) probe-conditional; an unsupported server never blocks export.
+- **Compose off the critical path** (ARCHITECTURE): disjoint files, verify-not-rebuild — parallelize after the sandbox gate.
 
 ### Research Flags
 
-Phases likely needing deeper research during planning:
-- **Phase 3 (bridge + worker):** Laya 0.4.2 question-shaping + evidence budgets must be re-verified (ARCH sketched the outdated `/predict` shape); threshold default needs a pt-BR accuracy gate design.
-- **Phase 6 (batch):** Chunk/journal/UIDVALIDITY interplay + live UTFPR throttling behavior need real-server verification.
+Phases likely needing deeper research during planning (`--research-phase`):
+- **Phase 2 CONDSTORE slice:** confirm vendored wiring shapes (`select_condstore` return, `Fetch.modseq` plumbing, raw-string CHANGEDSINCE args) against pinned source at plan time; fake-server transcript tripwire design.
+- **Phase 3 IDLE slice:** thread/runtime fit (dedicated `std::thread` vs blocking-pool slot for the long-lived wait loop); DONE/reconnect/backoff state machine detail.
+- **Phase 5 auto-confirm slice:** eligibility threshold tuning (N-streak default ~10–20), digest cadence, retention/prune window for `override_events`.
+- **Phase 7 upload slice (if probed positive):** io-managesieve 0.2.0 integration spike (blocking client vs I/O-free coroutine over existing transport); server script-name/activation semantics.
 
 Phases with standard patterns (skip research-phase):
-- **Phase 1:** Tauri `externalBin` + PyInstaller freeze is doc-driven (STACK §2 install block); measure, don't research.
-- **Phase 2:** Migration + queries follow the M2–M11 template mechanically.
-- **Phase 4:** Phase 10/11 verb reuse is the project's own proven pattern.
-- **Phase 5:** Editor-over-versioned-store is standard CRUD + migration.
+- **Phase 4 batch pair:** established planner-with-flag + run-record-filter shapes; Azure retry-pattern standard.
+- **Phase 5 Sieve export-text:** RFC 5228 `fileinto` subset is textbook string templating with golden-file tests; no protocol surface.
+- **Phase 6 compose:** v1.2 pipelines already proven; verification checklist is enumerated in FEATURES.md.
 
 ## Confidence Assessment
 
 | Area | Confidence | Notes |
 |------|------------|-------|
-| Stack | HIGH | Live `pyproject.toml` 0.4.2 + PyPI + HF file tree + Tauri v2 docs + crates.io, all read 2026-10-10; only delta is two Cargo lines |
-| Features | MEDIUM | Competitor UX from current web sources; Laya-specific UX inferred from SGE constraints; milestone scoping already pinned in PROJECT.md |
-| Architecture | HIGH-MEDIUM | HIGH on SGE side (direct repo read of manager/sync/store/commands); MEDIUM on Laya contract (integration-skill docs + installed 0.3.20, checkpoint flags to re-verify at build) |
-| Pitfalls | HIGH | Laya limits from official docs + community benchmarks; IMAP/Tauri modes from official docs + project history; every pitfall has a phase-mapped verification |
+| Stack | HIGH | IDLE/CONDSTORE APIs + MODSEQ parsing verified in vendored async-imap 0.11.3 / imap-proto 0.16.7 source; pins recorded. Only youth-risk item is io-managesieve 0.2.0 (production-extracted but 0.x) — quarantined behind the probe gate. |
+| Features | MEDIUM | RFC-grounded behavior HIGH; Rust-crate support claims were web-only at research time (superseded by vendored reads where they conflicted); competitor UX from docs, not teardowns. |
+| Architecture | HIGH | Direct repo read of `imap/`, `sync/`, `store/`, `classify/`, `commands/`, `lib.rs`, `Cargo.toml` plus vendored crate source; new/modified/untouched file list explicit; four prior-milestone invariants named. |
+| Pitfalls | MEDIUM | Codebase-grounded claims HIGH (lease pattern, epoch hygiene, NAMESPACE scar, sandbox contract); RFC-grounded MEDIUM; crate-ecosystem claims LOW (websearch tier, none-surfaced-ManageSieve-crate claim already corrected by STACK's io-managesieve find). |
 
-**Overall confidence:** HIGH-MEDIUM — the integration shape is settled and the build order is dependency-forced; remaining uncertainty is measured numbers (cold-start seconds, CPU ms/mail, pt-BR accuracy, installed GB), all owned by explicit phase exit gates.
+**Overall confidence:** MEDIUM-HIGH (buildable; remaining unknowns are probe-answered, not research-answered)
 
 ### Gaps to Address
 
-- **Measured numbers unknown until Phase 1/3 spikes:** cold-start latency, per-mail CPU latency, installed bundle size, RAM residency (~1.3 GB est.). Handle: packaging spike measures first; planning sets UX timeouts from numbers, not guesses.
-- **Confidence threshold default (e.g. 0.6):** no universal value; must be tuned on representative pt-BR UTFPR-like mail. Handle: Phase 3 accuracy gate stratified by hierarchy level + email-length bucket.
-- **`Auto`-root collision (user already owns `Auto`):** confirm-then-nest dialog decided at Phase 4 planning, not now.
-- **Snippet fidelity ceiling:** labels derive from cached headers + preview (~200 chars), no forced body FETCH. Handle: if Phase 3 evaluation disappoints, escalate to fetch-`body_text`-for-`pending`-only (worker change, not architecture change).
-- **Checkpoint revision pin:** pin the Hub snapshot hash + sha256 in the sidecar build script at Phase 1 build time so a Hub re-upload can't silently change weights.
-- **FTS over labels:** optional Phase 6+ polish (`messages_fts` join) — decide after the engine works.
+- **Real-server capabilities unknown:** IDLE/CONDSTORE/QRESYNC atoms + port-4190/ManageSieve greeting for `mail.utfpr.edu.br` unprobed in this environment. Handle: Phase 1 probe transcripts are entry gates; every tier has a no-capability baseline that ships instead.
+- **io-managesieve 0.2.0 integration fit:** young crate, blocking API vs single-session async runtime. Handle: plan-time spike (blocking-via-`spawn_blocking` vs I/O-free coroutine vs ~200-line hand-roll fallback); crate added only on probe success.
+- **Threshold tuning without data:** auto-confirm N-streak, per-category thresholds, `override_events` retention window, IDLE debounce interval. Handle: ship conservative defaults (N≈10–20, telemetry retained months not forever), tune from observed override rates in v1.5.x.
+- **QRESYNC cost unmeasured:** whether the `run_command` + manual VANISHED-parse follow-up is worth it given CONDSTORE-only covers Gmail-class servers. Handle: explicitly deferred; decide from real MODSEQ/reconnect behavior post-CONDSTORE.
+- **Zimbra-filter-API possibility:** if UTFPR runs Zimbra without ManageSieve, upload has no endpoint. Handle: probe decides; export-text-only + documented deferral is the honest pre-agreed outcome.
 
 ## Sources
 
 ### Primary (HIGH confidence)
-- Laya `pyproject.toml` @ main v0.4.2 (live fetch) — deps, extras, `laya-serve` entry point — STACK.md §1
-- Laya README @ main (live fetch) — Router, checkpoint table, serve env vars, `laya-ts` packaging notes — STACK.md §1
-- HuggingFace `convaiinnovations/laya-multilingual` file tree — 678 MB repo / 644 MB weights — STACK.md §1
-- Tauri v2 docs (`develop/sidecar`, `develop/resources`, `reference/config`) — `externalBin` + triple suffix + capabilities + resources — STACK.md + ARCHITECTURE.md
-- crates.io `tauri-plugin-shell` 2.4.0 (requires `tauri ^2.12`) — STACK.md §1
-- SGE repo source read (`imap/manager.rs`, `sync/{mod,worker}.rs`, `store/{mod,schema.sql,queries.rs}`, `commands/sync.rs`, `lib.rs`, `Cargo.toml`) + PROJECT.md v1.3 scoping — ARCHITECTURE.md
-- Laya limits (option budget ~20, 1024-token multilingual context, `choice:11+` temperature clamp, `noul`/`score` weak spots) via official-docs synthesis — PITFALLS.md
-- Tauri `externalBin` + IMAP RFC 4549 UIDVALIDITY + OWASP LLM02:2025 (output filtering required) — PITFALLS.md
+- Vendored `async-imap-0.11.3` source (`client.rs` select_condstore/idle/run_command, `extensions/idle.rs` Handle/IdleResponse/29-min guidance, `parse.rs` HIGHESTMODSEQ folding) + `imap-proto-0.16.7` (`types.rs` HighestModSeq/ModSeq/Vanished, `parser/rfc7162.rs`) — CONDSTORE read path + IDLE handle ground truth.
+- SGE repo at research time (`imap/{mod,manager,session}.rs`, `sync/{mod,worker}.rs`, `store/{mod,schema.sql}`, `classify/*`, `commands/*`, `lib.rs`, `Cargo.toml`) + `.planning/PROJECT.md` v1.5 scoping + `.planning/STATE.md` — existing architecture, pins, sandbox contract, scope guards.
+- RFC 2177 (IDLE/DONE, 29-min advisory), RFC 7162 (CONDSTORE/QRESYNC, MODSEQ/HIGHESTMODSEQ, epoch rules), RFC 5228 (Sieve `fileinto`/`header`/`address` base language).
 
 ### Secondary (MEDIUM confidence)
-- Competitor UX (Thunderbird filters, Gmail retroactive-apply, Superhuman auto-labels, Shortwave splits, Dynamics 365 classification, ThinkAutomation review gates) — FEATURES.md
-- Laya integration skill (`laya-integration` SKILL.md + `laya 0.3.20` install) — single-pass multi-question, serial forward-pass lock, latency figures — ARCHITECTURE.md (noted: re-verify flags at 0.4.2 build time)
-- `docs.rs/laya`, `laya-candle`, `laya-rs` READMEs (Rust-native options assessed and rejected) — ARCHITECTURE.md
-- Community benchmarks (Banking77, multilingual en 0.875 vs pt 0.625, CPU ~140 ms/mail) — PITFALLS.md
+- docs.rs `io-managesieve 0.2.0` (pimalaya, MIT/Apache, native-tls feature, RFC 5804 coverage) — upload-leg candidate, needs integration spike.
+- Thunderbird/Gmail/Apple Mail/Superhuman filter/push/bulk-UX docs; Azure retry-pattern guidance; active-learning literature (conceptual grounding for learning-v1).
+- RFC 5804 (ManageSieve, referenced not fetched); go-imap/mailledger CONDSTORE notes; Thunderbird/neomutt CONDSTORE experience (Gmail CONDSTORE-yes/QRESYNC-no).
 
-### Tertiary (LOW confidence, needs validation at build)
-- Exact cold-start seconds (~25–35 s est.) and installed GB (~1 GB est.) on the user's machine — Phase 1 spike measures
-- Optimal confidence threshold default — Phase 3 pt-BR gate tunes
-- `LAYA_IDLE_UNLOAD_SECONDS` residency policy — Phase 3 planning decides (default: resident)
+### Tertiary (LOW confidence)
+- `daaki-imap` / `io-imap` README CONDSTORE/QRESYNC claims — fallback-crate candidates only; not needed given vendored verification.
+- `async-imap` 0.12 (0.12/0.17 parser change) — explicitly rejected for v1.5; separate-migration material.
+- Original PITFALLS "no ManageSieve crate surfaced" claim — corrected by STACK's io-managesieve find; retained here so planners don't re-search blindly.
 
 ---
-*Research completed: 2026-10-10*
+*Research completed: 2026-10-13*
 *Ready for roadmap: yes*

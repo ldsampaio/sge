@@ -1,171 +1,105 @@
-# Stack Research — v1.3 Auto-Classify (Laya sidecar)
+# Stack Research: v1.5 Additions (IDLE / CONDSTORE-QRESYNC / Sieve / Override Learning)
 
-**Domain:** on-device email classification from Rust + Tauri v2 Linux desktop app
-**Researched:** 2026-10-10
-**Confidence:** HIGH (Laya 0.4.2 pyproject + README + PyPI + HF model pages read live; Tauri v2 sidecar/resources docs verified; crates.io versions checked)
+**Domain:** SGE v1.5 — push sync, fast resync, server-side rule export, classifier learning infra
+**Researched:** 2026-10-13
+**Confidence:** HIGH (IDLE/CONDSTORE verified in pinned crate source; ManageSieve verified on docs.rs)
 
-> Scope: ONLY what to ADD/CHANGE for Laya classification. Existing stack
-> (Tauri v2.12, async-imap 0.11, lettre 0.11, rusqlite 0.37, keyring 3, …)
-> is NOT re-researched. See prior STACK.md (v1.2) for the base.
+## Recommended Stack
 
-## TL;DR
-
-| Need | Decision |
-|------|----------|
-| Inference engine | **Bundled offline sidecar: `laya[serve]` 0.4.2 (Python) speaking `POST /v1/systemone` on `127.0.0.1`** |
-| Checkpoint | **Multilingual only** (`convaiinnovations/laya-multilingual`, 322M params, `model.safetensors` 644 MB), pinned Hub revision, shipped as Tauri `resources` |
-| Tauri ↔ sidecar bridge | **ADD `tauri-plugin-shell = "2"` (stable 2.4.0) + `reqwest = "0.12"`** — Rust backend spawns sidecar, calls it over localhost HTTP |
-| Sidecar packaging | **PyInstaller single binary** (`src-tauri/binaries/sge-laya-<target-triple>`) with CPU-only torch; model files as `resources`, NOT inside the binary |
-| Frontend | **No new npm deps** — classification UI goes through existing Tauri `invoke`, never touches the sidecar directly |
-
-`Cargo.toml` delta is **two lines** (`tauri-plugin-shell`, `reqwest`).
-`tauri.conf.json` delta is `externalBin` + `resources` + one capability entry.
-
----
-
-## 1. Recommended stack additions
-
-### Core additions
+### Core Technologies
 
 | Technology | Version | Purpose | Why Recommended |
 |------------|---------|---------|-----------------|
-| `laya` (PyPI, extra `serve`) | **0.4.2** (current, verified on PyPI 2026-10-10; `requires-python >=3.10`) | Typed-decision inference (`choice`/`score`/`noul`, single forward pass) + `laya-serve` HTTP server | This IS the classifier the milestone chose. The `serve` extra is the only integration surface the Rust backend needs: one Jev-compatible endpoint, batch route included. Zero-shot fits the "no fine-tuning in v1.3" constraint. Apache-2.0. |
-| `laya-multilingual` checkpoint | Hub repo `convaiinnovations/laya-multilingual`, **pin a revision hash** | pt-BR + 100-language classification (mmBERT-base 322M, ctx 1024, up to 8192 via `max_len`) | pt-BR mail (incl. short Latin-script subjects like "Quero cancelar") routes to `multilingual` by default since Laya 0.4.0 — English checkpoint can't be trusted for Portuguese. 322M is also ~2x faster than the 421M English checkpoint (121 ms vs 146 ms on MPS; ~192 ms on CPU per predict). Ship ONLY this checkpoint: all three = ~2.3 GB, multilingual alone = **~678 MB repo / 644 MB weights**. `LAYA_MAX_LOADED=1` keeps exactly one resident. |
-| `tauri-plugin-shell` | **2.4.0** (stable, crates.io; requires `tauri ^2.12` — matches the pinned Tauri v2.12) | Spawn + supervise the sidecar binary from the Rust backend (`ShellExt::sidecar`) | This is THE Tauri-blessed sidecar mechanism (`externalBin` + `sidecar()` + `shell:allow-execute` capability). Spawning from Rust (not JS `Command`) keeps mail bytes on the backend path the sync pipeline already uses, and lets the existing `SessionManager`-style lease/guard patterns supervise the child (kill on app exit is built into the plugin). |
-| `reqwest` | **0.12** (async, default features; plain `http://127.0.0.1` — no TLS feature decision needed) | Rust backend → sidecar HTTP client | Tauri runs on tokio; `reqwest` async fits without a new runtime. Only needs `json` (serde already in tree). Alternatives (`ureq` blocking, raw `tokio::net`) either fight the runtime or reimplement HTTP — no gain for a localhost JSON POST. |
-| PyInstaller | current (≈6.x, pin in sidecar build script) | Freeze `laya[serve]` + CPU torch into one `sge-laya` binary for `externalBin` | Tauri `externalBin` needs a **single self-contained executable**, not a venv. PyInstaller one-dir/one-file is the standard freeze for FastAPI+torch sidecars. The alternative (shipping a venv + system python3 dependency) breaks the "no extra user installs" promise of a `.deb`/AppImage. |
-| `torch` CPU-only wheel | `>=2.0` per laya deps; install via `--index-url https://download.pytorch.org/whl/cpu` at sidecar build time | Inference runtime inside the sidecar | Laya's verified numerics path (`verify/numerics_check.py`, SDPA vs eager) runs on torch. GPU builds are dead weight on a Linux email client (no CUDA target in this milestone, bundle targets are deb/AppImage for commodity machines). CPU-only torch ≈ 200 MB vs ≈ 800 MB+ CUDA — the single biggest sidecar-size lever. |
+| async-imap IDLE (`Session::idle` → `extensions::idle::Handle`) | 0.11.3 (already pinned, no bump) | Push notifications for new mail | Already in the tree and verified in local registry source (`src/extensions/idle.rs`): `idle()` consumes the session, `Handle::init/wait` blocks until *anything* changes, docs prescribe DONE/re-IDLE ≥ every 29 min. Zero new deps — the cheapest push path available. |
+| async-imap `select_condstore` + `run_command*` escape hatches | 0.11.3 (already pinned) | CONDSTORE fast path + hand-rolled QRESYNC | `select_condstore` is built in (verified line 394 of pinned `client.rs`); QRESYNC's `ENABLE` / `SELECT (QRESYNC…)` / `UID FETCH … (CHANGEDSINCE …)` go through the existing `run_command` / `run_command_untagged` raw-command hatch. imap-proto 0.16 (pinned transitive) already parses `HIGHESTMODSEQ` response codes and `MODSEQ` fetch attributes (verified in registry source `types.rs`). No new IMAP crate needed. |
+| io-managesieve | 0.2.0 (2026-09-29) | Sieve script upload/activate (ManageSieve RFC 5804) | Only maintained Rust ManageSieve client: extracted from Himalaya/Pimalaya (production mail client, NLnet-funded), full RFC 5804 coverage (LIST/PUT/CHECK/ACTIVATE/RENAME/DELETE scripts, STARTTLS, SASL via io-sasl), blocking std client with a **`native-tls` feature flag** that matches SGE's existing TLS stack (native-tls 0.2 / async-native-tls 0.5). MIT/Apache-2.0. Local Sieve *text generation* from smart rules is hand-rolled string templating (no crate); this crate covers only the *upload* leg. |
+| rusqlite + rusqlite_migration (existing) | 0.37 / 2.x (already pinned) | Override-learning log, MODSEQ store, rule import/export persistence | No new dep: learning-from-overrides = new tables (`override_events`, message `modseq`, per-folder `highestmodseq`, rule `version/etag` columns) behind the established M20+ migration pattern; rule import/export serializes with existing serde/serde_json. |
+| tokio `sync` + `time` (existing) | 1.x with `rt, sync, time` (already pinned) | IDLE task supervision, debounce, spawn_blocking bridge | No new dep: `tokio::task::spawn_blocking` hosts io-managesieve's blocking client off the Tauri async runtime; `watch`/`Notify` fan IDLE wakeups into the existing SyncGate single-flight path; `time::sleep` implements the 29-min IDLE refresh. `futures 0.3` (already pinned) polls the IDLE `Handle` stream. |
 
-### Sidecar Python dependency closure (exact)
+### Supporting Libraries
 
-From the live `pyproject.toml` of laya 0.4.2 — freeze these in the sidecar build, nothing else:
+| Library | Version | Purpose | When to Use |
+|---------|---------|---------|-------------|
+| io-managesieve with `native-tls` feature only | 0.2.0, `default-features = false, features = ["native-tls"]` | ManageSieve session (TCP + STARTTLS/implicit TLS + AUTHENTICATE + script commands) | Only in the Sieve-export phase, and only after a capability probe confirms the server offers ManageSieve (port 4190). Default features pull rustls-ring — disable to avoid a second TLS stack alongside native-tls. |
+| `log` facade | 0.4 (already transitive via async-imap) → promote to direct dep if diagnostics wanted | Structured backend diagnostics for IDLE/QRESYNC state machine | Only if the phase wants log output beyond SQLite journals; otherwise skip — override learning lives in SQLite, not in logs. |
 
-```
-laya[serve]==0.4.2
-  torch>=2.0.0            # CPU-only wheel via pytorch cpu index
-  transformers>=4.48.0
-  safetensors>=0.4.0
-  huggingface_hub>=0.20.0 # only used at BUILD time to bake the checkpoint; offline at runtime
-  numpy>=1.20.0
-  fastapi>=0.110.0        # serve extra
-  uvicorn>=0.27.0         # serve extra
-  python-multipart>=0.0.9 # serve extra
-```
+### Development Tools
 
-Do NOT install `fast`, `mcp`, `langchain`, `crewai`, `llamaindex`, `structured`, or `onnx` extras
-(see §4 — each rejected with a reason).
+| Tool | Purpose | Notes |
+|------|---------|-------|
+| `live-*.sh` harnesses (already built) + CAPABILITY probe snippet | Verify IDLE/CONDSTORE/QRESYNC/ManageSieve advertisement on mail.utfpr.edu.br before building | First step of each protocol phase: `CAPABILITY` decides IDLE-vs-poll, CONDSTORE-vs-baseline, Sieve-upload-vs-export-only. Do not build the feature before the probe. |
+| Local registry source (`~/.cargo/registry/src/*/async-imap-0.11.3`) | Ground truth for IDLE/escape-hatch APIs | Already used for this research; planners should read `extensions/idle.rs` + `client.rs` `run_command*` rather than trusting web docs (most web examples target 0.9/0.10). |
 
-### Supporting: Tauri config changes (no new deps, but part of the stack)
-
-| Change | Where | Why |
-|--------|-------|-----|
-| `bundle.externalBin: ["binaries/sge-laya"]` + binary at `src-tauri/binaries/sge-laya-x86_64-unknown-linux-gnu` | `tauri.conf.json` | The sidecar contract: Tauri looks up `<name>-<target-triple>` at bundle time. Linux-only milestone ⇒ exactly one triple to build (add `-aarch64-unknown-linux-gnu` only if ARM ship is ever scoped). |
-| `bundle.resources: { "<models dir>/": "laya-models/" }` (multilingual checkpoint files only) | `tauri.conf.json` | Model weights (~644 MB) must NOT be frozen inside the PyInstaller binary (would duplicate per build and defeat HF hash verification). `resources` lands them in `$RESOURCE/`; the backend passes the resolved path to the sidecar via env/argv. |
-| `shell:allow-execute` (or `allow-spawn`) scope for `sge-laya` + fixed argv | `src-tauri/capabilities/default.json` | Sidecar spawn is denied without it. Pin argv (`--host 127.0.0.1 --port <fixed> --models <resource-dir>`) statically — no dynamic user-controlled args (mail text travels in the POST body, never argv). |
-| `LAYA_HOST=127.0.0.1`, `LAYA_PORT=<fixed high port>`, `LAYA_MODELS=multilingual`, `LAYA_PRELOAD=1`, `LAYA_MAX_LOADED=1`, `LAYA_THREADS=<n-phys>`, `LAYA_API_KEY=<random per-boot>` | sidecar spawn env (set by Rust backend) | `127.0.0.1` (never the `0.0.0.0` default) keeps inference loopback-only — the offline/privacy constraint made concrete. Preload avoids first-classify latency spike; `MAX_LOADED=1` matches single-checkpoint residency; per-boot API key means even other local processes can't casually drive the classifier. |
-
-### Suggested Rust integration shape (for planners, not prescriptive code)
-
-- New module (e.g. `classify/`) owning: sidecar spawn (via `ShellExt::sidecar("sge-laya")`), `/health` readiness probe with backoff, `POST /v1/systemone` + `/v1/systemone/batch` (batch for the whole-account pass — capped at 64 states/server call, `LAYA_MAX_BATCH_TOKENS` splits internally), LRU of taxonomy→questions JSON.
-- Reuse the established patterns: spawn off-runtime like IMAP's dedicated blocking thread; serialize through a lease like `SessionManager::lease_for` (torch CPU inference is effectively single-flight per process — concurrent sync + batch classify must queue, not pile on); never log state/question bodies beyond lengths (sensitive-data rule).
-- Input budget: multilingual default ctx is 1024 tokens; pass `max_len=8192` only for long threads (costs ~1.7 s/4k tokens) — default path stays short (subject + snippet) so single-mail classify stays in the ~200 ms CPU band.
-
----
-
-## 2. Installation
+## Installation
 
 ```bash
-# --- Rust backend (the only Cargo delta) ---
-cargo add tauri-plugin-shell@2 reqwest@0.12
-# then register: tauri::Builder::default().plugin(tauri_plugin_shell::init())
+# Only addition for v1.5 (Sieve upload leg; everything else is already pinned)
+cargo add io-managesieve --no-default-features --features native-tls
+# Pin record: io-managesieve 0.2.x (MIT/Apache, pimalaya, verified on docs.rs 2026-10-13)
 
-# --- Sidecar build environment (build-time only, never shipped) ---
-python3.12 -m venv .sidecar-build && .sidecar-build/bin/python -m pip install \
-  --index-url https://download.pytorch.org/whl/cpu \
-  "torch>=2.0.0" \
-&& .sidecar-build/bin/python -m pip install "laya[serve]==0.4.2" pyinstaller
-# bake checkpoint once, with revision pin:
-#   HF_HUB_CACHE=./models .sidecar-build/bin/python -c \
-#     "from laya import Router; Router(models={'multilingual': '<pinned snapshot path>'}, preload=True)"
-# freeze:
-#   .sidecar-build/bin/pyinstaller --onefile --name sge-laya sidecar_main.py
-#   mv dist/sge-laya src-tauri/binaries/sge-laya-x86_64-unknown-linux-gnu
+# Everything below is already in src-tauri/Cargo.toml — DO NOT re-add:
+# async-imap 0.11 / async-native-tls 0.5 / async-std 1.13 (IDLE + CONDSTORE + transport)
+# futures 0.3 (IDLE stream polling) / tokio 1 (rt/sync/time supervision)
+# rusqlite 0.37 bundled + rusqlite_migration 2.x (modseq + override-event schema)
+# serde / serde_json 1 (rule import/export) / chrono 0.4 (event timestamps)
+# lettre 0.11 (compose hardening reuses v1.2 pipeline, no change)
 ```
 
-`sidecar_main.py` is a ~20-line shim calling `laya.serve` (or `create_app(router)` with a
-local-models `Router`) under uvicorn bound to the argv-supplied host/port. No frontend change:
-no `npm install` needed.
+## Alternatives Considered
 
----
+| Recommended | Alternative | When to Use Alternative |
+|-------------|-------------|-------------------------|
+| Stay on async-imap 0.11.3 | Bump to async-imap 0.12 (2026-09-30, imap-proto 0.17) | Only as a separate migration milestone: 0.12 changes the proto parser under every existing verb mock. v1.5 needs nothing 0.12 adds (IDLE/CONDSTORE/escape hatches all verified present in 0.11.3). |
+| io-managesieve 0.2.0 (upload leg) | Hand-rolled ManageSieve over async-native-tls | If io-managesieve 0.2.0's blocking API fights the single-session manager at plan time — RFC 5804 is a simple line protocol and the fallback is ~200 lines. Spike first; keep the crate as plan A. |
+| io-managesieve 0.2.0 | `managesieve` protocol-only crate + own transport | If only framing/parsing is wanted and session/TLS/Auth is hand-rolled anyway. More work, no benefit over io-managesieve's I/O-free coroutine layer which offers the same split. |
+| Hand-rolled Sieve text templates | `sieve-generator` crate | Never for v1.5: unmaintained since 2022. Sieve `require`/`if address :contains` generation for keyword/sender rules is trivial string building with snapshot tests. |
+| QRESYNC via `run_command` hatch | New IMAP crate (daaki-imap, io-imap, rusmes-imap) | Never for v1.5: replaces the proven SessionManager transport for one fast path. The hatch + imap-proto 0.16 MODSEQ parsing is sufficient; capability-gate to baseline UID sync where the server lacks QRESYNC. |
+| SQLite override-event tables | New logging/telemetry crate | Never: learning signal = queryable relational data ( Armed with timestamps, old/new category, confidence), not log lines. `log` facade only for operator diagnostics. |
 
-## 3. Alternatives considered (sidecar vs ONNX vs HTTP — the downstream question)
+## What NOT to Use
 
-| Recommended | Alternative | When to use alternative instead |
-|-------------|-------------|---------------------------------|
-| **Python sidecar (`laya[serve]` + torch CPU, `externalBin`)** | — (recommended) | Default for v1.3: official serving path, full `Router` parity (routing, `lang_guess`, `max_len`, `min_confidence`, batch), numerics verified upstream. |
-| Recommended | `laya-ts` ONNX in-JS (`encoder.onnx` + `head.onnx` via `onnxruntime-node`) | Only if the team later wants the classifier in the frontend process. Rejected now: ESM-only, Node-side runtime still needs bundling as a sidecar anyway (same packaging problem, less maturity), `sort_by_length` not ported, first load pulls ~1.3 GB, browser path assumes WebGPU/WASM — strictly worse packaging story than one Python binary. |
-| Recommended | Rust-native ONNX (`ort` crate + exported `encoder.onnx`/`head.onnx` + reimplemented Router) | Only as a future slim-down (drops the whole Python runtime; onnxruntime ≈ 50–100 MB vs torch CPU ≈ 200 MB + interpreter). Rejected now: requires reimplementing routing/tokenizer/head-wiring in Rust against an export script (`scripts/export_onnx.py`) whose parity surface is one test file — high risk for zero v1.3 capability gain. |
-| Recommended | Python `laya[onnx]` (`laya.onnx_agent`) inside the SAME sidecar | Consider as a v1.3-stretch size optimization if the torch sidecar measures too fat: same process shape, lighter runtime. Not the default because the torch path is the verified reference. |
-| Recommended | Hosted inference (TypeSafe Jev API, impossibl endpoint, any cloud) | **Never for mail content** — violates the hard "mail content must never leave the machine" constraint. Usable only for non-mail smoke tests during development, if at all. |
-| Recommended | `reqwest` localhost client | `ureq`/blocking client — only if the classifier module ends up fully synchronous outside tokio; currently nothing suggests that. |
-
-**Packaging recommendation, stated plainly:** the `.deb`/AppImage will grow by roughly
-**sidecar binary (~250–400 MB with CPU torch) + models resource (~650 MB)** ≈ ~1 GB installed.
-That is the honest price of bundled offline ML and the user already chose "bundled over external
-service" (PROJECT.md decision). Mitigations if size bites: (a) ship the `.deb` with
-`Recommends:`/split package for models — deferred, Linux packaging phase decides; (b) later
-migrate the sidecar interior from torch to `laya[onnx]` (same `externalBin` contract, smaller
-binary); (c) never "solve" size by switching to hosted inference — that trades megabytes for
-the privacy constraint.
-
----
-
-## 4. What NOT to add
-
-| Avoid | Why | Use instead |
+| Avoid | Why | Use Instead |
 |-------|-----|-------------|
-| `laya-client` npm package / `laya-ts` | Both assume either a running HTTP server (client) or a Node ONNX runtime (ts) — the Rust backend already speaks HTTP and there is no Node runtime in the app. Adds a second integration surface for zero capability. | `reqwest` from Rust backend |
-| Hosted Jev / `impossibl` API keys, `baseUrl` repointing | Mail bytes leave the machine; kills the milestone's core privacy guarantee. | Loopback sidecar |
-| CUDA/GPU torch builds, `laya[fast]` (TileLang) | No GPU target; TileLang is a GPU fast path with its own toolchain. Pure bundle bloat. | CPU-only torch |
-| `laya[mcp]`, `[langchain]`, `[llamaindex]`, `[crewai]`, `[structured]` extras | Agent-framework integrations — irrelevant to a deterministic classify-one-mail call. Each drags heavy transitive deps (pydantic, langchain-core, …). | Plain `POST /v1/systemone` JSON |
-| Checkpoint fine-tuning toolchain (train scripts, `laya-train`, Kaggle/MPS notebooks) | Explicitly out of scope ("zero-shot + keyword-assisted only", PROJECT.md). | Zero-shot `choice` questions built from the user's taxonomy + keyword pre-filter in Rust |
-| `laya-typed-decisions` / English checkpoints in the bundle | English mail is classifiable by the multilingual checkpoint; typed-decisions serves other workflows. Each adds ~800 MB–1 GB for no v1.3 gain. | Multilingual only; `model` field unset (router auto-selects, lands on multilingual for pt-BR) |
-| System-Python / pip-at-install dependency | Breaks hermetic `.deb`/AppImage install; version drift between user distro python and `>=3.10` floor. | Frozen PyInstaller binary in `externalBin` |
-| New credential/secret storage for the classifier | `LAYA_API_KEY` is an ephemeral per-boot token generated by the backend, not a user secret — keep it in memory only. | Existing keyring path untouched |
-| `examples/server.py` as the sidecar | It's a dev playground (serves a GUI + `/predict` API), not the Jev-compatible `laya-serve` surface the client code should target. | `laya-serve` (`laya.serve`) entry point |
+| sieve-rs / mailrs-sieve-core (Stalwart) | Server-side Sieve *interpreter*; pulls a 19k-LOC AGPL-tainted dependency to do work the server already does. SGE needs export (text), not interpretation. | Hand-rolled templates for text + io-managesieve for upload |
+| async-imap 0.12 bump inside v1.5 | imap-proto 0.16→0.17 parser change re-opens the NAMESPACE-class of session poisoning bugs already tripwired; zero v1.5 features require it | Stay on 0.11.3; schedule 0.12 as its own phase with mock regeneration |
+| rustls (via io-managesieve default features) | Duplicates the pinned native-tls 0.2 / async-native-tls 0.5 stack; bigger bundle, two TLS trust stores to reason about | io-managesieve with `default-features = false, features = ["native-tls"]` |
+| Second always-on IMAP session per folder for IDLE | IDLE binds one connection to one selected mailbox; per-folder IDLE connections multiply server load and break the single-SessionManager ownership model | One dedicated IDLE connection on INBOX (or the user's most-active folder) + 5-min poll retained as fallback for the rest; poll path stays the single guarded code path |
+| `UID FETCH … BODY[]` inside the IDLE wakeup handler | Defeats the push optimization — wakeup should enqueue a headers-first incremental sync through SyncGate, not fetch inline while holding the IDLE connection | Wakeup → `Notify`/event → existing single-flight sync path (headers-first, bodies on demand) |
+| New compose/send crates | v1.5 compose hardening explicitly reuses the v1.2 lettre 0.11 pipelines (verify + fix gaps, not a rebuild) | lettre 0.11 as pinned; no SMTP stack change |
 
----
+## Stack Patterns by Variant
 
-## 5. Version compatibility
+**If the server advertises IDLE (verify with CAPABILITY probe on mail.utfpr.edu.br):**
+- Spawn one supervised IDLE task on a dedicated connection (SessionManager mints a second session; IDLE `Handle` consumes it by design), `Handle::wait` loop with DONE/re-IDLE ≤ 29 min, wakeups fanning into SyncGate.
+- Because the single-session manager owns the primary session; IDLE must never hold the primary connection (it blocks all other verbs while active).
 
-| Package A | Compatible with | Notes |
+**If the server lacks IDLE or CONDSTORE/QRESYNC:**
+- Keep the 5-min poll + UID-range backfill exactly as-is (baseline already correct per Phase 8/9); gate fast paths behind capability checks with silent fallback, never hard-fail.
+
+**If the server offers no ManageSieve (port 4190 closed / no SIEVE capability — likely on corporate Zimbra):**
+- Ship Sieve *export-only* (downloadable `.sieve` file + copy-to-clipboard) with upload deferred and documented; do not block the milestone on the upload leg.
+
+**If io-managesieve's blocking client blocks plan-time integration:**
+- Drop to its I/O-free coroutine layer driven by the existing async-std transport, or hand-roll the ~6 ManageSieve commands needed (CAPABILITY → AUTHENTICATE → PUTSCRIPT → CHECKSCRIPT → SETACTIVE → LOGOUT) over async-native-tls. Target servers are one family (UTFPR), not the whole RFC matrix.
+
+## Version Compatibility
+
+| Package A | Compatible With | Notes |
 |-----------|-----------------|-------|
-| `laya 0.4.2` | Python 3.10–3.13, `transformers>=4.48`, `torch>=2.0`, `fastapi>=0.110`, `uvicorn>=0.27` | From live pyproject; floor is 3.10 (huggingface_hub 1.x). Build env: use 3.12 (matches upstream `uv venv --python 3.12` guidance). |
-| `tauri-plugin-shell 2.4.0` | `tauri ^2.12` (incl. pinned v2.12), Rust ≥1.90 (latest docs; crates.io 2.0.x line said 1.77.2 — use the project's current toolchain, already ≥ that) | JS guest binding `@tauri-apps/plugin-shell` NOT needed (Rust-side spawn only). |
-| `reqwest 0.12` | tokio 1 (already via Tauri), serde_json 1 (in tree) | Plain-HTTP localhost: no `rustls`/`native-tls` feature needed — avoids forking the native-tls story from v1.2 STACK. |
-| `laya-multilingual` Hub snapshot | `transformers>=4.48` (ModernBERT/mmBERT `rope_parameters` mapping) | Pin the snapshot revision AND `verify/checkpoints.py`-style sha256 in the build script so a Hub re-upload can't silently change weights under a future rebuild. |
-| PyInstallermfcp | Linux-only target `x86_64-unknown-linux-gnu` | Single-triple build; the `externalBin` suffix must equal `rustc --print host-tuple`. |
-
----
-
-## 6. Open risks / probes for planners
-
-1. **Sidecar cold start** — first spawn pays interpreter + checkpoint load (seconds). Mitigation is `LAYA_PRELOAD=1` at app start + `/health` gate before first sync-classify; measure and set the UX timeout from the number, not a guess.
-2. **RAM residency** — 322M fp32 ≈ 1.3 GB resident with `MAX_LOADED=1`. `LAYA_IDLE_UNLOAD_SECONDS` can page it out after idle (next classify pays cold load). Decide policy in planning; default to resident (personal daily-use client).
-3. **Port collision** — fixed loopback port must be free; backend should probe-and-retry on adjacent ports and pass the chosen one via argv (never let the sidecar pick silently).
-4. **Model-resource path resolution** — must work in `tauri dev` AND bundled builds (`PathResolver::resource_dir`); plan a dev fallback to `./models` checkout dir.
+| io-managesieve 0.2.0 (`native-tls` feature) | native-tls 0.2 (pinned) | Feature-gated; verify at `cargo tree` time that no rustls crate enters the graph |
+| io-managesieve 0.2.0 blocking client | tokio 1 `rt` (Tauri runtime) via `spawn_blocking` | Blocking calls must never run on async workers; wrap PUTSCRIPT/CHECKSCRIPT sessions in `spawn_blocking` or a dedicated std::thread |
+| async-imap 0.11.3 IDLE `Handle` | async-std 1.13 runtime (pinned transport) | `Handle: Stream` impl requires `Send`; poll it from the Tauri async runtime with `futures::StreamExt`, reuse the existing single-flight bridge pattern (Phase 17 tokio-sync precedent) |
+| MODSEQ schema additions (M20+) | rusqlite_migration 2.x + UIDVALIDITY epoch gating | `highestmodseq` stored per folder alongside `uidvalidity`; any UIDVALIDITY change invalidates stored modseqs (same rule as UIDs) |
+| imap-proto 0.16 (transitive) | async-imap 0.11.3 | Locked pair; do not bump independently |
 
 ## Sources
 
-- `pyproject.toml` @ laya main (v0.4.2, live fetch) — deps, extras, entry points (`laya-serve`)
-- Laya README @ main (live fetch) — Router, checkpoints table, `laya-serve` env vars, `laya-ts` packaging (~1.3 GB first load, ESM-only), `setup_laya.sh` (~2.3 GB all checkpoints)
-- `laya-ts/README.md` (live fetch) — export/peer-dep shape
-- PyPI `laya 0.4.2` page — version currency + extras matrix
-- HuggingFace `convaiinnovations/laya-multilingual` file tree — 678 MB repo / 644 MB `model.safetensors`
-- Tauri v2 docs: `develop/sidecar` (externalBin + target-triple + capabilities), `develop/resources`, `learn/sidecar-nodejs`, `reference/config` — sidecar/resources contract
-- crates.io `tauri-plugin-shell` (stable 2.4.0, requires `tauri ^2.12`) — bridge version
-- SGE `src-tauri/Cargo.toml`, `tauri.conf.json` (repo read) — base pins this stacks onto
+- Local registry source `async-imap-0.11.3/src/client.rs` (`select_condstore` line 394, `idle()` line 1134, `run_command*` lines 1364–1443) + `src/extensions/idle.rs` (Handle/init/wait, 29-min guidance) — HIGH, ground truth for pinned version
+- Local registry source `imap-proto-0.16.7/src/types.rs` (`HighestModSeq`, `ModSeq` attribute parsing) — HIGH
+- docs.rs `io-managesieve 0.2.0` (2026-09-29, pimalaya, MIT/Apache, native-tls feature, full RFC 5804, io-sasl auth) — MEDIUM-HIGH (crate young at 0.2.0 but extracted from production Himalaya; needs plan-time integration spike)
+- docs.rs `async-imap 0.12.0` Session docs (method list incl. `idle`, `select_condstore`) — corroborating only; 0.12 NOT recommended for v1.5
+- `.planning/PROJECT.md` (v1.5 scope: IDLE/CONDSTORE/QRESYNC, Sieve tentative, learning-from-overrides logging hooks, compose reuses v1.2 pipelines) + `src-tauri/Cargo.toml` (current pins) — HIGH
 
 ---
-*Stack research for: SGE v1.3 Auto-Classify (Laya bundled offline sidecar)*
-*Researched: 2026-10-10*
+*Stack research for: SGE v1.5 additions (IDLE / CONDSTORE-QRESYNC / Sieve / override learning)*
+*Researched: 2026-10-13*
