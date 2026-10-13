@@ -98,6 +98,7 @@ impl Store {
             M::up(M16_BATCH_ITEMS_SQL),
             M::up(M17_FTS_BODY_SQL),
             M::up(M18_FILTERS_SQL),
+            M::up(M19_RULES_SQL),
         ]);
         migrations.to_latest(conn)?;
         Ok(())
@@ -632,6 +633,44 @@ const M18_FILTERS_SQL: &str = concat!(
     "  key          TEXT PRIMARY KEY,",
     "  value        TEXT NOT NULL DEFAULT ''",
     ");",
+);
+
+/// M19 forward migration: smart folder rules + rule-sourced suggestions
+/// (Phase 25, Plan 25-01, RULE-01/02).
+///
+/// `folder_rules` holds deterministic filing rules (conditions as JSON
+/// data, destination as kind + display-or-category-id, scope as folder-set
+/// JSON, explicit integer priority). `rule_suggestions` holds pending
+/// rule hits: pointer-only by design (message + rule ids, destination —
+/// NEVER snippet/subject/justification text, so privacy is structural and
+/// justifications stay transient UI strings). `ON DELETE CASCADE` keeps
+/// suggestions consistent with expunge sweeps; UIDVALIDITY-epoch hygiene
+/// rides the same message-row lifecycle (stale epochs wipe messages,
+/// cascading here).
+const M19_RULES_SQL: &str = concat!(
+    "CREATE TABLE folder_rules (",
+    "  id              TEXT PRIMARY KEY,",
+    "  name            TEXT NOT NULL UNIQUE,",
+    "  priority        INTEGER NOT NULL DEFAULT 100,",
+    "  conditions_json TEXT NOT NULL DEFAULT '{}',",
+    "  dest_kind       TEXT NOT NULL DEFAULT 'folder'",
+    "    CHECK (dest_kind IN ('folder','category')),",
+    "  destination     TEXT NOT NULL DEFAULT '',",
+    "  scope_json      TEXT NOT NULL DEFAULT '[]',",
+    "  enabled         INTEGER NOT NULL DEFAULT 1,",
+    "  created_at      TEXT NOT NULL DEFAULT (datetime('now')),",
+    "  updated_at      TEXT NOT NULL DEFAULT (datetime('now'))",
+    ");",
+    "CREATE INDEX idx_rules_priority ON folder_rules(priority, created_at);",
+    "CREATE TABLE rule_suggestions (",
+    "  message_id   INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,",
+    "  rule_id      TEXT NOT NULL REFERENCES folder_rules(id) ON DELETE CASCADE,",
+    "  dest_kind    TEXT NOT NULL DEFAULT 'folder'",
+    "    CHECK (dest_kind IN ('folder','category')),",
+    "  destination  TEXT NOT NULL DEFAULT '',",
+    "  suggested_at TEXT NOT NULL DEFAULT (datetime('now'))",
+    ");",
+    "CREATE INDEX idx_rule_suggestions_rule ON rule_suggestions(rule_id);",
 );
 
 /// Returns the app-data attachment directory for a given mailbox UID.
@@ -1635,5 +1674,111 @@ mod m18_tests {
         .unwrap();
         let back = crate::store::queries::load_search_state(&conn).unwrap().unwrap();
         assert_eq!(back.query, "old");
+    }
+
+    #[test]
+    fn m19_adds_rules_tables_preserving_rows() {
+        // Simulate a v18 database (through M18, as shipped after Plan 23-02).
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        Migrations::new(vec![
+            M::up(include_str!("schema.sql")),
+            M::up(M2_FLAG_OUTBOX_SQL),
+            M::up(M3_UNSEEN_COUNT_SQL),
+            M::up(M4_BACKFILL_SQL),
+            M::up(M5_STATUS_TS_SQL),
+            M::up(M6_DELIMITER_SQL),
+            M::up(M7_IMAP_OUTBOX_SQL),
+            M::up(M8_ROLES_SQL),
+            M::up(M9_DRAFTS_SQL),
+            M::up(M10_SEND_QUEUE_SQL),
+            M::up(M11_SENT_UNFILED_SQL),
+            M::up(M12_CLASSIFY_SQL),
+            M::up(M13_EXCLUSIONS_SQL),
+            M::up(M14_REVIEW_SETTINGS_SQL),
+            M::up(M15_DISMISSED_SQL),
+            M::up(M16_BATCH_ITEMS_SQL),
+            M::up(M17_FTS_BODY_SQL),
+            M::up(M18_FILTERS_SQL),
+        ])
+        .to_latest(&mut conn)
+        .unwrap();
+        // Seed v18 rows: cached message + label + saved filter.
+        conn.execute(
+            "INSERT INTO mailboxes (name, uid_validity, uid_next) VALUES ('INBOX', 100, 4)",
+            [],
+        )
+        .unwrap();
+        let mb: i64 = conn
+            .query_row("SELECT id FROM mailboxes WHERE name = 'INBOX'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO messages (mailbox_id, uid, subject, from_addr, date_utc, flags, preview) \
+             VALUES (?1, 1, 'Antiga', 'a@x.com', '2024-01-01T00:00:00Z', '[]', 'p')",
+            rusqlite::params![mb],
+        )
+        .unwrap();
+        let msg_id: i64 = conn
+            .query_row(
+                "SELECT id FROM messages WHERE mailbox_id = ?1 AND uid = 1",
+                rusqlite::params![mb],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO labels (message_id, primary_id) VALUES (?1, 'financas')",
+            rusqlite::params![msg_id],
+        )
+        .unwrap();
+
+        // Forward-upgrade with the production set — only M19 applies.
+        Store::apply_migrations(&mut conn).unwrap();
+
+        // v18 rows survive the upgrade.
+        for (table, want) in [("messages", 1), ("labels", 1)] {
+            let n: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, want, "forward migration must preserve {table} rows");
+        }
+        // M19 surface exists.
+        for (kind, name) in [
+            ("table", "folder_rules"),
+            ("table", "rule_suggestions"),
+            ("index", "idx_rules_priority"),
+            ("index", "idx_rule_suggestions_rule"),
+        ] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = ?1 AND name = ?2",
+                    rusqlite::params![kind, name],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{kind} {name} should exist at schema v19");
+        }
+        // Fresh tables accept rule + suggestion writes round-trip.
+        conn.execute(
+            "INSERT INTO folder_rules (id, name, priority, conditions_json, dest_kind, destination) \
+             VALUES ('r-1', 'Pós-migração', 10, '{}', 'folder', 'Arquivo')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO rule_suggestions (message_id, rule_id, dest_kind, destination) \
+             VALUES (?1, 'r-1', 'folder', 'Arquivo')",
+            rusqlite::params![msg_id],
+        )
+        .unwrap();
+        let back: String = conn
+            .query_row(
+                "SELECT destination FROM rule_suggestions WHERE message_id = ?1",
+                rusqlite::params![msg_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(back, "Arquivo");
     }
 }

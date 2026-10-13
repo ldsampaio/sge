@@ -2500,6 +2500,203 @@ pub fn message_location(
     .map_err(super::StoreError::Sql)
 }
 
+// ── Plan 25-01: smart folder rules (RULE-01/02) ───────────────────
+// `folder_rules` rows are validated backend-side (`classify::rules`)
+// before every write; these helpers are dumb persistence. `Rule` JSON
+// blobs ride as bound parameters — conditions are data, never SQL.
+
+/// A persisted rule row (JSON blobs parsed by the caller layer).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleRow {
+    pub id: String,
+    pub name: String,
+    pub priority: i64,
+    pub conditions_json: String,
+    pub dest_kind: String,
+    pub destination: String,
+    pub scope_json: String,
+    pub enabled: bool,
+}
+
+fn rule_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RuleRow> {
+    Ok(RuleRow {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        priority: r.get(2)?,
+        conditions_json: r.get(3)?,
+        dest_kind: r.get(4)?,
+        destination: r.get(5)?,
+        scope_json: r.get(6)?,
+        enabled: r.get::<_, i64>(7)? != 0,
+    })
+}
+
+const RULE_COLS: &str = "id, name, priority, conditions_json, dest_kind, destination, scope_json, enabled";
+
+pub fn insert_rule(conn: &Connection, row: &RuleRow) -> StoreResult<()> {
+    conn.execute(
+        "INSERT INTO folder_rules (id, name, priority, conditions_json, dest_kind, destination, scope_json, enabled) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            row.id, row.name, row.priority, row.conditions_json,
+            row.dest_kind, row.destination, row.scope_json, row.enabled as i64,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn get_rule(conn: &Connection, id: &str) -> StoreResult<Option<RuleRow>> {
+    conn.query_row(
+        &format!("SELECT {RULE_COLS} FROM folder_rules WHERE id = ?1"),
+        rusqlite::params![id],
+        rule_from_row,
+    )
+    .optional()
+    .map_err(super::StoreError::Sql)
+}
+
+/// All rules in evaluation order: priority ASC (lower wins), ties by
+/// creation order (oldest wins — first match wins across rules).
+pub fn list_rules(conn: &Connection) -> StoreResult<Vec<RuleRow>> {
+    conn.prepare(&format!(
+        "SELECT {RULE_COLS} FROM folder_rules ORDER BY priority ASC, created_at ASC, id ASC"
+    ))?
+    .query_map([], rule_from_row)?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(super::StoreError::Sql)
+}
+
+pub fn update_rule(conn: &Connection, row: &RuleRow) -> StoreResult<()> {
+    conn.execute(
+        "UPDATE folder_rules SET name = ?2, priority = ?3, conditions_json = ?4, \
+         dest_kind = ?5, destination = ?6, scope_json = ?7, enabled = ?8, \
+         updated_at = datetime('now') WHERE id = ?1",
+        rusqlite::params![
+            row.id, row.name, row.priority, row.conditions_json,
+            row.dest_kind, row.destination, row.scope_json, row.enabled as i64,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Immediate delete (rules hold no mail — no confirm, mirrors Phase 23
+/// filter-delete semantics). Cascades pending suggestion rows.
+pub fn delete_rule(conn: &Connection, id: &str) -> StoreResult<usize> {
+    let n = conn.execute("DELETE FROM folder_rules WHERE id = ?1", rusqlite::params![id])?;
+    Ok(n)
+}
+
+pub fn set_rule_enabled(conn: &Connection, id: &str, enabled: bool) -> StoreResult<()> {
+    conn.execute(
+        "UPDATE folder_rules SET enabled = ?2, updated_at = datetime('now') WHERE id = ?1",
+        rusqlite::params![id, enabled as i64],
+    )?;
+    Ok(())
+}
+
+pub fn set_rule_priority(conn: &Connection, id: &str, priority: i64) -> StoreResult<()> {
+    conn.execute(
+        "UPDATE folder_rules SET priority = ?2, updated_at = datetime('now') WHERE id = ?1",
+        rusqlite::params![id, priority],
+    )?;
+    Ok(())
+}
+
+/// Remap category-kind rule destinations (taxonomy merge path, 25-02:
+/// same migration as the label remap). Plain-folder rows untouched.
+pub fn remap_rule_destinations(conn: &Connection, from: &str, to: &str) -> StoreResult<usize> {
+    let n = conn.execute(
+        "UPDATE folder_rules SET destination = ?2, updated_at = datetime('now') \
+         WHERE dest_kind = 'category' AND destination = ?1",
+        rusqlite::params![from, to],
+    )?;
+    Ok(n)
+}
+
+/// Rules still pointing at a taxonomy category id (delete/orphan path).
+pub fn rules_using_category(conn: &Connection, id: &str) -> StoreResult<Vec<RuleRow>> {
+    conn.prepare(&format!(
+        "SELECT {RULE_COLS} FROM folder_rules WHERE dest_kind = 'category' AND destination = ?1"
+    ))?
+    .query_map(rusqlite::params![id], rule_from_row)?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(super::StoreError::Sql)
+}
+
+// ── Rule-sourced suggestions: pointer-only, never content ────────────
+
+/// A pending rule hit. Carries ids + destination ONLY — no subject, sender,
+/// snippet, or justification text (transient UI strings are rebuilt at
+/// confirm time and redacted; logs carry rule-id + message-id).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleSuggestionRow {
+    pub message_id: u64,
+    pub rule_id: String,
+    pub dest_kind: String,
+    pub destination: String,
+}
+
+pub fn upsert_rule_suggestion(conn: &Connection, row: &RuleSuggestionRow) -> StoreResult<()> {
+    conn.execute(
+        "INSERT INTO rule_suggestions (message_id, rule_id, dest_kind, destination) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT (message_id) DO UPDATE SET rule_id = excluded.rule_id, \
+           dest_kind = excluded.dest_kind, destination = excluded.destination, \
+           suggested_at = datetime('now')",
+        rusqlite::params![row.message_id, row.rule_id, row.dest_kind, row.destination],
+    )?;
+    Ok(())
+}
+
+pub fn get_rule_suggestion(
+    conn: &Connection,
+    message_id: u64,
+) -> StoreResult<Option<RuleSuggestionRow>> {
+    conn.query_row(
+        "SELECT message_id, rule_id, dest_kind, destination FROM rule_suggestions WHERE message_id = ?1",
+        rusqlite::params![message_id],
+        |r| {
+            Ok(RuleSuggestionRow {
+                message_id: r.get(0)?,
+                rule_id: r.get(1)?,
+                dest_kind: r.get(2)?,
+                destination: r.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(super::StoreError::Sql)
+}
+
+pub fn delete_rule_suggestion(conn: &Connection, message_id: u64) -> StoreResult<()> {
+    conn.execute(
+        "DELETE FROM rule_suggestions WHERE message_id = ?1",
+        rusqlite::params![message_id],
+    )?;
+    Ok(())
+}
+
+/// Suggestions pending for a rule (bulk-mode surfacing, 25-02).
+pub fn rule_suggestions_for_rule(
+    conn: &Connection,
+    rule_id: &str,
+) -> StoreResult<Vec<RuleSuggestionRow>> {
+    conn.prepare(
+        "SELECT message_id, rule_id, dest_kind, destination FROM rule_suggestions \
+         WHERE rule_id = ?1 ORDER BY suggested_at ASC",
+    )?
+    .query_map(rusqlite::params![rule_id], |r| {
+        Ok(RuleSuggestionRow {
+            message_id: r.get(0)?,
+            rule_id: r.get(1)?,
+            dest_kind: r.get(2)?,
+            destination: r.get(3)?,
+        })
+    })?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(super::StoreError::Sql)
+}
+
 // ── tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]
