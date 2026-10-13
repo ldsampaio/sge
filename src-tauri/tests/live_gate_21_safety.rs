@@ -873,3 +873,88 @@ fn live_gate_21_retry_recorded_failure_schedules_inside_bounds() {
     );
     std::fs::remove_dir_all(&app_data).ok();
 }
+
+// ── Send-audit + secret-scan fixtures (D-13/D-14 — zero network) ─────────
+// Each violation shape the wrapper re-checks from the log is detected by
+// the bin helpers first: foreign recipients, non-empty cc/bcc, unprefixed
+// subjects, Bcc: header lines (header block only — body mentions pass),
+// reused Message-IDs, inflated call counts, planted credential substrings
+// (regex metachars included — matching is fixed-substring).
+
+#[test]
+fn live_gate_21_safety_audit_recipients_self_only_rule() {
+    let me = "me@example.com";
+    assert!(harness::audit_recipients_ok(r#"["me@example.com"]"#, "[]", "[]", me));
+    // Case + whitespace tolerance mirrors assert_self_only.
+    assert!(harness::audit_recipients_ok(r#"["  ME@EXAMPLE.COM  "]"#, "[]", "[]", me));
+    // Foreign To, extra To, empty To.
+    assert!(!harness::audit_recipients_ok(r#"["other@example.com"]"#, "[]", "[]", me));
+    assert!(!harness::audit_recipients_ok(r#"["me@example.com","other@example.com"]"#, "[]", "[]", me));
+    assert!(!harness::audit_recipients_ok("[]", "[]", "[]", me));
+    // Non-empty Cc / Bcc (whitespace-only still counts as empty, per D-01).
+    assert!(!harness::audit_recipients_ok(r#"["me@example.com"]"#, r#"["x@y.z"]"#, "[]", me));
+    assert!(!harness::audit_recipients_ok(r#"["me@example.com"]"#, "[]", r#"["x@y.z"]"#, me));
+    assert!(harness::audit_recipients_ok(r#"["me@example.com"]"#, r#"["  "]"#, "[]", me));
+    // Malformed JSON never passes.
+    assert!(!harness::audit_recipients_ok("not-json", "[]", "[]", me));
+}
+
+#[test]
+fn live_gate_21_safety_audit_subject_bcc_mid_rules() {
+    // Rule 2: sandbox prefix on every subject.
+    assert!(harness::audit_subject_prefixed("SGE-TEST-123-arrival"));
+    assert!(!harness::audit_subject_prefixed("hello world"));
+    assert!(!harness::audit_subject_prefixed("sge-test-lowercase"));
+    // Rule 3: Bcc: header line detected; body mentions and folded
+    // continuations are not headers.
+    assert!(harness::eml_has_bcc_header(b"From: a@x\r\nBcc: hidden@y\r\nSubject: SGE-TEST-1\r\n\r\nbody"));
+    assert!(harness::eml_has_bcc_header(b"from: a@x\nbcc: hidden@y\n\nbody"));
+    assert!(!harness::eml_has_bcc_header(b"From: a@x\r\nSubject: SGE-TEST-1\r\n\r\nwrite Bcc: in the body freely"));
+    assert!(!harness::eml_has_bcc_header(b"From: a@x\r\nSubject: Re: Bcc discussion\r\n\r\nbody"));
+    assert!(!harness::eml_has_bcc_header(b"From: a@x\r\n Subject: folded bcc: not-a-header\r\n\r\nbody"));
+    assert!(!harness::eml_has_bcc_header(b"From: a@x\r\nSubject: SGE-TEST-1\r\n"));
+    // Rule 4: duplicate Message-IDs detected.
+    assert_eq!(harness::audit_first_duplicate_mid(&["<a@x>", "<b@x>"]), None);
+    assert_eq!(
+        harness::audit_first_duplicate_mid(&["<a@x>", "<b@x>", "<a@x>"]),
+        Some("<a@x>".to_string())
+    );
+}
+
+#[test]
+fn live_gate_21_safety_scan_detects_planted_credential_substring() {
+    // Secrets carry regex metachars — matching is fixed-substring (contains).
+    let secrets = ["p@$$w0rd[.*]+foo", "second-secret"];
+    assert!(harness::scan_text_has_secret("log line p@$$w0rd[.*]+foo leaked", &secrets));
+    assert!(harness::scan_text_has_secret("has second-secret inside", &secrets));
+    assert!(!harness::scan_text_has_secret("clean log with RCPT=<me@example.com> only", &secrets));
+    // Partial passwords do NOT match (full-value scan, no prefix guessing).
+    assert!(!harness::scan_text_has_secret("log line p@$$w0rd leaked", &secrets));
+    // Empty secrets never match (unset env must not fail the scan).
+    assert!(!harness::scan_text_has_secret("anything at all", &["", "   ".trim()]));
+    assert!(!harness::scan_text_has_secret("anything at all", &[]));
+}
+
+#[test]
+fn live_gate_21_safety_dump_covers_all_temp_tables_for_scan() {
+    let store = Store::open_in_memory().unwrap();
+    let conn = store.conn();
+    let app_data = test_app_data("safety-dump");
+    let mb = queries::ensure_mailbox(conn, "INBOX").unwrap();
+    let mid = sge_lib::drafts::new_message_id("safety-dump");
+    queries::upsert_draft(conn, "draft-dump", mb, &mid, "SGE-TEST-dump", "probe", "me@example.com", "", "").unwrap();
+    let out = send_queue::enqueue_send(conn, &app_data, self_input("dump")).unwrap();
+    let (tables, rows, dump) = harness::dump_store_for_scan(conn);
+    assert!(tables.contains(&"send_queue".to_string()), "dump must cover send_queue: {:?}", tables);
+    assert!(tables.contains(&"drafts".to_string()), "dump must cover drafts: {:?}", tables);
+    assert!(rows > 0, "dump must carry rows");
+    assert!(dump.contains(&out.message_id), "dump must carry queue content");
+    assert!(dump.contains(&mid), "dump must carry drafts content");
+    // The dump text is what the password scan runs over.
+    assert!(!harness::scan_text_has_secret(&dump, &["definitely-not-present-secret"]));
+    assert!(harness::scan_text_has_secret(
+        &format!("{}\nplanted-secret-xyz", dump),
+        &["planted-secret-xyz"]
+    ));
+    std::fs::remove_dir_all(&app_data).ok();
+}

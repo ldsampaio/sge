@@ -600,6 +600,47 @@ pub fn scan_text_has_secret(text: &str, secrets: &[&str]) -> bool {
         .any(|s| !s.is_empty() && text.contains(s))
 }
 
+/// Full SQLite dump for the secret scan (D-13, T-21-04): renders EVERY
+/// table of the temp store. Runs in-process BEFORE cleanup removes the DB
+/// (post-run the file is gone, so the wrapper cannot dump it). Returns
+/// (table names, total rows, dump text). The caller greps the dump for the
+/// password values as fixed substrings and names WHICH artifact matched,
+/// never the secret itself.
+pub fn dump_store_for_scan(conn: &rusqlite::Connection) -> (Vec<String>, usize, String) {
+    let mut tables = Vec::new();
+    let mut rows = 0usize;
+    let mut dump = String::new();
+    let names: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+        .and_then(|mut s| {
+            s.query_map([], |r| r.get::<_, String>(0))
+                .map(|it| it.filter_map(|n| n.ok()).collect())
+        })
+        .unwrap_or_default();
+    for name in names {
+        tables.push(name.clone());
+        let sql = format!("SELECT * FROM \"{}\"", name.replace('"', ""));
+        if let Ok(mut s2) = conn.prepare(&sql) {
+            let coln = s2.column_count();
+            if let Ok(mapped) = s2.query_map([], |r| {
+                let mut cells = Vec::with_capacity(coln);
+                for i in 0..coln {
+                    let v: rusqlite::types::Value = r.get(i)?;
+                    cells.push(format!("{:?}", v));
+                }
+                Ok(cells.join("|"))
+            }) {
+                for line in mapped.filter_map(|l| l.ok()) {
+                    rows += 1;
+                    dump.push_str(&line);
+                    dump.push('\n');
+                }
+            }
+        }
+    }
+    (tables, rows, dump)
+}
+
 /// Backoff-schedule check (D-09): a deferred row's `next_retry_at` must fall
 /// inside `backoff_bounds(attempts)` measured from `now_epoch`.
 /// `slack_secs` absorbs the seconds between the schedule write and this
@@ -1047,6 +1088,10 @@ pub struct TrackedMail {
     pub draft_mid: Option<String>,
     pub draft_id: Option<String>,
     pub draft_server_uid: Option<u32>,
+    /// Credential values for the in-bin secret scan (D-13): cloned from the
+    /// keyring/env config at run start, used ONLY as fixed-substring scan
+    /// needles over the temp-DB dump — never printed.
+    pub scan_secrets: Vec<zeroize::Zeroizing<String>>,
 }
 
 impl TrackedMail {
@@ -1073,6 +1118,7 @@ async fn run() -> i32 {
     let db_path = std::env::temp_dir().join(format!("sge-live21-{tag}.sqlite"));
     let app_data = std::env::temp_dir().join(format!("sge-live21-{tag}-data"));
     let mut tracked = TrackedMail::default();
+    tracked.scan_secrets = vec![cfg.password.clone(), cfg.smtp_password.clone()];
     let store = match Store::open(&db_path) {
         Ok(s) => Arc::new(Mutex::new(s)),
         Err(e) => {
@@ -2510,6 +2556,399 @@ async fn run() -> i32 {
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
 
+    // 10. draft-send (D-16, BINARY verdict) — sandbox draft → production
+    // send → no-orphan assert. PASS ONLY if the flush itself removed the
+    // local drafts row AND the server copy with zero harness-side discard
+    // (same-transaction delete per D-16). Any orphan → FAIL BY DESIGN — the
+    // honest outcome (RESEARCH A6 re-verified at execution time: no
+    // draft-delete call exists in flush_one_row/flush_send_queue, only the
+    // draft_id Message-ID-reuse arm in enqueue_send) routing to gap closure.
+    // This verification-only phase implements no product fix and performs no
+    // assisted discard on this path.
+    let draft_folder = format!("{}{}-drafts", SANDBOX_PREFIX, tag);
+    if let Err(e) = assert_sandbox_prefix(&draft_folder) {
+        log_step(&tracked, 10, "draft-send", false, &format!("sandbox guard refused the draft folder: {}", e));
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    // Sandbox APPEND preferred (D-16 researcher flag): attempt account-root
+    // CREATE for the draft sandbox first.
+    let sandbox_created = {
+        let mut lease = match manager.lease_for("INBOX").await {
+            Ok(l) => l,
+            Err(e) => {
+                log_step(&tracked, 10, "draft-send", false, &format!("INBOX lease failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        };
+        lease.session().create_mailbox(&draft_folder).await.is_ok()
+    };
+    // Real-Drafts fallback with tracked-UID cleanup when the server refuses
+    // root CREATE — recorded verbatim in the STEP detail line.
+    let mut fallback_note = String::new();
+    let draft_wire = if sandbox_created {
+        draft_folder.clone()
+    } else {
+        let infos = match manager.list_mailboxes().await {
+            Ok(i) => i,
+            Err(e) => {
+                log_step(&tracked, 10, "draft-send", false, &format!("LIST for Drafts fallback failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        };
+        let wire = infos
+            .iter()
+            .find(|i| i.name == "Drafts")
+            .or_else(|| infos.iter().find(|i| i.name.eq_ignore_ascii_case("drafts")))
+            .or_else(|| infos.iter().find(|i| i.name.eq_ignore_ascii_case("rascunhos")))
+            .map(|i| i.name.clone());
+        match wire {
+            Some(w) => {
+                fallback_note = format!("fallback: real Drafts {:?} (server refused root CREATE for {:?}; tracked-UID cleanup only, never DELETE)", w, draft_folder);
+                w
+            }
+            None => {
+                log_step(&tracked, 10, "draft-send", false, "no Drafts folder resolved for the fallback — refusing blind APPEND elsewhere");
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        }
+    };
+    if sandbox_created {
+        tracked.draft_sandbox = Some(draft_folder.clone());
+    } else {
+        tracked.draft_used_real_drafts = true;
+        tracked.draft_real_drafts_wire = Some(draft_wire.clone());
+    }
+    // Local drafts row (the Message-ID anchor the draft_id arm reuses).
+    let draft_id = format!("live21-{}-draftsend", tag);
+    let draft_mid = new_message_id(&format!("live21-{}-draftsend", tag));
+    let draft_subject = format!("{}{}-draftsend", SUBJECT_PREFIX, tag);
+    {
+        let guard = store.lock().unwrap();
+        let mb = match queries::ensure_mailbox(guard.conn(), "INBOX") {
+            Ok(id) => id,
+            Err(e) => {
+                log_step(&tracked, 10, "draft-send", false, &format!("temp mailbox seed failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        };
+        if let Err(e) = queries::upsert_draft(
+            guard.conn(),
+            &draft_id,
+            mb,
+            &draft_mid,
+            &draft_subject,
+            "live gate draft-send probe",
+            &cfg.self_addr,
+            "",
+            "",
+        ) {
+            log_step(&tracked, 10, "draft-send", false, &format!("temp draft seed failed: {}", e));
+            return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+        }
+    }
+    tracked.draft_id = Some(draft_id.clone());
+    tracked.draft_mid = Some(draft_mid.clone());
+    // Enqueue with draft_id set (production path reuses the drafts row
+    // Message-ID per the send_queue.rs draft_id arm).
+    if let Err(e) = assert_self_only(&cfg.self_addr, &[cfg.self_addr.clone()], &[], &[], &cfg.self_addr) {
+        log_step(&tracked, 10, "draft-send", false, &e);
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    {
+        let guard = store.lock().unwrap();
+        match send_queue::enqueue_send(
+            guard.conn(),
+            &app_data,
+            EnqueueInput {
+                from: cfg.self_addr.clone(),
+                to: vec![cfg.self_addr.clone()],
+                cc: vec![],
+                bcc: vec![],
+                subject: draft_subject.clone(),
+                body: "live gate draft-send probe".to_string(),
+                draft_id: Some(draft_id.clone()),
+            },
+        ) {
+            Ok(out) => {
+                if out.deduped || out.message_id != draft_mid {
+                    log_step(
+                        &tracked,
+                        10,
+                        "draft-send",
+                        false,
+                        &format!("draft_id arm did not reuse the drafts-row Message-ID (deduped={} mid={})", out.deduped, out.message_id),
+                    );
+                    return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+                }
+            }
+            Err(e) => {
+                log_step(&tracked, 10, "draft-send", false, &format!("draft-anchored enqueue_send failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        }
+    }
+    // Server copy: APPEND the queued .eml bytes (same Message-ID) to the
+    // sandbox / fallback Drafts. Harness-issued, MID-tracked, allow-listed.
+    let draft_eml = {
+        let guard = store.lock().unwrap();
+        match queries::get_send_row_by_message_id(guard.conn(), &draft_mid) {
+            Ok(Some(row)) => std::fs::read(&row.eml_path).unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    };
+    if draft_eml.is_empty() {
+        log_step(&tracked, 10, "draft-send", false, "queued .eml unreadable for the draft server copy");
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    if let Err(e) = assert_harness_append_target(&draft_wire, &[draft_wire.clone()]) {
+        log_step(&tracked, 10, "draft-send", false, &format!("append-target guard refused the draft wire: {}", e));
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    {
+        let mut lease = match manager.lease_for(&draft_wire).await {
+            Ok(l) => l,
+            Err(e) => {
+                log_step(&tracked, 10, "draft-send", false, &format!("draft-wire lease failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        };
+        if let Err(e) = lease.session().append_message(&draft_wire, "\\Seen", &draft_eml).await {
+            log_step(&tracked, 10, "draft-send", false, &format!("draft server-copy APPEND failed: {}", e));
+            return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+        }
+        match lease.session().uid_search_header("Message-ID", &draft_mid).await {
+            Ok(hits) => match assert_exactly_one(&hits, "draft-send server copy") {
+                Ok(u) => {
+                    tracked.draft_server_uid = Some(u);
+                }
+                Err(e) => {
+                    log_step(&tracked, 10, "draft-send", false, &e);
+                    return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+                }
+            },
+            Err(e) => {
+                log_step(&tracked, 10, "draft-send", false, &format!("draft-wire SEARCH failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        }
+    }
+    // Flush the draft-anchored send for real (SMTP → INBOX arrival + Sent
+    // filing — the send half must succeed for the orphan verdict to mean
+    // anything).
+    let calls_before_draft = send_calls.load(Ordering::SeqCst);
+    eprintln!("[live-gate] {} (draft-send leg)", envelope_log_line(&cfg.self_addr, &[cfg.self_addr.clone()]));
+    let draft_summary = worker.flush_send_queue(&flush_env).await;
+    let calls_after_draft = send_calls.load(Ordering::SeqCst);
+    record_calls(&tracked, "draft-send", calls_before_draft, calls_after_draft);
+    eprintln!(
+        "[live-gate] draft flush done: sent={} deferred={} failed={} uncertain={} unfiled={} transport_calls={}",
+        draft_summary.sent,
+        draft_summary.deferred,
+        draft_summary.failed,
+        draft_summary.uncertain,
+        draft_summary.sent_unfiled,
+        calls_after_draft
+    );
+    if draft_summary.sent != 1 || calls_after_draft != calls_before_draft + 1 {
+        log_step(
+            &tracked,
+            10,
+            "draft-send",
+            false,
+            &format!("draft send did not deliver once (sent={} calls {} -> {})", draft_summary.sent, calls_before_draft, calls_after_draft),
+        );
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    let draft_uid = match poll_inbox_for_mid(&manager, &draft_mid, inbox_validity).await {
+        Ok(u) => u,
+        Err(d) => {
+            log_step(&tracked, 10, "draft-send", false, &d);
+            return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+        }
+    };
+    if !peek_confirms_mid(&manager, "INBOX", draft_uid, &draft_mid).await {
+        log_step(&tracked, 10, "draft-send", false, "PEEK header confirm failed (subject prefix / Message-ID)");
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    let draft_sent_uid = match search_sent_for_mid(&manager, &sent_wire, &draft_mid).await {
+        Ok(hits) => match assert_exactly_one(&hits, "draft-send sent-copy") {
+            Ok(u) => u,
+            Err(e) => {
+                log_step(&tracked, 10, "draft-send", false, &e);
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        },
+        Err(e) => {
+            log_step(&tracked, 10, "draft-send", false, &e);
+            return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+        }
+    };
+    tracked.message_ids.push(draft_mid.clone());
+    tracked.inbox_uids.push((draft_mid.clone(), draft_uid));
+    tracked.sent_uids.push((draft_mid.clone(), draft_sent_uid));
+    // BINARY no-orphan verdict on the AUTO path: PASS only if the flush
+    // ITSELF removed the local drafts row AND the server copy with zero
+    // harness-side discard. No assisted-discard fallback, never a PASS with
+    // a GAP footnote.
+    let local_gone = {
+        let guard = store.lock().unwrap();
+        match queries::get_draft(guard.conn(), &draft_id) {
+            Ok(None) => true,
+            Ok(Some(_)) => false,
+            Err(e) => {
+                log_step(&tracked, 10, "draft-send", false, &format!("drafts-row lookup failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        }
+    };
+    let server_hits: Vec<u32> = {
+        let mut lease = match manager.lease_for(&draft_wire).await {
+            Ok(l) => l,
+            Err(e) => {
+                log_step(&tracked, 10, "draft-send", false, &format!("draft-wire lease failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        };
+        match lease.session().uid_search_header("Message-ID", &draft_mid).await {
+            Ok(h) => h,
+            Err(e) => {
+                log_step(&tracked, 10, "draft-send", false, &format!("orphan re-SEARCH failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        }
+    };
+    // Zero harness-side discard ran on this path — recorded as a constant,
+    // not an inference (this leg performs no discard call).
+    let harness_discard_ran = false;
+    let draft_evidenced = if fallback_note.is_empty() {
+        format!("sandbox {:?}", draft_wire)
+    } else {
+        fallback_note.clone()
+    };
+    if local_gone && server_hits.is_empty() && !harness_discard_ran {
+        if !log_step(
+            &tracked,
+            10,
+            "draft-send",
+            true,
+            &format!("flush itself removed the local drafts row AND the server copy ({}); drafts-row lookup: gone; server SEARCH: 0 hits; harness discard ran: false (same-transaction delete D-16 observed)", draft_evidenced),
+        ) {
+            return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+        }
+    } else {
+        log_step(
+            &tracked,
+            10,
+            "draft-send",
+            false,
+            &format!("FAIL BY DESIGN (binary verdict): local drafts row gone={} (want true), server copy SEARCH hits={} (want 0), harness discard ran={} (want false); {} — prod flush performs no delete_draft (RESEARCH A6 re-verified this run: draft_id arm reuses the Message-ID, nothing deletes the row); routes to gap closure (delete_draft-in-flush fix or explicit D-16 deferral)", local_gone, server_hits.len(), harness_discard_ran, draft_evidenced),
+        );
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    if !check_list_stable(&manager, &before, &list_guard, &tracked, 10, "draft-send-list").await {
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+
+    // Send audit (D-14, T-21-01): all five rules over the temp queue rows +
+    // rendered bytes, printed as AUDIT-* lines for the wrapper re-check
+    // (defense in depth — the bin aborts on any violation first).
+    {
+        let (rows, calls_snapshot): (Vec<(String, String, String, String, String)>, Vec<(String, usize, usize)>) = {
+            let guard = store.lock().unwrap();
+            let mut rows = Vec::new();
+            if let Ok(mut stmt) = guard.conn().prepare(
+                "SELECT message_id, to_addrs, cc_addrs, bcc_addrs, eml_path FROM send_queue ORDER BY created_at",
+            ) {
+                if let Ok(mapped) = stmt.query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
+                }) {
+                    rows = mapped.filter_map(|r| r.ok()).collect();
+                }
+            }
+            let calls_snapshot = tracked
+                .calls_log
+                .lock()
+                .map(|l| l.clone())
+                .unwrap_or_default();
+            (rows, calls_snapshot)
+        };
+        let mut violations: Vec<String> = Vec::new();
+        let mut mids: Vec<String> = Vec::new();
+        for (mid, to_json, cc_json, bcc_json, eml_path) in &rows {
+            println!("AUDIT-ROW mid={} to={} cc={} bcc={}", mid, to_json, cc_json, bcc_json);
+            if !audit_recipients_ok(to_json, cc_json, bcc_json, &cfg.self_addr) {
+                violations.push(format!("rule1 recipients not self-only: mid {}", mid));
+            }
+            mids.push(mid.clone());
+            match std::fs::read(eml_path) {
+                Ok(bytes) => {
+                    let subject = mail_parser::MessageParser::new()
+                        .parse(&bytes)
+                        .and_then(|m| m.subject().map(|s| s.to_string()))
+                        .unwrap_or_default();
+                    let subject_ok = !subject.is_empty() && audit_subject_prefixed(&subject);
+                    let bcc_absent = !eml_has_bcc_header(&bytes);
+                    println!("AUDIT-EML mid={} subject_ok={} bcc_absent={}", mid, subject_ok, bcc_absent);
+                    println!("AUDIT-SUBJECT {}", subject);
+                    if !subject_ok {
+                        violations.push(format!("rule2 subject without prefix: mid {}", mid));
+                    }
+                    if !bcc_absent {
+                        violations.push(format!("rule3 Bcc: header in sent bytes: mid {}", mid));
+                    }
+                }
+                Err(e) => {
+                    violations.push(format!("rule2/3 unreadable .eml for mid {}: {}", mid, e));
+                }
+            }
+        }
+        for m in &mids {
+            println!("AUDIT-MID {}", m);
+        }
+        let mid_refs: Vec<&str> = mids.iter().map(|s| s.as_str()).collect();
+        if let Some(dup) = audit_first_duplicate_mid(&mid_refs) {
+            violations.push(format!("rule4 reused Message-ID: {}", dup));
+        }
+        for (leg, before, after) in &calls_snapshot {
+            let delta = after.saturating_sub(*before);
+            let exp = expected_calls_delta(leg);
+            let ok = exp == Some(delta);
+            println!(
+                "AUDIT-CALLS leg={} delta={} expected={} ok={}",
+                leg,
+                delta,
+                exp.map(|e| e.to_string()).unwrap_or_else(|| "?".to_string()),
+                ok
+            );
+            if !ok {
+                violations.push(format!("rule5 call-count mismatch: leg {} delta {} (want {:?})", leg, delta, exp));
+            }
+        }
+        if violations.is_empty() {
+            println!(
+                "AUDIT summary: PASS rules=5 rows={} mids-unique=true calls-ok=true",
+                rows.len()
+            );
+            log_step(
+                &tracked,
+                10,
+                "send-audit",
+                true,
+                &format!("rules 1-5 hold over {} queue rows (self-only recipients, prefixed subjects, no Bcc: header, unique MIDs, call counts reconcile)", rows.len()),
+            );
+        } else {
+            println!("AUDIT summary: FAIL {}", violations.join("; "));
+            log_step(&tracked, 10, "send-audit", false, &violations.join("; "));
+            return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+        }
+    }
+
     // 11. autosave-probe (D-08): the end state must be exactly 1 Sent UID
     // either way — explicit APPEND or server auto-save deduped by the filing
     // leg's probe SEARCH (no twin copy). Which branch ran is named by the
@@ -2568,6 +3007,66 @@ async fn cleanup(
     tracked: &TrackedMail,
 ) -> i32 {
     let mut ok = true;
+    // Secret scan (D-13, T-21-04): full SQLite dump of the temp store,
+    // scanned in-process BEFORE cleanup removes the DB file (post-run the
+    // file is gone, so the wrapper cannot dump it — it re-checks the
+    // SCAN-DB line instead). Fixed-substring match over the full password
+    // values; any hit names WHICH artifact matched, never the secret.
+    {
+        let (tables, rows, dump) =
+            match rusqlite::Connection::open_with_flags(
+                db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            ) {
+                Ok(conn) => dump_store_for_scan(&conn),
+                Err(e) => {
+                    eprintln!(
+                        "[live-gate] secret-scan: temp DB unreadable ({e}) — scanning empty dump"
+                    );
+                    (Vec::new(), 0, String::new())
+                }
+            };
+        let secrets: Vec<&str> = tracked
+            .scan_secrets
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        let hit = scan_text_has_secret(&dump, &secrets);
+        if hit {
+            println!(
+                "SECRET-LEAK: credential substring in temp-DB dump (artifact: sqlite-dump tables={:?}; see which artifact matched, never the secret)",
+                tables
+            );
+        }
+        println!(
+            "SCAN-DB tables={} rows={} result={} (log + full temp-DB dump carry {} credential substring)",
+            tables.len(),
+            rows,
+            if hit { "FAIL" } else { "PASS" },
+            if hit { "a" } else { "no" }
+        );
+        if !log_step(
+            tracked,
+            TOTAL_STEPS,
+            "secret-scan",
+            !hit,
+            &format!(
+                "full temp-DB dump scanned (tables={} rows={}); {}",
+                tables.len(),
+                rows,
+                if hit {
+                    "CREDENTIAL HIT — run fails"
+                } else {
+                    "no credential substring in dump (log scanned by the wrapper)"
+                }
+            ),
+        ) {
+            ok = false;
+        }
+        if hit {
+            ok = false;
+        }
+    }
     // INBOX arrivals expunged via INBOX, Sent copies via the Sent wire —
     // UIDs are per-folder (T-21-05).
     for (mid, uid) in tracked.inbox_uids.iter() {
@@ -2605,7 +3104,16 @@ async fn cleanup(
     );
     let _ = std::fs::remove_file(db_path);
     let _ = std::fs::remove_dir_all(app_data);
-    if ok && clean { 0 } else { 1 }
+    // Exit-code contract (USAGE: 0 all-pass · 1 assertion FAIL): a mid-run
+    // STEP FAIL must propagate even when cleanup itself succeeds — the
+    // canonical outcome log is the witness (Rule 1 fix: pre-21-02 code
+    // returned `ok && clean` only, swallowing leg failures).
+    let steps_ok = tracked
+        .step_log
+        .lock()
+        .map(|log| log.iter().all(|s| s.ok))
+        .unwrap_or(false);
+    if ok && clean && steps_ok { 0 } else { 1 }
 }
 
 const USAGE: &str = r#"live_gate_21 — Phase 21 sandboxed live gate (tracer)
