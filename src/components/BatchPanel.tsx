@@ -1,10 +1,14 @@
 import React from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { kindFromReport } from "./ArchivePanel";
 
 /** Phase 20 batch UI: explicit whole-account run with live progress,
  *  persisted report, and undo. Unconfirmed BY DESIGN (one account-level
- *  decision) — distinct from single-email always-confirmed. */
+ *  decision) — distinct from single-email always-confirmed.
+ *  Phase 24 extension: archive runs (kind tag in totals_json) show an
+ *  archive label + threshold echo and resume via archive_run — the shared
+ *  progress/report/undo surface serves both kinds. */
 
 interface BatchProgressEvent {
   run_id: number;
@@ -21,6 +25,10 @@ interface BatchReport {
   per_category: Array<[string, number]>;
   remainder: number;
   undone: number;
+  /** Raw totals_json (Phase 24: carries {"kind":"archive",...} for
+   *  archive runs — parsed client-side for LABELING ONLY, never trusted
+   *  for safety decisions). Absent on old cached payloads. */
+  totals_json?: string;
 }
 
 interface BatchPanelProps {
@@ -40,15 +48,36 @@ export function BatchPanel({ onClose }: BatchPanelProps) {
   const [message, setMessage] = React.useState<string | null>(null);
   const [busy, setBusy] = React.useState(false);
   const [pastRuns, setPastRuns] = React.useState<BatchRunRow[]>([]);
+  /** Run-id → totals kind ("archive" vs classify), resolved from
+   *  batch_report payloads (backend truth). Interrupted archive runs
+   *  resume via archive_run, classify runs via batch_classify. */
+  const [runKinds, setRunKinds] = React.useState<Record<number, string>>({});
+  const [runThresholds, setRunThresholds] = React.useState<Record<number, number | null>>({});
+
+  const resolveKind = React.useCallback(async (id: number) => {
+    try {
+      const r = (await invoke("batch_report", { runId: id })) as BatchReport;
+      const parsed = kindFromReport(r.totals_json, r.per_category);
+      setRunKinds((prev) => (prev[id] === parsed.kind ? prev : { ...prev, [id]: parsed.kind }));
+      setRunThresholds((prev) => ({ ...prev, [id]: parsed.thresholdDays }));
+      return r;
+    } catch {
+      return null;
+    }
+  }, []);
 
   const loadRuns = React.useCallback(async () => {
     try {
       const rows = (await invoke("batch_runs_list")) as BatchRunRow[];
       setPastRuns(rows);
+      // Label interrupted runs by kind so resume picks the right command.
+      for (const r of rows.filter((x) => x.state === "interrupted")) {
+        void resolveKind(r.id);
+      }
     } catch {
       /* panel shows start-only */
     }
-  }, []);
+  }, [resolveKind]);
 
   React.useEffect(() => {
     void loadRuns();
@@ -57,6 +86,11 @@ export function BatchPanel({ onClose }: BatchPanelProps) {
   React.useEffect(() => {
     const unlisten = listen<BatchProgressEvent>("batch-progress", (e) => {
       setProgress(e.payload);
+      // Resolve the run kind once so archive progress shows its label +
+      // threshold echo while running (report arrives at the end).
+      if (runKinds[e.payload.run_id] === undefined) {
+        void resolveKind(e.payload.run_id);
+      }
       if (e.payload.state === "done" || e.payload.state === "interrupted") {
         setBusy(false);
         void loadReport(e.payload.run_id);
@@ -65,16 +99,21 @@ export function BatchPanel({ onClose }: BatchPanelProps) {
     return () => {
       void unlisten.then((f) => f());
     };
-  }, []);
+  }, [resolveKind, runKinds]);
 
   const loadReport = async (id: number) => {
     try {
       const r = (await invoke("batch_report", { runId: id })) as BatchReport;
       setReport(r);
+      const parsed = kindFromReport(r.totals_json, r.per_category);
+      setRunKinds((prev) => ({ ...prev, [id]: parsed.kind }));
+      setRunThresholds((prev) => ({ ...prev, [id]: parsed.thresholdDays }));
     } catch (e) {
       setMessage(`Falha no relatório: ${e}`);
     }
   };
+
+  const kindOf = (id: number | null): string => (id === null ? "classify" : runKinds[id] ?? "classify");
 
   const start = async (resume?: number) => {
     if (resume === undefined) {
@@ -85,8 +124,15 @@ export function BatchPanel({ onClose }: BatchPanelProps) {
     setReport(null);
     setProgress(null);
     try {
-      const id = (await invoke("batch_classify", { scope: null, resumeRun: resume ?? null })) as number;
-      setRunId(id);
+      if (resume !== undefined && kindOf(resume) === "archive") {
+        // Interrupted ARCHIVE run: resume on the archive path (the
+        // classifier path would misfile archive candidates).
+        const id = (await invoke("archive_run", { resumeRun: resume })) as number;
+        setRunId(id);
+      } else {
+        const id = (await invoke("batch_classify", { scope: null, resumeRun: resume ?? null })) as number;
+        setRunId(id);
+      }
       await loadRuns();
     } catch (e) {
       setMessage(`Falha ao iniciar: ${e}`);
@@ -104,7 +150,8 @@ export function BatchPanel({ onClose }: BatchPanelProps) {
 
   const undo = async () => {
     if (runId === null) return;
-    if (!window.confirm("Desfazer a reorganização e restaurar os originais?")) return;
+    const archiveUndo = kindOf(report?.run_id ?? runId) === "archive";
+    if (!window.confirm(archiveUndo ? "Desfazer o arquivamento e restaurar os originais?" : "Desfazer a reorganização e restaurar os originais?")) return;
     try {
       const n = (await invoke("undo_batch", { runId })) as number;
       setMessage(`${n} e-mails restaurados.`);
@@ -164,7 +211,7 @@ export function BatchPanel({ onClose }: BatchPanelProps) {
                 style={{ marginLeft: 8 }}
                 onClick={() => void start(r.id)}
               >
-                Retomar #{r.id}
+                Retomar #{r.id}{kindOf(r.id) === "archive" ? " (arquivo)" : ""}
               </button>
             ))}
           </>
@@ -173,6 +220,11 @@ export function BatchPanel({ onClose }: BatchPanelProps) {
           <div style={{ margin: "12px 0" }}>
             <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.85rem" }}>
               <span>
+                {(progress?.run_id ?? runId) !== null && kindOf(progress?.run_id ?? runId) === "archive" ? (
+                  <>
+                    Arquivo · mais de {runThresholds[progress?.run_id ?? runId ?? -1] ?? "?"} dias ·{" "}
+                  </>
+                ) : null}
                 {progress?.done ?? 0} de {progress?.total ?? "?"} · {progress?.moved ?? 0} movidos ·{" "}
                 {progress?.review ?? 0} para revisão
               </span>
@@ -190,7 +242,12 @@ export function BatchPanel({ onClose }: BatchPanelProps) {
         )}
         {report && (
           <div style={{ marginTop: 12 }}>
-            <h3>Relatório</h3>
+            <h3>Relatório{kindOf(report.run_id) === "archive" ? " de arquivo" : ""}</h3>
+            {kindOf(report.run_id) === "archive" && runThresholds[report.run_id] != null && (
+              <p style={{ color: "#94a3b8", fontSize: "0.8rem" }}>
+                Arquivo · mais de {runThresholds[report.run_id]} dias
+              </p>
+            )}
             <ul style={{ listStyle: "none", padding: 0 }}>
               {report.per_category.map(([cat, n]) => (
                 <li key={cat}>
@@ -204,7 +261,7 @@ export function BatchPanel({ onClose }: BatchPanelProps) {
             </p>
             {report.state === "done" && (
               <button type="button" className="btn btn-small" onClick={() => void undo()}>
-                Desfazer reorganização
+                {kindOf(report.run_id) === "archive" ? "Desfazer arquivamento" : "Desfazer reorganização"}
               </button>
             )}
           </div>

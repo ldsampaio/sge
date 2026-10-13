@@ -55,6 +55,22 @@ export function parseArchiveKind(totalsJson: string): { kind: string; thresholdD
   }
 }
 
+/** Run kind from a report payload: backend totals_json kind first
+ *  (authoritative); per-category `archive` label id as fallback for runs
+ *  whose totals were overwritten by the shared undo (`{}` — verbatim
+ *  Phase-20 behavior, see 24-01). Labeling only, never safety. */
+export function kindFromReport(
+  totalsJson: string | undefined,
+  perCategory: Array<[string, number]> | undefined,
+): { kind: string; thresholdDays: number | null } {
+  const parsed = parseArchiveKind(totalsJson ?? "");
+  if (parsed.kind === "archive") return parsed;
+  if ((perCategory ?? []).some(([cat]) => cat === "archive")) {
+    return { kind: "archive", thresholdDays: parsed.thresholdDays };
+  }
+  return parsed;
+}
+
 /** Structural always-excluded folders (mirrors the backend selector —
  *  UI restraint never the only guard; the backend refuses these even if
  *  forged via IPC). Returns the one-line trust rationale or null. */
@@ -121,7 +137,7 @@ export function ArchivePanel({ onClose }: ArchivePanelProps) {
     try {
       const r = (await invoke("batch_report", { runId: id })) as BatchReport;
       setReport(r);
-      setReportKind(parseArchiveKind(r.totals_json ?? "").kind);
+      setReportKind(kindFromReport(r.totals_json, r.per_category).kind);
     } catch (e) {
       setMessage(`Falha no relatório: ${e}`);
     }
