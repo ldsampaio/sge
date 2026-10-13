@@ -7,6 +7,11 @@
 //! pipeline through `enqueue_send` → `SyncWorker::flush_send_queue` with a
 //! real `SmtpTransporter` behind a counting decorator.
 //!
+//! 12 STEPs: 1 preflight, 2 recipient-guard, 3 arrival, 4 sent-copy,
+//! 5 no-duplicate, 6 sent-unfiled, 7 offline-flush (D-09), 8 uncertain-
+//! reconcile (D-10), 9 crash-recover (D-11), 10 draft-send (D-16, binary
+//! verdict), 11 autosave-probe, 12 cleanup (D-15) + REPORT.
+//!
 //! Safety contract (D-01..D-04, D-13/D-14):
 //! - Test mail goes ONLY to `SGE_LIVE_SELF` (envelope AND headers).
 //!   `assert_self_only` aborts the run BEFORE `enqueue_send` is ever called
@@ -52,9 +57,9 @@ pub const SANDBOX_PREFIX: &str = "SGE-Test-";
 /// may leave the box).
 pub const SUBJECT_PREFIX: &str = "SGE-TEST-";
 
-/// Step count for this tracer slice (Task 1 implements preflight,
-/// recipient-guard and cleanup; Tasks 2-3 fill in the middle legs).
-pub const TOTAL_STEPS: usize = 8;
+/// Step count for the full gate (21-02 expansion: failure-mode legs 7-9,
+/// draft-send leg 10, probe 11, cleanup 12).
+pub const TOTAL_STEPS: usize = 12;
 
 /// Cleanup discipline (D-15, discretion): 3 retries with backoff, then exact
 /// manual steps — never an unbounded destructive loop.
@@ -452,6 +457,321 @@ impl SmtpTransport for SharedCountingTransport {
     }
 }
 
+// ── DATA-timeout fault decorator (D-10, zero prod-code changes) ──────────
+// Wraps the real transport: while `fault_armed`, returns
+// `SmtpOutcome::Uncertain` WITHOUT calling the inner transport (zero SMTP
+// bytes leave the box on the faulted attempt — the deterministic analogue of
+// a DATA-timeout, cf. RESEARCH decorator recommendation). Disarmed, forwards
+// and counts the real call. `inner_calls` counts only forwarded calls, so a
+// reconcile-not-resend proof reads it across `reconcile_uncertain_sends`
+// (a SEARCH hit must confirm with the count UNCHANGED).
+
+pub struct TimeoutTransport {
+    inner: Arc<dyn SmtpTransport>,
+    armed: Arc<AtomicBool>,
+    inner_calls: Arc<AtomicUsize>,
+}
+
+impl TimeoutTransport {
+    pub fn new(inner: Arc<dyn SmtpTransport>) -> (Self, Arc<AtomicBool>, Arc<AtomicUsize>) {
+        let armed = Arc::new(AtomicBool::new(false));
+        let inner_calls = Arc::new(AtomicUsize::new(0));
+        (
+            Self {
+                inner,
+                armed: armed.clone(),
+                inner_calls: inner_calls.clone(),
+            },
+            armed,
+            inner_calls,
+        )
+    }
+}
+
+impl SmtpTransport for TimeoutTransport {
+    fn send_raw(
+        &self,
+        account: &SmtpAccount,
+        envelope_from: &str,
+        envelope_to: &[String],
+        bytes: &[u8],
+    ) -> SmtpOutcome {
+        if self.armed.load(Ordering::SeqCst) {
+            return SmtpOutcome::Uncertain {
+                reason: "live-gate: injected DATA timeout".to_string(),
+            };
+        }
+        self.inner_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.send_raw(account, envelope_from, envelope_to, bytes)
+    }
+}
+
+/// Harness-issued APPEND scoping (D-03, T-21-05): a manual APPEND is allowed
+/// ONLY to an explicitly passed allow-list — the preflight-resolved Sent wire
+/// (uncertain-leg simulated server-accept, mirroring the filing leg's APPEND)
+/// or the per-run sandbox / recorded Drafts fallback (draft leg). INBOX is
+/// never appendable by the harness (arrival lands by server delivery only),
+/// so it can never appear in the allow-list.
+pub fn assert_harness_append_target(wire: &str, allowed: &[String]) -> Result<(), SyncError> {
+    if allowed.iter().any(|a| a == wire) {
+        Ok(())
+    } else {
+        Err(SyncError::Refused(format!(
+            "live-gate: refusing harness APPEND to {wire:?} (allowed: {allowed:?})"
+        )))
+    }
+}
+
+// ── Send-audit helpers (D-14, T-21-01 — pure, offline-testable) ──────────
+// The live legs print one AUDIT-ROW / AUDIT-EML / AUDIT-CALLS / AUDIT-MID
+// line per item; `scripts/live-21.sh` re-verifies the five rules from the
+// wrapper log (defense in depth — the bin aborts on any violation first).
+
+/// Rule 1: every queue row's recipients are exactly self-only (mirrors
+/// `assert_self_only`; columns arrive as the stored JSON arrays).
+pub fn audit_recipients_ok(to_json: &str, cc_json: &str, bcc_json: &str, self_addr: &str) -> bool {
+    let want = self_addr.trim().to_ascii_lowercase();
+    let to: Vec<String> = serde_json::from_str(to_json).unwrap_or_default();
+    let cc: Vec<String> = serde_json::from_str(cc_json).unwrap_or_default();
+    let bcc: Vec<String> = serde_json::from_str(bcc_json).unwrap_or_default();
+    to.len() == 1
+        && to[0].trim().to_ascii_lowercase() == want
+        && cc.iter().all(|s| s.trim().is_empty())
+        && bcc.iter().all(|s| s.trim().is_empty())
+}
+
+/// Rule 2: every queued `.eml` Subject carries the sandbox prefix (A-09).
+pub fn audit_subject_prefixed(subject: &str) -> bool {
+    subject.starts_with(SUBJECT_PREFIX)
+}
+
+/// Rule 3: no `Bcc:` header line in the rendered bytes (envelope-only
+/// invariant, re-asserted live on the actual sent bytes; D-12: live BCC
+/// sends are never attempted). Only the header block is scanned — a "Bcc:"
+/// mention in the body is NOT a leak. Folded continuation lines (leading
+/// whitespace) can never start a header.
+pub fn eml_has_bcc_header(eml_bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(eml_bytes);
+    let mut lines = text.lines();
+    for line in &mut lines {
+        let stripped = line.strip_suffix('\r').unwrap_or(line);
+        if stripped.is_empty() {
+            break; // end of the header block — body follows, unscanned
+        }
+        if stripped.to_ascii_lowercase().starts_with("bcc:") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Rule 4: per-run unique Message-IDs — first duplicate found, if any.
+pub fn audit_first_duplicate_mid<'a>(mids: &[&'a str]) -> Option<String> {
+    let mut seen = std::collections::HashSet::new();
+    for m in mids {
+        if !seen.insert(*m) {
+            return Some((*m).to_string());
+        }
+    }
+    None
+}
+
+/// Rule 5 expectation per leg: how many transport calls a leg may add.
+/// Reconcile / re-flush / wait-poll legs must add ZERO (catches stray
+/// resends — the reconcile legs prove reconcile-not-resend).
+pub fn expected_calls_delta(leg: &str) -> Option<usize> {
+    match leg {
+        "arrival" | "no-duplicate" | "sent-unfiled" | "offline-flush" | "draft-send"
+        | "crash-final-flush" => Some(1),
+        "sent-unfiled-reflush" | "uncertain-armed-flush" | "uncertain-reconcile"
+        | "crash-triage-flush" | "crash-reconcile" | "crash-backoff-poll" => Some(0),
+        _ => None,
+    }
+}
+
+// ── Secret-scan helper (D-13, T-21-04 — pure, offline-testable) ──────────
+// Fixed-substring match (passwords contain regex metachars — never regex).
+// Empty secrets never match. Returns true on ANY hit; the caller names WHICH
+// artifact matched, never the secret itself.
+
+pub fn scan_text_has_secret(text: &str, secrets: &[&str]) -> bool {
+    secrets
+        .iter()
+        .any(|s| !s.is_empty() && text.contains(s))
+}
+
+/// Backoff-schedule check (D-09): a deferred row's `next_retry_at` must fall
+/// inside `backoff_bounds(attempts)` measured from `now_epoch`.
+/// `slack_secs` absorbs the seconds between the schedule write and this
+/// read (the check runs after network I/O, so strict `>= lo` would flake).
+pub fn retry_within_bounds(
+    next_retry_at: &Option<String>,
+    attempts: u32,
+    now_epoch: i64,
+    slack_secs: i64,
+) -> bool {
+    let ts = match next_retry_at {
+        Some(s) => s,
+        None => return false,
+    };
+    let parsed = match chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S") {
+        Ok(dt) => dt.and_utc().timestamp(),
+        Err(_) => return false,
+    };
+    let (lo, hi) = send_queue::backoff_bounds(attempts);
+    let diff = parsed - now_epoch;
+    diff >= lo - slack_secs && diff <= hi
+}
+
+/// Pure shape of the deferred-backoff audit: `(row id, attempts,
+/// next_retry_at)` triples checked against the bounds at `now_epoch`.
+/// Empty input passes vacuously (a clean first-try send defers nothing —
+/// the bounds VALUES are pinned by offline tests either way).
+pub fn deferred_backoff_ok(
+    rows: &[(String, i64, Option<String>)],
+    now_epoch: i64,
+) -> (bool, String) {
+    if rows.is_empty() {
+        return (
+            true,
+            "no deferred rows (clean first-try send); bounds shape pinned offline \
+             (backoff_bounds(0)==(24,36), cap (720,1080))"
+                .to_string(),
+        );
+    }
+    let mut bad = Vec::new();
+    for (id, attempts, next) in rows {
+        let attempts_u = (*attempts).max(0) as u32;
+        if !retry_within_bounds(next, attempts_u, now_epoch, 15) {
+            bad.push(id.clone());
+        }
+    }
+    if bad.is_empty() {
+        (true, format!("{} deferred row(s) inside backoff_bounds", rows.len()))
+    } else {
+        (false, format!("deferred rows outside backoff_bounds: {:?}", bad))
+    }
+}
+
+// ── Canonical STEP outcome log (REPORT backbone + exit-code contract) ────
+// Every canonical STEP verdict is recorded here (in print order). `cleanup`
+// fails the run when ANY logged step failed — a mid-run FAIL can no longer
+// exit 0 through a clean cleanup (the exit 0/1 contract in USAGE).
+
+#[derive(Clone)]
+pub struct LoggedStep {
+    pub n: usize,
+    pub name: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+pub fn log_step(tracked: &TrackedMail, n: usize, name: &str, ok: bool, detail: &str) -> bool {
+    if let Ok(mut log) = tracked.step_log.lock() {
+        log.push(LoggedStep {
+            n,
+            name: name.to_string(),
+            ok,
+            detail: detail.to_string(),
+        });
+    }
+    step(n, name, ok, detail)
+}
+
+pub fn record_calls(tracked: &TrackedMail, leg: &str, before: usize, after: usize) {
+    if let Ok(mut log) = tracked.calls_log.lock() {
+        log.push((leg.to_string(), before, after));
+    }
+}
+
+pub fn logged_outcome(tracked: &TrackedMail, n: usize, name: &str) -> Option<bool> {
+    tracked
+        .step_log
+        .lock()
+        .ok()
+        .and_then(|log| log.iter().find(|s| s.n == n && s.name == name).map(|s| s.ok))
+}
+
+// ── Live IMAP helpers for the failure-mode legs ──────────────────────────
+
+/// Bounded poll for server-side delivery (D-05): 3×10s, then Err — never an
+/// open-ended wait. Epoch-guarded (aborts loud on UIDVALIDITY change).
+async fn poll_inbox_for_mid(
+    mgr: &SessionManager,
+    mid: &str,
+    validity: u32,
+) -> Result<u32, String> {
+    let mut detail = String::new();
+    for round in 0..ARRIVAL_POLL_ROUNDS {
+        if round > 0 {
+            async_std::task::sleep(std::time::Duration::from_secs(ARRIVAL_POLL_SECS)).await;
+        }
+        let mut lease = mgr
+            .lease_for("INBOX")
+            .await
+            .map_err(|e| format!("INBOX lease failed: {e}"))?;
+        match lease.selected_validity() {
+            Some(v) if v == validity => {}
+            other => {
+                return Err(format!(
+                    "INBOX epoch change mid-run (want {validity:?}, got {other:?}) — aborting loud"
+                ));
+            }
+        }
+        match lease.session().uid_search_header("Message-ID", mid).await {
+            Ok(hits) => {
+                if hits.len() == 1 {
+                    return Ok(hits[0]);
+                }
+                detail = format!("round {}: {} INBOX hits (want 1)", round + 1, hits.len());
+            }
+            Err(e) => return Err(format!("INBOX SEARCH failed: {e}")),
+        }
+    }
+    Err(detail)
+}
+
+/// PEEK-only header confirm over any folder wire (never BODY[] — the fetch
+/// must not set `\Seen`; RESEARCH Pitfall 3).
+async fn peek_confirms_mid(mgr: &SessionManager, wire: &str, uid: u32, mid: &str) -> bool {
+    let mut lease = match mgr.lease_for(wire).await {
+        Ok(l) => l,
+        Err(_) => return false,
+    };
+    match lease.session().fetch_body(uid).await {
+        Ok(bytes) => match mail_parser::MessageParser::new().parse(&bytes) {
+            Some(m) => {
+                let subj_ok = m
+                    .subject()
+                    .map(|s| s.starts_with(SUBJECT_PREFIX))
+                    .unwrap_or(false);
+                let bare = mid.trim_matches(&['<', '>'][..]);
+                let mid_ok = m.message_id().map(|id| id == bare).unwrap_or(false);
+                subj_ok && mid_ok
+            }
+            None => false,
+        },
+        Err(_) => false,
+    }
+}
+
+/// One-shot Message-ID SEARCH over the Sent wire.
+async fn search_sent_for_mid(
+    mgr: &SessionManager,
+    sent_wire: &str,
+    mid: &str,
+) -> Result<Vec<u32>, String> {
+    let mut lease = mgr
+        .lease_for(sent_wire)
+        .await
+        .map_err(|e| format!("Sent lease failed: {e}"))?;
+    lease
+        .session()
+        .uid_search_header("Message-ID", mid)
+        .await
+        .map_err(|e| format!("Sent SEARCH failed: {e}"))
+}
+
 // ── Config (env-only, D-04/D-13) ──────────────────────────────────────────
 
 struct LiveConfig {
@@ -641,15 +961,16 @@ async fn check_list_stable(
     mgr: &SessionManager,
     before: &[String],
     guard_marker: &str,
+    tracked: &TrackedMail,
     n: usize,
     name: &str,
 ) -> bool {
     match list_snapshot(mgr).await {
         Ok(after) => {
             let delta = unexpected_list_delta(before, &after, guard_marker);
-            step(n, name, delta.is_empty(), &format!("LIST deltas: {:?}", delta))
+            log_step(tracked, n, name, delta.is_empty(), &format!("LIST deltas: {:?}", delta))
         }
-        Err(e) => step(n, name, false, &format!("re-LIST failed: {}", e)),
+        Err(e) => log_step(tracked, n, name, false, &format!("re-LIST failed: {}", e)),
     }
 }
 
@@ -698,7 +1019,7 @@ fn manual_cleanup_steps(mids: &[String]) -> String {
 /// Sent UIDs for those (0 = no autosave, 1 = server autosaved), while filed
 /// legs must hold exactly 1 — and no leg may ever hold 2 (twin).
 #[derive(Default)]
-struct TrackedMail {
+pub struct TrackedMail {
     message_ids: Vec<String>,
     inbox_uids: Vec<(String, u32)>,
     sent_uids: Vec<(String, u32)>,
@@ -707,6 +1028,32 @@ struct TrackedMail {
     /// this wire (UIDs are per-folder; INBOX expunge of a Sent UID would
     /// delete the WRONG mail — T-21-05).
     sent_wire: Option<String>,
+    /// Canonical STEP outcomes, in print order (REPORT backbone; cleanup
+    /// fails the run when any entry failed).
+    pub step_log: Mutex<Vec<LoggedStep>>,
+    /// Per-leg transport call deltas (leg, calls_before, calls_after) for
+    /// the never-resend proof (AUDIT-CALLS + REPORT).
+    pub calls_log: Mutex<Vec<(String, usize, usize)>>,
+    /// Autosave-probe end state per Message-ID: (mid, sent_uids, is_unfiled).
+    pub probe_counts: Vec<(String, usize, bool)>,
+    /// Verbatim probe detail line (REPORT autosave-branch evidence).
+    pub probe_detail: String,
+    /// Draft leg (D-16): sandbox folder created for the server draft copy
+    /// (None when the real-Drafts fallback ran), fallback wire, draft MID,
+    /// local drafts row id, and the server copy UID for tracked cleanup.
+    pub draft_sandbox: Option<String>,
+    pub draft_used_real_drafts: bool,
+    pub draft_real_drafts_wire: Option<String>,
+    pub draft_mid: Option<String>,
+    pub draft_id: Option<String>,
+    pub draft_server_uid: Option<u32>,
+}
+
+impl TrackedMail {
+    /// Blank tracker for unit tests driving the outcome log (REPORT backbone).
+    pub fn empty() -> Self {
+        Self::default()
+    }
 }
 
 // ── Run ──────────────────────────────────────────────────────────────────
@@ -725,35 +1072,35 @@ async fn run() -> i32 {
     let manager = Arc::new(SessionManager::new(account_config(&cfg)));
     let db_path = std::env::temp_dir().join(format!("sge-live21-{tag}.sqlite"));
     let app_data = std::env::temp_dir().join(format!("sge-live21-{tag}-data"));
+    let mut tracked = TrackedMail::default();
     let store = match Store::open(&db_path) {
         Ok(s) => Arc::new(Mutex::new(s)),
         Err(e) => {
-            step(1, "preflight", false, &format!("temp store: {e}"));
+            log_step(&tracked, 1, "preflight", false, &format!("temp store: {e}"));
             return 1;
         }
     };
-    let mut tracked = TrackedMail::default();
 
     // 1. preflight — LIST snapshot; resolve + record the Sent wire and the
     // INBOX/Sent UIDVALIDITY epoch for epoch-scoped asserts.
     let before = match list_snapshot(&manager).await {
         Ok(names) => names,
         Err(e) => {
-            step(1, "preflight", false, &format!("LIST failed: {e}"));
+            log_step(&tracked, 1, "preflight", false, &format!("LIST failed: {e}"));
             return cleanup(&manager, &db_path, &app_data, &before_list_or_empty(), &tracked).await;
         }
     };
     let sent_wire = match manager.list_mailboxes().await {
         Ok(infos) => resolve_sent_wire(&infos),
         Err(e) => {
-            step(1, "preflight", false, &format!("LIST for Sent resolve failed: {e}"));
+            log_step(&tracked, 1, "preflight", false, &format!("LIST for Sent resolve failed: {e}"));
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
     };
     let sent_wire = match sent_wire {
         Some(w) => w,
         None => {
-            step(1, "preflight", false, "no Sent folder resolved (need Sent for D-06)");
+            log_step(&tracked, 1, "preflight", false, "no Sent folder resolved (need Sent for D-06)");
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
     };
@@ -761,18 +1108,18 @@ async fn run() -> i32 {
     let inbox_validity = match current_validity(&manager, "INBOX").await {
         Ok(v) => v,
         Err(e) => {
-            step(1, "preflight", false, &format!("INBOX UIDVALIDITY read failed: {e}"));
+            log_step(&tracked, 1, "preflight", false, &format!("INBOX UIDVALIDITY read failed: {e}"));
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
     };
     let sent_validity = match current_validity(&manager, &sent_wire).await {
         Ok(v) => v,
         Err(e) => {
-            step(1, "preflight", false, &format!("Sent UIDVALIDITY read failed: {e}"));
+            log_step(&tracked, 1, "preflight", false, &format!("Sent UIDVALIDITY read failed: {e}"));
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
     };
-    if !step(
+    if !log_step(&tracked,
         1,
         "preflight",
         true,
@@ -792,17 +1139,19 @@ async fn run() -> i32 {
     let to_self = vec![cfg.self_addr.clone()];
     match assert_self_only(&cfg.self_addr, &to_self, &[], &[], &cfg.self_addr) {
         Ok(()) => {
-            if !step(2, "recipient-guard", true, &format!("self-only envelope to=<{}>", cfg.self_addr)) {
+            if !log_step(&tracked, 2, "recipient-guard", true, &format!("self-only envelope to=<{}>", cfg.self_addr)) {
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         }
         Err(e) => {
-            step(2, "recipient-guard", false, &e);
+            log_step(&tracked, 2, "recipient-guard", false, &e);
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
     }
 
-    // Middle legs: 3 arrival, 4 sent-copy, 7 autosave-probe (Task 2);
+    // Middle legs: 3 arrival, 4 sent-copy, 5 no-duplicate, 6 sent-unfiled,
+    // 7 offline-flush, 8 uncertain-reconcile, 9 crash-recover, 10 draft-send,
+    // 11 autosave-probe. Step numbers stay stable so logs stay comparable.
     // 5 no-duplicate, 6 sent-unfiled (Task 3). Step numbers stay stable so
     // logs stay comparable across tasks.
     let list_guard = format!("{}never-created-{}", SANDBOX_PREFIX, tag);
@@ -828,13 +1177,13 @@ async fn run() -> i32 {
         ) {
             Ok(out) => {
                 if out.deduped {
-                    step(3, "arrival", false, "fresh run_tag unexpectedly deduped");
+                    log_step(&tracked, 3, "arrival", false, "fresh run_tag unexpectedly deduped");
                     return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
                 }
                 out.message_id
             }
             Err(e) => {
-                step(3, "arrival", false, &format!("enqueue_send failed: {}", e));
+                log_step(&tracked, 3, "arrival", false, &format!("enqueue_send failed: {}", e));
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         }
@@ -846,7 +1195,7 @@ async fn run() -> i32 {
         match send_queue::send_status_snapshot(guard.conn()) {
             Ok(snap) => {
                 if !(snap.pending_count >= 1 && snap.queued >= 1) {
-                    step(
+                    log_step(&tracked,
                         3,
                         "arrival",
                         false,
@@ -859,7 +1208,7 @@ async fn run() -> i32 {
                 }
             }
             Err(e) => {
-                step(3, "arrival", false, &format!("send_status snapshot failed: {}", e));
+                log_step(&tracked, 3, "arrival", false, &format!("send_status snapshot failed: {}", e));
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         }
@@ -893,7 +1242,7 @@ async fn run() -> i32 {
         send_calls.load(Ordering::SeqCst)
     );
     if summary.sent != 1 {
-        step(
+        log_step(&tracked,
             3,
             "arrival",
             false,
@@ -942,7 +1291,7 @@ async fn run() -> i32 {
     let arrival_uid = match arrival_uid {
         Some(u) => u,
         None => {
-            step(3, "arrival", false, &arrival_detail);
+            log_step(&tracked, 3, "arrival", false, &arrival_detail);
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
     };
@@ -963,7 +1312,7 @@ async fn run() -> i32 {
         Err(_) => false,
     };
     if !header_ok {
-        step(3, "arrival", false, "PEEK header confirm failed (subject prefix / Message-ID)");
+        log_step(&tracked, 3, "arrival", false, "PEEK header confirm failed (subject prefix / Message-ID)");
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
     // A-02/A-03: clean state after ack (badge hidden, no failed surface).
@@ -975,15 +1324,15 @@ async fn run() -> i32 {
         }
     };
     if !post_ok {
-        step(3, "arrival", false, "A-02/A-03 post-condition failed (pending/failed/uncertain not all 0)");
+        log_step(&tracked, 3, "arrival", false, "A-02/A-03 post-condition failed (pending/failed/uncertain not all 0)");
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
     tracked.message_ids.push(arrival_mid.clone());
     tracked.inbox_uids.push((arrival_mid.clone(), arrival_uid));
-    if !step(3, "arrival", true, &format!("1 INBOX UID + headers confirm (mid {})", arrival_mid)) {
+    if !log_step(&tracked, 3, "arrival", true, &format!("1 INBOX UID + headers confirm (mid {})", arrival_mid)) {
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
-    if !check_list_stable(&manager, &before, &list_guard, 3, "arrival-list").await {
+    if !check_list_stable(&manager, &before, &list_guard, &tracked, 3, "arrival-list").await {
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
 
@@ -993,28 +1342,28 @@ async fn run() -> i32 {
         let mut lease = match manager.lease_for(&sent_wire).await {
             Ok(l) => l,
             Err(e) => {
-                step(4, "sent-copy", false, &format!("Sent lease failed: {}", e));
+                log_step(&tracked, 4, "sent-copy", false, &format!("Sent lease failed: {}", e));
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         };
         match lease.selected_validity() {
             Some(v) if v == sent_validity => {}
             other => {
-                step(4, "sent-copy", false, &format!("Sent epoch change mid-run (want {:?}, got {:?})", sent_validity, other));
+                log_step(&tracked, 4, "sent-copy", false, &format!("Sent epoch change mid-run (want {:?}, got {:?})", sent_validity, other));
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         }
         let hits = match lease.session().uid_search_header("Message-ID", &arrival_mid).await {
             Ok(h) => h,
             Err(e) => {
-                step(4, "sent-copy", false, &format!("Sent SEARCH failed: {}", e));
+                log_step(&tracked, 4, "sent-copy", false, &format!("Sent SEARCH failed: {}", e));
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         };
         let uid = match assert_exactly_one(&hits, "sent-copy") {
             Ok(u) => u,
             Err(e) => {
-                step(4, "sent-copy", false, &e);
+                log_step(&tracked, 4, "sent-copy", false, &e);
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         };
@@ -1024,13 +1373,13 @@ async fn run() -> i32 {
             Err(_) => false,
         };
         if !seen_ok {
-            step(4, "sent-copy", false, "\\Seen not set on the Sent copy");
+            log_step(&tracked, 4, "sent-copy", false, "\\Seen not set on the Sent copy");
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
         let server_bytes = match lease.session().fetch_body(uid).await {
             Ok(b) => b,
             Err(e) => {
-                step(4, "sent-copy", false, &format!("Sent PEEK fetch failed: {}", e));
+                log_step(&tracked, 4, "sent-copy", false, &format!("Sent PEEK fetch failed: {}", e));
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         };
@@ -1042,16 +1391,16 @@ async fn run() -> i32 {
             }
         };
         if queued_bytes.is_empty() || !verbatim_equal(&server_bytes, &queued_bytes) {
-            step(4, "sent-copy", false, "Sent copy bytes differ from the queued .eml (not verbatim)");
+            log_step(&tracked, 4, "sent-copy", false, "Sent copy bytes differ from the queued .eml (not verbatim)");
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
         uid
     };
     tracked.sent_uids.push((arrival_mid.clone(), sent_uid));
-    if !step(4, "sent-copy", true, &format!("1 Sent UID + \\Seen + verbatim bytes (uid {})", sent_uid)) {
+    if !log_step(&tracked, 4, "sent-copy", true, &format!("1 Sent UID + \\Seen + verbatim bytes (uid {})", sent_uid)) {
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
-    if !check_list_stable(&manager, &before, &list_guard, 4, "sent-copy-list").await {
+    if !check_list_stable(&manager, &before, &list_guard, &tracked, 4, "sent-copy-list").await {
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
 
@@ -1063,7 +1412,7 @@ async fn run() -> i32 {
         let mb = match queries::ensure_mailbox(guard.conn(), "INBOX") {
             Ok(id) => id,
             Err(e) => {
-                step(5, "no-duplicate", false, &format!("temp mailbox seed failed: {}", e));
+                log_step(&tracked, 5, "no-duplicate", false, &format!("temp mailbox seed failed: {}", e));
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         };
@@ -1080,7 +1429,7 @@ async fn run() -> i32 {
             "",
             "",
         ) {
-            step(5, "no-duplicate", false, &format!("temp draft seed failed: {}", e));
+            log_step(&tracked, 5, "no-duplicate", false, &format!("temp draft seed failed: {}", e));
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
         let mk_input = |did: Option<String>| EnqueueInput {
@@ -1095,24 +1444,24 @@ async fn run() -> i32 {
         let first = match send_queue::enqueue_send(guard.conn(), &app_data, mk_input(Some(draft_id.clone()))) {
             Ok(o) => o,
             Err(e) => {
-                step(5, "no-duplicate", false, &format!("first enqueue failed: {}", e));
+                log_step(&tracked, 5, "no-duplicate", false, &format!("first enqueue failed: {}", e));
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         };
         // Recipient guard re-checked on the resolved second envelope too.
         if let Err(e) = assert_self_only(&cfg.self_addr, &[cfg.self_addr.clone()], &[], &[], &cfg.self_addr) {
-            step(5, "no-duplicate", false, &e);
+            log_step(&tracked, 5, "no-duplicate", false, &e);
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
         let second = match send_queue::enqueue_send(guard.conn(), &app_data, mk_input(Some(draft_id))) {
             Ok(o) => o,
             Err(e) => {
-                step(5, "no-duplicate", false, &format!("second enqueue failed: {}", e));
+                log_step(&tracked, 5, "no-duplicate", false, &format!("second enqueue failed: {}", e));
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         };
         if !(second.deduped && second.queue_id == first.queue_id && second.message_id == first.message_id) {
-            step(
+            log_step(&tracked,
                 5,
                 "no-duplicate",
                 false,
@@ -1133,7 +1482,7 @@ async fn run() -> i32 {
             )
             .unwrap_or(-1);
         if row_count != 1 {
-            step(5, "no-duplicate", false, &format!("{} rows for one Message-ID (want 1)", row_count));
+            log_step(&tracked, 5, "no-duplicate", false, &format!("{} rows for one Message-ID (want 1)", row_count));
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
         mid
@@ -1151,7 +1500,7 @@ async fn run() -> i32 {
         send_calls.load(Ordering::SeqCst)
     );
     if nondup_summary.sent != 1 {
-        step(
+        log_step(&tracked,
             5,
             "no-duplicate",
             false,
@@ -1165,17 +1514,17 @@ async fn run() -> i32 {
             Ok(hits) => match assert_exactly_one(&hits, "no-duplicate arrival") {
                 Ok(u) => u,
                 Err(e) => {
-                    step(5, "no-duplicate", false, &e);
+                    log_step(&tracked, 5, "no-duplicate", false, &e);
                     return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
                 }
             },
             Err(e) => {
-                step(5, "no-duplicate", false, &format!("INBOX SEARCH failed: {}", e));
+                log_step(&tracked, 5, "no-duplicate", false, &format!("INBOX SEARCH failed: {}", e));
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         },
         Err(e) => {
-            step(5, "no-duplicate", false, &format!("INBOX lease failed: {}", e));
+            log_step(&tracked, 5, "no-duplicate", false, &format!("INBOX lease failed: {}", e));
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
     };
@@ -1185,24 +1534,24 @@ async fn run() -> i32 {
             Ok(hits) => match assert_exactly_one(&hits, "no-duplicate sent-copy") {
                 Ok(u) => u,
                 Err(e) => {
-                    step(5, "no-duplicate", false, &e);
+                    log_step(&tracked, 5, "no-duplicate", false, &e);
                     return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
                 }
             },
             Err(e) => {
-                step(5, "no-duplicate", false, &format!("Sent SEARCH failed: {}", e));
+                log_step(&tracked, 5, "no-duplicate", false, &format!("Sent SEARCH failed: {}", e));
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         },
         Err(e) => {
-            step(5, "no-duplicate", false, &format!("Sent lease failed: {}", e));
+            log_step(&tracked, 5, "no-duplicate", false, &format!("Sent lease failed: {}", e));
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
     };
     tracked.message_ids.push(nondup_mid.clone());
     tracked.inbox_uids.push((nondup_mid.clone(), nondup_uid));
     tracked.sent_uids.push((nondup_mid.clone(), nondup_sent_uid));
-    if !step(
+    if !log_step(&tracked,
         5,
         "no-duplicate",
         true,
@@ -1214,7 +1563,7 @@ async fn run() -> i32 {
     ) {
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
-    if !check_list_stable(&manager, &before, &list_guard, 5, "no-duplicate-list").await {
+    if !check_list_stable(&manager, &before, &list_guard, &tracked, 5, "no-duplicate-list").await {
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
 
@@ -1241,7 +1590,7 @@ async fn run() -> i32 {
         ) {
             Ok(out) => out.message_id,
             Err(e) => {
-                step(6, "sent-unfiled", false, &format!("enqueue_send failed: {}", e));
+                log_step(&tracked, 6, "sent-unfiled", false, &format!("enqueue_send failed: {}", e));
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         }
@@ -1276,7 +1625,7 @@ async fn run() -> i32 {
         calls_after_unfiled
     );
     if unfiled_summary.sent_unfiled != 1 {
-        step(
+        log_step(&tracked,
             6,
             "sent-unfiled",
             false,
@@ -1285,7 +1634,7 @@ async fn run() -> i32 {
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
     if calls_after_unfiled != calls_before_unfiled + 1 {
-        step(
+        log_step(&tracked,
             6,
             "sent-unfiled",
             false,
@@ -1302,7 +1651,7 @@ async fn run() -> i32 {
         }
     };
     if !parked_sent {
-        step(6, "sent-unfiled", false, "row not parked sent after SentUnfiled");
+        log_step(&tracked, 6, "sent-unfiled", false, "row not parked sent after SentUnfiled");
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
     // Never-resend: a second flush adds zero transport calls (parked sent
@@ -1310,7 +1659,7 @@ async fn run() -> i32 {
     let reflush_summary = worker.flush_send_queue(&unfiled_env).await;
     let calls_after_reflush = send_calls.load(Ordering::SeqCst);
     if reflush_summary != FlushSummary::default() {
-        step(
+        log_step(&tracked,
             6,
             "sent-unfiled",
             false,
@@ -1322,7 +1671,7 @@ async fn run() -> i32 {
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
     if calls_after_reflush != calls_after_unfiled {
-        step(
+        log_step(&tracked,
             6,
             "sent-unfiled",
             false,
@@ -1338,17 +1687,17 @@ async fn run() -> i32 {
             Ok(hits) => match assert_exactly_one(&hits, "sent-unfiled arrival") {
                 Ok(u) => u,
                 Err(e) => {
-                    step(6, "sent-unfiled", false, &e);
+                    log_step(&tracked, 6, "sent-unfiled", false, &e);
                     return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
                 }
             },
             Err(e) => {
-                step(6, "sent-unfiled", false, &format!("INBOX SEARCH failed: {}", e));
+                log_step(&tracked, 6, "sent-unfiled", false, &format!("INBOX SEARCH failed: {}", e));
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         },
         Err(e) => {
-            step(6, "sent-unfiled", false, &format!("INBOX lease failed: {}", e));
+            log_step(&tracked, 6, "sent-unfiled", false, &format!("INBOX lease failed: {}", e));
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
     };
@@ -1359,7 +1708,7 @@ async fn run() -> i32 {
     // send_status_snapshot().sent_unfiled hard-codes 0 — A-07 is asserted
     // via FlushOutcome::SentUnfiled counts + transport call counts, never via
     // the snapshot field.
-    if !step(
+    if !log_step(&tracked,
         6,
         "sent-unfiled",
         true,
@@ -1369,11 +1718,799 @@ async fn run() -> i32 {
     ) {
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
-    if !check_list_stable(&manager, &before, &list_guard, 6, "sent-unfiled-list").await {
+    if !check_list_stable(&manager, &before, &list_guard, &tracked, 6, "sent-unfiled-list").await {
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
 
-    // 7. autosave-probe (D-08): the end state must be exactly 1 Sent UID
+    // 7. offline-flush (D-09) — enqueue under the closed app-level gate,
+    // prove the durable queue holds (A-01: OutboxBadgeWired
+    // "{N} mensagem(s) pendentes" + SendStatus
+    // "{N} alteração(ões) aguardando envio"), reopen, flush for real with the
+    // backoff schedule visible, arrive exactly once (A-02/A-03).
+    let offline_mid = {
+        // Close the IMAP-side gate FIRST and prove it fails closed with a
+        // zero-effect write attempt (the decorator errors BEFORE touching
+        // the server — no UID on the box is at risk).
+        let gate_flag = Arc::new(AtomicBool::new(true));
+        {
+            let mut lease = match manager.lease_for("INBOX").await {
+                Ok(l) => l,
+                Err(e) => {
+                    log_step(&tracked, 7, "offline-flush", false, &format!("INBOX lease failed: {}", e));
+                    return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+                }
+            };
+            let mut gated = GateSession::new(lease.session(), gate_flag.clone());
+            match gated.store_deleted(u32::MAX, true).await {
+                Err(e) if e.to_string().contains("offline gate closed") => {}
+                Err(e) => {
+                    log_step(&tracked, 7, "offline-flush", false, &format!("gate-closed write failed unexpectedly: {}", e));
+                    return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+                }
+                Ok(()) => {
+                    log_step(&tracked, 7, "offline-flush", false, "gate-closed write SUCCEEDED — gate is not failing closed");
+                    return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+                }
+            }
+        }
+        // Enqueue locally while "offline" (the durable queue needs no
+        // network — D-09). Recipient guard first, like every leg.
+        if let Err(e) = assert_self_only(&cfg.self_addr, &[cfg.self_addr.clone()], &[], &[], &cfg.self_addr) {
+            log_step(&tracked, 7, "offline-flush", false, &e);
+            return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+        }
+        let mid = {
+            let guard = store.lock().unwrap();
+            match send_queue::enqueue_send(
+                guard.conn(),
+                &app_data,
+                EnqueueInput {
+                    from: cfg.self_addr.clone(),
+                    to: vec![cfg.self_addr.clone()],
+                    cc: vec![],
+                    bcc: vec![],
+                    subject: format!("{}{}-offline", SUBJECT_PREFIX, tag),
+                    body: "live gate offline-flush probe".to_string(),
+                    draft_id: None,
+                },
+            ) {
+                Ok(out) => out.message_id,
+                Err(e) => {
+                    log_step(&tracked, 7, "offline-flush", false, &format!("offline enqueue_send failed: {}", e));
+                    return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+                }
+            }
+        };
+        // A-01 observable-state precondition: pending visible before any
+        // network (existing OutboxBadgeWired + SendStatus copy, no new UI).
+        {
+            let guard = store.lock().unwrap();
+            match send_queue::send_status_snapshot(guard.conn()) {
+                Ok(snap) => {
+                    if !(snap.pending_count >= 1 && snap.queued >= 1) {
+                        log_step(
+                            &tracked,
+                            7,
+                            "offline-flush",
+                            false,
+                            &format!(
+                                "A-01 precondition failed: pending={} queued={}",
+                                snap.pending_count, snap.queued
+                            ),
+                        );
+                        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+                    }
+                }
+                Err(e) => {
+                    log_step(&tracked, 7, "offline-flush", false, &format!("send_status snapshot failed: {}", e));
+                    return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+                }
+            }
+        }
+        // Reopen the gate; prove the pre-send baseline (no leftover MID).
+        gate_flag.store(false, Ordering::SeqCst);
+        {
+            let mut lease = match manager.lease_for("INBOX").await {
+                Ok(l) => l,
+                Err(e) => {
+                    log_step(&tracked, 7, "offline-flush", false, &format!("INBOX lease failed: {}", e));
+                    return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+                }
+            };
+            match lease.session().uid_search_header("Message-ID", &mid).await {
+                Ok(hits) if hits.is_empty() => {}
+                Ok(hits) => {
+                    log_step(&tracked, 7, "offline-flush", false, &format!("pre-send INBOX baseline not empty: {} hit(s) — prior-run leftover, aborting loud", hits.len()));
+                    return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+                }
+                Err(e) => {
+                    log_step(&tracked, 7, "offline-flush", false, &format!("pre-send INBOX SEARCH failed: {}", e));
+                    return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+                }
+            }
+        }
+        mid
+    };
+    let calls_before_offline = send_calls.load(Ordering::SeqCst);
+    eprintln!("[live-gate] {} (offline-flush leg, gate reopened)", envelope_log_line(&cfg.self_addr, &[cfg.self_addr.clone()]));
+    let offline_summary = worker.flush_send_queue(&flush_env).await;
+    let calls_after_offline = send_calls.load(Ordering::SeqCst);
+    record_calls(&tracked, "offline-flush", calls_before_offline, calls_after_offline);
+    eprintln!(
+        "[live-gate] offline flush done: sent={} deferred={} failed={} uncertain={} unfiled={} transport_calls={}",
+        offline_summary.sent,
+        offline_summary.deferred,
+        offline_summary.failed,
+        offline_summary.uncertain,
+        offline_summary.sent_unfiled,
+        calls_after_offline
+    );
+    if offline_summary.sent != 1 {
+        log_step(
+            &tracked,
+            7,
+            "offline-flush",
+            false,
+            &format!(
+                "flush summary sent={} (want 1) deferred={} failed={} uncertain={}",
+                offline_summary.sent, offline_summary.deferred, offline_summary.failed, offline_summary.uncertain
+            ),
+        );
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    if calls_after_offline != calls_before_offline + 1 {
+        log_step(
+            &tracked,
+            7,
+            "offline-flush",
+            false,
+            &format!("transport calls {} -> {} (want exactly +1 SMTP send)", calls_before_offline, calls_after_offline),
+        );
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    // Backoff visible (D-09): any deferred row's next_retry_at must sit
+    // inside backoff_bounds(attempts). A clean first-try send defers nothing
+    // (vacuous pass recorded); the bounds VALUES are pinned offline.
+    {
+        let (ok, detail) = {
+            let guard = store.lock().unwrap();
+            let mut rows: Vec<(String, i64, Option<String>)> = Vec::new();
+            if let Ok(mut stmt) = guard.conn().prepare(
+                "SELECT id, attempts, next_retry_at FROM send_queue WHERE attempts > 0",
+            ) {
+                if let Ok(mapped) = stmt.query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                }) {
+                    rows = mapped.filter_map(|r| r.ok()).collect();
+                }
+            }
+            deferred_backoff_ok(&rows, chrono::Utc::now().timestamp())
+        };
+        if !ok {
+            log_step(&tracked, 7, "offline-flush", false, &format!("backoff schedule violated: {}", detail));
+            return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+        }
+        eprintln!("[live-gate] offline backoff check: {}", detail);
+    }
+    // Arrival exactly once + PEEK confirm + clean state (A-02/A-03).
+    let offline_uid = match poll_inbox_for_mid(&manager, &offline_mid, inbox_validity).await {
+        Ok(u) => u,
+        Err(d) => {
+            log_step(&tracked, 7, "offline-flush", false, &d);
+            return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+        }
+    };
+    if !peek_confirms_mid(&manager, "INBOX", offline_uid, &offline_mid).await {
+        log_step(&tracked, 7, "offline-flush", false, "PEEK header confirm failed (subject prefix / Message-ID)");
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    {
+        let guard = store.lock().unwrap();
+        match send_queue::send_status_snapshot(guard.conn()) {
+            Ok(snap) => {
+                if !(snap.pending_count == 0 && snap.failed == 0 && snap.uncertain == 0) {
+                    log_step(&tracked, 7, "offline-flush", false, "A-02/A-03 post-condition failed (pending/failed/uncertain not all 0)");
+                    return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+                }
+            }
+            Err(e) => {
+                log_step(&tracked, 7, "offline-flush", false, &format!("send_status snapshot failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        }
+    }
+    // Sent-side filing for the offline leg (same verbatim-copy bar as D-06).
+    let offline_sent_uid = match search_sent_for_mid(&manager, &sent_wire, &offline_mid).await {
+        Ok(hits) => match assert_exactly_one(&hits, "offline-flush sent-copy") {
+            Ok(u) => u,
+            Err(e) => {
+                log_step(&tracked, 7, "offline-flush", false, &e);
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        },
+        Err(e) => {
+            log_step(&tracked, 7, "offline-flush", false, &e);
+            return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+        }
+    };
+    tracked.message_ids.push(offline_mid.clone());
+    tracked.inbox_uids.push((offline_mid.clone(), offline_uid));
+    tracked.sent_uids.push((offline_mid.clone(), offline_sent_uid));
+    if !log_step(
+        &tracked,
+        7,
+        "offline-flush",
+        true,
+        &format!("gate-closed enqueue held (A-01), reopen flush sent once (+1 call), 1 INBOX UID + 1 Sent UID, backoff visible, clean state (A-02/A-03/A-08)"),
+    ) {
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    if !check_list_stable(&manager, &before, &list_guard, &tracked, 7, "offline-flush-list").await {
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+
+    // 8. uncertain-reconcile (D-10) — harness-injected DATA-timeout fault →
+    // `uncertain` hold (A-04: SendStatus uncertain hold line, no new send
+    // issued) → simulated ambiguous server-accept → reconcile-not-resend
+    // (SEARCH hit confirms with ZERO new transport calls).
+    let uncertain_mid = {
+        if let Err(e) = assert_self_only(&cfg.self_addr, &[cfg.self_addr.clone()], &[], &[], &cfg.self_addr) {
+            log_step(&tracked, 8, "uncertain-reconcile", false, &e);
+            return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+        }
+        let guard = store.lock().unwrap();
+        match send_queue::enqueue_send(
+            guard.conn(),
+            &app_data,
+            EnqueueInput {
+                from: cfg.self_addr.clone(),
+                to: vec![cfg.self_addr.clone()],
+                cc: vec![],
+                bcc: vec![],
+                subject: format!("{}{}-uncertain", SUBJECT_PREFIX, tag),
+                body: "live gate uncertain-reconcile probe".to_string(),
+                draft_id: None,
+            },
+        ) {
+            Ok(out) => out.message_id,
+            Err(e) => {
+                log_step(&tracked, 8, "uncertain-reconcile", false, &format!("enqueue_send failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        }
+    };
+    // Fault rig: TimeoutTransport over a shared-counting inner, so real
+    // sends still count into the run-wide never-resend counter while the
+    // faulted attempt counts nowhere.
+    let (timeout_transport, fault_armed, fault_inner_calls) = TimeoutTransport::new(Arc::new(
+        SharedCountingTransport::new(Arc::new(SmtpTransporter::new()), send_calls.clone()),
+    ));
+    fault_armed.store(true, Ordering::SeqCst);
+    let fault_env = SendFlushEnv {
+        gate: SendGate::default(),
+        transport: Arc::new(timeout_transport),
+        account: smtp_account(&cfg),
+        manager: Some(manager.clone()),
+        sent_wire: Some(sent_wire.clone()),
+    };
+    let calls_before_fault = send_calls.load(Ordering::SeqCst);
+    let inner_before_fault = fault_inner_calls.load(Ordering::SeqCst);
+    eprintln!("[live-gate] {} (uncertain leg, DATA-timeout fault ARMED)", envelope_log_line(&cfg.self_addr, &[cfg.self_addr.clone()]));
+    let fault_summary = worker.flush_send_queue(&fault_env).await;
+    let calls_after_fault = send_calls.load(Ordering::SeqCst);
+    let inner_after_fault = fault_inner_calls.load(Ordering::SeqCst);
+    record_calls(&tracked, "uncertain-armed-flush", calls_before_fault, calls_after_fault);
+    eprintln!(
+        "[live-gate] uncertain flush done: sent={} deferred={} failed={} uncertain={} unfiled={} transport_calls={}",
+        fault_summary.sent,
+        fault_summary.deferred,
+        fault_summary.failed,
+        fault_summary.uncertain,
+        fault_summary.sent_unfiled,
+        calls_after_fault
+    );
+    if fault_summary.uncertain != 1 || fault_summary.sent != 0 {
+        log_step(
+            &tracked,
+            8,
+            "uncertain-reconcile",
+            false,
+            &format!(
+                "armed flush sent={} uncertain={} (want sent=0 uncertain=1)",
+                fault_summary.sent, fault_summary.uncertain
+            ),
+        );
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    if calls_after_fault != calls_before_fault || inner_after_fault != inner_before_fault {
+        log_step(
+            &tracked,
+            8,
+            "uncertain-reconcile",
+            false,
+            &format!(
+                "faulted attempt left the box (run-wide {} -> {}, inner {} -> {}) — zero SMTP bytes required",
+                calls_before_fault, calls_after_fault, inner_before_fault, inner_after_fault
+            ),
+        );
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    // A-04 + A-06: uncertain hold visible, and uncertain never renders as
+    // failed (SendStatus shows the "Reconciliando na pasta Enviadas" hold
+    // line, never the failed surface + Retentar for this row).
+    {
+        let guard = store.lock().unwrap();
+        match send_queue::send_status_snapshot(guard.conn()) {
+            Ok(snap) => {
+                if !(snap.uncertain >= 1 && snap.failed == 0) {
+                    log_step(
+                        &tracked,
+                        8,
+                        "uncertain-reconcile",
+                        false,
+                        &format!("A-04/A-06 violated: uncertain={} failed={} (want uncertain>=1 failed=0)", snap.uncertain, snap.failed),
+                    );
+                    return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+                }
+            }
+            Err(e) => {
+                log_step(&tracked, 8, "uncertain-reconcile", false, &format!("send_status snapshot failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        }
+    }
+    // Negative control: zero SMTP bytes means zero INBOX hits for this MID.
+    {
+        let mut lease = match manager.lease_for("INBOX").await {
+            Ok(l) => l,
+            Err(e) => {
+                log_step(&tracked, 8, "uncertain-reconcile", false, &format!("INBOX lease failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        };
+        match lease.session().uid_search_header("Message-ID", &uncertain_mid).await {
+            Ok(hits) if hits.is_empty() => {}
+            Ok(hits) => {
+                log_step(&tracked, 8, "uncertain-reconcile", false, &format!("fault leaked bytes: {} INBOX hit(s) for an unsent MID", hits.len()));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+            Err(e) => {
+                log_step(&tracked, 8, "uncertain-reconcile", false, &format!("INBOX SEARCH failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        }
+    }
+    // Simulated ambiguous server-accept: a real DATA-timeout may land
+    // server-side while the client sees the timeout. Mirror the filing leg's
+    // APPEND (verbatim queued bytes + \Seen) through the preflight-resolved
+    // Sent wire — harness-issued, MID-tracked, explicitly allowed (never
+    // INBOX: arrival lands by delivery only).
+    let uncertain_eml = {
+        let guard = store.lock().unwrap();
+        match queries::get_send_row_by_message_id(guard.conn(), &uncertain_mid) {
+            Ok(Some(row)) => std::fs::read(&row.eml_path).unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    };
+    if uncertain_eml.is_empty() {
+        log_step(&tracked, 8, "uncertain-reconcile", false, "queued .eml unreadable for the simulated accept");
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    if let Err(e) = assert_harness_append_target(&sent_wire, &[sent_wire.clone()]) {
+        log_step(&tracked, 8, "uncertain-reconcile", false, &format!("append-target guard refused the Sent wire: {}", e));
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    {
+        let mut lease = match manager.lease_for(&sent_wire).await {
+            Ok(l) => l,
+            Err(e) => {
+                log_step(&tracked, 8, "uncertain-reconcile", false, &format!("Sent lease failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        };
+        if let Err(e) = lease.session().append_message(&sent_wire, "\\Seen", &uncertain_eml).await {
+            log_step(&tracked, 8, "uncertain-reconcile", false, &format!("simulated-accept APPEND failed: {}", e));
+            return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+        }
+    }
+    fault_armed.store(false, Ordering::SeqCst);
+    // Reconcile: SEARCH-before-resend. The hit must confirm with the
+    // transport call counts UNCHANGED (D-10: reconcile-not-resend).
+    let rec_before = send_calls.load(Ordering::SeqCst);
+    let rec_inner_before = fault_inner_calls.load(Ordering::SeqCst);
+    let reconcile_summary = {
+        let mut lease = match manager.lease_for("INBOX").await {
+            Ok(l) => l,
+            Err(e) => {
+                log_step(&tracked, 8, "uncertain-reconcile", false, &format!("INBOX lease failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        };
+        match worker
+            .reconcile_uncertain_sends(lease.session(), Some(sent_wire.as_str()), "INBOX")
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                log_step(&tracked, 8, "uncertain-reconcile", false, &format!("reconcile failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        }
+    };
+    let rec_after = send_calls.load(Ordering::SeqCst);
+    let rec_inner_after = fault_inner_calls.load(Ordering::SeqCst);
+    record_calls(&tracked, "uncertain-reconcile", rec_before, rec_after);
+    eprintln!(
+        "[live-gate] uncertain reconcile done: confirmed_sent={} requeued={} still_uncertain={} transport_calls={}",
+        reconcile_summary.confirmed_sent,
+        reconcile_summary.requeued,
+        reconcile_summary.still_uncertain,
+        rec_after
+    );
+    if reconcile_summary.confirmed_sent != 1 || reconcile_summary.requeued != 0 {
+        log_step(
+            &tracked,
+            8,
+            "uncertain-reconcile",
+            false,
+            &format!(
+                "reconcile confirmed_sent={} requeued={} (want 1/0 on the SEARCH hit)",
+                reconcile_summary.confirmed_sent, reconcile_summary.requeued
+            ),
+        );
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    if rec_after != rec_before || rec_inner_after != rec_inner_before {
+        log_step(
+            &tracked,
+            8,
+            "uncertain-reconcile",
+            false,
+            &format!("reconcile re-sent (run-wide {} -> {}, inner {} -> {}) — SEARCH hit must confirm without a transport call", rec_before, rec_after, rec_inner_before, rec_inner_after),
+        );
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    // End state: exactly 1 Sent UID (the simulated accept), row parked sent.
+    let uncertain_sent_uid = match search_sent_for_mid(&manager, &sent_wire, &uncertain_mid).await {
+        Ok(hits) => match assert_exactly_one(&hits, "uncertain-reconcile sent-copy") {
+            Ok(u) => u,
+            Err(e) => {
+                log_step(&tracked, 8, "uncertain-reconcile", false, &e);
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        },
+        Err(e) => {
+            log_step(&tracked, 8, "uncertain-reconcile", false, &e);
+            return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+        }
+    };
+    tracked.message_ids.push(uncertain_mid.clone());
+    tracked.sent_uids.push((uncertain_mid.clone(), uncertain_sent_uid));
+    if !log_step(
+        &tracked,
+        8,
+        "uncertain-reconcile",
+        true,
+        &format!("armed flush uncertain=1 (+0 calls, INBOX 0 hits); simulated server-accept APPENDed to Sent (uid {}); reconcile confirmed_sent=1 with transport calls unchanged (reconcile-not-resend); A-04 hold line observed, failed=0 (A-06)", uncertain_sent_uid),
+    ) {
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    if !check_list_stable(&manager, &before, &list_guard, &tracked, 8, "uncertain-reconcile-list").await {
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+
+    // 9. crash-recover (D-11) — kill mid-`sending` → restart → flush-pass
+    // uncertain triage (A-05, superseding the UI-SPEC `queued` wording per
+    // RESEARCH Pitfall 4) → reconcile-miss requeue (no blind resend) →
+    // backoff-waited single send: exactly 1 INBOX UID + 1 Sent UID,
+    // failed == 0 (pending, never failed).
+    let (crash_mid, crash_qid) = {
+        if let Err(e) = assert_self_only(&cfg.self_addr, &[cfg.self_addr.clone()], &[], &[], &cfg.self_addr) {
+            log_step(&tracked, 9, "crash-recover", false, &e);
+            return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+        }
+        let guard = store.lock().unwrap();
+        match send_queue::enqueue_send(
+            guard.conn(),
+            &app_data,
+            EnqueueInput {
+                from: cfg.self_addr.clone(),
+                to: vec![cfg.self_addr.clone()],
+                cc: vec![],
+                bcc: vec![],
+                subject: format!("{}{}-crash", SUBJECT_PREFIX, tag),
+                body: "live gate crash-recover probe".to_string(),
+                draft_id: None,
+            },
+        ) {
+            Ok(out) => (out.message_id, out.queue_id),
+            Err(e) => {
+                log_step(&tracked, 9, "crash-recover", false, &format!("enqueue_send failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        }
+    };
+    // Kill #1: claim the row to `sending` (the exact first write
+    // flush_one_row performs), then drop all state without a verdict —
+    // the kill lands between claim and verdict.
+    {
+        let guard = store.lock().unwrap();
+        if let Err(e) = queries::set_send_state(guard.conn(), &crash_qid, queries::SEND_STATE_SENDING) {
+            log_step(&tracked, 9, "crash-recover", false, &format!("claim to sending failed: {}", e));
+            return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+        }
+    }
+    // Restart #1: launch-discipline crash_recover flips stranded rows back
+    // to `queued` — assert the D-11 reset ran (returns the flipped count).
+    {
+        let guard = store.lock().unwrap();
+        match send_queue::crash_recover(guard.conn()) {
+            Ok(1) => {}
+            Ok(n) => {
+                log_step(&tracked, 9, "crash-recover", false, &format!("crash_recover flipped {} rows (want 1)", n));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+            Err(e) => {
+                log_step(&tracked, 9, "crash-recover", false, &format!("crash_recover failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        }
+        match queries::get_send_row(guard.conn(), &crash_qid) {
+            Ok(Some(row)) if row.state == queries::SEND_STATE_QUEUED => {}
+            Ok(Some(row)) => {
+                log_step(&tracked, 9, "crash-recover", false, &format!("post-crash_recover state={} (want queued)", row.state));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+            _ => {
+                log_step(&tracked, 9, "crash-recover", false, "crash row vanished after crash_recover");
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        }
+    }
+    // Kill #2: strand the row in the claim window again, then restart
+    // STRAIGHT into a flush pass — the pass header triage (crash_recover +
+    // promote stranded `sending` to `uncertain`) IS the production recovery
+    // path, so no explicit crash_recover runs here (it would empty the
+    // stranded set the triage must observe).
+    {
+        let guard = store.lock().unwrap();
+        if let Err(e) = queries::set_send_state(guard.conn(), &crash_qid, queries::SEND_STATE_SENDING) {
+            log_step(&tracked, 9, "crash-recover", false, &format!("re-claim to sending failed: {}", e));
+            return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+        }
+    }
+    let calls_before_crash = send_calls.load(Ordering::SeqCst);
+    eprintln!("[live-gate] {} (crash-recover leg, restart into flush pass)", envelope_log_line(&cfg.self_addr, &[cfg.self_addr.clone()]));
+    let crash_summary = worker.flush_send_queue(&flush_env).await;
+    let calls_after_crash = send_calls.load(Ordering::SeqCst);
+    record_calls(&tracked, "crash-triage-flush", calls_before_crash, calls_after_crash);
+    eprintln!(
+        "[live-gate] crash triage flush done: sent={} deferred={} failed={} uncertain={} unfiled={} transport_calls={}",
+        crash_summary.sent,
+        crash_summary.deferred,
+        crash_summary.failed,
+        crash_summary.uncertain,
+        crash_summary.sent_unfiled,
+        calls_after_crash
+    );
+    if crash_summary.sent != 0 || calls_after_crash != calls_before_crash {
+        log_step(
+            &tracked,
+            9,
+            "crash-recover",
+            false,
+            &format!("recovery pass sent={} calls {} -> {} — triage must send nothing (no blind resend)", crash_summary.sent, calls_before_crash, calls_after_crash),
+        );
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    // Post-restart state MUST be `uncertain` (flush-pass triage), never
+    // `queued` (RESEARCH Pitfall 4) and never `failed` (A-05/A-06).
+    {
+        let guard = store.lock().unwrap();
+        match send_queue::send_status_snapshot(guard.conn()) {
+            Ok(snap) => {
+                if !(snap.uncertain >= 1 && snap.failed == 0) {
+                    log_step(
+                        &tracked,
+                        9,
+                        "crash-recover",
+                        false,
+                        &format!("post-restart state uncertain={} failed={} (want uncertain>=1 failed=0 — triage, not queued/failed)", snap.uncertain, snap.failed),
+                    );
+                    return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+                }
+            }
+            Err(e) => {
+                log_step(&tracked, 9, "crash-recover", false, &format!("send_status snapshot failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        }
+        match queries::get_send_row(guard.conn(), &crash_qid) {
+            Ok(Some(row)) if row.state == queries::SEND_STATE_UNCERTAIN => {}
+            Ok(Some(row)) => {
+                log_step(&tracked, 9, "crash-recover", false, &format!("crash row state={} (want uncertain — Pitfall 4)", row.state));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+            _ => {
+                log_step(&tracked, 9, "crash-recover", false, "crash row vanished after the triage pass");
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        }
+    }
+    // Reconcile: SEARCH Sent MISSES (zero bytes ever left the box) → exactly
+    // one requeue with attempts counted and backoff scheduled (no blind
+    // resend — the miss path still SEARCHes first).
+    let crash_rec_before = send_calls.load(Ordering::SeqCst);
+    let crash_reconcile = {
+        let mut lease = match manager.lease_for("INBOX").await {
+            Ok(l) => l,
+            Err(e) => {
+                log_step(&tracked, 9, "crash-recover", false, &format!("INBOX lease failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        };
+        match worker
+            .reconcile_uncertain_sends(lease.session(), Some(sent_wire.as_str()), "INBOX")
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                log_step(&tracked, 9, "crash-recover", false, &format!("reconcile failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        }
+    };
+    let crash_rec_after = send_calls.load(Ordering::SeqCst);
+    record_calls(&tracked, "crash-reconcile", crash_rec_before, crash_rec_after);
+    if crash_reconcile.requeued != 1 || crash_reconcile.confirmed_sent != 0 {
+        log_step(
+            &tracked,
+            9,
+            "crash-recover",
+            false,
+            &format!(
+                "reconcile requeued={} confirmed_sent={} (want 1/0 — SEARCH miss on zero sent bytes)",
+                crash_reconcile.requeued, crash_reconcile.confirmed_sent
+            ),
+        );
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    if crash_rec_after != crash_rec_before {
+        log_step(
+            &tracked,
+            9,
+            "crash-recover",
+            false,
+            &format!("reconcile re-sent (calls {} -> {}) — miss path must requeue, never resend", crash_rec_before, crash_rec_after),
+        );
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    // The requeue carries attempts=1 with a scheduled backoff — prove the
+    // schedule sits inside the bounds (D-09, second sighting).
+    {
+        let guard = store.lock().unwrap();
+        match queries::get_send_row(guard.conn(), &crash_qid) {
+            Ok(Some(row)) => {
+                let now = chrono::Utc::now().timestamp();
+                if row.attempts != 1 || !retry_within_bounds(&row.next_retry_at, 1, now, 15) {
+                    log_step(
+                        &tracked,
+                        9,
+                        "crash-recover",
+                        false,
+                        &format!("requeue schedule off: attempts={} next_retry_at={:?} (want attempts=1 inside backoff_bounds(1))", row.attempts, row.next_retry_at),
+                    );
+                    return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+                }
+            }
+            _ => {
+                log_step(&tracked, 9, "crash-recover", false, "crash row vanished after reconcile");
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        }
+    }
+    // Backoff-waited single send: poll-flush until the row is due (≤10 ×
+    // 15s — production due-gating decides, never a forced send). Non-winning
+    // polls must add zero calls; the winning pass adds exactly one.
+    let mut crash_sent = false;
+    for round in 0..10usize {
+        if round > 0 {
+            async_std::task::sleep(std::time::Duration::from_secs(15)).await;
+        }
+        let b = send_calls.load(Ordering::SeqCst);
+        let s = worker.flush_send_queue(&flush_env).await;
+        let a = send_calls.load(Ordering::SeqCst);
+        eprintln!(
+            "[live-gate] crash backoff poll {}/10: sent={} deferred={} failed={} uncertain={} transport_calls={}",
+            round + 1,
+            s.sent,
+            s.deferred,
+            s.failed,
+            s.uncertain,
+            a
+        );
+        if s.sent == 1 {
+            record_calls(&tracked, "crash-final-flush", b, a);
+            crash_sent = true;
+            break;
+        }
+        record_calls(&tracked, "crash-backoff-poll", b, a);
+        if a != b || s.sent != 0 {
+            log_step(
+                &tracked,
+                9,
+                "crash-recover",
+                false,
+                &format!("backoff poll {} sent without due row (sent={} calls {} -> {})", round + 1, s.sent, b, a),
+            );
+            return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+        }
+    }
+    if !crash_sent {
+        log_step(&tracked, 9, "crash-recover", false, "requeued row never became due within 10 × 15s polls");
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    // Exactly-once: 1 INBOX UID + 1 Sent UID, failed == 0, leg calls +1.
+    let crash_uid = match poll_inbox_for_mid(&manager, &crash_mid, inbox_validity).await {
+        Ok(u) => u,
+        Err(d) => {
+            log_step(&tracked, 9, "crash-recover", false, &d);
+            return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+        }
+    };
+    if !peek_confirms_mid(&manager, "INBOX", crash_uid, &crash_mid).await {
+        log_step(&tracked, 9, "crash-recover", false, "PEEK header confirm failed (subject prefix / Message-ID)");
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    let crash_sent_uid = match search_sent_for_mid(&manager, &sent_wire, &crash_mid).await {
+        Ok(hits) => match assert_exactly_one(&hits, "crash-recover sent-copy") {
+            Ok(u) => u,
+            Err(e) => {
+                log_step(&tracked, 9, "crash-recover", false, &e);
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        },
+        Err(e) => {
+            log_step(&tracked, 9, "crash-recover", false, &e);
+            return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+        }
+    };
+    {
+        let guard = store.lock().unwrap();
+        match send_queue::send_status_snapshot(guard.conn()) {
+            Ok(snap) => {
+                if snap.failed != 0 {
+                    log_step(&tracked, 9, "crash-recover", false, &format!("failed={} (want 0 — crash-recovered item shows pending, never failed)", snap.failed));
+                    return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+                }
+            }
+            Err(e) => {
+                log_step(&tracked, 9, "crash-recover", false, &format!("send_status snapshot failed: {}", e));
+                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+            }
+        }
+    }
+    tracked.message_ids.push(crash_mid.clone());
+    tracked.inbox_uids.push((crash_mid.clone(), crash_uid));
+    tracked.sent_uids.push((crash_mid.clone(), crash_sent_uid));
+    if !log_step(
+        &tracked,
+        9,
+        "crash-recover",
+        true,
+        &format!("kill→crash_recover=1 (queued reset)→re-strand→flush triage uncertain (A-05 post-flush-triage, failed=0); reconcile miss→requeue (no blind resend, backoff in bounds); backoff-waited flush sent once: 1 INBOX UID + 1 Sent UID, leg calls +1 (exactly once)"),
+    ) {
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+    if !check_list_stable(&manager, &before, &list_guard, &tracked, 9, "crash-recover-list").await {
+        return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+    }
+
+    // 11. autosave-probe (D-08): the end state must be exactly 1 Sent UID
     // either way — explicit APPEND or server auto-save deduped by the filing
     // leg's probe SEARCH (no twin copy). Which branch ran is named by the
     // flush stderr lines captured in the wrapper log ("deduped in Sent" vs
@@ -1381,10 +2518,11 @@ async fn run() -> i32 {
     {
         let mut probe_ok = true;
         let mut probe_detail = String::new();
+        let mut probe_counts: Vec<(String, usize, bool)> = Vec::new();
         let mut lease = match manager.lease_for(&sent_wire).await {
             Ok(l) => l,
             Err(e) => {
-                step(7, "autosave-probe", false, &format!("Sent lease failed: {}", e));
+                log_step(&tracked, 11, "autosave-probe", false, &format!("Sent lease failed: {}", e));
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         };
@@ -1396,17 +2534,20 @@ async fn run() -> i32 {
                 probe_ok = false;
             }
             probe_detail.push_str(&format!("{}:sent_uids={}{}; ", mid, count, if is_unfiled { "(unfiled)" } else { "" }));
+            probe_counts.push((mid.clone(), count, is_unfiled));
         }
         probe_detail.push_str("branch per [SGE send] flush lines in log (deduped-in-Sent vs APPENDed-to-Sent)");
-        if !step(7, "autosave-probe", probe_ok, &probe_detail) {
+        tracked.probe_counts = probe_counts;
+        tracked.probe_detail = probe_detail.clone();
+        if !log_step(&tracked, 11, "autosave-probe", probe_ok, &probe_detail) {
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
     }
-    if !check_list_stable(&manager, &before, &list_guard, 7, "autosave-probe-list").await {
+    if !check_list_stable(&manager, &before, &list_guard, &tracked, 11, "autosave-probe-list").await {
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
 
-    // 8. cleanup — ALWAYS runs: expunge tracked UIDs, re-LIST must equal the
+    // 12. cleanup — ALWAYS runs: expunge tracked UIDs, re-LIST must equal the
     // pre-run snapshot.
     cleanup(&manager, &db_path, &app_data, &before, &tracked).await
 }
@@ -1446,7 +2587,8 @@ async fn cleanup(
     if !clean {
         ok = false;
     }
-    step(
+    log_step(
+        tracked,
         TOTAL_STEPS,
         "cleanup",
         ok && clean,
@@ -1637,5 +2779,121 @@ mod live_gate_21_preflight_tests {
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(t.calls(), 1);
+    }
+
+    #[test]
+    fn live_gate_21_timeout_transport_armed_emits_uncertain_with_zero_inner_calls() {
+        let (inner, inner_calls) = CountingTransport::offline();
+        let (t, armed, forwarded) = TimeoutTransport::new(Arc::new(inner));
+        armed.store(true, Ordering::SeqCst);
+        let acct = SmtpAccount {
+            host: "smtp.example".to_string(),
+            port: 587,
+            username: "u".to_string(),
+            password: "p".to_string(),
+        };
+        let verdict = t.send_raw(&acct, "a@example.com", &["b@example.com".to_string()], b"bytes");
+        assert!(
+            matches!(verdict, SmtpOutcome::Uncertain { .. }),
+            "armed fault must surface Uncertain"
+        );
+        assert_eq!(inner_calls.load(Ordering::SeqCst), 0, "zero inner calls while armed");
+        assert_eq!(forwarded.load(Ordering::SeqCst), 0, "zero forwarded calls while armed");
+        // Disarmed: forwards to the inner transport and counts once.
+        armed.store(false, Ordering::SeqCst);
+        assert_eq!(
+            t.send_raw(&acct, "a@example.com", &["b@example.com".to_string()], b"bytes"),
+            SmtpOutcome::Sent
+        );
+        assert_eq!(inner_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(forwarded.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn live_gate_21_harness_append_target_allows_only_the_allow_list() {
+        let sent = "Sent".to_string();
+        let sandbox = "SGE-Test-1-drafts".to_string();
+        assert!(assert_harness_append_target(&sent, &[sent.clone()]).is_ok());
+        assert!(assert_harness_append_target(&sandbox, &[sent.clone(), sandbox.clone()]).is_ok());
+        // INBOX is never appendable by the harness — arrival lands by
+        // server delivery only.
+        assert!(assert_harness_append_target("INBOX", &[sent.clone(), sandbox.clone()]).is_err());
+        assert!(assert_harness_append_target("Drafts", &[sent.clone()]).is_err());
+        assert!(assert_harness_append_target(&sent, &[]).is_err());
+    }
+
+    #[test]
+    fn live_gate_21_backoff_bounds_growth_pinned() {
+        // Growth pinned offline per the plan: (24,36) at 0, cap (720,1080).
+        assert_eq!(send_queue::backoff_bounds(0), (24, 36));
+        assert_eq!(send_queue::backoff_bounds(u32::MAX), (720, 1080));
+        let (lo, hi) = send_queue::backoff_bounds(1);
+        assert_eq!((lo, hi), (48, 72));
+    }
+
+    #[test]
+    fn live_gate_21_retry_within_bounds_shapes() {
+        let now = chrono::Utc::now().timestamp();
+        let in_window = chrono::DateTime::from_timestamp(now + 30, 0)
+            .unwrap()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        assert!(retry_within_bounds(&Some(in_window), 0, now, 15));
+        assert!(!retry_within_bounds(&None, 0, now, 15));
+        assert!(!retry_within_bounds(&Some("not-a-timestamp".to_string()), 0, now, 15));
+        // Far-future schedule is outside the bounds (not a valid backoff).
+        let far = chrono::DateTime::from_timestamp(now + 100_000, 0)
+            .unwrap()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        assert!(!retry_within_bounds(&Some(far), 0, now, 15));
+    }
+
+    #[test]
+    fn live_gate_21_deferred_backoff_ok_vacuous_and_violation() {
+        let now = chrono::Utc::now().timestamp();
+        let (ok, _) = deferred_backoff_ok(&[], now);
+        assert!(ok, "no deferred rows passes vacuously");
+        let good_ts = chrono::DateTime::from_timestamp(now + 60, 0)
+            .unwrap()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let (ok, _) = deferred_backoff_ok(&[("q1".to_string(), 1, Some(good_ts))], now);
+        assert!(ok);
+        let (ok, detail) = deferred_backoff_ok(&[("q9".to_string(), 0, None)], now);
+        assert!(!ok, "missing schedule must fail: {detail}");
+    }
+
+    #[test]
+    fn live_gate_21_step_log_records_outcomes_for_report() {
+        let tracked = TrackedMail::empty();
+        assert!(log_step(&tracked, 7, "offline-flush", true, "detail-a"));
+        assert!(!log_step(&tracked, 8, "uncertain-reconcile", false, "detail-b"));
+        assert_eq!(logged_outcome(&tracked, 7, "offline-flush"), Some(true));
+        assert_eq!(logged_outcome(&tracked, 8, "uncertain-reconcile"), Some(false));
+        assert_eq!(logged_outcome(&tracked, 9, "crash-recover"), None);
+        record_calls(&tracked, "offline-flush", 3, 4);
+        let calls = tracked.calls_log.lock().unwrap();
+        assert_eq!(calls.as_slice(), &[("offline-flush".to_string(), 3, 4)]);
+    }
+
+    #[test]
+    fn live_gate_21_expected_calls_delta_pins_reconcile_at_zero() {
+        for leg in ["arrival", "offline-flush", "draft-send", "crash-final-flush"] {
+            assert_eq!(expected_calls_delta(leg), Some(1));
+        }
+        // Reconcile / re-flush / wait-poll legs must add ZERO transport
+        // calls — the reconcile-not-resend proof.
+        for leg in [
+            "uncertain-armed-flush",
+            "uncertain-reconcile",
+            "crash-triage-flush",
+            "crash-reconcile",
+            "crash-backoff-poll",
+            "sent-unfiled-reflush",
+        ] {
+            assert_eq!(expected_calls_delta(leg), Some(0), "leg {leg} must add zero calls");
+        }
+        assert_eq!(expected_calls_delta("no-such-leg"), None);
     }
 }

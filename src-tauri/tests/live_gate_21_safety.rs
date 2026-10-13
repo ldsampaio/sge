@@ -681,3 +681,195 @@ fn live_gate_21_envelope_log_has_no_bcc_line_but_envelope_keeps_bcc() {
     assert!(!line.to_ascii_lowercase().contains("bcc:"));
     std::fs::remove_dir_all(&app_data).ok();
 }
+
+// ── Retry / uncertain / crash shapes (D-09/D-10/D-11 — zero network) ─────
+// The REAL prod path under a fault decorator: armed flush marks `uncertain`
+// with zero transport calls; reconcile SEARCH-hit confirms without resend;
+// SEARCH-miss requeues once with a bounded backoff; a stranded `sending`
+// row is triaged to `uncertain` by the flush pass (never back to `queued` —
+// RESEARCH Pitfall 4) and `requeue_failed` refuses non-failed rows (A-06:
+// uncertain never offers resend-as-Retentar).
+
+fn offline_flush_env(
+    transport: Arc<dyn SmtpTransport>,
+) -> sge_lib::sync::worker::SendFlushEnv {
+    use sge_lib::send_queue::SendGate;
+    sge_lib::sync::worker::SendFlushEnv {
+        gate: SendGate::default(),
+        transport,
+        account: SmtpAccount {
+            host: "smtp.example".to_string(),
+            port: 587,
+            username: "u".to_string(),
+            password: "p".to_string(),
+        },
+        manager: None,
+        sent_wire: None,
+    }
+}
+
+#[test]
+fn live_gate_21_retry_armed_flush_marks_uncertain_with_zero_calls() {
+    let store = Arc::new(std::sync::Mutex::new(Store::open_in_memory().unwrap()));
+    let app_data = test_app_data("retry-armed");
+    let (qid, mid) = {
+        let guard = store.lock().unwrap();
+        let out = send_queue::enqueue_send(guard.conn(), &app_data, self_input("armed")).unwrap();
+        (out.queue_id, out.message_id)
+    };
+    let (inner, calls) = harness::CountingTransport::offline();
+    let (fault, armed, forwarded) = harness::TimeoutTransport::new(Arc::new(inner));
+    armed.store(true, Ordering::SeqCst);
+    let worker = SyncWorker::new(store.clone());
+    let summary = block_on(worker.flush_send_queue(&offline_flush_env(Arc::new(fault))));
+    assert_eq!(summary.uncertain, 1, "armed fault must mark the row uncertain");
+    assert_eq!(summary.sent, 0, "faulted attempt must not send");
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "zero inner calls while armed");
+    assert_eq!(forwarded.load(Ordering::SeqCst), 0, "zero forwarded calls while armed");
+    // A-04/A-06 shape: uncertain hold visible, never failed.
+    {
+        let guard = store.lock().unwrap();
+        let snap = send_queue::send_status_snapshot(guard.conn()).unwrap();
+        assert!(snap.uncertain >= 1 && snap.failed == 0);
+        let row = queries::get_send_row(guard.conn(), &qid).unwrap().unwrap();
+        assert_eq!(row.state, "uncertain");
+        assert_eq!(row.message_id, mid);
+    }
+    std::fs::remove_dir_all(&app_data).ok();
+}
+
+#[test]
+fn live_gate_21_retry_reconcile_hit_confirms_without_resend() {
+    let store = Arc::new(std::sync::Mutex::new(Store::open_in_memory().unwrap()));
+    let app_data = test_app_data("retry-hit");
+    let mid = {
+        let guard = store.lock().unwrap();
+        let out = send_queue::enqueue_send(guard.conn(), &app_data, self_input("hit")).unwrap();
+        // Drive the row to `uncertain` through the REAL armed-fault path.
+        let (inner, _) = harness::CountingTransport::offline();
+        let (fault, armed, _) = harness::TimeoutTransport::new(Arc::new(inner));
+        armed.store(true, Ordering::SeqCst);
+        drop(guard);
+        let worker = SyncWorker::new(store.clone());
+        let summary = block_on(worker.flush_send_queue(&offline_flush_env(Arc::new(fault))));
+        assert_eq!(summary.uncertain, 1);
+        out.message_id
+    };
+    // Simulated ambiguous server-accept: the bytes sit in Sent.
+    let mut fake = FakeSession::with_mailbox("Sent");
+    let bytes = format!("Message-ID: {mid}\r\nSubject: {0}hit\r\n\r\nb", harness::SUBJECT_PREFIX).into_bytes();
+    block_on(fake.append_message("Sent", "\\Seen", &bytes)).unwrap();
+    let (inner, calls) = harness::CountingTransport::offline();
+    let worker = SyncWorker::new(store.clone());
+    let before = calls.load(Ordering::SeqCst);
+    let rec = block_on(worker.reconcile_uncertain_sends(&mut fake, Some("Sent"), "INBOX")).unwrap();
+    assert_eq!(rec.confirmed_sent, 1, "SEARCH hit must confirm");
+    assert_eq!(rec.requeued, 0);
+    assert_eq!(rec.still_uncertain, 0);
+    assert_eq!(calls.load(Ordering::SeqCst), before, "reconcile must not call the transport");
+    {
+        let guard = store.lock().unwrap();
+        let row = queries::get_send_row_by_message_id(guard.conn(), &mid).unwrap().unwrap();
+        assert_eq!(row.state, "sent");
+    }
+    let _ = inner;
+    std::fs::remove_dir_all(&app_data).ok();
+}
+
+#[test]
+fn live_gate_21_retry_reconcile_miss_requeues_once_with_bounded_backoff() {
+    let store = Arc::new(std::sync::Mutex::new(Store::open_in_memory().unwrap()));
+    let app_data = test_app_data("retry-miss");
+    let (qid, mid) = {
+        let guard = store.lock().unwrap();
+        let out = send_queue::enqueue_send(guard.conn(), &app_data, self_input("miss")).unwrap();
+        queries::mark_send_uncertain(guard.conn(), &out.queue_id, "injected timeout").unwrap();
+        (out.queue_id, out.message_id)
+    };
+    // Sent exists but holds nothing for this MID → SEARCH miss.
+    let mut fake = FakeSession::with_mailbox("Sent");
+    let worker = SyncWorker::new(store.clone());
+    let rec = block_on(worker.reconcile_uncertain_sends(&mut fake, Some("Sent"), "INBOX")).unwrap();
+    assert_eq!(rec.requeued, 1, "SEARCH miss must requeue exactly once");
+    assert_eq!(rec.confirmed_sent, 0);
+    assert_eq!(rec.still_uncertain, 0);
+    {
+        let guard = store.lock().unwrap();
+        let row = queries::get_send_row(guard.conn(), &qid).unwrap().unwrap();
+        assert_eq!(row.state, "queued");
+        assert_eq!(row.attempts, 1, "miss counts the attempt");
+        let now = chrono::Utc::now().timestamp();
+        assert!(
+            harness::retry_within_bounds(&row.next_retry_at, 1, now, 15),
+            "requeue backoff must sit inside backoff_bounds(1): {:?}",
+            row.next_retry_at
+        );
+        assert_eq!(row.message_id, mid);
+    }
+    std::fs::remove_dir_all(&app_data).ok();
+}
+
+#[test]
+fn live_gate_21_retry_crash_claim_triaged_to_uncertain_never_queued() {
+    let store = Arc::new(std::sync::Mutex::new(Store::open_in_memory().unwrap()));
+    let app_data = test_app_data("retry-crash");
+    let qid = {
+        let guard = store.lock().unwrap();
+        let out = send_queue::enqueue_send(guard.conn(), &app_data, self_input("crash")).unwrap();
+        // Kill between claim and verdict: the exact first write the flush
+        // performs, then no verdict ever lands.
+        queries::set_send_state(guard.conn(), &out.queue_id, queries::SEND_STATE_SENDING).unwrap();
+        out.queue_id
+    };
+    // Restart #1: launch-discipline crash_recover resets to queued (D-11).
+    {
+        let guard = store.lock().unwrap();
+        assert_eq!(send_queue::crash_recover(guard.conn()).unwrap(), 1);
+        let row = queries::get_send_row(guard.conn(), &qid).unwrap().unwrap();
+        assert_eq!(row.state, queries::SEND_STATE_QUEUED);
+    }
+    // Kill #2 strands the row again; restart straight into a flush pass —
+    // the pass header triage promotes stranded `sending` to `uncertain`
+    // (Pitfall 4: never assert `queued` here).
+    {
+        let guard = store.lock().unwrap();
+        queries::set_send_state(guard.conn(), &qid, queries::SEND_STATE_SENDING).unwrap();
+    }
+    let (transport, calls) = harness::CountingTransport::offline();
+    let worker = SyncWorker::new(store.clone());
+    let summary = block_on(worker.flush_send_queue(&offline_flush_env(Arc::new(transport))));
+    assert_eq!(summary, sge_lib::sync::worker::FlushSummary::default(), "triage emits no send outcome");
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "triage must send nothing");
+    {
+        let guard = store.lock().unwrap();
+        let row = queries::get_send_row(guard.conn(), &qid).unwrap().unwrap();
+        assert_eq!(row.state, queries::SEND_STATE_UNCERTAIN, "stranded sending triages to uncertain, not queued");
+        let snap = send_queue::send_status_snapshot(guard.conn()).unwrap();
+        assert!(snap.uncertain >= 1 && snap.failed == 0, "A-05/A-06: uncertain hold, never failed");
+        // A-06 contract: retry never yanks a row out of `uncertain` (the
+        // Retentar backend only requeues genuinely failed rows).
+        assert!(
+            !send_queue::requeue_failed(guard.conn(), &qid).unwrap(),
+            "requeue_failed must refuse uncertain rows"
+        );
+    }
+    std::fs::remove_dir_all(&app_data).ok();
+}
+
+#[test]
+fn live_gate_21_retry_recorded_failure_schedules_inside_bounds() {
+    let store = Store::open_in_memory().unwrap();
+    let conn = store.conn();
+    let app_data = test_app_data("retry-bounds");
+    let out = send_queue::enqueue_send(conn, &app_data, self_input("bounds")).unwrap();
+    let attempts = send_queue::record_send_failure(conn, &out.queue_id, "boom").unwrap();
+    assert_eq!(attempts, 1);
+    let row = queries::get_send_row(conn, &out.queue_id).unwrap().unwrap();
+    let now = chrono::Utc::now().timestamp();
+    assert!(
+        harness::retry_within_bounds(&row.next_retry_at, 1, now, 15),
+        "next_retry_at must sit inside backoff_bounds(1): {:?}",
+        row.next_retry_at
+    );
+    std::fs::remove_dir_all(&app_data).ok();
+}
