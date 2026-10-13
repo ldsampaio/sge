@@ -535,4 +535,165 @@ mod tests {
         let j = rule_justification(&r);
         assert!(j.contains("utfpr.edu.br") && j.contains("Arquivo"));
     }
+
+    // ── rule_valid: backend-enforced validation (T-25-01, T-25-03) ──
+
+    fn valid_test_db() -> crate::store::Store {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        conn.execute(
+            "INSERT INTO mailboxes (name, uid_validity, uid_next, delimiter) \
+             VALUES ('INBOX', 1, 1, '/'), ('Arquivo', 1, 1, '/')",
+            [],
+        )
+        .unwrap();
+        store
+    }
+
+    fn dest_folder(display: &str) -> RuleDestination {
+        RuleDestination::Folder { display: display.to_string() }
+    }
+
+    fn sender_cond() -> RuleConditions {
+        let mut c = cond();
+        c.sender_domain = Some("utfpr.edu.br".into());
+        c
+    }
+
+    #[test]
+    fn rule_valid_empty_patterns_rejected() {
+        let store = valid_test_db();
+        let err = validate_rule(
+            store.conn(), "Sem condição", &cond(), &dest_folder("Arquivo"),
+            &RuleScope::default(), None,
+        )
+        .unwrap_err();
+        assert_eq!(err, RuleError::EmptyConditions);
+    }
+
+    #[test]
+    fn rule_valid_bad_regex_and_pattern_cap_rejected() {
+        let store = valid_test_db();
+        let mut c = cond();
+        c.subject_regex = Some("([aberto".into());
+        let err = validate_rule(
+            store.conn(), "Regex ruim", &c, &dest_folder("Arquivo"),
+            &RuleScope::default(), None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, RuleError::BadRegex(_)), "got {err:?}");
+        let mut c2 = cond();
+        c2.subject_regex = Some("a".repeat(RULE_REGEX_MAX + 1));
+        assert_eq!(
+            validate_rule(
+                store.conn(), "Regex longa", &c2, &dest_folder("Arquivo"),
+                &RuleScope::default(), None
+            )
+            .unwrap_err(),
+            RuleError::PatternTooLong
+        );
+    }
+
+    #[test]
+    fn rule_valid_reserved_destinations_rejected() {
+        let store = valid_test_db();
+        for reserved in ["Auto", "auto", "INBOX", "inbox"] {
+            let err = validate_rule(
+                store.conn(), "R", &sender_cond(), &dest_folder(reserved),
+                &RuleScope::default(), None,
+            )
+            .unwrap_err();
+            assert_eq!(err, RuleError::ReservedDestination(reserved.to_string()), "for {reserved}");
+        }
+        // Destructive resolutions rejected structurally (T-25-03).
+        for bad in ["\\Deleted", "expunge"] {
+            let err = validate_rule(
+                store.conn(), "R", &sender_cond(), &dest_folder(bad),
+                &RuleScope::default(), None,
+            )
+            .unwrap_err();
+            assert_eq!(err, RuleError::DestructiveDestination(bad.to_string()), "for {bad}");
+        }
+    }
+
+    #[test]
+    fn rule_valid_names_guarded() {
+        let store = valid_test_db();
+        let d = dest_folder("Arquivo");
+        let s = RuleScope::default();
+        assert_eq!(
+            validate_rule(store.conn(), "  ", &sender_cond(), &d, &s, None).unwrap_err(),
+            RuleError::EmptyName
+        );
+        assert_eq!(
+            validate_rule(store.conn(), &"n".repeat(81), &sender_cond(), &d, &s, None)
+                .unwrap_err(),
+            RuleError::NameTooLong
+        );
+        assert!(matches!(
+            validate_rule(store.conn(), "a/b", &sender_cond(), &d, &s, None).unwrap_err(),
+            RuleError::NameInjection(_)
+        ));
+        // Uniqueness (case-insensitive); self excluded on edit.
+        conn_seed_rule(store.conn(), "r-1", "Boletos");
+        assert_eq!(
+            validate_rule(store.conn(), "boletos", &sender_cond(), &d, &s, None).unwrap_err(),
+            RuleError::DuplicateName("boletos".to_string())
+        );
+        validate_rule(store.conn(), "boletos", &sender_cond(), &d, &s, Some("r-1")).unwrap();
+    }
+
+    #[test]
+    fn rule_valid_unknown_scope_folder_rejected() {
+        let store = valid_test_db();
+        let scope = RuleScope { folders: vec!["PastaFantasma".into()] };
+        assert_eq!(
+            validate_rule(
+                store.conn(), "R", &sender_cond(), &dest_folder("Arquivo"), &scope, None
+            )
+            .unwrap_err(),
+            RuleError::UnknownScopeFolder("PastaFantasma".to_string())
+        );
+    }
+
+    #[test]
+    fn rule_valid_taxonomy_category_must_exist() {
+        let store = valid_test_db();
+        let missing = RuleDestination::TaxonomyCategory { id: "nao-existe".into() };
+        assert_eq!(
+            validate_rule(
+                store.conn(), "R", &sender_cond(), &missing, &RuleScope::default(), None
+            )
+            .unwrap_err(),
+            RuleError::UnknownDestination("nao-existe".to_string())
+        );
+    }
+
+    #[test]
+    fn rule_valid_quote_laden_patterns_are_data_not_sql() {
+        // Quote-laden patterns must not error as SQL — conditions ride as
+        // bound params and the matcher runs in Rust (no injection surface).
+        let store = valid_test_db();
+        conn_seed_rule(store.conn(), "r-q", "Intacta");
+        let mut c = cond();
+        c.subject_keyword = Some("d'água \"especial\"; DROP TABLE folder_rules;--".into());
+        validate_rule(
+            store.conn(), "Aspas", &c, &dest_folder("Arquivo"), &RuleScope::default(), None,
+        )
+        .unwrap();
+        let n: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM folder_rules", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "quote-laden pattern must not disturb stored rows");
+    }
+
+    fn conn_seed_rule(conn: &Connection, id: &str, name: &str) {
+        conn.execute(
+            "INSERT INTO folder_rules (id, name, priority, conditions_json, dest_kind, destination) \
+             VALUES (?1, ?2, 100, '{}', 'folder', 'Arquivo')",
+            rusqlite::params![id, name],
+        )
+        .unwrap();
+    }
 }

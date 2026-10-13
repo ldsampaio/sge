@@ -1526,3 +1526,192 @@ pub async fn archive_run(
     });
     Ok(run_id)
 }
+
+// ── Phase 25: smart folder rules — validated CRUD (RULE-01) ─────────
+//
+// Every write path validates backend-side (`rules::validate_rule`) with
+// plain-language errors; UI restraint is never the only guard. Rule hits
+// become `rule_suggestions` rows confirmed through the UNMODIFIED
+// `confirm_suggestion` path — rules never move mail directly.
+
+use crate::classify::rules::{self, RuleConditions, RuleDestination, RuleScope};
+use crate::store::queries::RuleRow;
+
+/// Rule surface for the options UI (conditions/destination as data).
+#[derive(Debug, Clone, Serialize)]
+pub struct RuleView {
+    pub id: String,
+    pub name: String,
+    pub priority: i64,
+    pub conditions: RuleConditions,
+    pub destination: RuleDestination,
+    pub scope_folders: Vec<String>,
+    pub enabled: bool,
+}
+
+fn rule_view(row: &RuleRow) -> Result<RuleView, String> {
+    let conditions: RuleConditions =
+        serde_json::from_str(&row.conditions_json).map_err(|e| e.to_string())?;
+    let destination = if row.dest_kind == "category" {
+        RuleDestination::TaxonomyCategory { id: row.destination.clone() }
+    } else {
+        RuleDestination::Folder { display: row.destination.clone() }
+    };
+    let scope_folders: Vec<String> =
+        serde_json::from_str(&row.scope_json).unwrap_or_default();
+    Ok(RuleView {
+        id: row.id.clone(),
+        name: row.name.clone(),
+        priority: row.priority,
+        conditions,
+        destination,
+        scope_folders,
+        enabled: row.enabled,
+    })
+}
+
+/// Next free priority (append at the bottom — explicit reorder lowers it).
+fn next_rule_priority(conn: &rusqlite::Connection) -> i64 {
+    conn.query_row("SELECT IFNULL(MAX(priority), 99) + 1 FROM folder_rules", [], |r| {
+        r.get::<_, i64>(0)
+    })
+    .unwrap_or(rules::RULE_DEFAULT_PRIORITY)
+}
+
+/// Dedupe a slug id (`boletos`, `boletos-2`, …).
+fn unique_rule_id(conn: &rusqlite::Connection, base: &str) -> String {
+    let mut id = base.to_string();
+    let mut n = 2;
+    loop {
+        let taken: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM folder_rules WHERE id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap_or(1);
+        if taken == 0 {
+            return id;
+        }
+        id = format!("{base}-{n}");
+        n += 1;
+    }
+}
+
+/// Create a rule: validate → assign id/priority → persist. Any validation
+/// failure rejects with a plain-language reason; nothing is stored.
+#[tauri::command]
+pub async fn create_rule(
+    state: State<'_, AppState>,
+    name: String,
+    conditions: RuleConditions,
+    destination: RuleDestination,
+    scope_folders: Vec<String>,
+) -> Result<RuleView, String> {
+    let guard = state.store.lock().unwrap();
+    let conn = guard.conn();
+    let scope = RuleScope { folders: scope_folders };
+    rules::validate_rule(conn, &name, &conditions, &destination, &scope, None)
+        .map_err(|e| e.to_string())?;
+    let id = unique_rule_id(conn, &rules::slug_for(&name));
+    let row = RuleRow {
+        id,
+        name: name.trim().to_string(),
+        priority: next_rule_priority(conn),
+        conditions_json: serde_json::to_string(&conditions).map_err(|e| e.to_string())?,
+        dest_kind: match &destination {
+            RuleDestination::Folder { .. } => "folder".to_string(),
+            RuleDestination::TaxonomyCategory { .. } => "category".to_string(),
+        },
+        destination: match &destination {
+            RuleDestination::Folder { display } => display.trim().to_string(),
+            RuleDestination::TaxonomyCategory { id } => id.clone(),
+        },
+        scope_json: serde_json::to_string(&scope.folders).map_err(|e| e.to_string())?,
+        enabled: true,
+    };
+    crate::store::queries::insert_rule(conn, &row).map_err(|e| e.to_string())?;
+    rule_view(&row)
+}
+
+/// List all rules in evaluation order (priority ASC, oldest wins ties).
+#[tauri::command]
+pub async fn list_rules(state: State<'_, AppState>) -> Result<Vec<RuleView>, String> {
+    let guard = state.store.lock().unwrap();
+    let rows = crate::store::queries::list_rules(guard.conn()).map_err(|e| e.to_string())?;
+    rows.iter().map(rule_view).collect()
+}
+
+/// Edit a rule: re-validates the NEW values; an invalid edit is rejected
+/// and the old rule is kept untouched (validate-before-write).
+#[tauri::command]
+pub async fn update_rule(
+    state: State<'_, AppState>,
+    id: String,
+    name: String,
+    conditions: RuleConditions,
+    destination: RuleDestination,
+    scope_folders: Vec<String>,
+    enabled: bool,
+) -> Result<RuleView, String> {
+    let guard = state.store.lock().unwrap();
+    let conn = guard.conn();
+    let existing = crate::store::queries::get_rule(conn, &id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "regra desconhecida".to_string())?;
+    let scope = RuleScope { folders: scope_folders };
+    rules::validate_rule(conn, &name, &conditions, &destination, &scope, Some(&id))
+        .map_err(|e| e.to_string())?;
+    let row = RuleRow {
+        id: id.clone(),
+        name: name.trim().to_string(),
+        priority: existing.priority,
+        conditions_json: serde_json::to_string(&conditions).map_err(|e| e.to_string())?,
+        dest_kind: match &destination {
+            RuleDestination::Folder { .. } => "folder".to_string(),
+            RuleDestination::TaxonomyCategory { .. } => "category".to_string(),
+        },
+        destination: match &destination {
+            RuleDestination::Folder { display } => display.trim().to_string(),
+            RuleDestination::TaxonomyCategory { id } => id.clone(),
+        },
+        scope_json: serde_json::to_string(&scope.folders).map_err(|e| e.to_string())?,
+        enabled,
+    };
+    crate::store::queries::update_rule(conn, &row).map_err(|e| e.to_string())?;
+    rule_view(&row)
+}
+
+/// Delete a rule: immediate, no confirm (rules hold no mail — mirrors
+/// Phase 23 filter-delete semantics). Pending suggestion rows cascade.
+#[tauri::command]
+pub async fn delete_rule(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let guard = state.store.lock().unwrap();
+    crate::store::queries::delete_rule(guard.conn(), &id).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Enable/disable toggle (no confirm).
+#[tauri::command]
+pub async fn set_rule_enabled(
+    state: State<'_, AppState>,
+    id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let guard = state.store.lock().unwrap();
+    crate::store::queries::set_rule_enabled(guard.conn(), &id, enabled)
+        .map_err(|e| e.to_string())
+}
+
+/// Explicit integer priority (lower wins; ties by creation order).
+/// The UI wires this to move-up/move-down controls.
+#[tauri::command]
+pub async fn set_rule_priority(
+    state: State<'_, AppState>,
+    id: String,
+    priority: i64,
+) -> Result<(), String> {
+    let guard = state.store.lock().unwrap();
+    crate::store::queries::set_rule_priority(guard.conn(), &id, priority)
+        .map_err(|e| e.to_string())
+}
