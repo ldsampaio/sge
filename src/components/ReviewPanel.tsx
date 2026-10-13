@@ -16,6 +16,24 @@ interface ReviewItem {
   needs_review: boolean;
 }
 
+/** Phase 25 rule hit: deterministic suggestion with transient redacted
+ *  justification, overlap warning, and the classifier alternative when
+ *  both exist (user picks — dismissal keeps mail in place). */
+interface RuleHit {
+  message_id: number;
+  rule_id: string;
+  rule_name: string;
+  dest_kind: string;
+  destination: string;
+  justification: string;
+  overlap_note: string | null;
+  classifier_alternative: {
+    category_id: string;
+    category_name: string;
+    confidence: number;
+  } | null;
+}
+
 interface ReviewPanelProps {
   onClose: () => void;
   onChanged: () => void;
@@ -23,6 +41,7 @@ interface ReviewPanelProps {
 
 export function ReviewPanel({ onClose, onChanged }: ReviewPanelProps) {
   const [items, setItems] = React.useState<ReviewItem[] | null>(null);
+  const [ruleHits, setRuleHits] = React.useState<RuleHit[] | null>(null);
   const [threshold, setThreshold] = React.useState<number>(0.6);
   const [busy, setBusy] = React.useState(false);
   const [message, setMessage] = React.useState<string | null>(null);
@@ -33,6 +52,12 @@ export function ReviewPanel({ onClose, onChanged }: ReviewPanelProps) {
       setItems(rows);
     } catch (e) {
       setMessage(`Falha ao carregar a revisão: ${e}`);
+    }
+    try {
+      const hits = (await invoke("pending_rule_suggestions", { limit: 100 })) as RuleHit[];
+      setRuleHits(hits);
+    } catch (e) {
+      setMessage(`Falha ao carregar sugestões de regras: ${e}`);
     }
   }, []);
 
@@ -82,6 +107,48 @@ export function ReviewPanel({ onClose, onChanged }: ReviewPanelProps) {
       await reload();
     } catch (e) {
       setMessage(`Falha ao dispensar: ${e}`);
+    }
+  };
+
+  /** Confirm one rule hit. `pick` resolves rule-vs-classifier conflicts:
+   *  "rule" moves to the rule destination, "classifier" to the suggested
+   *  category; dismissal (above) keeps mail in place. Overlap destinations
+   *  ("gerenciada pelo classificador") reuse the same confirm path — the
+   *  Auto-collision dialog appears when the tree needs nesting. */
+  const confirmRule = async (messageId: number, pick: "rule" | "classifier") => {
+    setBusy(true);
+    setMessage(null);
+    try {
+      const r = (await invoke("confirm_suggestion", {
+        messageId,
+        allowNest: false,
+        prefer: pick === "classifier" ? "classifier" : null,
+      })) as { detail: string };
+      setMessage(r.detail);
+      onChanged();
+      await reload();
+    } catch (e) {
+      const s = String(e);
+      if (s.includes("COLLISION")) {
+        if (window.confirm("Já existe uma pasta Auto. Arquivar dentro dela?")) {
+          try {
+            const r2 = (await invoke("confirm_suggestion", {
+              messageId,
+              allowNest: true,
+              prefer: pick === "classifier" ? "classifier" : null,
+            })) as { detail: string };
+            setMessage(r2.detail);
+            onChanged();
+            await reload();
+          } catch (e2) {
+            setMessage(`Falha ao arquivar: ${e2}`);
+          }
+        }
+      } else {
+        setMessage(`Falha ao arquivar: ${e}`);
+      }
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -168,6 +235,61 @@ export function ReviewPanel({ onClose, onChanged }: ReviewPanelProps) {
                 <button type="button" className="btn btn-small" disabled={busy} onClick={() => void dismiss(it.message_id)}>
                   Dispensar
                 </button>
+              </li>
+            ))}
+          </ul>
+        )}
+        <h3 style={{ margin: "16px 0 4px" }}>Sugestões de regras</h3>
+        <p style={{ color: "#94a3b8", fontSize: "0.8rem", margin: "0 0 8px" }}>
+          Destinos determinísticos das suas regras — nada se move sem confirmar.
+        </p>
+        {ruleHits === null ? (
+          <p>Carregando…</p>
+        ) : ruleHits.length === 0 ? (
+          <p style={{ fontSize: "0.85rem" }}>Nenhuma sugestão de regra pendente.</p>
+        ) : (
+          <ul style={{ listStyle: "none", padding: 0 }}>
+            {ruleHits.map((h) => (
+              <li
+                key={h.message_id}
+                style={{ padding: "8px 0", borderTop: "1px solid #1e293b" }}
+              >
+                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <span style={{ flex: 1 }}>
+                    <strong>{h.rule_name}</strong> → {h.destination}
+                  </span>
+                  <button type="button" className="btn btn-small" disabled={busy} onClick={() => void confirmRule(h.message_id, "rule")}>
+                    Mover
+                  </button>
+                  {h.classifier_alternative && (
+                    <button
+                      type="button"
+                      className="btn btn-small"
+                      disabled={busy}
+                      title={`Classificador sugere ${h.classifier_alternative.category_name}`}
+                      onClick={() => void confirmRule(h.message_id, "classifier")}
+                    >
+                      Usar {h.classifier_alternative.category_name}
+                    </button>
+                  )}
+                  <button type="button" className="btn btn-small" disabled={busy} onClick={() => void dismiss(h.message_id)}>
+                    Dispensar
+                  </button>
+                </div>
+                {h.justification && (
+                  <div style={{ color: "#94a3b8", fontSize: "0.8rem", marginTop: 4 }}>{h.justification}</div>
+                )}
+                {h.classifier_alternative && (
+                  <div style={{ color: "#eab308", fontSize: "0.8rem", marginTop: 4 }}>
+                    O classificador sugere {h.classifier_alternative.category_name} (
+                    {Math.round(h.classifier_alternative.confidence * 100)}%) — escolha um destino.
+                  </div>
+                )}
+                {h.overlap_note && (
+                  <div style={{ color: "#eab308", fontSize: "0.8rem", marginTop: 4 }}>
+                    {h.overlap_note}
+                  </div>
+                )}
               </li>
             ))}
           </ul>

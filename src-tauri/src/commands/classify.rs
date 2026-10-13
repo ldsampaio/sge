@@ -201,16 +201,22 @@ use crate::classify::taxonomy::load_default;
 use crate::commands::sync::{load_account_config, manager_for};
 
 /// Confirm a suggestion: suggest → confirm → MOVE into `Auto/<Top>/<Child>`.
+/// (or a rule destination — see below).
 ///
 /// Backend-enforced: refuses without a label row (nothing suggested),
 /// refuses stale rows (taxonomy changed — reclassify first). Offline
 /// confirms replay via `imap_outbox`. `allow_nest` answers the one-time
 /// `Auto`-collision dialog (user-owned `Auto` without our marker).
+/// `prefer` resolves rule-vs-classifier conflicts: `"classifier"` confirms
+/// the classifier label (clearing the rule hit); anything else confirms
+/// the rule hit when one exists, else the label. Dismissal (via
+/// `dismiss_suggestion`) always keeps mail in place.
 #[tauri::command]
 pub async fn confirm_suggestion(
     state: State<'_, AppState>,
     message_id: u64,
     allow_nest: Option<bool>,
+    prefer: Option<String>,
 ) -> Result<ConfirmResult, String> {
     let store = state.store.clone();
     // Phase 25: rule-sourced rows confirm through this SAME path unchanged
@@ -219,59 +225,102 @@ pub async fn confirm_suggestion(
     // reuses Phase 10 `move_one_uid` + `imap_outbox` (UID-only addressing,
     // UIDVALIDITY epoch gating); the suggestion row clears on resolution
     // and the log carries rule-id + message-id only (T-25-06).
-    let rule_hit = {
+    let rule_hit = if prefer.as_deref() == Some("classifier") {
+        None
+    } else {
         let guard = store.lock().unwrap();
         plan_rule_filing(guard.conn(), message_id).ok()
     };
     if let Some(plan) = rule_hit {
         let account_cfg = load_account_config(state.clone()).await?;
         let manager = manager_for(&state, &account_cfg);
-        let (dest_wire, dest_display) = if plan.dest_kind == "category" {
+        // Destination resolution: taxonomy categories AND plain-folder
+        // destinations nested under `Auto/` reuse `ensure_auto_tree`
+        // (confirm-then-nest collision semantics unchanged); other plain
+        // folders reuse the Phase 11 CREATE guards.
+        let (fplan, dest_display) = if plan.dest_kind == "category" {
             let tax = load_default().map_err(|e| e.to_string())?;
             let (dest_display, top_name, child_name) =
                 filing::auto_path_for_id(&tax, &plan.destination)
                     .map_err(|e| e.to_string())?;
-            let fplan = filing::FilePlan {
-                message_id,
-                mailbox: plan.mailbox.clone(),
-                uid: plan.uid,
-                dest_display: dest_display.clone(),
-                top_name,
-                child_name,
-                threshold_used: 0.0,
-                confidence: 1.0,
-                needs_review: false,
-            };
-            let wire = filing::ensure_auto_tree(
-                &manager,
-                &store,
-                &fplan,
-                allow_nest.unwrap_or(false),
+            (
+                filing::FilePlan {
+                    message_id,
+                    mailbox: plan.mailbox.clone(),
+                    uid: plan.uid,
+                    dest_display: dest_display.clone(),
+                    top_name,
+                    child_name,
+                    threshold_used: 0.0,
+                    confidence: 1.0,
+                    needs_review: false,
+                },
+                dest_display,
             )
-            .await
-            .map_err(|e| e.to_string())?;
-            (wire, dest_display)
+        } else if let Some((top_name, child_name)) = split_auto_nest(&plan.destination) {
+            (
+                filing::FilePlan {
+                    message_id,
+                    mailbox: plan.mailbox.clone(),
+                    uid: plan.uid,
+                    dest_display: plan.destination.clone(),
+                    top_name,
+                    child_name,
+                    threshold_used: 0.0,
+                    confidence: 1.0,
+                    needs_review: false,
+                },
+                plan.destination.clone(),
+            )
         } else {
             let wire = ensure_rule_folder(&manager, &store, &plan.destination).await?;
-            (wire, plan.destination.clone())
+            (
+                filing::FilePlan {
+                    message_id,
+                    mailbox: plan.mailbox.clone(),
+                    uid: plan.uid,
+                    dest_display: plan.destination.clone(),
+                    top_name: plan.destination.clone(),
+                    child_name: None,
+                    threshold_used: 0.0,
+                    confidence: 1.0,
+                    needs_review: false,
+                },
+                wire,
+            )
         };
-        let result = filing::move_one_uid(
-            &manager,
-            &store,
-            &plan.mailbox,
-            plan.uid,
-            &dest_wire,
-            &format!("Arquivado em {dest_display}"),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+        // Auto-tree destinations (category + Auto/-nested) go through the
+        // tree ensure (collision dialog via `allow_nest`); plain folders
+        // already ensured above carry their wire in `dest_display`.
+        let dest_wire = if plan.dest_kind == "category"
+            || split_auto_nest(&plan.destination).is_some()
+        {
+            filing::ensure_auto_tree(&manager, &store, &fplan, allow_nest.unwrap_or(false))
+                .await
+                .map_err(|e| e.to_string())?
+        } else {
+            dest_display.clone()
+        };
+        let result = filing::execute_filing_move(&manager, &store, &fplan, &dest_wire)
+            .await
+            .map_err(|e| e.to_string())?;
         {
             let guard = store.lock().unwrap();
             let _ =
                 crate::store::queries::delete_rule_suggestion(guard.conn(), message_id);
+            // Pin the outcome: a confirmed rule move must not re-fire on
+            // the next sync (the message still matches the rule in its new
+            // folder). `latest_override` presence blocks re-evaluation.
+            let _ = crate::store::queries::log_override(
+                guard.conn(),
+                message_id,
+                &plan.rule_id,
+                &plan.destination,
+            );
         }
         eprintln!(
-            "[SGE rules] confirmed message={message_id} -> {dest_wire} (rule suggestion resolved)"
+            "[SGE rules] confirmed rule={} message={message_id} -> {dest_wire}",
+            plan.rule_id
         );
         return Ok(result);
     }
@@ -290,9 +339,17 @@ pub async fn confirm_suggestion(
     let dest_wire = filing::ensure_auto_tree(&manager, &store, &plan, allow_nest.unwrap_or(false))
         .await
         .map_err(|e| e.to_string())?;
-    filing::execute_filing_move(&manager, &store, &plan, &dest_wire)
+    let result = filing::execute_filing_move(&manager, &store, &plan, &dest_wire)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // The user picked the classifier side of a rule-vs-classifier
+    // conflict: the pending rule hit resolves away (no re-fire — the
+    // message now carries a label row, which evaluation skips).
+    {
+        let guard = store.lock().unwrap();
+        let _ = crate::store::queries::delete_rule_suggestion(guard.conn(), message_id);
+    }
+    Ok(result)
 }
 
 /// Override a classification in one click: MOVE to the corrected folder +
@@ -408,10 +465,46 @@ pub struct SuggestionDetail {
     /// Transient redacted justification (never persisted).
     pub justification: String,
     pub tops: Vec<(String, String)>,
+    /// Phase 25: rule-vs-classifier comparison. A rule hit NEVER silently
+    /// overrides the classifier label — when both exist the confirm dialog
+    /// shows both and the user picks; dismissal keeps mail in place.
+    pub rule_alternative: Option<RuleAlternative>,
+}
+
+/// Rule side of the confirm comparison (transient, redacted).
+#[derive(Debug, Clone, Serialize)]
+pub struct RuleAlternative {
+    pub rule_id: String,
+    pub rule_name: String,
+    pub dest_kind: String,
+    pub destination: String,
+    pub justification: String,
+    /// Some when the destination overlaps the taxonomy-managed tree
+    /// (RULE-01 verbatim overlap wording for the dialog).
+    pub overlap_note: Option<String>,
+}
+
+/// Rule-vs-taxonomy overlap (RULE-01 verbatim): a destination inside the
+/// `Auto/` tree or a taxonomy-managed folder resolves by user confirmation
+/// reusing `confirm_suggestion`. Category-kind destinations always resolve
+/// into the `Auto/` tree, so they always overlap.
+pub fn rule_overlap_note(dest_kind: &str, destination: &str) -> Option<String> {
+    let d = destination.trim();
+    let under_auto = dest_kind == "category"
+        || d.eq_ignore_ascii_case("auto")
+        || d.len() > 5
+            && (d.starts_with("Auto/") || d.starts_with("auto/") || d.starts_with("AUTO/"));
+    if under_auto {
+        Some(
+            "esta pasta é gerenciada pelo classificador — confirme para mover".to_string(),
+        )
+    } else {
+        None
+    }
 }
 
 /// Everything the confirm surface needs for one message. None when the
-/// message was never classified.
+/// message was never classified AND has no rule hit.
 #[tauri::command]
 pub async fn suggestion_detail(
     state: State<'_, AppState>,
@@ -419,53 +512,168 @@ pub async fn suggestion_detail(
 ) -> Result<Option<SuggestionDetail>, String> {
     let tax = load_default().map_err(|e| e.to_string())?;
     let guard = state.store.lock().unwrap();
-    let conn = guard.conn();
+    suggestion_detail_inner(guard.conn(), message_id, &tax)
+}
+
+/// Pure detail builder (testable without Tauri state).
+pub fn suggestion_detail_inner(
+    conn: &rusqlite::Connection,
+    message_id: u64,
+    tax: &Taxonomy,
+) -> Result<Option<SuggestionDetail>, String> {
     let label = match crate::store::queries::get_label(conn, message_id)
         .map_err(|e| e.to_string())?
     {
-        Some(l) => l,
-        None => return Ok(None),
+        Some(l) => Some(l),
+        None => None,
     };
-    let dismissed = crate::store::queries::is_dismissed(conn, message_id)
+    let rule_hit = crate::store::queries::get_rule_suggestion(conn, message_id)
         .map_err(|e| e.to_string())?;
+    if label.is_none() && rule_hit.is_none() {
+        return Ok(None);
+    }
+    let dismissed = match &label {
+        Some(_) => crate::store::queries::is_dismissed(conn, message_id)
+            .map_err(|e| e.to_string())?,
+        None => false,
+    };
     let fields = crate::store::queries::message_classify_fields(conn, message_id)
         .map_err(|e| e.to_string())?;
-    let top_name = tax
-        .categories
-        .iter()
-        .find(|c| c.id == label.primary_id)
-        .map(|c| c.name.clone())
-        .unwrap_or_else(|| label.primary_id.clone());
-    let (child_name, justification) = match fields {
-        Some((subject, snippet, from_addr, atts)) => {
-            let domain = from_addr.rsplit('@').next().unwrap_or("");
-            let is_reply = subject.to_lowercase().starts_with("re:");
-            let ev = crate::classify::evidence::build_evidence(
-                &subject, &snippet, domain, atts, is_reply,
-            );
-            let kids: Vec<&crate::classify::taxonomy::Category> =
-                crate::classify::taxonomy::children_of(&tax, &label.primary_id);
-            let child = crate::classify::taxonomy::match_keywords(&ev, &kids)
-                .into_iter()
-                .next()
-                .and_then(|(id, _)| {
-                    tax.categories.iter().find(|c| c.id == id).map(|c| c.name.clone())
-                });
-            let just = crate::classify::redact::filter_output(&justification(
-                &label.primary_id,
-                &ev,
-                &tax,
-            ));
-            (child, just)
+    // Rule side of the comparison (transient redacted justification +
+    // overlap note for the dialog). Present whenever a rule hit exists —
+    // alone (rule-only suggestion) or beside a classifier label.
+    let rule_alternative: Option<RuleAlternative> = match &rule_hit {
+        Some(hit) => {
+            let rule = crate::store::queries::get_rule(conn, &hit.rule_id)
+                .map_err(|e| e.to_string())?;
+            let (rule_name, justification) = match rule {
+                Some(r) => {
+                    let conditions: RuleConditions =
+                        serde_json::from_str(&r.conditions_json).unwrap_or_default();
+                    let destination = if r.dest_kind == "category" {
+                        RuleDestination::TaxonomyCategory { id: r.destination.clone() }
+                    } else {
+                        RuleDestination::Folder { display: r.destination.clone() }
+                    };
+                    let typed = Rule {
+                        id: r.id.clone(),
+                        name: r.name.clone(),
+                        priority: r.priority,
+                        conditions,
+                        destination,
+                        scope: RuleScope { folders: vec![] },
+                        enabled: r.enabled,
+                    };
+                    let just = crate::classify::redact::filter_output(
+                        &rules::rule_justification(&typed),
+                    );
+                    (r.name, just)
+                }
+                None => (hit.rule_id.clone(), String::new()),
+            };
+            Some(RuleAlternative {
+                rule_id: hit.rule_id.clone(),
+                rule_name,
+                dest_kind: hit.dest_kind.clone(),
+                destination: hit.destination.clone(),
+                justification,
+                overlap_note: rule_overlap_note(&hit.dest_kind, &hit.destination),
+            })
         }
-        None => (None, String::new()),
+        None => None,
     };
-    let secondary_name = label.secondary_id.as_ref().and_then(|sid| {
-        tax.categories.iter().find(|c| &c.id == sid).map(|c| c.name.clone())
-    });
-    let dest_display = match &child_name {
-        Some(c) => format!("Auto/{top_name}/{c}"),
-        None => format!("Auto/{top_name}"),
+    // Classifier side. Rule-only hits (no label row) surface with the rule
+    // destination as the primary so the confirm dialog has one shape.
+    let (
+        primary_id,
+        primary_name,
+        child_name,
+        secondary_name,
+        confidence,
+        needs_review,
+        stale,
+        dest_display,
+        justification,
+    ) = match &label {
+        Some(l) => {
+            let top_name = tax
+                .categories
+                .iter()
+                .find(|c| c.id == l.primary_id)
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| l.primary_id.clone());
+            let (child_name, justification) = match &fields {
+                Some((subject, snippet, from_addr, atts)) => {
+                    let domain = from_addr.rsplit('@').next().unwrap_or("");
+                    let is_reply = subject.to_lowercase().starts_with("re:");
+                    let ev = crate::classify::evidence::build_evidence(
+                        &subject, &snippet, domain, *atts, is_reply,
+                    );
+                    let kids: Vec<&crate::classify::taxonomy::Category> =
+                        crate::classify::taxonomy::children_of(&tax, &l.primary_id);
+                    let child = crate::classify::taxonomy::match_keywords(&ev, &kids)
+                        .into_iter()
+                        .next()
+                        .and_then(|(id, _)| {
+                            tax.categories.iter().find(|c| c.id == id).map(|c| c.name.clone())
+                        });
+                    let just = crate::classify::redact::filter_output(&justification(
+                        &l.primary_id,
+                        &ev,
+                        &tax,
+                    ));
+                    (child, just)
+                }
+                None => (None, String::new()),
+            };
+            let secondary_name = l.secondary_id.as_ref().and_then(|sid| {
+                tax.categories.iter().find(|c| &c.id == sid).map(|c| c.name.clone())
+            });
+            let dest_display = match &child_name {
+                Some(c) => format!("Auto/{top_name}/{c}"),
+                None => format!("Auto/{top_name}"),
+            };
+            (
+                l.primary_id.clone(),
+                top_name,
+                child_name,
+                secondary_name,
+                l.confidence,
+                l.needs_review,
+                l.stale,
+                dest_display,
+                justification,
+            )
+        }
+        None => {
+            // Rule-only: primary mirrors the rule destination.
+            let alt = rule_alternative.as_ref().cloned().unwrap_or(RuleAlternative {
+                rule_id: String::new(),
+                rule_name: String::new(),
+                dest_kind: "folder".to_string(),
+                destination: String::new(),
+                justification: String::new(),
+                overlap_note: None,
+            });
+            let dest_display = if alt.dest_kind == "category" {
+                crate::classify::filing::auto_path_for_id(tax, &alt.destination)
+                    .map(|(d, _, _)| d)
+                    .unwrap_or_else(|_| alt.destination.clone())
+            } else {
+                alt.destination.clone()
+            };
+            (
+                alt.destination.clone(),
+                dest_display.clone(),
+                None,
+                None,
+                1.0,
+                false,
+                false,
+                dest_display,
+                alt.justification.clone(),
+            )
+        }
     };
     let tops = tax
         .categories
@@ -475,17 +683,18 @@ pub async fn suggestion_detail(
         .collect();
     Ok(Some(SuggestionDetail {
         message_id,
-        primary_id: label.primary_id,
-        primary_name: top_name,
+        primary_id,
+        primary_name,
         child_name,
         secondary_name,
-        confidence: label.confidence,
-        needs_review: label.needs_review,
-        stale: label.stale,
+        confidence,
+        needs_review,
+        stale,
         dismissed,
         dest_display,
         justification,
         tops,
+        rule_alternative,
     }))
 }
 
@@ -1936,12 +2145,31 @@ pub fn rule_after_sync(state: &AppState, mailbox: &str, app: &tauri::AppHandle) 
     });
 }
 
+/// Split an `Auto/`-nested plain-folder destination into
+/// `(top, child?)` for the `ensure_auto_tree` path. Returns None for
+/// non-`Auto/` destinations and for depths the tree path cannot express
+/// (3+ levels fall back to the Phase 11 guarded ensure).
+fn split_auto_nest(display: &str) -> Option<(String, Option<String>)> {
+    let rest = display
+        .strip_prefix("Auto/")
+        .or_else(|| display.strip_prefix("auto/"))
+        .or_else(|| display.strip_prefix("AUTO/"))?;
+    let mut parts = rest.split('/').map(str::trim).filter(|s| !s.is_empty());
+    let top = parts.next()?.to_string();
+    let child = parts.next().map(str::to_string);
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((top, child))
+}
+
 /// Pure rule filing plan: suggestion row + cached location (UID-only
 /// addressing — no sequence numbers anywhere on this path).
 pub struct RuleFilePlan {
     pub message_id: u64,
     pub mailbox: String,
     pub uid: u32,
+    pub rule_id: String,
     pub dest_kind: String,
     pub destination: String,
 }
@@ -1960,6 +2188,7 @@ pub fn plan_rule_filing(
         message_id,
         mailbox,
         uid,
+        rule_id: hit.rule_id,
         dest_kind: hit.dest_kind,
         destination: hit.destination,
     })
@@ -2061,6 +2290,19 @@ pub struct RuleSuggestionView {
     pub dest_kind: String,
     pub destination: String,
     pub justification: String,
+    /// Some when the destination overlaps the taxonomy-managed tree.
+    pub overlap_note: Option<String>,
+    /// Some when the classifier ALSO labeled this message (disagreement —
+    /// the dialog shows both and the user picks).
+    pub classifier_alternative: Option<ClassifierAlternative>,
+}
+
+/// Classifier side of a rule-vs-classifier disagreement.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClassifierAlternative {
+    pub category_id: String,
+    pub category_name: String,
+    pub confidence: f64,
 }
 
 #[tauri::command]
@@ -2068,6 +2310,7 @@ pub async fn pending_rule_suggestions(
     state: State<'_, AppState>,
     limit: Option<usize>,
 ) -> Result<Vec<RuleSuggestionView>, String> {
+    let tax = load_default().map_err(|e| e.to_string())?;
     let guard = state.store.lock().unwrap();
     let conn = guard.conn();
     let rows =
@@ -2100,13 +2343,30 @@ pub async fn pending_rule_suggestions(
             }
             None => (s.rule_id.clone(), String::new()),
         };
+        let classifier_alternative = queries::get_label(conn, s.message_id)
+            .map_err(|e| e.to_string())?
+            .map(|l| {
+                let category_name = tax
+                    .categories
+                    .iter()
+                    .find(|c| c.id == l.primary_id)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| l.primary_id.clone());
+                ClassifierAlternative {
+                    category_id: l.primary_id,
+                    category_name,
+                    confidence: l.confidence,
+                }
+            });
         out.push(RuleSuggestionView {
             message_id: s.message_id,
             rule_id: s.rule_id,
             rule_name: name,
-            dest_kind: s.dest_kind,
-            destination: s.destination,
+            dest_kind: s.dest_kind.clone(),
+            destination: s.destination.clone(),
             justification: just,
+            overlap_note: rule_overlap_note(&s.dest_kind, &s.destination),
+            classifier_alternative,
         });
     }
     Ok(out)
@@ -2303,5 +2563,207 @@ mod rule_apply_tests {
         assert_eq!(plan.mailbox, "INBOX");
         assert!((1..=3).contains(&plan.uid), "uid-only addressing, got {}", plan.uid);
         assert_eq!(plan.destination, "Arquivo");
+    }
+}
+
+#[cfg(test)]
+mod rule_conflict_tests {
+    use super::*;
+    use crate::store::Store;
+
+    fn seed_db() -> Store {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        conn.execute(
+            "INSERT INTO mailboxes (name, uid_validity, uid_next, delimiter) \
+             VALUES ('INBOX', 77, 10, '/'), ('Arquivo', 77, 10, '/')",
+            [],
+        )
+        .unwrap();
+        let mb: i64 = conn
+            .query_row("SELECT id FROM mailboxes WHERE name = 'INBOX'", [], |r| r.get(0))
+            .unwrap();
+        for (uid, subject, from, preview) in [
+            (1u32, "Fatura de energia", "contas@utfpr.edu.br", "segue o boleto de outubro"),
+            (2, "Reunião quinta", "chefe@empresa.com", "pauta da reunião"),
+        ] {
+            queries::upsert_message(
+                conn, mb as u64, uid, None, subject, from, "[]", "[]",
+                "2024-01-01T00:00:00Z", "[]", false, preview,
+            )
+            .unwrap();
+        }
+        store
+    }
+
+    fn seed_rule(
+        conn: &rusqlite::Connection,
+        id: &str,
+        name: &str,
+        priority: i64,
+        conditions_json: &str,
+        dest_kind: &str,
+        destination: &str,
+    ) {
+        queries::insert_rule(
+            conn,
+            &RuleRow {
+                id: id.to_string(),
+                name: name.to_string(),
+                priority,
+                conditions_json: conditions_json.to_string(),
+                dest_kind: dest_kind.to_string(),
+                destination: destination.to_string(),
+                scope_json: "[]".to_string(),
+                enabled: true,
+            },
+        )
+        .unwrap();
+    }
+
+    fn mid_for_uid(conn: &rusqlite::Connection, uid: u32) -> u64 {
+        conn.query_row("SELECT id FROM messages WHERE uid = ?1", rusqlite::params![uid], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn rule_conflict_priority_cutoff_with_tie_by_creation() {
+        let store = seed_db();
+        let conn = store.conn();
+        let cond = r#"{"sender_domain":"utfpr.edu.br"}"#;
+        // Three overlapping rules; the priority-5 pair ties — oldest wins.
+        seed_rule(conn, "r-old", "Antiga", 5, cond, "folder", "Arquivo");
+        seed_rule(conn, "r-new", "Nova", 5, cond, "folder", "Arquivo");
+        seed_rule(conn, "r-low", "Baixa", 50, cond, "folder", "Arquivo");
+        // Force distinct creation order (second-resolution timestamps tie
+        // inside fast tests — the ORDER BY falls back deterministically).
+        conn.execute(
+            "UPDATE folder_rules SET created_at = '2024-01-01 00:00:01' WHERE id = 'r-old'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE folder_rules SET created_at = '2024-01-01 00:00:02' WHERE id = 'r-new'",
+            [],
+        )
+        .unwrap();
+        let cands = queries::rule_candidate_rows(conn, Some("INBOX")).unwrap();
+        let hits = evaluate_rules(conn, &cands);
+        assert_eq!(hits.len(), 1, "exactly one hit expected, got {hits:?}");
+        assert_eq!(hits[0].rule_id, "r-old", "tie goes to the oldest rule");
+    }
+
+    #[test]
+    fn rule_conflict_detail_carries_both_options() {
+        let store = seed_db();
+        let conn = store.conn();
+        let tax = crate::classify::taxonomy::load_default().unwrap();
+        seed_rule(
+            conn, "r-1", "Boletos", 10,
+            r#"{"sender_domain":"utfpr.edu.br"}"#, "folder", "Arquivo",
+        );
+        let mid = mid_for_uid(conn, 1);
+        queries::upsert_label(conn, mid, "academico", None, 0.85, 0.6, false).unwrap();
+        queries::upsert_rule_suggestion(
+            conn,
+            &RuleSuggestionRow {
+                message_id: mid,
+                rule_id: "r-1".to_string(),
+                dest_kind: "folder".to_string(),
+                destination: "Arquivo".to_string(),
+            },
+        )
+        .unwrap();
+        let detail = suggestion_detail_inner(conn, mid, &tax).unwrap().unwrap();
+        // Classifier side intact (never silently overridden)…
+        assert_eq!(detail.primary_id, "academico");
+        // …and the rule side rides along for the user pick.
+        let alt = detail.rule_alternative.expect("rule alternative must be present");
+        assert_eq!(alt.rule_id, "r-1");
+        assert_eq!(alt.destination, "Arquivo");
+        assert!(alt.justification.contains("Boletos"));
+        assert!(alt.overlap_note.is_none(), "plain folder must not warn overlap");
+    }
+
+    #[test]
+    fn rule_conflict_overlap_named_for_auto_destinations() {
+        assert!(rule_overlap_note("folder", "Arquivo").is_none());
+        let note = rule_overlap_note("folder", "Auto/Finanças")
+            .expect("Auto/-nested folder must warn overlap");
+        assert!(note.contains("gerenciada pelo classificador"));
+        let cat = rule_overlap_note("category", "academico")
+            .expect("taxonomy-category destinations always overlap");
+        assert!(cat.contains("gerenciada pelo classificador"));
+        // Tree-path split: two levels route via ensure_auto_tree.
+        assert_eq!(
+            split_auto_nest("Auto/Finanças"),
+            Some(("Finanças".to_string(), None))
+        );
+        assert_eq!(
+            split_auto_nest("Auto/Finanças/Contas"),
+            Some(("Finanças".to_string(), Some("Contas".to_string())))
+        );
+        assert!(split_auto_nest("Arquivo").is_none());
+        assert!(split_auto_nest("Auto/A/B/C").is_none(), "3+ levels fall back to guarded ensure");
+    }
+
+    #[test]
+    fn rule_conflict_below_threshold_never_auto_moves() {
+        // Below-threshold `A Classificar` mail: rules MAY propose, but
+        // ALWAYS behind the confirm dialog — evaluation alone must leave
+        // every durable outbox empty.
+        let store = seed_db();
+        let conn = store.conn();
+        seed_rule(
+            conn, "r-1", "Boletos", 10,
+            r#"{"sender_domain":"utfpr.edu.br"}"#, "folder", "Arquivo",
+        );
+        let mid = mid_for_uid(conn, 1);
+        queries::upsert_label(conn, mid, "academico", None, 0.2, 0.6, true).unwrap();
+        // Labeled mail is classifier territory: no rule suggestion fires —
+        // and nothing moved anywhere.
+        let cands = queries::rule_candidate_rows(conn, Some("INBOX")).unwrap();
+        assert!(evaluate_rules(conn, &cands).iter().all(|h| h.message_id != mid));
+        let mb: i64 = conn
+            .query_row("SELECT id FROM mailboxes WHERE name = 'INBOX'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(queries::imap_outbox_count(conn, mb as u64).unwrap(), 0);
+        assert_eq!(queries::outbox_count(conn, mb as u64).unwrap(), 0);
+    }
+
+    #[test]
+    fn rule_conflict_dismissal_keeps_mail_in_place() {
+        let store = seed_db();
+        let conn = store.conn();
+        seed_rule(
+            conn, "r-1", "Boletos", 10,
+            r#"{"sender_domain":"utfpr.edu.br"}"#, "folder", "Arquivo",
+        );
+        let mid = mid_for_uid(conn, 1);
+        queries::upsert_label(conn, mid, "academico", None, 0.85, 0.6, false).unwrap();
+        queries::upsert_rule_suggestion(
+            conn,
+            &RuleSuggestionRow {
+                message_id: mid,
+                rule_id: "r-1".to_string(),
+                dest_kind: "folder".to_string(),
+                destination: "Arquivo".to_string(),
+            },
+        )
+        .unwrap();
+        // Dismiss path (same writes `dismiss_suggestion` performs).
+        queries::dismiss_label(conn, mid).unwrap();
+        queries::delete_rule_suggestion(conn, mid).unwrap();
+        // Mail untouched: row present, not hidden, nothing queued.
+        let loc = queries::message_location(conn, mid).unwrap();
+        assert!(loc.is_some(), "dismissal must keep mail in place");
+        let mb: i64 = conn
+            .query_row("SELECT id FROM mailboxes WHERE name = 'INBOX'", [], |r| r.get(0))
+            .unwrap();
+        assert!(!queries::is_pending_delete(conn, mb as u64, 1).unwrap());
+        assert_eq!(queries::imap_outbox_count(conn, mb as u64).unwrap(), 0);
+        assert_eq!(queries::outbox_count(conn, mb as u64).unwrap(), 0);
     }
 }
