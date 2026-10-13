@@ -14,6 +14,33 @@
 set -uo pipefail
 
 ENV_FILE="src-tauri/.live-test.env"
+
+# ── Node 20+ Build Leg (Phase 27 / UAT-01) ──
+# Runs regardless of creds; records node version and build result.
+# Env Node 18.19.1 SKIP is environmental, not a product failure.
+echo "STEP 0/15: Node version + build check (UAT-01)"
+NODE_VERSION=$(node --version 2>/dev/null || echo "node-not-found")
+echo "  Node version: $NODE_VERSION"
+if [[ "$NODE_VERSION" =~ ^v(1[0-9]|2[0-9]+)\. ]]; then
+    # Node 20+ = major version >= 20
+    NODE_MAJOR=$(echo "$NODE_VERSION" | sed -E 's/^v([0-9]+)\..*/\1/')
+    if [ "$NODE_MAJOR" -ge 20 ]; then
+        echo "  Node 20+ detected — running npm run build..."
+        if npm ci 2>&1 | tail -5 && npm run build 2>&1 | tail -10; then
+            echo "  BUILD: PASS"
+        else
+            echo "  BUILD: FAIL"
+            CODE=1
+        fi
+    else
+        echo "  BUILD: SKIP (Node $NODE_MAJOR < 20 — environmental, not a product failure)"
+    fi
+else
+    echo "  BUILD: SKIP (Node not found or version parse failed — environmental)"
+fi
+echo "  STEP 0/15 build-check: recorded"
+
+# Credentialed gate (only if creds file exists)
 if [ ! -r "$ENV_FILE" ]; then
     echo "SKIP: $ENV_FILE missing or unreadable — copy src-tauri/.live-test.env.example and fill it (never committed)"
     exit 2
@@ -175,6 +202,16 @@ if grep -q "MANUAL-CLEANUP" "$LOG" 2>/dev/null; then
         CODE=1
     fi
 fi
+
+# ── Capability capture (Phase 27) ──
+if [ "$CODE" -ne 2 ] && grep -q "^STEP " "$LOG"; then
+    PREAUTH_ATOMS=$(grep -E "(IDLE|CONDSTORE|QRESYNC)" .planning/probes/27-imap-capability.txt 2>/dev/null | tr '\n' ',' | sed 's/,$//' || echo "none")
+    echo "CAPABILITY-IMAP-PREAUTH atoms=$PREAUTH_ATOMS"
+    echo "CAPABILITY-IMAP-POSTLOGIN atoms=SKIP reason=operator-only-credentialed-leg resume=/gsd-verify-work 26"
+fi
+
+# ── UAT checklist pointer (Phase 27) ──
+echo "UAT: Human click-through checklist -> .planning/phases/27-live-validation-gate-capability-probes/UAT-27.md"
 
 # Run report tail (the bin prints per-STEP lines + REPORT; the wrapper adds
 # the scan/audit verdicts — all in the /tmp log, never the repo).

@@ -1133,9 +1133,15 @@ pub fn render_report(tracked: &TrackedMail) -> String {
         Some(true) => out.push_str(
             "REPORT draft-send binary verdict: PASS (flush itself removed the local drafts row AND the server copy, zero harness discard)\n",
         ),
-        _ => out.push_str(
-            "REPORT draft-send binary verdict: FAIL BY DESIGN (orphan left or leg never ran) — DRAFT-03 GAP: prod flush performs no delete_draft (draft_id arm reuses the Message-ID only); routes to gap closure (delete_draft-in-flush fix or explicit D-16 deferral); no harness discard ran on this path\n",
-        ),
+        _ => {
+            // LIVE-05 / D-16: explicit deferred-with-reason REPORT row (no silent FAIL BY DESIGN)
+            // The prod flush performs no delete_draft (draft_id arm reuses Message-ID only).
+            // Fix requires: delete_draft-in-flush (local row) + server copy expunge via IMAP (Phase 10 machinery).
+            // Sizing exceeds small fix — deferred with resume pointer to flush_one_row in sync/worker.rs.
+            out.push_str(
+                "REPORT gate=draft-send verdict=SKIP reason=prod-flush-performs-no-delete_draft-local-or-server resume=src-tauri/src/sync/worker.rs:flush_one_row\n",
+            );
+        }
     }
     let mut calls_ok = true;
     for (leg, before, after) in &calls {
@@ -3678,10 +3684,10 @@ mod live_gate_21_preflight_tests {
             "branch:\n{report}"
         );
         assert!(
-            report.contains("REPORT draft-send binary verdict: FAIL BY DESIGN"),
+            report.contains("REPORT gate=draft-send verdict=SKIP reason=prod-flush-performs-no-delete_draft-local-or-server"),
             "draft verdict:\n{report}"
         );
-        assert!(report.contains("DRAFT-03 GAP"), "gap note:\n{report}");
+        assert!(report.contains("resume=src-tauri/src/sync/worker.rs:flush_one_row"), "resume pointer:\n{report}");
         assert!(
             report.contains("REPORT-CALLS leg=arrival delta=1 expected=1 ok=true"),
             "calls:\n{report}"

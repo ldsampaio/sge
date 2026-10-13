@@ -117,6 +117,16 @@ if grep -q "MANUAL-CLEANUP" "$LOG" 2>/dev/null; then
     fi
 fi
 
+# ── Capability capture (Phase 27) ──
+if [ "$CODE" -ne 2 ] && grep -q "^STEP " "$LOG"; then
+    PREAUTH_ATOMS=$(grep -E "(IDLE|CONDSTORE|QRESYNC)" .planning/probes/27-imap-capability.txt 2>/dev/null | tr '\n' ',' | sed 's/,$//' || echo "none")
+    echo "CAPABILITY-IMAP-PREAUTH atoms=$PREAUTH_ATOMS"
+    echo "CAPABILITY-IMAP-POSTLOGIN atoms=SKIP reason=operator-only-credentialed-leg resume=/gsd-verify-work 22"
+fi
+
+# ── UAT checklist pointer (Phase 27) ──
+echo "UAT: Human click-through checklist -> .planning/phases/27-live-validation-gate-capability-probes/UAT-27.md"
+
 # Run report tail (the bin prints per-STEP lines + REPORT; the wrapper adds
 # the scan/audit verdicts — all in the /tmp log, never the repo).
 echo "SCAN-VERDICT: $([ "$CODE" = 0 ] && echo PASS || echo CHECK-LOG) log=$LOG dump=${DUMP:-none}"

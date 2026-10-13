@@ -115,6 +115,19 @@ else
     echo "SCAN run: SKIPPED (gate did not run — seed-only or pre-flight skip)"
 fi
 
+# ── Capability capture (Phase 27) ──
+# Emit pre-auth atoms from 27-01 probe transcripts (agent-verifiable, no re-parsing IMAP).
+# Post-login leg is operator-only; record SKIP with non-empty reason + resume pointer.
+if [ "$CODE" -ne 2 ] && grep -q "^STEP " "$LOG"; then
+    PREAUTH_ATOMS=$(grep -E "(IDLE|CONDSTORE|QRESYNC)" .planning/probes/27-imap-capability.txt 2>/dev/null | tr '\n' ',' | sed 's/,$//' || echo "none")
+    echo "CAPABILITY-IMAP-PREAUTH atoms=$PREAUTH_ATOMS"
+    echo "CAPABILITY-IMAP-POSTLOGIN atoms=SKIP reason=operator-only-credentialed-leg resume=/gsd-verify-work 21"
+fi
+
+# ── UAT checklist pointer (Phase 27) ──
+# Operator executes credentialed legs; trace to UAT-27.md for the human click-through.
+echo "UAT: Human click-through checklist -> .planning/phases/27-live-validation-gate-capability-probes/UAT-27.md"
+
 # Scrub secrets from this shell before any further output.
 unset SGE_LIVE_IMAP_PASS SGE_LIVE_SMTP_PASS || true
 exit "$CODE"
