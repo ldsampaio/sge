@@ -257,7 +257,11 @@ Plans:
 **Goal:** User-defined rules (keyword/sender/pattern) validated → applies at sync/on-demand; conflict = confirm; SQLite-persisted. **Requires:** Phase 18 + 11. **Requirements:** RULE-01/02/03. **UI:** yes. **Plans:** TBD.
 
 ### Phase 26: Live Validation Bundle (Live-03, SANDBOXED)
-**Goal:** Execute all deferred `/gsd-verify-work` behaviors (v1.1 6/7/8, v1.2 12/13, v1.3 confirm→MOVE/batch) vs real server under the sandbox contract; document. **Requires:** all phases + creds file. **Requirements:** LIVE-03. **UI:** no. **Plans:** TBD.
+**Goal:** Execute all deferred `/gsd-verify-work` behaviors (v1.1 6/7/8, v1.2 12/13, v1.3 confirm→MOVE/batch) vs real server under the sandbox contract; document. **Requires:** all phases + creds file. **Requirements:** LIVE-03. **UI:** no.
+
+Plans:
+- [x] 26-01-PLAN.md — Tracer: live_gate_26 skeleton + v1.1 read-side legs (gates 6/7/8) + offline doubles (bin 7/7, safety 24/24 green)
+- [x] 26-02-PLAN.md — Expansion: v1.3 legs (confirm→MOVE→undo, RENAME/DELETE, batch probe) + 12/13 citation rows + combined bundle REPORT (bin 15/15, safety 48/48 green; live pending creds)
 
 ### Phase 27: Milestone Close — Verification + Audit
 **Goal:** Confirm criteria, write `.planning/v1.4-MILESTONE-AUDIT.md`, update STATE.md. **Requires:** all phases verified. **Plans:** TBD.
@@ -292,3 +296,4 @@ Plans:
 | 22. Draft & Seen Round-Trip — Live Gate | v1.4 | 2/2 | Complete (offline 19/19 green; live run pending human via scripts/live-22.sh) | 2026-10-13 |
 | 23. Search + Filters | v1.4 | 3/3 | Complete (345 lib tests green, tsc clean; vite bundle blocked environmentally — Node 18 vs required 20+) | 2026-10-13 |
 | 24. Auto-Archive | v1.4 | 2/2 | Complete (472 tests green, tsc clean; scheduler structurally absent) | 2026-10-13 |
+| 26. Live Validation Bundle | v1.4 | 2/2 | Complete (offline: bin 15/15, safety 48/48 green; live pending human via scripts/live-26.sh) | 2026-10-13 |
