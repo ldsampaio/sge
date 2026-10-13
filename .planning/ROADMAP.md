@@ -20,7 +20,8 @@ v1.3 Auto-Classify adds one new lane — on-device automatic email classificatio
 - ✅ **v1.0 Read-only Viewer** - Phases 1-5 (shipped 2026-10-03, archived under `.planning/milestones/archived-20261004-phases/`)
 - ✅ **v1.1 Triage & Folders** - Phases 6-9 (shipped 2026-10-05, archived under `.planning/milestones/v1.1-ROADMAP.md`, audit `.planning/v1.1-MILESTONE-AUDIT.md`)
 - ✅ **v1.2 Compose & Organize** - Phases 10-14 (shipped 2026-10-08)
-- 🚧 **v1.3 Auto-Classify** - Phases 15-20 (in progress)
+- ✅ **v1.3 Auto-Classify** - Phases 15-20 (shipped 2026-10-10, audit `.planning/v1.3-MILESTONE-AUDIT.md`: PASSED 17/17, 328 tests green, deferred live gates documented)
+- 🚧 **v1.4 SMTP Send + Search/Filters + Offline Verification + Auto-Archive + Smart Folder Rules** - Phases 21-27 (starting 2026-10-11; close deferred behaviors via offline doubles — NO live-server testing, server unreachable — + final capabilities)
 
 ## Phases
 
@@ -221,10 +222,32 @@ Decimal phases appear between their surrounding integers in numeric order. v1.2 
 **UI hint**: yes
 **Plans**: TBD
 
+## Phase Details (v1.4 continuation — phases 21-27)
+
+### Phase 21: SMTP Send — Verification Gate (Live-01, OFFLINE)
+**Goal:** Prove v1.2 send pipeline WITHOUT a live server (unreachable): record-and-replay SMTP transport asserts accept, no-duplicate (Message-ID incl. DATA-timeout → `uncertain` reconcile-not-resend), Sent filing, retry/backoff, no secret leak. **Requires:** Phase 14 + doubles. **Requirements:** LIVE-01. **Success:** transport log shows single DATA per Message-ID, Sent APPEND verbatim + `\Seen`, `sent-unfiled` path covered, keyring creds reused. Genuine 587 wire interop deferred with reason. **UI:** yes. **Plans:** TBD.
+
+### Phase 22: Draft & Seen Round-Trip — Verification Gate (Live-02, OFFLINE)
+**Goal:** Draft APPEND 1-copy, Seen survives simulated reconnect, `imap_outbox` replay, no silent resurrection — all asserted via MockSession/FakeSession verb logs. **Requires:** Phase 12/13 + doubles. **Requirements:** LIVE-02. **UI:** minimal. **Plans:** TBD.
+
+### Phase 23: Search + Filters
+**Goal:** SQLite search (subject/body/attach/sender), saved filters, multi-folder, persisted. **Requires:** Phase 3. **Requirements:** SRCH-01/02/03. **UI:** yes. **Plans:** TBD.
+
+### Phase 24: Auto-Archive
+**Goal:** Age-based MOVE to `Auto/Archive/`; journaled batch with resume/undo; never deletes. **Requires:** Phase 20 + 19. **Requirements:** ARCH-01/02. **UI:** yes. **Plans:** TBD.
+
+### Phase 25: Smart Folder Rules
+**Goal:** User-defined rules (keyword/sender/pattern) validated → applies at sync/on-demand; conflict = confirm; SQLite-persisted. **Requires:** Phase 18 + 11. **Requirements:** RULE-01/02/03. **UI:** yes. **Plans:** TBD.
+
+### Phase 26: Offline Verification Bundle (Live-03, OFFLINE)
+**Goal:** Execute all deferred `/gsd-verify-work` behaviors (v1.1 6/7/8, v1.2 12/13, v1.3 confirm→MOVE/batch) against offline doubles with wire-level assertions; document. **Requires:** all phases + doubles. **Requirements:** LIVE-03. **UI:** no. **Plans:** TBD.
+
+### Phase 27: Milestone Close — Verification + Audit
+**Goal:** Confirm criteria, write `.planning/v1.4-MILESTONE-AUDIT.md`, update STATE.md. **Requires:** all phases verified. **Plans:** TBD.
+
 ## Progress
 
-**Execution Order:**
-Phases execute in numeric order: 10 → 11 → 12 → 13 → 14 → 15 → 16 → 17 → 18 → 19 → 20
+**Execution Order:** ... → 20 → 21 → 22 → 23 → 24 → 25 → 26 → 27
 
 | Phase | Milestone | Plans Complete | Status | Completed |
 |-------|-----------|----------------|--------|-----------|

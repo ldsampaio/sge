@@ -1,17 +1,17 @@
 ---
 gsd_state_version: "1.0"
-milestone: v1.3
-milestone_name: Auto-Classify
-status: complete
-last_updated: "2026-10-10T19:00:00Z"
-last_activity: 2026-10-10
-ship_status: Milestone v1.3 shipped — PR #1 (ship/v1.3 → main), open, awaiting review/merge
+milestone: v1.4
+milestone_name: SMTP Send + Search/Filters + Offline Verification + Auto-Archive + Smart Folder Rules
+status: starting
+last_updated: "2026-10-11T00:00:00Z"
+last_activity: 2026-10-11
+ship_status: Milestone v1.3 complete (audit passed); v1.4 started — phases 21-27 scoped in ROADMAP.md (not yet planned per-phase)
 progress:
-  total_phases: 6
-  completed_phases: 6
-  total_plans: 12
-  completed_plans: 12
-  percent: 100
+  total_phases: 7   # 21-27 (scoped, not yet planned per phase)
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 ---
@@ -22,11 +22,12 @@ progress:
 See: .planning/PROJECT.md (updated 2026-10-10 — Milestone v1.3 complete)
 
 **Core value:** Connect to an IMAP server on Linux and read your mail locally in a fast Gmail-like UI.
-**Current focus:** v1.3 Auto-Classify — all 6 phases complete (Phases 15-20)
+**Current focus:** v1.4 SMTP Send + Search/Filters + Offline Verification + Auto-Archive + Smart Folder Rules — phases 21-27 scoped (not yet planned per-phase); NO live-server testing (mail.utfpr.edu.br unreachable, 2026-10-13) — verification gates run OFFLINE via MockSession/FakeSession + record-replay SMTP transport; search/filter, auto-archive, smart rules added.
 
 ## Milestone Status
 
-**v1.3 Auto-Classify: PASSED** — 17/17 requirements, 6/6 phases, integration conditional-pass closed in-audit.
+**v1.4 SMTP Send + ...: STARTED** — 0/7 phases planned; requirements in `.planning/REQUIREMENTS.md`; roadmap phases 21-27 added in `.planning/ROADMAP.md`. Constraint 2026-10-13: NO live-server testing (server unreachable) — LIVE-01/02/03 verify OFFLINE via doubles.
+**v1.3 Auto-Classify: PASSED** — 17/17 requirements, 6/6 phases (15-20), audit `.planning/v1.3-MILESTONE-AUDIT.md` (PASSED, deferred live gates documented).
 
 - Milestone audit: `.planning/v1.3-MILESTONE-AUDIT.md` — status: passed, scores: requirements 17/17, phases 6/6, integration 18/18 paths wired (1 blocker found + fixed in-audit)
 - All phase summaries verified and complete

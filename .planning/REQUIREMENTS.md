@@ -77,3 +77,35 @@ Which phases cover which requirements. Updated during roadmap creation.
 | TRUST-03 | Phase 18 | Done |
 | BATCH-01 | Phase 20 | Done |
 | BATCH-02 | Phase 20 | Done |
+
+---
+
+## v1.4 Requirements (Starting 2026-10-11; revised 2026-10-13 — NO live-server testing)
+
+**Milestone:** SMTP Send + Search/Filters + Offline Verification + Auto-Archive + Smart Folder Rules
+**Phases:** 21–27 (continue from 20; to be refined at plan-phase)
+**Status:** Scoped — not yet planned per-phase. Phase 21 planning will split into 21 (SMTP Verification Gate) / 22 (Draft/Seen Verification Gate) / 23 (Search + Filters) / 24 (Auto-Archive) / 25 (Smart Rules) / 26 (Offline Verification Bundle) / 27 (Verification / Audit Update).
+
+> **Hard constraint (2026-10-13): `mail.utfpr.edu.br` / `smtp.utfpr.edu.br` are unreachable from this environment — no live-server testing is possible.** All LIVE-* gates below are verified OFFLINE via the deterministic doubles already in the codebase (`MockSession`/`FakeSession` implementing `SyncSession`, record-and-replay SMTP transport in `smtp.rs` tests, `sync_demo` harness): tests assert wire-level verb sequences (APPEND-new + expunge-old one-copy, UID-only STORE Seen, outbox replay order, no-resurrection across simulated reconnect) instead of real round-trips. Anything that genuinely needs a real server stays explicitly deferred with reason.
+
+### Verification Gates (close deferred v1.1/v1.2/v1.3 behaviors — OFFLINE via doubles, no live server)
+- [ ] **LIVE-01** (Phase 21): End-to-end SMTP send proven WITHOUT a live server — record-and-replay SMTP transport asserts: message accepted, no duplicate (Message-ID check incl. double-queue + DATA-timeout → `uncertain` reconcile-not-resend), Sent APPEND filed verbatim with `\Seen`, retry/backoff surfaces cleanly, keyring creds reused, no secret leakage in logs. Genuine 587 wire interop stays deferred with reason.
+- [ ] **LIVE-02** (Phase 22): Draft APPEND leaves exactly one server copy per session (`draft_uid` tracked) proven via MockSession verb log; edit offline + simulated-reconnect survives; delete/move replay from `imap_outbox` with no silent resurrection by backfill (tombstoning/convergence asserted across simulated reconnect); Seen-flag round-trip survives simulated reconnect.
+- [ ] **LIVE-03** (Phase 26): All deferred `/gsd-verify-work` behaviors (6/7/8 for v1.1, 12/13 for v1.2, confirm→MOVE for v1.3) executed against offline doubles with real wire-level assertions; results recorded; anything genuinely needing a live server documented as deferred with reason.
+
+### Search + Filters
+- [ ] **SRCH-01** (Phase 23): User searches local SQLite by subject, body snippet, sender, attachment name, folder scope; results ranked; multi-folder selectable.
+- [ ] **SRCH-02** (Phase 23): User saves, edits, deletes filter queries; filters applied at sync time or query-time; state persisted across restarts.
+- [ ] **SRCH-03** (Phase 23): Search state (query + folder scope + sort) survives app restart and reconnect.
+
+### Auto-Archive
+- [ ] **ARCH-01** (Phase 24): User configures auto-archive age rule (e.g., >30 days in folder → `Auto/Archive/`); batch job journaled per message with resume/undo; uses `batch_classify` machinery with archive-specific threshold.
+- [ ] **ARCH-02** (Phase 24): Archive never deletes — only MOVE; user can review archive folder; undo-batch restores originals.
+
+### Smart Folder Rules
+- [ ] **RULE-01** (Phase 25): User defines rule (keyword / sender pattern / subject regex); rule validated (no empty patterns, no reserved folder names); conflicts with existing taxonomy resolved by user confirmation reusing `confirm_suggestion`.
+- [ ] **RULE-02** (Phase 25): Rule applies at sync or on-demand to new/incoming mail; moves use UID-only + UIDVALIDITY gating; rule persists in SQLite; survives taxonomy version bumps (ID-stable references).
+- [ ] **RULE-03** (Phase 25): User can list/edit/delete rules; rules never auto-delete messages (only MOVE to user-selected folder); sensitive-data redaction applies to any rule justification/logs.
+
+### Scope / Constraints (carried forward)
+- Body.PEEK-only reads; no silent expunge; UID-only addressed with UIDVALIDITY epoch gating; keyring-only creds; Linux-only bundle; no cloud/Laya fallback.

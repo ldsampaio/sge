@@ -8,18 +8,21 @@ SGE is a Linux desktop email client built with Rust + Tauri v2 + React + SQLite.
 
 Connect to an IMAP server on Linux and read your mail locally in a fast Gmail-like UI — if this doesn't work, nothing else matters.
 
-## Current Milestone: v1.3 Auto-Classify
+## Current Milestone: v1.4 SMTP Send + Search/Filters + Offline Verification + Auto-Archive + Smart Folder Rules
 
-**Goal:** SGE classifica e-mails automaticamente com Laya (on-device) e os organiza numa árvore de pastas `Auto/`, sempre com confirmação do usuário exceto no modo lote.
+**Status:** Starting — continues from phase 21 (v1.3 phases 15-20 complete, audit `.planning/v1.3-MILESTONE-AUDIT.md`: PASSED 17/17, deferred live gates documented).
+
+**Goal:** Close v1.2/v1.3 deferred behaviors WITHOUT a live server (`mail.utfpr.edu.br` / `smtp.utfpr.edu.br:587` unreachable from this environment — verified 2026-10-13) via the offline doubles already in the codebase (MockSession/FakeSession, record-and-replay SMTP transport), and add final capabilities: advanced search/filter, auto-archive by taxonomy age, smart folder rules (keyword/pattern auto-file). Genuine wire interop stays explicitly deferred with reason.
 
 **Target features:**
-- Motor Laya embarcado (sidecar offline, checkpoint multilíngue p/ pt-BR) servindo classificação ao backend Rust
-- Classificação automática ao sincronizar + classificação manual por e-mail, ambas com confirmação do usuário antes de mover
-- Árvore `Auto/` criada sob demanda espelhando a taxonomia; raiz sempre `Auto` para diferenciar de pastas do usuário
-- UI de opções: importar taxonomia via JSON (padrão UTFPR embarcado) + editar categorias/keywords/regras na UI
-- UI de override: corrigir classificação (re-move + registra override)
-- Classificação em lote: reorganiza toda a conta sem confirmação individual (progresso + relatório)
-- Rótulos locais primário + secundário no SQLite; secundário nunca move; regra de dados sensíveis respeitada
+- SMTP Send (Verification Gate, OFFLINE) — record-replay send, Message-ID dedupe, Sent filing, retry/backoff visible
+- Draft & Seen Round-Trip (Verification Gate, OFFLINE) — APPEND one-copy, Seen survives simulated reconnect, `imap_outbox` replay, no silent resurrection
+- Search + Filters — SQLite search (subject/body/attach), saved filters, multi-folder, persisted state
+- Auto-Archive — aging into `Auto/Archive/`, journaled batch, taxonomy-driven
+- Smart Folder Rules — validated keyword/sender rules → folder, conflict = user confirm, SQLite-persisted
+- Offline Verification Bundle — verification plan closing deferred `/gsd-verify-work` behaviors via doubles; document new deferrals
+
+**Scope guard (not in v1.4):** No cloud fallback; no Sieve server-side; single account; Linux only; NO live-server testing (server unreachable — all LIVE-* gates verified via deterministic doubles).
 
 ## Requirements
 
