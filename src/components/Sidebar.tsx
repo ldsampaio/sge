@@ -6,6 +6,7 @@ import "./MailboxView.css";
 import FolderContextMenu from "./FolderContextMenu";
 import { ReviewPanel } from "./ReviewPanel";
 import { TaxonomyEditor } from "./TaxonomyEditor";
+import { RulesPanel } from "./RulesPanel";
 import { BatchPanel } from "./BatchPanel";
 import { ArchivePanel } from "./ArchivePanel";
 import { IconBook, IconFolderPlus, IconInbox, IconMail, IconMove, IconTrash } from "./icons";
@@ -142,6 +143,8 @@ export default function Sidebar({
   const [reviewCount, setReviewCount] = useState(0);
   /** Phase 19 taxonomy editor modal. */
   const [editorOpen, setEditorOpen] = useState(false);
+  /** Phase 25 smart-folder rules panel modal. */
+  const [rulesOpen, setRulesOpen] = useState(false);
   /** Phase 20 batch panel modal. */
   const [batchOpen, setBatchOpen] = useState(false);
   /** Phase 24 archive panel modal (rule editor + manual run). */
@@ -334,6 +337,17 @@ export default function Sidebar({
         <button
           type="button"
           className="sidebar-newfolder"
+          onClick={() => setRulesOpen(true)}
+          aria-label="Regras de arquivamento"
+        >
+          <span className="sidebar-newfolder-icon" aria-hidden="true">
+            <IconMail size={17} />
+          </span>
+          <span>Regras</span>
+        </button>
+        <button
+          type="button"
+          className="sidebar-newfolder"
           onClick={() => setBatchOpen(true)}
           aria-label="Reorganizar toda a conta"
         >
@@ -372,6 +386,7 @@ export default function Sidebar({
         />
       )}
       {editorOpen && <TaxonomyEditor onClose={() => setEditorOpen(false)} />}
+      {rulesOpen && <RulesPanel onClose={() => setRulesOpen(false)} />}
       {batchOpen && <BatchPanel onClose={() => setBatchOpen(false)} />}
       {archiveOpen && <ArchivePanel onClose={() => setArchiveOpen(false)} />}
       {menu !== null &&
