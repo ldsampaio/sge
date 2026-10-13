@@ -228,7 +228,11 @@ Decimal phases appear between their surrounding integers in numeric order. v1.2 
 **Goal:** Prove v1.2 send pipeline vs `smtp.utfpr.edu.br:587` with user-provided creds (git-ignored): test mail ONLY to own address, arrives, Sent copy, no duplicate (Message-ID), retry/backoff clean, no secret leak. **Requires:** Phase 14 + creds file. **Requirements:** LIVE-01. **Success:** self-addressed mail arrives + Sent copy, no other recipient ever addressed, existing mail untouched. **UI:** yes. **Plans:** TBD.
 
 ### Phase 22: Draft & Seen Round-Trip — Live Gate (Live-02, SANDBOXED)
-**Goal:** Draft APPEND 1-copy inside `SGE-Test-<run-id>` sandbox, Seen survives reconnect, `imap_outbox` replay, no silent resurrection — pre-flight guard + post-run cleanup. **Requires:** Phase 12/13 + creds file. **Requirements:** LIVE-02. **UI:** minimal. **Plans:** TBD.
+**Goal:** Draft APPEND 1-copy inside `SGE-Test-<run-id>` sandbox, Seen survives reconnect, `imap_outbox` replay, no silent resurrection — pre-flight guard + post-run cleanup. **Requires:** Phase 12/13 + creds file. **Requirements:** LIVE-02. **UI:** minimal. **Plans:** 2 plans.
+
+Plans:
+- [ ] 22-01-PLAN.md — Tracer: harness skeleton + pre-flight/sandbox + one-copy draft + kill-reconcile + offline-edit (offline doubles green, live clean-skip)
+- [ ] 22-02-PLAN.md — Expansion: replay-order + double-sync resurrection + Seen both ways + secret scan + prefix audit + cleanup/report
 
 ### Phase 23: Search + Filters
 **Goal:** SQLite search (subject/body/attach/sender), saved filters, multi-folder, persisted. **Requires:** Phase 3. **Requirements:** SRCH-01/02/03. **UI:** yes. **Plans:** TBD.
