@@ -3,7 +3,7 @@ gsd_state_version: "1.0"
 milestone: v1.4
 milestone_name: SMTP Send + Search/Filters + Live Validation + Auto-Archive + Smart Folder Rules
 status: starting
-stopped_at: Completed 21-02-PLAN.md (expansion, offline green; live run pending)
+stopped_at: 22-01 SUMMARY written + verified (10/10 offline green, SKIP exit-2); 22-02 executing in background; 23 smart-discuss in background
 last_updated: "2026-10-13T14:18:40.048Z"
 state_head: 95082b99cf54cf70b1da3b7165f63a8526f320ff
 progress:
@@ -112,7 +112,11 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-**Stopped at:** Completed 21-02-PLAN.md (expansion, offline green; live run pending)
+**Stopped at:** 22-01 SUMMARY written + verified (10/10 offline green, SKIP exit-2); 22-02 executing in background agent; 23 smart-discuss in background agent (2026-10-13)
+
+**Operator repairs 2026-10-13 (autonomous run pre-flight):**
+- `38bd940` restored 6 product files wrongly deleted by `04fe8ca` cleanup (`sync.rs` 2773 lines, `filing.rs`, MailboxView, TaxonomyEditor, package.json/lock) — tsc clean after restore
+- `fc2cd74` added `scripts/build-env.sh` (REQUIRED source before any cargo cmd: flatpak-SDK pkg-config + /tmp/opencode stub .pc/.so + host-only linking; never export LD_LIBRARY_PATH globally — segfaults cargo; sidecar binary path holds Phase-15 dev shim, weights dir empty stub, both git-ignored)
 
 Last session: 2026-10-13T14:18:40.036Z
 Milestone: v1.3 Auto-Classify complete
