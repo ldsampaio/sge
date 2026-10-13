@@ -3,7 +3,7 @@ gsd_state_version: "1.0"
 milestone: v1.4
 milestone_name: SMTP Send + Search/Filters + Live Validation + Auto-Archive + Smart Folder Rules
 status: starting
-stopped_at: Phase 26 COMPLETE (offline 63/63, live pending creds); 25-exec running (watch: transient rules.rs lib-test failure flagged by 26-02); 27 opens after 25
+stopped_at: All v1.4 phases 21–26 COMPLETE; running full-suite gate before Phase 27/audit
 last_updated: "2026-10-13T14:18:40.048Z"
 state_head: 95082b99cf54cf70b1da3b7165f63a8526f320ff
 progress:
@@ -43,7 +43,7 @@ See: .planning/PROJECT.md (updated 2026-10-10 — Milestone v1.3 complete)
 | 22-01 Tracer | complete | Harness skeleton + pre-flight guard + GateSession + one-copy helpers, 10 offline tests |
 | 22-02 Expansion | complete | Replay-order + double-sync resurrection + Seen both ways + secret scan + prefix audit + cleanup/report, 19/19 tests green |
 
-Phase 21 likewise complete (offline green; live pending `scripts/live-21.sh`). Phase 23 COMPLETE 2026-10-13 (SRCH-01/02/03: M17/M18, 345 lib green, tsc clean). Phase 24 COMPLETE 2026-10-13 (ARCH-01/02: 472 green, tsc clean). Phase 26 COMPLETE 2026-10-13 (LIVE-03 offline scope: bin 15/15, safety 48/48; live pending creds via `scripts/live-26.sh`). 25 executing, 27 open.
+Phase 21 likewise complete (offline green; live pending `scripts/live-21.sh`). Phase 23 COMPLETE 2026-10-13 (SRCH-01/02/03: M17/M18, 345 lib green, tsc clean). Phase 24 COMPLETE 2026-10-13 (ARCH-01/02: 472 green, tsc clean). Phase 26 COMPLETE 2026-10-13 (LIVE-03 offline scope: bin 15/15, safety 48/48; live pending creds via `scripts/live-26.sh`). Phase 25 COMPLETE 2026-10-13 (RULE-01/02/03: 392 lib green incl. 37 rule tests, tsc clean). All v1.4 phases 21–26 complete → Phase 27 milestone close.
 
 All 6 phases (15-20) are **complete** as of 2026-10-10:
 

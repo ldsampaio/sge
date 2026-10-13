@@ -254,7 +254,11 @@ Plans:
 - [x] 24-02-PLAN.md — UI: rule editor + manual trigger panel + kind-aware resume/undo on BatchPanel (tsc clean)
 
 ### Phase 25: Smart Folder Rules
-**Goal:** User-defined rules (keyword/sender/pattern) validated → applies at sync/on-demand; conflict = confirm; SQLite-persisted. **Requires:** Phase 18 + 11. **Requirements:** RULE-01/02/03. **UI:** yes. **Plans:** TBD.
+**Goal:** User-defined rules (keyword/sender/pattern) validated → applies at sync/on-demand; conflict = confirm; SQLite-persisted. **Requires:** Phase 18 + 11. **Requirements:** RULE-01/02/03. **UI:** yes.
+
+Plans:
+- [x] 25-01-PLAN.md — Backend: folder_rules M19 + matcher over cached text + validation/CRUD + post-sync hook through confirm_suggestion (37 rule tests)
+- [x] 25-02-PLAN.md — Conflicts (first-match + BOTH-shown dialog) + ID-stable taxonomy evolution + redacted justifications + journaled bulk apply + RulesPanel UI (tsc clean)
 
 ### Phase 26: Live Validation Bundle (Live-03, SANDBOXED)
 **Goal:** Execute all deferred `/gsd-verify-work` behaviors (v1.1 6/7/8, v1.2 12/13, v1.3 confirm→MOVE/batch) vs real server under the sandbox contract; document. **Requires:** all phases + creds file. **Requirements:** LIVE-03. **UI:** no.
@@ -296,4 +300,5 @@ Plans:
 | 22. Draft & Seen Round-Trip — Live Gate | v1.4 | 2/2 | Complete (offline 19/19 green; live run pending human via scripts/live-22.sh) | 2026-10-13 |
 | 23. Search + Filters | v1.4 | 3/3 | Complete (345 lib tests green, tsc clean; vite bundle blocked environmentally — Node 18 vs required 20+) | 2026-10-13 |
 | 24. Auto-Archive | v1.4 | 2/2 | Complete (472 tests green, tsc clean; scheduler structurally absent) | 2026-10-13 |
+| 25. Smart Folder Rules | v1.4 | 2/2 | Complete (392 lib green incl. 37 rule tests, tsc clean) | 2026-10-13 |
 | 26. Live Validation Bundle | v1.4 | 2/2 | Complete (offline: bin 15/15, safety 48/48 green; live pending human via scripts/live-26.sh) | 2026-10-13 |
