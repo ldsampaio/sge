@@ -225,7 +225,11 @@ Decimal phases appear between their surrounding integers in numeric order. v1.2 
 ## Phase Details (v1.4 continuation — phases 21-27)
 
 ### Phase 21: SMTP Send — Live Gate (Live-01, SANDBOXED)
-**Goal:** Prove v1.2 send pipeline vs `smtp.utfpr.edu.br:587` with user-provided creds (git-ignored): test mail ONLY to own address, arrives, Sent copy, no duplicate (Message-ID), retry/backoff clean, no secret leak. **Requires:** Phase 14 + creds file. **Requirements:** LIVE-01. **Success:** self-addressed mail arrives + Sent copy, no other recipient ever addressed, existing mail untouched. **UI:** yes. **Plans:** TBD.
+**Goal:** Prove v1.2 send pipeline vs `smtp.utfpr.edu.br:587` with user-provided creds (git-ignored): test mail ONLY to own address, arrives, Sent copy, no duplicate (Message-ID), retry/backoff clean, no secret leak. **Requires:** Phase 14 + creds file. **Requirements:** LIVE-01. **Success:** self-addressed mail arrives + Sent copy, no other recipient ever addressed, existing mail untouched. **UI:** yes. **Plans:** 2 plans.
+
+Plans:
+- [ ] 21-01-PLAN.md — Tracer: harness skeleton + recipient guard + self-send arrival + verbatim Sent copy + double-enqueue single-delivery + sent-unfiled never-resends (offline doubles green, live clean-skip)
+- [ ] 21-02-PLAN.md — Expansion: offline-flush backoff + DATA-timeout uncertain reconcile + kill-mid-sending recovery + draft-send no-orphan + secret scan + send audit + cleanup/report
 
 ### Phase 22: Draft & Seen Round-Trip — Live Gate (Live-02, SANDBOXED)
 **Goal:** Draft APPEND 1-copy inside `SGE-Test-<run-id>` sandbox, Seen survives reconnect, `imap_outbox` replay, no silent resurrection — pre-flight guard + post-run cleanup. **Requires:** Phase 12/13 + creds file. **Requirements:** LIVE-02. **UI:** minimal. **Plans:** 2 plans.
