@@ -12,6 +12,22 @@ Connect to an IMAP server on Linux and read your mail locally in a fast Gmail-li
 
 SGE is a Linux desktop email client (Rust + Tauri v2 + React + SQLite) with triage, folders, drafts, SMTP compose, on-device auto-classification, full-text search with saved filters, age-based auto-archive, and user-defined smart folder rules. v1.4 audit `.planning/v1.4-MILESTONE-AUDIT.md`: PASSED 11/11 (LIVE-01/02/03, SRCH-01/02/03, ARCH-01/02, RULE-01/02/03), 6/6 phases (21-26), 13 plans. Live-server runs deferred-with-reason (no creds file in this environment; exit-2 SKIP contracts verified). Environment caveat: `vite` bundle needs Node 20+ (env has Node 18); `tsc --noEmit` clean.
 
+## Current Milestone: v1.5 Live Validation + Compose Hardening + Deferred Features
+
+**Status:** Defining requirements — continues from phase 27 (v1.4 shipped 2026-10-13, audit `.planning/v1.4-MILESTONE-AUDIT.md`: PASSED 11/11).
+
+**Goal:** Close every open thread — prove the live-server gates with real credentials, verify the bundle and UI end-to-end, ship the deferred classifier/sync features, and harden compose (send/drafts/reply/reply-all).
+
+**Target features:**
+- Live validation with real creds — `live-21/22/26.sh` runs vs own account under the sandbox contract + draft-send gap closure (FAIL BY DESIGN → fix or explicit deferral)
+- Bundle & UAT — Node 20+ `npm run build` check (rolldown-vite needs `node:util` styleText) + human click-through UAT (search/filter restore, archive trigger→undo, rules tracer)
+- Classifier follow-throughs — rule import/export, learning-from-overrides, per-category auto-confirm, override history view, batch dry-run + retry-failed
+- Sync protocol upgrades — IDLE push (poll stays fallback), CONDSTORE/QRESYNC fast path
+- Sieve export — server-side rule export (previously out-of-scope as "a second product"; in scope tentatively, validate complexity at plan time)
+- Compose hardening — send new email, save drafts, reply, reply-all verified end-to-end over the v1.2 pipelines (verify + fix gaps, not a rebuild)
+
+**Scope guard (not in v1.5):** No cloud fallback; single account; Linux only; no Laya fine-tuning runtime changes beyond logging hooks needed for learning-from-overrides.
+
 <details>
 <summary>Previous milestone block (v1.4 in progress, archived at close)</summary>
 
@@ -37,10 +53,8 @@ SGE is a Linux desktop email client (Rust + Tauri v2 + React + SQLite) with tria
 
 ## Next Milestone Goals
 
-- Live runs with human creds: `scripts/live-21.sh`, `scripts/live-22.sh`, `scripts/live-26.sh` vs own account under the sandbox contract (git-ignored `src-tauri/.live-test.env`); draft-send STEP expected FAIL BY DESIGN → gap closure or explicit deferral
-- Node 20+ bundle check: retry `npm run build` on a Node 20+ host (rolldown-vite requires `node:util` styleText)
-- Human click-through UAT: scoped search / filter CRUD / relaunch restore, archive rule save → Arquivar agora → progress → report → undo, rules live end-to-end tracer
-- Deferred ideas: rule import/export, learning-from-overrides, per-category auto-confirm, Sieve export (all explicitly out of scope for v1.4, not gaps)
+- Post-v1.5 outlook TBD during v1.5 execution (candidates: multi-account, Sieve follow-through if deferred, mobile/remote-access stories — all currently out of scope).
+- v1.5 consumes the previous next-goals list (live runs, Node 20+ bundle check, click-through UAT, deferred ideas) — see Current Milestone above.
 
 ## Requirements
 

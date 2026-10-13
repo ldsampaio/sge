@@ -1,19 +1,16 @@
 ---
 gsd_state_version: "1.0"
-milestone: v1.4
-milestone_name: SMTP Send + Search/Filters + Live Validation + Auto-Archive + Smart Folder Rules
-status: complete
-stopped_at: Milestone v1.4 SHIPPED 2026-10-13 (audit PASSED 11/11); planning scope archived, REQUIREMENTS.md removed for next milestone
-last_updated: "2026-10-13T22:30:00.000Z"
-state_head: 95082b99cf54cf70b1da3b7165f63a8526f320ff
+milestone: v1.5
+milestone_name: Live Validation + Compose Hardening + Deferred Features
+status: planning
+last_updated: "2026-10-13T22:31:45.083Z"
+last_activity: 2026-10-13
 progress:
-  total_phases: 18
-  completed_phases: 20
-  total_plans: 18
-  completed_plans: 2
-last_activity: 2026-10-11
-ship_status: Milestone v1.4 SHIPPED 2026-10-13 (audit PASSED 11/11, 6/6 phases, 13 plans; live runs deferred-with-reason, Node-18 vite caveat recorded)
-current_phase_name: SMTP Send — Live Gate (Live-01, SANDBOXED)
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 ---
@@ -36,29 +33,10 @@ See: .planning/PROJECT.md (updated 2026-10-10 — Milestone v1.3 complete)
 
 ## Current Position
 
-**Phase 22 COMPLETE 2026-10-13** (LIVE-02 offline scope; live run pending human creds via `scripts/live-22.sh`):
-
-| Plan | Status | Key Deliverables |
-|------|--------|-----------------|
-| 22-01 Tracer | complete | Harness skeleton + pre-flight guard + GateSession + one-copy helpers, 10 offline tests |
-| 22-02 Expansion | complete | Replay-order + double-sync resurrection + Seen both ways + secret scan + prefix audit + cleanup/report, 19/19 tests green |
-
-Phase 21 likewise complete (offline green; live pending `scripts/live-21.sh`). Phase 23 COMPLETE 2026-10-13 (SRCH-01/02/03: M17/M18, 345 lib green, tsc clean). Phase 24 COMPLETE 2026-10-13 (ARCH-01/02: 472 green, tsc clean). Phase 26 COMPLETE 2026-10-13 (LIVE-03 offline scope: bin 15/15, safety 48/48; live pending creds via `scripts/live-26.sh`). Phase 25 COMPLETE 2026-10-13 (RULE-01/02/03: 392 lib green incl. 37 rule tests, tsc clean). All v1.4 phases 21–26 complete → Phase 27 milestone close.
-
-All 6 phases (15-20) are **complete** as of 2026-10-10:
-
-| Phase | Status | Key Deliverables |
-|-------|--------|-----------------|
-| 15. Sidecar Packaging Spike | complete | Frozen binary 294MB, 6s cold-start, CONTRACT.md verified, 13 unit tests |
-| 16. Taxonomy + Store | complete | 23 ID-stable taxonomy ids, M12+ migrations, redaction sanitizer, 56 store tests |
-| 17. Classify Engine (No Moves) | complete | Behind-sync suggestions, keyword veto → review bucket, 44 classify tests |
-| 18. Confirm + Trust UX | complete | Confirm-gated MOVE, override/log/pin, badges, threshold, 6 filing tests |
-| 19. Taxonomy Editor + Import | complete | Add/rename/delete/merge, import/export, ID-stable ops, 10 taxedit tests |
-| 20. Batch Reorganization | complete | Journal/resume/undo, chunked 25, UIDVALIDITY re-check, 3 batch tests |
-
-**Integration:** 18/18 paths wired; 1 blocker (`classify_message` orphaned from UI) found and fixed in-audit.
-
-**Performance:** 328 Rust tests green, tsc clean, zero warnings. Frozen binary: 294MB, 6s cold-start. Bundles: .deb (sge-laya + 63 weights files) + AppImage (RC=0).
+Phase: Not started (defining requirements)
+Plan: —
+Status: Defining requirements
+Last activity: 2026-10-13 — Milestone v1.5 started
 
 ## Performance Metrics
 
