@@ -1041,7 +1041,7 @@ async fn expunge_tracked(mgr: &SessionManager, wire: &str, uid: u32, mid: &str) 
                     e,
                     secs
                 );
-                std::thread::sleep(std::time::Duration::from_secs(*secs));
+                async_std::task::sleep(std::time::Duration::from_secs(*secs)).await;
             }
         }
     }
@@ -3219,7 +3219,19 @@ async fn cleanup(
             ok = false;
         }
     }
-    let sent_folder = tracked.sent_wire.clone().unwrap_or_else(|| "INBOX".to_string());
+    let sent_folder = if let Some(w) = tracked.sent_wire.clone() {
+        w
+    } else {
+        // WR-02: Fail closed — never fall back to INBOX for a Sent UID
+        // expunge (UIDs are per-folder; that would delete the wrong mail).
+        // Skip Sent cleanup and force the manual path in the final log_step.
+        eprintln!(
+            "[live-gate] cleanup: Sent wire unknown — skipping Sent expunge; {}",
+            manual_cleanup_steps(tracked)
+        );
+        ok = false;
+        "INBOX".to_string()
+    };
     for (mid, uid) in tracked.sent_uids.iter() {
         if !expunge_tracked(mgr, &sent_folder, *uid, mid).await {
             ok = false;
@@ -3255,7 +3267,7 @@ async fn cleanup(
                         e,
                         secs
                     );
-                    std::thread::sleep(std::time::Duration::from_secs(*secs));
+                    async_std::task::sleep(std::time::Duration::from_secs(*secs)).await;
                 }
             }
         }
@@ -3327,7 +3339,7 @@ async fn cleanup(
         ok && clean,
         &if clean && tracked.message_ids.is_empty() {
             "nothing sent, LIST matches pre-run snapshot".to_string()
-        } else if clean {
+        } else if clean && ok {
             format!(
                 "tracked uids expunged, LIST matches pre-run snapshot (mids {:?})",
                 tracked.message_ids

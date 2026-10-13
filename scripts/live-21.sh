@@ -23,7 +23,7 @@ set -a
 . "$ENV_FILE"
 set +a
 
-LOG="/tmp/sge-live21-$$.log"
+LOG="$(mktemp /tmp/sge-live21-XXXXXX.log)"
 cargo run --manifest-path src-tauri/Cargo.toml --bin live_gate_21 "$@" 2>&1 | tee "$LOG"
 CODE="${PIPESTATUS[0]}"
 
@@ -63,6 +63,11 @@ if [ "$CODE" -ne 2 ] && grep -q "^STEP " "$LOG"; then
     if [ -n "$UNPREFIXED" ]; then
         AUDIT_FAIL="${AUDIT_FAIL} unprefixed-subject-line;"
     fi
+    # Count AUDIT-SUBJECT lines; fail if zero (cover vacuous passes).
+    SUBJECT_TOTAL=$(grep -c "^AUDIT-SUBJECT " "$LOG" || true)
+    if [ "$SUBJECT_TOTAL" -eq 0 ]; then
+        AUDIT_FAIL="${AUDIT_FAIL} missing-subject-line-count;"
+    fi
     # Rule 4: Message-IDs unique per run.
     DUP_MID=$(grep "^AUDIT-MID " "$LOG" | sort | uniq -d || true)
     if [ -n "$DUP_MID" ]; then
@@ -87,7 +92,7 @@ if [ "$CODE" -ne 2 ] && grep -q "^STEP " "$LOG"; then
     # artifact matched, never the secret.
     SCAN_FAIL=""
     for secret in "${SGE_LIVE_IMAP_PASS:-}" "${SGE_LIVE_SMTP_PASS:-}"; do
-        if [ -n "$secret" ] && grep -F -q "$secret" "$LOG"; then
+        if [ -n "$secret" ] && printf '%s' "$secret" | grep -F -q -f /dev/stdin "$LOG"; then
             SCAN_FAIL="${SCAN_FAIL} log-leak;"
         fi
     done

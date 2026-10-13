@@ -75,7 +75,11 @@ impl SyncSession for FakeSession {
 
     fn search_uids(&mut self) -> sge_lib::imap::PinBox<'_, Result<Vec<u32>, SyncError>> {
         Box::pin(async move {
-            let mut uids: Vec<u32> = self.messages.keys().copied().collect();
+            let selected = self.selected.as_deref();
+            let mut uids: Vec<u32> = self.messages.iter()
+                .filter(|(_, (mb, _, _, _))| selected.map_or(true, |sel| sel == mb.as_str()))
+                .map(|(&uid, _)| uid)
+                .collect();
             uids.sort_unstable();
             Ok(uids)
         })
