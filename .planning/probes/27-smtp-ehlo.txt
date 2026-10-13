@@ -1,0 +1,126 @@
+depth=2 C = BE, O = GlobalSign nv-sa, CN = GlobalSign Root R46
+verify return:1
+depth=1 C = BR, O = REDE NACIONAL DE ENSINO E PESQUISA - RNP, CN = RNP ICPEdu GR46 OV TLS CA 2025
+verify return:1
+depth=0 C = BR, ST = PARANA, L = CURITIBA, O = UNIVERSIDADE TECNOLOGICA FEDERAL DO PARANA, CN = *.utfpr.edu.br
+verify return:1
+CONNECTED(00000003)
+---
+Certificate chain
+ 0 s:C = BR, ST = PARANA, L = CURITIBA, O = UNIVERSIDADE TECNOLOGICA FEDERAL DO PARANA, CN = *.utfpr.edu.br
+   i:C = BR, O = REDE NACIONAL DE ENSINO E PESQUISA - RNP, CN = RNP ICPEdu GR46 OV TLS CA 2025
+   a:PKEY: rsaEncryption, 2048 (bit); sigalg: RSA-SHA256
+   v:NotBefore: Sep 29 14:01:34 2026 GMT; NotAfter: Apr 16 14:01:34 2027 GMT
+ 1 s:C = BR, O = REDE NACIONAL DE ENSINO E PESQUISA - RNP, CN = RNP ICPEdu GR46 OV TLS CA 2025
+   i:C = BE, O = GlobalSign nv-sa, CN = GlobalSign Root R46
+   a:PKEY: rsaEncryption, 4096 (bit); sigalg: RSA-SHA384
+   v:NotBefore: Nov 19 03:27:55 2025 GMT; NotAfter: Nov 19 00:00:00 2030 GMT
+---
+Server certificate
+-----BEGIN CERTIFICATE-----
+MIIHSjCCBTKgAwIBAgIMagcV+3oNLxVs/ybwMA0GCSqGSIb3DQEBCwUAMGkxCzAJ
+BgNVBAYTAkJSMTEwLwYDVQQKEyhSRURFIE5BQ0lPTkFMIERFIEVOU0lOTyBFIFBF
+U1FVSVNBIC0gUk5QMScwJQYDVQQDEx5STlAgSUNQRWR1IEdSNDYgT1YgVExTIENB
+IDIwMjUwHhcNMjYwOTI5MTQwMTM0WhcNMjcwNDE2MTQwMTM0WjB/MQswCQYDVQQG
+EwJCUjEPMA0GA1UECBMGUEFSQU5BMREwDwYDVQQHEwhDVVJJVElCQTEzMDEGA1UE
+ChMqVU5JVkVSU0lEQURFIFRFQ05PTE9HSUNBIEZFREVSQUwgRE8gUEFSQU5BMRcw
+FQYDVQQDDA4qLnV0ZnByLmVkdS5icjCCASIwDQYJKoZIhvcNAQEBBQADggEPADCC
+AQoCggEBAMb6MrAqj4NP7EIwwPn6kbxjdfAAO7QoAtv5hsOyIaAKSx6QW3L/X0Lb
+fLPHW8NBGVxD3CFPy1EN4BzjqKsPyYSvs31DTGaL23krzNoE3Rp3WH8pPhtc4vL2
+p8ao7i2xVA93GT25WsGTP44+8VVbI5nrh8SOSY6rQVBvTqE4qEPeKIc9liKNUjlV
+NFKqzef27o7MduK+pjnlWRcIUnsKfEtRzLKSlBP5YY6sx7SfpokpHbYHU8wLizKe
+cSOhzobLvzcT9yAmVEAVkWspcJbcFg6beNKX1I1n/CjxU31gM1AZiylB3YlOAq/1
+ROlXC16rZXy7waZllI3Uqce9JY5NsMkCAwEAAaOCAtowggLWMA4GA1UdDwEB/wQE
+AwIFoDAMBgNVHRMBAf8EAjAAMIGfBggrBgEFBQcBAQSBkjCBjzBMBggrBgEFBQcw
+AoZAaHR0cDovL3NlY3VyZS5nbG9iYWxzaWduLmNvbS9jYWNlcnQvcm5waWNwZWR1
+Z3I0Nm92dGxzY2EyMDI1LmNydDA/BggrBgEFBQcwAYYzaHR0cDovL29jc3AuZ2xv
+YmFsc2lnbi5jb20vcm5waWNwZWR1Z3I0Nm92dGxzY2EyMDI1MBMGA1UdIAQMMAow
+CAYGZ4EMAQICMCcGA1UdEQQgMB6CDioudXRmcHIuZWR1LmJyggx1dGZwci5lZHUu
+YnIwHwYDVR0jBBgwFoAUlLDJT8HgbO/Oxitss7TLIop2SbcwEwYDVR0lBAwwCgYI
+KwYBBQUHAwEwHQYDVR0OBBYEFB5A9crfkGq2N7Ps4P8gdN7xmVmSMIIBfwYKKwYB
+BAHWeQIEAgSCAW8EggFrAWkAdgAcn2gs6frwRWlQ+BuWiofd2zIQ2EzmyLLjglJK
+xM9ZnwAAAaDteJ5RAAAEAwBHMEUCIQDy3Gp4+iyMkv4ZFVbRvqVHoI4LZAZ3wvnX
+ERJ+zx0vMAIgXlbchNeDEzmC66p2W/gwcNCgrtu/ytnUO6OKIujIiKkAdgBMY9yY
+5Zwdq4j2Hoo93q6Pq0SjN3tfm5TD+6Gc/MG+JgAAAaDteJx7AAAEAwBHMEUCIQCA
+lNQf03qPPpY2k1p44auU35Ih78mUikxq/hdD/fKtFgIgaBBCil+atTBz6D6NBFOP
+vSkZ0Dqok0PWq8iLa+i08foAdwBgTJqven93XwHUBvySDciZ6wscffjJUhv6+hd3
+O5eLyQAAAaDteJukAAAEAwBIMEYCIQC4LJveqbJqJ60YqaxS+cbc98ef4nB7Pvh4
+k7J7kEMAMgIhALntdhfMu//CLLi6g+fLuHbuD8hq0wkqq8GdbqTJgM2cMA0GCSqG
+SIb3DQEBCwUAA4ICAQCXz0Zf/rAvonsKZ4dkhtGcDM+SFONiHUTqZ3XYHTz1voS/
+e8q3Gb+k+3cIrIYMFn31OgbILwE+5bLRmAN2QyZ1I5+WeUuDiulReh9ZYrzE0WTz
+oYOkI+/i/iVXBYogI4YUhD3pHjYoFI7jdbQh0cOyBeHkJgRp7fihD74YjzxykkDW
++IPSwWS6J2TT6zo57N+XQsoYPNe+sKfLMLn0Km4s8HlhJDVxTkETVDYtOf/D2AJg
+z7mw/L7ALe4aV/UatFjonf4/InOdBo59nkBOBXWIIY4zyAGNKa/b3BKYVJUsILDF
+EvitHZblexAT5DRXSuyoVlFph17zcJdZ+Iq6zLElqUv7OduA0kj+tBKL7f1j7y9Q
+bcYFInUmpsPcEZrTVtPVXuMuVKOJ024HWEhGkq7AV8fypN15fKgpZMt7Dr849K4Z
+tHNrXEwE82jzUW0UNrr/vpGkYtVxfo/HKsePgPNqGKpsnIxPIBq/CKNVZsYMU2tt
+yl8Do3jw+Jg1lXjCrP/Tcg1wov9YpsxdOgEd0HzS8dFqmqL/uxG+GK3MRodiwECu
+PwXSPytczns7h8t37PryuvTqHACAdLg5TLHsGlPmGu9Y4Nh0SjlweLZLfFFVt3+y
+sXBBgqYKvrvvcv+Y6Cy/ZQjUgJfVTbj4vt3UiGY+q8qmq/lyPreHTgf85yhABQ==
+-----END CERTIFICATE-----
+subject=C = BR, ST = PARANA, L = CURITIBA, O = UNIVERSIDADE TECNOLOGICA FEDERAL DO PARANA, CN = *.utfpr.edu.br
+issuer=C = BR, O = REDE NACIONAL DE ENSINO E PESQUISA - RNP, CN = RNP ICPEdu GR46 OV TLS CA 2025
+---
+No client certificate CA names sent
+Peer signing digest: SHA256
+Peer signature type: RSA-PSS
+Server Temp Key: X25519, 253 bits
+---
+SSL handshake has read 4363 bytes and written 432 bytes
+Verification: OK
+---
+New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384
+Server public key is 2048 bit
+Secure Renegotiation IS NOT supported
+Compression: NONE
+Expansion: NONE
+No ALPN negotiated
+Early data was not sent
+Verify return code: 0 (ok)
+---
+250 CHUNKING
+250-mail.utfpr.edu.br
+250-PIPELINING
+250-SIZE 31465824
+250-VRFY
+250-ETRN
+250-ENHANCEDSTATUSCODES
+250-8BITMIME
+250-DSN
+250 CHUNKING
+221 2.0.0 Bye
+---
+Post-Handshake New Session Ticket arrived:
+SSL-Session:
+    Protocol  : TLSv1.3
+    Cipher    : TLS_AES_256_GCM_SHA384
+    Session-ID: 6201D91C6F5684B840B2261EBDC3D3D8CE5488D6E48429EB00C55364F0E1D5AC
+    Session-ID-ctx: 
+    Resumption PSK: 6AC4C35BE976C9AA6FA51665DE684B9D367676B260E4C8783E470CE293EC83459A9EB3B6776F89465849A7AA5EC4665B
+    PSK identity: None
+    PSK identity hint: None
+    SRP username: None
+    TLS session ticket lifetime hint: 7200 (seconds)
+    TLS session ticket:
+    0000 - 03 ae a5 07 02 2e 02 9c-07 40 62 aa 2e e4 ee 19   .........@b.....
+    0010 - c6 48 d9 74 03 1d 5c db-01 8e b3 82 6d 8b 04 20   .H.t..\.....m.. 
+    0020 - c4 1f 55 c8 b6 1d 00 f3-92 5a c0 18 8d 7e 9d 48   ..U......Z...~.H
+    0030 - d4 8a bb 9f 5f 68 db ef-00 a7 f2 89 83 12 ae 2b   ...._h.........+
+    0040 - 2a 89 e8 af bf 69 f6 4d-e2 2b 60 a9 6a 8b ab 30   *....i.M.+`.j..0
+    0050 - 27 b0 76 48 00 b0 0d 4f-51 f5 a6 98 c9 a2 df f0   '.vH...OQ.......
+    0060 - 6f fe 05 81 a0 dc fe 25-26 8d a4 af 6e bc 65 ef   o......%&...n.e.
+    0070 - 71 6c 69 da cb 0f ee a1-b6 93 2d b7 39 a8 c0 54   qli.......-.9..T
+    0080 - 78 8c aa 69 b9 d8 14 ac-21 21 50 63 af e5 b7 15   x..i....!!Pc....
+    0090 - 5b 22 f6 c1 18 fa 91 14-50 49 da 7b ac 28 d7 57   ["......PI.{.(.W
+    00a0 - 5f 4c 9f c6 8e 1c a1 91-86 09 8a f2 61 b9 d4 ad   _L..........a...
+    00b0 - 6c 50 02 d7 2c 61 35 fd-9a 4c ea fb 5b 9a 20 34   lP..,a5..L..[. 4
+    00c0 - 1f 28 40 8c 3d 83 28 78-c0 2e 01 1a 62 71 1a 44   .(@.=.(x....bq.D
+
+    Start Time: 1791932815
+    Timeout   : 7200 (sec)
+    Verify return code: 0 (ok)
+    Extended master secret: no
+    Max Early Data: 0
+---
+read R BLOCK
+closed

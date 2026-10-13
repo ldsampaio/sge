@@ -1,0 +1,1 @@
+# ManageSieve probe: filtered/timeout (no greeting captured)

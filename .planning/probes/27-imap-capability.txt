@@ -1,0 +1,5 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.75s
+     Running `src-tauri/target/debug/imap_probe --host mail.utfpr.edu.br --port 993 --mode implicit_tls --pre-auth-only`
+# PRE-AUTH CONNECT mail.utfpr.edu.br:993 mode=implicit_tls
+C: a0 CAPABILITY
+S: a0 OK Pre-login capabilities listed, post-login capabilities have more.

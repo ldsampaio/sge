@@ -1,0 +1,38 @@
+{
+  "schema_version": "1",
+  "probed_at": "2026-10-13T23:07:25Z",
+  "probe_tool": "probe-27.sh",
+  "accounts": [
+    {
+      "host": "mail.utfpr.edu.br",
+      "port": 993,
+      "mode": "implicit_tls",
+      "greeting": "",
+      "capability_preauth": [],
+      "capability_postlogin": "SKIP: operator-only credentialed leg",
+      "atoms": {
+        "IDLE": false,
+        "CONDSTORE": false,
+        "QRESYNC": false
+      },
+      "smtp": {
+        "host": "smtp.utfpr.edu.br",
+        "port": 587,
+        "mode": "starttls",
+        "ehlo": ["mail.utfpr.edu.br","PIPELINING","SIZE 31465824","VRFY","ETRN","ENHANCEDSTATUSCODES","8BITMIME","DSN"]
+      },
+      "managesieve": {
+        "port": null,
+        "reachable": false,
+        "greeting": "",
+        "verdict": "filtered/timeout"
+      },
+      "transcripts": {
+        "imap": "27-imap-capability.txt",
+        "smtp": "27-smtp-ehlo.txt",
+        "managesieve": "27-managesieve-4190.txt"
+      },
+      "phase33_armed": false
+    }
+  ]
+}
