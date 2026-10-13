@@ -3,7 +3,7 @@ gsd_state_version: "1.0"
 milestone: v1.4
 milestone_name: SMTP Send + Search/Filters + Live Validation + Auto-Archive + Smart Folder Rules
 status: starting
-stopped_at: Phase 22 COMPLETE (19/19 green, live pending creds); 23 executing; 24/25 queued; 26 discuss dispatching
+stopped_at: Phase 23 COMPLETE (345 green, tsc clean); 24-exec dispatched; 25 queued behind 24; 26-01 executing
 last_updated: "2026-10-13T14:18:40.048Z"
 state_head: 95082b99cf54cf70b1da3b7165f63a8526f320ff
 progress:
@@ -43,7 +43,7 @@ See: .planning/PROJECT.md (updated 2026-10-10 — Milestone v1.3 complete)
 | 22-01 Tracer | complete | Harness skeleton + pre-flight guard + GateSession + one-copy helpers, 10 offline tests |
 | 22-02 Expansion | complete | Replay-order + double-sync resurrection + Seen both ways + secret scan + prefix audit + cleanup/report, 19/19 tests green |
 
-Phase 21 likewise complete (offline green; live pending `scripts/live-21.sh`). Phase 23 executing (3 waves), 24/25 queued, 26/27 open.
+Phase 21 likewise complete (offline green; live pending `scripts/live-21.sh`). Phase 23 COMPLETE 2026-10-13 (SRCH-01/02/03: M17/M18, 345 lib green, tsc clean). 24 executing, 25 queued, 26-01 executing, 27 open.
 
 All 6 phases (15-20) are **complete** as of 2026-10-10:
 
