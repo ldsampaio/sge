@@ -3,7 +3,7 @@ gsd_state_version: "1.0"
 milestone: v1.4
 milestone_name: SMTP Send + Search/Filters + Live Validation + Auto-Archive + Smart Folder Rules
 status: starting
-stopped_at: 23 executing; 24 + 25 planned, both QUEUED (25: 2 plans, 51aecf7); exec order after 23: 24-exec then 25-exec (shared queries.rs + commands/classify.rs); 22-02 executing
+stopped_at: Phase 22 COMPLETE (19/19 green, live pending creds); 23 executing; 24/25 queued; 26 discuss dispatching
 last_updated: "2026-10-13T14:18:40.048Z"
 state_head: 95082b99cf54cf70b1da3b7165f63a8526f320ff
 progress:
@@ -28,13 +28,22 @@ See: .planning/PROJECT.md (updated 2026-10-10 — Milestone v1.3 complete)
 
 ## Milestone Status
 
-**v1.4 SMTP Send + ...: STARTED** — 0/7 phases planned; requirements in `.planning/REQUIREMENTS.md`; roadmap phases 21-27 added in `.planning/ROADMAP.md`. Live testing vs own account under sandbox contract (2026-10-13): creds in git-ignored `src-tauri/.live-test.env`, test mail only to self, `SGE-Test-<run-id>` sandbox, post-run cleanup.
+**v1.4 SMTP Send + ...: IN PROGRESS** — Phase 21 + 22 complete (offline green, live runs pending human creds); 23/24/25 planned (23 executing); 26/27 open. Requirements in `.planning/REQUIREMENTS.md`. Live testing vs own account under sandbox contract (2026-10-13): creds in git-ignored `src-tauri/.live-test.env`, test mail only to self, `SGE-Test-<run-id>` sandbox, post-run cleanup.
 **v1.3 Auto-Classify: PASSED** — 17/17 requirements, 6/6 phases (15-20), audit `.planning/v1.3-MILESTONE-AUDIT.md` (PASSED, deferred live gates documented).
 
 - Milestone audit: `.planning/v1.3-MILESTONE-AUDIT.md` — status: passed, scores: requirements 17/17, phases 6/6, integration 18/18 paths wired (1 blocker found + fixed in-audit)
 - All phase summaries verified and complete
 
 ## Current Position
+
+**Phase 22 COMPLETE 2026-10-13** (LIVE-02 offline scope; live run pending human creds via `scripts/live-22.sh`):
+
+| Plan | Status | Key Deliverables |
+|------|--------|-----------------|
+| 22-01 Tracer | complete | Harness skeleton + pre-flight guard + GateSession + one-copy helpers, 10 offline tests |
+| 22-02 Expansion | complete | Replay-order + double-sync resurrection + Seen both ways + secret scan + prefix audit + cleanup/report, 19/19 tests green |
+
+Phase 21 likewise complete (offline green; live pending `scripts/live-21.sh`). Phase 23 executing (3 waves), 24/25 queued, 26/27 open.
 
 All 6 phases (15-20) are **complete** as of 2026-10-10:
 

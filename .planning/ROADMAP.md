@@ -235,8 +235,8 @@ Plans:
 **Goal:** Draft APPEND 1-copy inside `SGE-Test-<run-id>` sandbox, Seen survives reconnect, `imap_outbox` replay, no silent resurrection — pre-flight guard + post-run cleanup. **Requires:** Phase 12/13 + creds file. **Requirements:** LIVE-02. **UI:** minimal. **Plans:** 2 plans.
 
 Plans:
-- [ ] 22-01-PLAN.md — Tracer: harness skeleton + pre-flight/sandbox + one-copy draft + kill-reconcile + offline-edit (offline doubles green, live clean-skip)
-- [ ] 22-02-PLAN.md — Expansion: replay-order + double-sync resurrection + Seen both ways + secret scan + prefix audit + cleanup/report
+- [x] 22-01-PLAN.md — Tracer: harness skeleton + pre-flight/sandbox + one-copy draft + kill-reconcile + offline-edit (offline doubles green, live clean-skip)
+- [x] 22-02-PLAN.md — Expansion: replay-order + double-sync resurrection + Seen both ways + secret scan + prefix audit + cleanup/report
 
 ### Phase 23: Search + Filters
 **Goal:** SQLite search (subject/body/attach/sender), saved filters, multi-folder, persisted. **Requires:** Phase 3. **Requirements:** SRCH-01/02/03. **UI:** yes. **Plans:** TBD.
@@ -279,3 +279,5 @@ Plans:
 | 18. Confirm + Trust UX | v1.3 | 2/2 | Complete | 2026-10-10 |
 | 19. Taxonomy Editor + Import | v1.3 | 2/2 | Complete | 2026-10-10 |
 | 20. Batch Reorganization | v1.3 | 2/2 | Complete | 2026-10-10 |
+| 21. SMTP Send — Live Gate | v1.4 | 2/2 | Complete (offline green; live run pending human via scripts/live-21.sh) | 2026-10-13 |
+| 22. Draft & Seen Round-Trip — Live Gate | v1.4 | 2/2 | Complete (offline 19/19 green; live run pending human via scripts/live-22.sh) | 2026-10-13 |
