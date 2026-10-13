@@ -205,4 +205,35 @@ mod tests {
         let out = redact_input("código: 555666 e senha: segredo!");
         assert!(out.contains("[REDACTED:code]") && out.contains("[REDACTED:password]"));
     }
+
+    // ── Phase 25 (rule_evolv): rule-justification fixtures ──────────
+    // Rule-match explanations are transient UI strings through
+    // filter_output (never persisted); these fixtures pin the scrubbing
+    // discipline for justification-shaped text (T-25-10).
+
+    #[test]
+    fn rule_evolv_justification_with_password_reset_scrubbed() {
+        let just = "Regra “Boletos”: remetente contém “contas” → Arquivo. \
+            Trecho: sua senha: Temp1234 e o código 739201 valem por 10 min.";
+        let out = filter_output(just);
+        assert!(!out.contains("Temp1234"), "password value leaked:\n{out}");
+        assert!(!out.contains("739201"), "code value leaked:\n{out}");
+        assert!(out.contains("Boletos"), "rule name is the user's own label — kept");
+        assert!(looks_clean(&out));
+    }
+
+    #[test]
+    fn rule_evolv_justification_with_rule_named_secret_scrubbed() {
+        // Even when the RULE ITSELF names a secret pattern, values from
+        // mail content must not survive — only the rule's own pattern text
+        // (user-authored) may remain.
+        let just = "Regra “Banco”: domínio “banco.com” → Arquivo. \
+            Linha digitável 23793381286007000123456000000012347650000012345 paga.";
+        let out = filter_output(just);
+        assert!(
+            !out.contains("23793381286007000123456000000012347650000012345"),
+            "barcode leaked:\n{out}"
+        );
+        assert!(out.contains("[REDACTED:barcode]"));
+    }
 }

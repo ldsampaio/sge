@@ -781,7 +781,8 @@ fn read_taxonomy(conn: &rusqlite::Connection) -> Result<Taxonomy, String> {
 }
 
 /// Persist a structural taxonomy change: validate → version++ → install →
-/// stale-flag vanished ids. Returns the new version.
+/// stale-flag vanished ids → revalidate rules (never drop). Returns the new
+/// version.
 fn persist_taxonomy(conn: &rusqlite::Connection, tax: &Taxonomy) -> Result<u32, String> {
     let mut tax = tax.clone();
     tax.version += 1;
@@ -790,7 +791,91 @@ fn persist_taxonomy(conn: &rusqlite::Connection, tax: &Taxonomy) -> Result<u32, 
         .map_err(|e| e.to_string())?;
     let ids: Vec<&str> = tax.categories.iter().map(|c| c.id.as_str()).collect();
     crate::store::queries::mark_stale_unknown(conn, &ids).map_err(|e| e.to_string())?;
+    // Rules survive bumps via ID-stable references: revalidate, never drop.
+    for notice in revalidate_rules(conn, &tax)? {
+        eprintln!("[SGE rules] taxonomy v{}: {notice}", tax.version);
+    }
     Ok(tax.version)
+}
+
+/// Revalidate category-kind rules against a (possibly bumped) taxonomy.
+/// Rules are NEVER silently dropped: ones whose destination id vanished
+/// are DISABLED in place (row kept) and their names returned so the UI
+/// can carry the plain-language notice.
+pub fn revalidate_rules(
+    conn: &rusqlite::Connection,
+    tax: &Taxonomy,
+) -> Result<Vec<String>, String> {
+    let ids = crate::classify::taxonomy::category_ids(tax);
+    let rules = crate::store::queries::list_rules(conn).map_err(|e| e.to_string())?;
+    let mut disabled = Vec::new();
+    for r in rules.iter().filter(|r| r.enabled && r.dest_kind == "category") {
+        if !ids.iter().any(|id| id == &r.destination) {
+            let mut row = r.clone();
+            row.enabled = false;
+            crate::store::queries::update_rule(conn, &row).map_err(|e| e.to_string())?;
+            disabled.push(format!(
+                "regra “{}” desativada — a categoria de destino não existe mais",
+                r.name
+            ));
+        }
+    }
+    Ok(disabled)
+}
+
+/// Follow a category delete: rules pointing at the deleted id fall back to
+/// the reassigned id; when the target cannot hold them they disable with a
+/// notice (never silently dropped). Returns (remapped, disabled-notices).
+pub fn reassign_deleted_rules(
+    conn: &rusqlite::Connection,
+    from: &str,
+    to: &str,
+) -> Result<(usize, Vec<String>), String> {
+    let tax = read_taxonomy(conn)?;
+    let ids = crate::classify::taxonomy::category_ids(&tax);
+    // NOTE: read_taxonomy returns the CURRENT taxonomy — the delete caller
+    // persists the removal first, so `from` is already gone and `to` must
+    // be present for a remap.
+    let target_ok = ids.iter().any(|id| id == to);
+    let rules =
+        crate::store::queries::rules_using_category(conn, from).map_err(|e| e.to_string())?;
+    let mut remapped = 0usize;
+    let mut disabled = Vec::new();
+    for r in rules {
+        if target_ok {
+            if let Some(new_dest) =
+                taxedit::remap_rule_destination(&r.dest_kind, &r.destination, from, to)
+            {
+                let mut row = r.clone();
+                row.destination = new_dest;
+                // Re-enable: the row may have been disabled by the bump
+                // revalidation an instant earlier — its destination is
+                // valid again by construction, so the rule stays alive.
+                row.enabled = true;
+                crate::store::queries::update_rule(conn, &row)
+                    .map_err(|e| e.to_string())?;
+                remapped += 1;
+            }
+        } else {
+            let mut row = r.clone();
+            row.enabled = false;
+            crate::store::queries::update_rule(conn, &row).map_err(|e| e.to_string())?;
+            disabled.push(format!(
+                "regra “{}” desativada — a categoria de destino foi excluída",
+                r.name
+            ));
+        }
+    }
+    Ok((remapped, disabled))
+}
+
+/// Outcome of a structural taxonomy change for the editor notice surface:
+/// mail moved + rule destinations remapped + rules disabled (with reasons).
+#[derive(Debug, Clone, Serialize)]
+pub struct TaxonomyChangeReport {
+    pub moved: usize,
+    pub rules_remapped: usize,
+    pub rules_disabled: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -980,7 +1065,7 @@ pub async fn merge_categories(
     state: State<'_, AppState>,
     from: String,
     into: String,
-) -> Result<usize, String> {
+) -> Result<TaxonomyChangeReport, String> {
     let store = state.store.clone();
     let account_cfg = load_account_config(state.clone()).await?;
     let manager = manager_for(&state, &account_cfg);
@@ -1052,16 +1137,21 @@ pub async fn merge_categories(
         }
         refresh_mailbox_tree(&manager, &store).await?;
     }
-    // 4. Taxonomy merge + label remap + version++ (brief lock).
-    {
+    // 4. Taxonomy merge + label remap + rule destination remap + version++
+    // (brief lock). Rule remap rides the SAME migration as the label remap
+    // and runs BEFORE persist so the bump revalidation sees clean rows.
+    let rules_remapped = {
         let guard = store.lock().unwrap();
         let conn = guard.conn();
         let mut tax = read_taxonomy(conn)?;
         taxedit::apply_merge(&mut tax, &from, &into).map_err(edit_err)?;
-        persist_taxonomy(conn, &tax)?;
         crate::store::queries::remap_label_ids(conn, &from, &into).map_err(|e| e.to_string())?;
-    }
-    Ok(moved)
+        let remapped = crate::store::queries::remap_rule_destinations(conn, &from, &into)
+            .map_err(|e| e.to_string())?;
+        persist_taxonomy(conn, &tax)?;
+        remapped
+    };
+    Ok(TaxonomyChangeReport { moved, rules_remapped, rules_disabled: vec![] })
 }
 
 /// Delete a category: mail moves to `reassign_to` first, then folder DELETE
@@ -1071,7 +1161,7 @@ pub async fn delete_category(
     state: State<'_, AppState>,
     id: String,
     reassign_to: String,
-) -> Result<usize, String> {
+) -> Result<TaxonomyChangeReport, String> {
     let store = state.store.clone();
     let account_cfg = load_account_config(state.clone()).await?;
     let manager = manager_for(&state, &account_cfg);
@@ -1127,20 +1217,32 @@ pub async fn delete_category(
         }
         refresh_mailbox_tree(&manager, &store).await?;
     }
-    {
+    // 4. Taxonomy delete + label remap + rule reassign-or-disable +
+    // version++ (brief lock). Rule reassignment rides the same migration
+    // and runs BEFORE persist so the bump revalidation sees clean rows;
+    // un-reassignable rules disable with a plain-language notice (never
+    // silently dropped).
+    let (rules_remapped, rules_disabled) = {
         let guard = store.lock().unwrap();
         let conn = guard.conn();
         let mut tax = read_taxonomy(conn)?;
         taxedit::apply_delete(&mut tax, &id).map_err(edit_err)?;
-        persist_taxonomy(conn, &tax)?;
         crate::store::queries::remap_label_ids(conn, &id, &reassign_to)
             .map_err(|e| e.to_string())?;
         let orphans = crate::store::queries::labels_using(conn, &id).map_err(|e| e.to_string())?;
         if orphans > 0 {
             return Err(format!("{orphans} rótulos órfãos — migração incompleta"));
         }
-    }
-    Ok(moved)
+        // Reassign-against-old-taxonomy would see `to` present and remap —
+        // but `apply_delete` above only mutated memory. Persist first so
+        // the stored taxonomy matches, then reassign (target check reads
+        // the NEW taxonomy where `to` must exist), then the bump
+        // revalidation can only confirm.
+        persist_taxonomy(conn, &tax)?;
+        let (remapped, disabled) = reassign_deleted_rules(conn, &id, &reassign_to)?;
+        (remapped, disabled)
+    };
+    Ok(TaxonomyChangeReport { moved, rules_remapped, rules_disabled })
 }
 
 /// Edit keywords/rules in place (no version bump, no folder touch).
@@ -2765,5 +2867,135 @@ mod rule_conflict_tests {
         assert!(!queries::is_pending_delete(conn, mb as u64, 1).unwrap());
         assert_eq!(queries::imap_outbox_count(conn, mb as u64).unwrap(), 0);
         assert_eq!(queries::outbox_count(conn, mb as u64).unwrap(), 0);
+    }
+}
+
+#[cfg(test)]
+mod rule_evolv_tests {
+    use super::*;
+    use crate::classify::taxonomy::{Category, Taxonomy};
+    use crate::store::Store;
+
+    fn two_cat_tax() -> Taxonomy {
+        Taxonomy {
+            version: 1,
+            name: "t".to_string(),
+            categories: vec![
+                Category {
+                    id: "cat-a".to_string(),
+                    name: "A".to_string(),
+                    parent: None,
+                    keywords: vec![],
+                    rule: String::new(),
+                },
+                Category {
+                    id: "cat-b".to_string(),
+                    name: "B".to_string(),
+                    parent: None,
+                    keywords: vec![],
+                    rule: String::new(),
+                },
+            ],
+        }
+    }
+
+    fn seed_taxonomy_db() -> Store {
+        let store = Store::open_in_memory().unwrap();
+        let tax = two_cat_tax();
+        let json = serde_json::to_string(&tax).unwrap();
+        queries::install_taxonomy(store.conn(), 1, "t", &json).unwrap();
+        store
+    }
+
+    fn seed_cat_rule(conn: &rusqlite::Connection, id: &str, name: &str, dest: &str) {
+        queries::insert_rule(
+            conn,
+            &RuleRow {
+                id: id.to_string(),
+                name: name.to_string(),
+                priority: 10,
+                conditions_json: r#"{"sender_domain":"x.com"}"#.to_string(),
+                dest_kind: "category".to_string(),
+                destination: dest.to_string(),
+                scope_json: "[]".to_string(),
+                enabled: true,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rule_evolv_merge_remaps_rule_destination_ids() {
+        let store = seed_taxonomy_db();
+        let conn = store.conn();
+        seed_cat_rule(conn, "r-1", "R", "cat-a");
+        // Same migration as the label remap: merge cat-a into cat-b.
+        let n = queries::remap_rule_destinations(conn, "cat-a", "cat-b").unwrap();
+        assert_eq!(n, 1);
+        let row = queries::get_rule(conn, "r-1").unwrap().unwrap();
+        assert_eq!(row.destination, "cat-b");
+        assert!(row.enabled, "merge remap must not disable the rule");
+    }
+
+    #[test]
+    fn rule_evolv_delete_reassigns_or_disables_with_notice() {
+        let store = seed_taxonomy_db();
+        let conn = store.conn();
+        seed_cat_rule(conn, "r-1", "VaiParaB", "cat-a");
+        // Persist the deletion (bump revalidation disables the orphan)…
+        let mut tax = read_taxonomy(conn).unwrap();
+        taxedit::apply_delete(&mut tax, "cat-a").unwrap();
+        persist_taxonomy(conn, &tax).unwrap();
+        let disabled_row = queries::get_rule(conn, "r-1").unwrap().unwrap();
+        assert!(!disabled_row.enabled, "bump must stale-disable the orphan");
+        // …then the orphan-prompt reassignment revives it at the new id.
+        let (remapped, notices) = reassign_deleted_rules(conn, "cat-a", "cat-b").unwrap();
+        assert_eq!(remapped, 1);
+        assert!(notices.is_empty());
+        let row = queries::get_rule(conn, "r-1").unwrap().unwrap();
+        assert_eq!(row.destination, "cat-b");
+        assert!(row.enabled, "reassigned rule stays alive");
+        // Unknown target: disable with notice, NEVER drop the row.
+        seed_cat_rule(conn, "r-2", "Orfa", "cat-a");
+        let (remapped2, notices2) = reassign_deleted_rules(conn, "cat-a", "cat-ghost").unwrap();
+        assert_eq!(remapped2, 0);
+        assert_eq!(notices2.len(), 1);
+        assert!(notices2[0].contains("Orfa"), "notice names the rule: {}", notices2[0]);
+        assert!(queries::get_rule(conn, "r-2").unwrap().is_some(), "disabled, never dropped");
+    }
+
+    #[test]
+    fn rule_evolv_rename_never_breaks_rules() {
+        let store = seed_taxonomy_db();
+        let conn = store.conn();
+        seed_cat_rule(conn, "r-1", "R", "cat-a");
+        let mut tax = read_taxonomy(conn).unwrap();
+        taxedit::apply_rename(&mut tax, "cat-a", "A Renomeada").unwrap();
+        persist_taxonomy(conn, &tax).unwrap();
+        // ID-stable: the rule still resolves to the renamed display path.
+        let tax2 = read_taxonomy(conn).unwrap();
+        let (display, _, _) = filing::auto_path_for_id(&tax2, "cat-a").unwrap();
+        assert!(display.contains("A Renomeada"), "got {display}");
+        let row = queries::get_rule(conn, "r-1").unwrap().unwrap();
+        assert!(row.enabled, "rename must not touch rules");
+        assert!(revalidate_rules(conn, &tax2).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rule_evolv_bump_revalidates_never_drops() {
+        let store = seed_taxonomy_db();
+        let conn = store.conn();
+        seed_cat_rule(conn, "r-ok", "Boa", "cat-a");
+        seed_cat_rule(conn, "r-bad", "Fantasma", "cat-ghost");
+        let tax = read_taxonomy(conn).unwrap();
+        let notices = revalidate_rules(conn, &tax).unwrap();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("Fantasma"));
+        // Invalid rule disabled AND kept; valid rule untouched.
+        let bad = queries::get_rule(conn, "r-bad").unwrap().unwrap();
+        assert!(!bad.enabled);
+        let ok = queries::get_rule(conn, "r-ok").unwrap().unwrap();
+        assert!(ok.enabled);
+        assert_eq!(queries::list_rules(conn).unwrap().len(), 2, "revalidate never drops rows");
     }
 }

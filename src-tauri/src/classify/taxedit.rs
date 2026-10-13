@@ -190,6 +190,25 @@ pub fn apply_delete(tax: &mut Taxonomy, id: &str) -> Result<(), EditError> {
     Ok(())
 }
 
+/// Remap ONE rule destination across a taxonomy merge/delete (pure — the
+/// command layer persists the taxonomy and remaps labels + rules in the
+/// same migration). Category-kind rows pointing at `from` move to `to`;
+/// plain-folder rows and unrelated ids pass through untouched (`None` =
+/// no change). Renames need no call at all: rules store stable ids, so a
+/// rename never breaks them.
+pub fn remap_rule_destination(
+    dest_kind: &str,
+    destination: &str,
+    from: &str,
+    to: &str,
+) -> Option<String> {
+    if dest_kind == "category" && destination == from {
+        Some(to.to_string())
+    } else {
+        None
+    }
+}
+
 /// Update keywords/rules in place (NO version bump — non-structural).
 pub fn apply_keywords(
     tax: &mut Taxonomy,
@@ -250,8 +269,22 @@ mod tests {
     }
 
     #[test]
-    fn add_top_and_child_with_dedupe() {
-        let mut tax = test_tax();
+    #[test]
+    fn rule_evolv_remap_moves_only_matching_category_rows() {
+        assert_eq!(
+            remap_rule_destination("category", "a", "a", "b"),
+            Some("b".to_string())
+        );
+        assert_eq!(remap_rule_destination("category", "c", "a", "b"), None);
+        assert_eq!(
+            remap_rule_destination("folder", "a", "a", "b"),
+            None,
+            "plain-folder rows never remap on taxonomy edits"
+        );
+    }
+
+    #[test]
+    fn add_top_and_child_with_dedupe() {        let mut tax = test_tax();
         let id = apply_add(&mut tax, None, "Esportes", vec!["futebol".into()], "").unwrap();
         assert_eq!(id, "esportes");
         let id2 = apply_add(&mut tax, Some("esportes"), "Futebol", vec!["gol".into()], "").unwrap();

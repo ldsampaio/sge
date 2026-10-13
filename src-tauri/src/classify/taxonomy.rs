@@ -161,6 +161,12 @@ pub fn children_of<'a>(tax: &'a Taxonomy, parent_id: &str) -> Vec<&'a Category> 
         .collect()
 }
 
+/// All known category ids (Phase 25: rule destination validation +
+/// post-bump revalidation read the same id set labels use).
+pub fn category_ids(tax: &Taxonomy) -> Vec<String> {
+    tax.categories.iter().map(|c| c.id.clone()).collect()
+}
+
 /// Fold diacritics + lowercase for accent-insensitive matching
 /// (pt-BR mail mixes "código"/"codigo", "avaliação"/"avaliacao").
 pub fn fold(s: &str) -> String {
@@ -207,6 +213,15 @@ pub fn match_keywords(text: &str, candidates: &[&Category]) -> Vec<(String, usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rule_evolv_category_ids_lists_every_id() {
+        let tax = load_default().unwrap();
+        let ids = category_ids(&tax);
+        assert!(ids.contains(&"academico".to_string()));
+        assert!(ids.contains(&"academico.aulas".to_string()));
+        assert_eq!(ids.len(), tax.categories.len());
+    }
 
     fn minimal_valid() -> Taxonomy {
         Taxonomy {

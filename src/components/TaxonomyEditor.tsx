@@ -134,8 +134,18 @@ export function TaxonomyEditor({ onClose }: TaxonomyEditorProps) {
         setMessage("Escolha a categoria que recebe os e-mails antes de excluir.");
         return;
       }
-      await invoke("delete_category", { id: c.id, reassignTo: reassign });
-    });
+      const rep = (await invoke("delete_category", { id: c.id, reassignTo: reassign })) as {
+        moved: number;
+        rules_remapped: number;
+        rules_disabled: string[];
+      };
+      // Phase 25: rule destinations follow the reassignment; un-reassignable
+      // rules disable with a notice (never silently dropped — see Regras).
+      const bits: string[] = [];
+      if (rep.rules_remapped > 0) bits.push(`${rep.rules_remapped} regra(s) remapeada(s)`);
+      for (const n of rep.rules_disabled ?? []) bits.push(n);
+      if (bits.length > 0) setMessage(bits.join(" · "));
+    }, false);
 
   const importFile = async (file: File) => {
     const text = await file.text();
