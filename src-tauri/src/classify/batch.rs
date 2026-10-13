@@ -39,6 +39,10 @@ pub struct BatchReport {
     pub per_category: Vec<(String, usize)>,
     pub remainder: usize,
     pub undone: usize,
+    /// Raw `totals_json` (Phase 24: carries `{"kind":"archive",...}` for
+    /// archive runs so report surfaces can label them distinctly without
+    /// a second query — additive, existing readers ignore it).
+    pub totals_json: String,
 }
 
 /// Pre-create the FULL `Auto/` tree up front (all tops + children).
@@ -327,5 +331,16 @@ mod tests {
         log_override(conn, a, "academico", "financeiro").unwrap();
         let cands = collect_candidates(conn, None).unwrap();
         assert!(cands.is_empty(), "pinned mail must not enter batch");
+    }
+
+    #[test]
+    fn batch_chunk_stays_25_shared_with_archive() {
+        // Chunk-size discipline (Phase 20 tuning against the throttling
+        // UTFPR server): the archive runner reuses this constant verbatim
+        // (see classify::archive). A new size needs live evidence — this
+        // pin fails the build if either side drifts. Cooperative cancel +
+        // per-chunk UIDVALIDITY re-check assume small chunks; do not bump
+        // without re-running the Phase 26 live bundle.
+        assert_eq!(BATCH_CHUNK, 25);
     }
 }

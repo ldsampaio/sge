@@ -687,8 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn tracer_old_mail_archives_young_stays() {
-        async_std::task::block_on(async {
+    fn tracer_old_mail_archives_young_stays() {        async_std::task::block_on(async {
             let store = seeded();
             let store = Arc::new(Mutex::new(store));
             let (manager, fake) = ArchiveFake::with_mailboxes(&["INBOX", "Sent", "A Classificar", "Auto/Financeiro"]);
@@ -734,6 +733,73 @@ mod tests {
             let guard = store.lock().unwrap();
             let young = find_message_id(guard.conn(), mailbox_id(guard.conn(), "INBOX").unwrap().unwrap(), 2).unwrap().unwrap();
             assert!(journaled_ids(guard.conn(), run).unwrap().iter().all(|id| *id != young));
+        });
+    }
+
+    #[test]
+    fn shared_undo_reverses_archive_runs_and_kind_tag_labels() {
+        async_std::task::block_on(async {
+            // Journal an archive run by hand (same rows archive_run
+            // writes): one moved row labeled "archive".
+            let store = Store::open_in_memory().unwrap();
+            let conn = store.conn();
+            let inbox = ensure_mailbox(conn, "INBOX").unwrap();
+            let dest = ensure_mailbox(conn, "Auto/Archive/2026/INBOX").unwrap();
+            upsert_message(conn, dest, 1, None, "Arquivado", "a@x", "[]", "[]",
+                &dt_days_ago(100), "[]", false, "").unwrap();
+            let mid = find_message_id(conn, dest, 1).unwrap().unwrap();
+            let run = create_batch_run(conn).unwrap();
+            journal_intent(conn, run, mid, "INBOX", "Auto/Archive/2026/INBOX", ARCHIVE_LABEL_ID, 0).unwrap();
+            journal_moved(conn, run, mid).unwrap();
+            // Resume contract: a second pass skips the journaled row.
+            let remaining: Vec<u64> = vec![mid, 999]
+                .into_iter()
+                .filter(|m| !journaled_ids(conn, run).unwrap().contains(m))
+                .collect();
+            assert_eq!(remaining, vec![999]);
+            // The command finishes with {"kind":"archive",...}: the report
+            // contract — backend truth the UI parses for labeling.
+            let totals = serde_json::json!({"kind": "archive", "threshold_days": 90, "done": 1, "moved": 1}).to_string();
+            finish_batch_run(conn, run, "done", &totals).unwrap();
+            let stored: String = conn.query_row(
+                "SELECT totals_json FROM batch_runs WHERE id = ?1",
+                rusqlite::params![run], |r| r.get(0)).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&stored).unwrap();
+            assert_eq!(parsed["kind"], serde_json::Value::String("archive".to_string()));
+            assert_eq!(parsed["threshold_days"], serde_json::Value::Number(90.into()));
+            // Shared undo_batch reverses the archive move (reverse
+            // to→from order), marks the run undone. The report survives
+            // in the Phase 20 sense: per-category rows (grouped by the
+            // "archive" label id) + undone count stay queryable — the UI
+            // labels archive runs by totals kind pre-undo, by the
+            // per-category "archive" id post-undo. undo_run itself is
+            // reused VERBATIM (its "{}" totals overwrite is shared
+            // Phase-20 behavior, not archive-specific).
+            let store = Arc::new(Mutex::new(store));
+            let (manager, fake) = ArchiveFake::with_mailboxes(&["INBOX", "Auto/Archive/2026/INBOX"]);
+            let restored = super::super::batch::undo_run(&manager, &store, run).await.unwrap();
+            assert_eq!(restored, 1);
+            let moved = fake.moved.lock().unwrap();
+            assert_eq!(moved.len(), 1);
+            assert_eq!(moved[0].1, "INBOX");
+            assert!(fake.removal_calls.lock().unwrap().is_empty());
+            let guard = store.lock().unwrap();
+            let state: String = guard.conn().query_row(
+                "SELECT state FROM batch_runs WHERE id = ?1",
+                rusqlite::params![run], |r| r.get(0)).unwrap();
+            assert_eq!(state, "undone");
+            // Report survives: per-category still groups the moved row
+            // under the "archive" label id; undone count is 1.
+            let per_cat: Vec<(String, i64)> = guard.conn().prepare(
+                "SELECT label_id, count(*) FROM batch_items WHERE run_id = ?1 AND moved = 1 GROUP BY label_id")
+                .unwrap().query_map(rusqlite::params![run], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+            assert_eq!(per_cat, vec![("archive".to_string(), 1)]);
+            let undone: i64 = guard.conn().query_row(
+                "SELECT count(*) FROM batch_items WHERE run_id = ?1 AND undone = 1",
+                rusqlite::params![run], |r| r.get(0)).unwrap();
+            assert_eq!(undone, 1);
+            let _ = inbox;
         });
     }
 }
