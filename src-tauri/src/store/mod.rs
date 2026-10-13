@@ -96,6 +96,7 @@ impl Store {
             M::up(M14_REVIEW_SETTINGS_SQL),
             M::up(M15_DISMISSED_SQL),
             M::up(M16_BATCH_ITEMS_SQL),
+            M::up(M17_FTS_BODY_SQL),
         ]);
         migrations.to_latest(conn)?;
         Ok(())
@@ -446,6 +447,164 @@ const M16_BATCH_ITEMS_SQL: &str = concat!(
     "  undone       INTEGER NOT NULL DEFAULT 0",
     ");",
     "CREATE INDEX idx_batch_items_run ON batch_items(run_id, id);",
+);
+
+/// M17 forward migration: FTS body text + attachment filenames (Phase 23,
+/// Plan 23-01, SRCH-01).
+///
+/// The Phase 3 `messages_fts` index covered subject/from_addr/preview only.
+/// FTS5 cannot ADD COLUMN, so the index is rebuilt: new table with
+/// `body_text` (sanitized `message_bodies.body_text`, never `body_html`)
+/// + `attachment_names` (space-joined `attachment_parts.filename`
+/// aggregate), one-shot backfill from already-cached rows, drop/rename,
+/// then fresh triggers. `pending_delete` hiding stays a query predicate
+/// (not indexed); UID-only addressing and UIDVALIDITY gating untouched.
+///
+/// FTS5 delete entries need the OLD indexed terms (external-content table),
+/// so every trigger passes old values on the `delete` leg and recomputed
+/// values on the insert leg. `msg_au` is WHEN-gated to FTS-indexed columns
+/// so flag/pending_delete churn never rewrites the index.
+const M17_FTS_BODY_SQL: &str = concat!(
+    "DROP TRIGGER IF EXISTS msg_ai;",
+    "DROP TRIGGER IF EXISTS msg_ad;",
+    "CREATE VIRTUAL TABLE messages_fts_new USING fts5(",
+    "subject, from_addr, preview, body_text, attachment_names, ",
+    "content='messages', content_rowid='id');",
+    "INSERT INTO messages_fts_new",
+    "(rowid, subject, from_addr, preview, body_text, attachment_names) ",
+    "SELECT m.id, m.subject, m.from_addr, m.preview, ",
+    "IFNULL((SELECT b.body_text FROM message_bodies b ",
+    "WHERE b.message_id = m.id), ''), ",
+    "IFNULL((SELECT GROUP_CONCAT(a.filename, ' ') FROM attachment_parts a ",
+    "WHERE a.message_id = m.id), '') ",
+    "FROM messages m;",
+    "DROP TABLE messages_fts;",
+    "ALTER TABLE messages_fts_new RENAME TO messages_fts;",
+    // Message-row triggers (insert / indexed-column update / delete).
+    "CREATE TRIGGER msg_ai AFTER INSERT ON messages BEGIN ",
+    "INSERT INTO messages_fts",
+    "(rowid, subject, from_addr, preview, body_text, attachment_names) ",
+    "VALUES (new.id, new.subject, new.from_addr, new.preview, ",
+    "IFNULL((SELECT b.body_text FROM message_bodies b ",
+    "WHERE b.message_id = new.id), ''), ",
+    "IFNULL((SELECT GROUP_CONCAT(a.filename, ' ') FROM attachment_parts a ",
+    "WHERE a.message_id = new.id), '')); ",
+    "END;",
+    "CREATE TRIGGER msg_au AFTER UPDATE ON messages ",
+    "WHEN old.subject IS NOT new.subject ",
+    "OR old.from_addr IS NOT new.from_addr ",
+    "OR old.preview IS NOT new.preview BEGIN ",
+    "INSERT INTO messages_fts",
+    "(messages_fts, rowid, subject, from_addr, preview, body_text, attachment_names) ",
+    "VALUES ('delete', old.id, old.subject, old.from_addr, old.preview, ",
+    "IFNULL((SELECT b.body_text FROM message_bodies b ",
+    "WHERE b.message_id = old.id), ''), ",
+    "IFNULL((SELECT GROUP_CONCAT(a.filename, ' ') FROM attachment_parts a ",
+    "WHERE a.message_id = old.id), '')); ",
+    "INSERT INTO messages_fts",
+    "(rowid, subject, from_addr, preview, body_text, attachment_names) ",
+    "VALUES (new.id, new.subject, new.from_addr, new.preview, ",
+    "IFNULL((SELECT b.body_text FROM message_bodies b ",
+    "WHERE b.message_id = new.id), ''), ",
+    "IFNULL((SELECT GROUP_CONCAT(a.filename, ' ') FROM attachment_parts a ",
+    "WHERE a.message_id = new.id), '')); ",
+    "END;",
+    "CREATE TRIGGER msg_ad AFTER DELETE ON messages BEGIN ",
+    "INSERT INTO messages_fts",
+    "(messages_fts, rowid, subject, from_addr, preview, body_text, attachment_names) ",
+    "VALUES ('delete', old.id, old.subject, old.from_addr, old.preview, ",
+    "IFNULL((SELECT b.body_text FROM message_bodies b ",
+    "WHERE b.message_id = old.id), ''), ",
+    "IFNULL((SELECT GROUP_CONCAT(a.filename, ' ') FROM attachment_parts a ",
+    "WHERE a.message_id = old.id), '')); ",
+    "END;",
+    // Body-text triggers (insert_body upsert path: INSERT then UPDATE).
+    "CREATE TRIGGER body_ai AFTER INSERT ON message_bodies BEGIN ",
+    "INSERT INTO messages_fts",
+    "(messages_fts, rowid, subject, from_addr, preview, body_text, attachment_names) ",
+    "SELECT 'delete', m.id, m.subject, m.from_addr, m.preview, '', ",
+    "IFNULL((SELECT GROUP_CONCAT(a.filename, ' ') FROM attachment_parts a ",
+    "WHERE a.message_id = m.id), '') ",
+    "FROM messages m WHERE m.id = new.message_id; ",
+    "INSERT INTO messages_fts",
+    "(rowid, subject, from_addr, preview, body_text, attachment_names) ",
+    "SELECT m.id, m.subject, m.from_addr, m.preview, IFNULL(new.body_text, ''), ",
+    "IFNULL((SELECT GROUP_CONCAT(a.filename, ' ') FROM attachment_parts a ",
+    "WHERE a.message_id = m.id), '') ",
+    "FROM messages m WHERE m.id = new.message_id; ",
+    "END;",
+    "CREATE TRIGGER body_au AFTER UPDATE ON message_bodies BEGIN ",
+    "INSERT INTO messages_fts",
+    "(messages_fts, rowid, subject, from_addr, preview, body_text, attachment_names) ",
+    "SELECT 'delete', m.id, m.subject, m.from_addr, m.preview, ",
+    "IFNULL(old.body_text, ''), ",
+    "IFNULL((SELECT GROUP_CONCAT(a.filename, ' ') FROM attachment_parts a ",
+    "WHERE a.message_id = m.id), '') ",
+    "FROM messages m WHERE m.id = new.message_id; ",
+    "INSERT INTO messages_fts",
+    "(rowid, subject, from_addr, preview, body_text, attachment_names) ",
+    "SELECT m.id, m.subject, m.from_addr, m.preview, IFNULL(new.body_text, ''), ",
+    "IFNULL((SELECT GROUP_CONCAT(a.filename, ' ') FROM attachment_parts a ",
+    "WHERE a.message_id = m.id), '') ",
+    "FROM messages m WHERE m.id = new.message_id; ",
+    "END;",
+    // Attachment-filename triggers (old aggregate reconstructed from the
+    // surviving rows + the changed row: token MULTISET is what the FTS5
+    // delete leg needs, order is irrelevant).
+    "CREATE TRIGGER att_ai AFTER INSERT ON attachment_parts BEGIN ",
+    "INSERT INTO messages_fts",
+    "(messages_fts, rowid, subject, from_addr, preview, body_text, attachment_names) ",
+    "SELECT 'delete', m.id, m.subject, m.from_addr, m.preview, ",
+    "IFNULL((SELECT b.body_text FROM message_bodies b ",
+    "WHERE b.message_id = m.id), ''), ",
+    "IFNULL((SELECT GROUP_CONCAT(a.filename, ' ') FROM attachment_parts a ",
+    "WHERE a.message_id = m.id AND a.id != new.id), '') ",
+    "FROM messages m WHERE m.id = new.message_id; ",
+    "INSERT INTO messages_fts",
+    "(rowid, subject, from_addr, preview, body_text, attachment_names) ",
+    "SELECT m.id, m.subject, m.from_addr, m.preview, ",
+    "IFNULL((SELECT b.body_text FROM message_bodies b ",
+    "WHERE b.message_id = m.id), ''), ",
+    "IFNULL((SELECT GROUP_CONCAT(a.filename, ' ') FROM attachment_parts a ",
+    "WHERE a.message_id = m.id), '') ",
+    "FROM messages m WHERE m.id = new.message_id; ",
+    "END;",
+    "CREATE TRIGGER att_ad AFTER DELETE ON attachment_parts BEGIN ",
+    "INSERT INTO messages_fts",
+    "(messages_fts, rowid, subject, from_addr, preview, body_text, attachment_names) ",
+    "SELECT 'delete', m.id, m.subject, m.from_addr, m.preview, ",
+    "IFNULL((SELECT b.body_text FROM message_bodies b ",
+    "WHERE b.message_id = m.id), ''), ",
+    "IFNULL((SELECT GROUP_CONCAT(a.filename, ' ') FROM attachment_parts a ",
+    "WHERE a.message_id = m.id), '') || ' ' || IFNULL(old.filename, '') ",
+    "FROM messages m WHERE m.id = old.message_id; ",
+    "INSERT INTO messages_fts",
+    "(rowid, subject, from_addr, preview, body_text, attachment_names) ",
+    "SELECT m.id, m.subject, m.from_addr, m.preview, ",
+    "IFNULL((SELECT b.body_text FROM message_bodies b ",
+    "WHERE b.message_id = m.id), ''), ",
+    "IFNULL((SELECT GROUP_CONCAT(a.filename, ' ') FROM attachment_parts a ",
+    "WHERE a.message_id = m.id), '') ",
+    "FROM messages m WHERE m.id = old.message_id; ",
+    "END;",
+    "CREATE TRIGGER att_au AFTER UPDATE ON attachment_parts BEGIN ",
+    "INSERT INTO messages_fts",
+    "(messages_fts, rowid, subject, from_addr, preview, body_text, attachment_names) ",
+    "SELECT 'delete', m.id, m.subject, m.from_addr, m.preview, ",
+    "IFNULL((SELECT b.body_text FROM message_bodies b ",
+    "WHERE b.message_id = m.id), ''), ",
+    "IFNULL((SELECT GROUP_CONCAT(a.filename, ' ') FROM attachment_parts a ",
+    "WHERE a.message_id = m.id AND a.id != new.id), '') || ' ' || IFNULL(old.filename, '') ",
+    "FROM messages m WHERE m.id = new.message_id; ",
+    "INSERT INTO messages_fts",
+    "(rowid, subject, from_addr, preview, body_text, attachment_names) ",
+    "SELECT m.id, m.subject, m.from_addr, m.preview, ",
+    "IFNULL((SELECT b.body_text FROM message_bodies b ",
+    "WHERE b.message_id = m.id), ''), ",
+    "IFNULL((SELECT GROUP_CONCAT(a.filename, ' ') FROM attachment_parts a ",
+    "WHERE a.message_id = m.id), '') ",
+    "FROM messages m WHERE m.id = new.message_id; ",
+    "END;",
 );
 
 /// Returns the app-data attachment directory for a given mailbox UID.
@@ -1208,5 +1367,146 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
             .unwrap();
         assert_eq!(msgs, 1, "forward migration must preserve cached rows");
+    }
+
+    #[test]
+    fn m17_rebuilds_fts_preserving_rows_with_body_backfill() {
+        // Simulate a v16 database (through M16, as shipped before Phase 23).
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        Migrations::new(vec![
+            M::up(include_str!("schema.sql")),
+            M::up(M2_FLAG_OUTBOX_SQL),
+            M::up(M3_UNSEEN_COUNT_SQL),
+            M::up(M4_BACKFILL_SQL),
+            M::up(M5_STATUS_TS_SQL),
+            M::up(M6_DELIMITER_SQL),
+            M::up(M7_IMAP_OUTBOX_SQL),
+            M::up(M8_ROLES_SQL),
+            M::up(M9_DRAFTS_SQL),
+            M::up(M10_SEND_QUEUE_SQL),
+            M::up(M11_SENT_UNFILED_SQL),
+            M::up(M12_CLASSIFY_SQL),
+            M::up(M13_EXCLUSIONS_SQL),
+            M::up(M14_REVIEW_SETTINGS_SQL),
+            M::up(M15_DISMISSED_SQL),
+            M::up(M16_BATCH_ITEMS_SQL),
+        ])
+        .to_latest(&mut conn)
+        .unwrap();
+        // Seed v16 rows: cached message + fetched body + attachment metadata.
+        conn.execute(
+            "INSERT INTO mailboxes (name, uid_validity, uid_next) VALUES ('INBOX', 100, 4)",
+            [],
+        )
+        .unwrap();
+        let mb: i64 = conn
+            .query_row("SELECT id FROM mailboxes WHERE name = 'INBOX'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO messages (mailbox_id, uid, subject, from_addr, date_utc, flags, preview) \
+             VALUES (?1, 1, 'Antigo', 'a@x.com', '2024-01-01T00:00:00Z', '[]', 'prev')",
+            rusqlite::params![mb],
+        )
+        .unwrap();
+        let msg_id: i64 = conn
+            .query_row(
+                "SELECT id FROM messages WHERE mailbox_id = ?1 AND uid = 1",
+                rusqlite::params![mb],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO message_bodies (message_id, body_text, body_complete) \
+             VALUES (?1, 'texto legado do corpo', 1)",
+            rusqlite::params![msg_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO attachment_parts (message_id, part_number, filename) \
+             VALUES (?1, '2', 'legado.pdf')",
+            rusqlite::params![msg_id],
+        )
+        .unwrap();
+
+        // Forward-upgrade with the production set — only M17 applies.
+        Store::apply_migrations(&mut conn).unwrap();
+
+        // v16 rows survive the rebuild across all three tables.
+        for (table, want) in [
+            ("messages", 1),
+            ("message_bodies", 1),
+            ("attachment_parts", 1),
+        ] {
+            let n: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, want, "forward migration must preserve {table} rows");
+        }
+        let body: String = conn
+            .query_row(
+                "SELECT body_text FROM message_bodies WHERE message_id = ?1",
+                rusqlite::params![msg_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(body, "texto legado do corpo");
+        // Rebuilt FTS has all five columns with the backfilled content.
+        let cols: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('messages_fts') WHERE name IN \
+                 ('subject','from_addr','preview','body_text','attachment_names')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cols, 5, "messages_fts must carry all five columns at v17");
+        for (kind, name) in [
+            ("trigger", "msg_ai"),
+            ("trigger", "msg_au"),
+            ("trigger", "msg_ad"),
+            ("trigger", "body_ai"),
+            ("trigger", "body_au"),
+            ("trigger", "att_ai"),
+            ("trigger", "att_ad"),
+            ("trigger", "att_au"),
+        ] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = ?1 AND name = ?2",
+                    rusqlite::params![kind, name],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{kind} {name} should exist at schema v17");
+        }
+        // Backfilled rows are searchable by body + attachment name.
+        let by_body: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH '\"legado\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(by_body, 1, "migrated body text must be indexed");
+        let by_att: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH '\"legado.pdf\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(by_att, 1, "migrated attachment names must be indexed");
+        // Pre-M17 subject rows still match (no index loss in the rebuild).
+        let by_subj: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH '\"Antigo\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(by_subj, 1);
     }
 }

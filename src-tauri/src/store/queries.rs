@@ -861,33 +861,228 @@ pub fn list_messages(
 }
 
 /// Full-text search over `messages_fts` with BM25 ranking.
+///
 /// `mailbox = None` searches the whole account (all folders); `Some(name)`
 /// scopes to one folder. Every row carries its folder in `mailbox` so
 /// global results can jump to the right folder.
+///
+/// Thin wrapper over [`fts_search_scoped`] kept for the single-mailbox
+/// call sites (`search_messages` command, sync worker assertions).
 pub fn fts_search(
     conn: &Connection,
     mailbox: Option<&str>,
     query: &str,
 ) -> StoreResult<Vec<MessageRow>> {
-    let sql = concat!(
-        "SELECT m.uid, m.subject, m.from_addr, m.to_addrs, ",
-        "m.date_utc, m.flags, m.has_attachments, m.preview, mb.name ",
-        "FROM messages_fts ",
-        "JOIN messages m ON messages_fts.rowid = m.id ",
-        "JOIN mailboxes mb ON m.mailbox_id = mb.id ",
-        "WHERE messages_fts MATCH ?1 ",
-        "AND (?2 IS NULL OR mb.name = ?2) ",
-        "AND m.pending_delete = 0 ",
-        "ORDER BY rank",
+    match mailbox {
+        None => fts_search_scoped(conn, None, query),
+        Some(name) => fts_search_scoped(conn, Some(&[name]), query),
+    }
+}
+
+/// Maximum rows per search (T-23-03): ranking + cap happen in-SQL, never
+/// as an in-memory full-table sort.
+pub const SEARCH_RESULT_LIMIT: i64 = 200;
+
+/// Escape untrusted user text for FTS5 MATCH (T-23-01).
+///
+/// The escaped string is passed as a parameter binding — never
+/// interpolated — and every token is double-quoted, so FTS5 operators
+/// (`*`, `:`, `"`, parens, `AND`/`OR`/`NOT`/`NEAR`) degrade to literal
+/// text instead of query syntax. Tokens join with implicit AND.
+fn escape_fts_query(query: &str) -> String {
+    let mut out = Vec::new();
+    for tok in query.split_whitespace() {
+        let clean: String = tok
+            .chars()
+            .filter(|c| !matches!(c, '"' | '*' | ':' | '(' | ')'))
+            .collect();
+        let clean = clean.trim_matches(|c| c == '^' || c == '-' || c == '+' || c == '~');
+        if clean.is_empty() {
+            continue;
+        }
+        out.push(format!("\"{clean}\""));
+    }
+    out.join(" ")
+}
+
+/// Full-text search with multi-folder scoping (Phase 23, SRCH-01).
+///
+/// `folders = None` searches the whole account; `Some(set)` narrows to
+/// `mb.name IN set` (an empty set matches nothing). MATCH covers all five
+/// FTS columns (subject, sender, preview, body text, attachment filenames);
+/// ranking is BM25 with `date_utc DESC` tie-break so recent mail surfaces
+/// first on equal relevance; results cap at [`SEARCH_RESULT_LIMIT`] with
+/// `pending_delete` rows always hidden. Local SQLite only — this function
+/// never opens an IMAP session (live-gate: no live server leg applies).
+pub fn fts_search_scoped(
+    conn: &Connection,
+    folders: Option<&[&str]>,
+    query: &str,
+) -> StoreResult<Vec<MessageRow>> {
+    let escaped = escape_fts_query(query);
+    if escaped.is_empty() {
+        return Ok(Vec::new());
+    }
+    let scope_sql: String;
+    let mut params: Vec<&dyn rusqlite::ToSql> = Vec::new();
+    params.push(&escaped);
+    match folders {
+        None => {
+            scope_sql = "1 = 1".to_string();
+        }
+        Some(set) if set.is_empty() => {
+            return Ok(Vec::new());
+        }
+        Some(set) => {
+            let placeholders = "?,".repeat(set.len());
+            let in_clause = &placeholders[..placeholders.len() - 1];
+            scope_sql = format!("mb.name IN ({in_clause})");
+            for name in set {
+                params.push(name);
+            }
+        }
+    }
+    let sql = format!(
+        "SELECT m.uid, m.subject, m.from_addr, m.to_addrs, \
+         m.date_utc, m.flags, m.has_attachments, m.preview, mb.name \
+         FROM messages_fts \
+         JOIN messages m ON messages_fts.rowid = m.id \
+         JOIN mailboxes mb ON m.mailbox_id = mb.id \
+         WHERE messages_fts MATCH ?1 \
+         AND ({scope_sql}) \
+         AND m.pending_delete = 0 \
+         ORDER BY rank, m.date_utc DESC, m.uid DESC \
+         LIMIT {SEARCH_RESULT_LIMIT}",
     );
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(rusqlite::params![query, mailbox], row_to_message)?;
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params.as_slice(), row_to_message)?;
 
     let mut result = Vec::new();
     for row in rows {
         result.push(row?);
     }
     Ok(result)
+}
+
+/// Matched excerpt for one message as sanitized text (T-23-02).
+///
+/// Drawn from `body_text` first, falling back to `preview` when the body
+/// carries no match context. The excerpt is built store-side (the FTS5
+/// index is an external-content table, so its `snippet()` aux function
+/// cannot read the off-table `body_text` column): the first
+/// case-insensitive token hit anchors a ~120-char window with `…`
+/// truncation markers. Raw `body_html` is never returned; tag-looking
+/// spans are stripped (defence in depth — the source columns are plain
+/// text) and the Phase 16 redaction sanitizer
+/// ([`crate::classify::redact::redact_input`]) runs before return, so no
+/// secret-shaped text reaches the UI.
+pub fn search_snippet(
+    conn: &Connection,
+    message_id: u64,
+    query: &str,
+) -> StoreResult<String> {
+    let tokens: Vec<String> = query
+        .split_whitespace()
+        .map(|t| t.to_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if tokens.is_empty() {
+        return Ok(String::new());
+    }
+    let (body, preview): (Option<String>, String) = match conn.query_row(
+        "SELECT b.body_text, m.preview FROM messages m \
+         LEFT JOIN message_bodies b ON b.message_id = m.id WHERE m.id = ?1",
+        rusqlite::params![message_id as i64],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ) {
+        Ok(v) => v,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(String::new()),
+        Err(e) => return Err(StoreError::Sql(e)),
+    };
+    let source = body.as_deref().unwrap_or("");
+    let excerpt = excerpt_around_hit(source, &tokens)
+        .or_else(|| excerpt_around_hit(&preview, &tokens))
+        .unwrap_or_default();
+    // Strip tag-looking spans (`</?[a-z]…>`); bare `<3` / `a < b` survive
+    // (the `<` must open a letter). Snippets render as text nodes upstream.
+    let stripped = strip_snippet_tags(&excerpt);
+    Ok(crate::classify::redact::redact_input(&stripped))
+}
+
+/// First-hit-anchored excerpt window (~120 chars, `…`-marked).
+///
+/// Returns `None` when no token occurs in `text` (caller falls back to
+/// the next source column).
+fn excerpt_around_hit(text: &str, tokens: &[String]) -> Option<String> {
+    const WINDOW: usize = 120;
+    const CONTEXT_BEFORE: usize = 40;
+    let lower = text.to_lowercase();
+    let hit = tokens
+        .iter()
+        .filter_map(|t| lower.find(t.as_str()).map(|pos| (pos, t.len())))
+        .min_by_key(|(pos, _)| *pos)?;
+    let (byte_pos, token_len) = hit;
+    // Anchor CONTEXT_BEFORE chars before the hit (char-boundary safe).
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let hit_char = text[..byte_pos].chars().count();
+    let start_char = hit_char.saturating_sub(CONTEXT_BEFORE);
+    let start_byte = chars.get(start_char).map(|(b, _)| *b).unwrap_or(text.len());
+    let mut end_byte = (byte_pos + token_len + (WINDOW - CONTEXT_BEFORE)).min(text.len());
+    while end_byte < text.len() && !text.is_char_boundary(end_byte) {
+        end_byte += 1;
+    }
+    // Extend the end to a word boundary when cheap (cleaner excerpts).
+    let mut end = end_byte;
+    while end < text.len()
+        && end < start_byte + WINDOW + 20
+        && !text[end..].chars().next().map(|c| c.is_whitespace()).unwrap_or(true)
+    {
+        end += text[end..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+    }
+    let mut out = String::new();
+    if start_byte > 0 {
+        out.push('…');
+    }
+    out.push_str(text[start_byte..end].trim());
+    if end < text.len() {
+        out.push('…');
+    }
+    if out.trim().is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Remove tag-looking spans from a snippet without an HTML parser.
+///
+/// Only `<` directly followed by an optional `/` and an ASCII letter
+/// counts as a tag open — comparison text (`a < b`, `<3`) is preserved.
+fn strip_snippet_tags(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            let mut j = i + 1;
+            if j < bytes.len() && bytes[j] == b'/' {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j].is_ascii_alphabetic() {
+                // Skip to the closing `>` (or end of string on malformed).
+                while j < bytes.len() && bytes[j] != b'>' {
+                    j += 1;
+                }
+                i = if j < bytes.len() { j + 1 } else { bytes.len() };
+                continue;
+            }
+        }
+        // Advance one UTF-8 char.
+        let ch = text[i..].chars().next().unwrap_or('\u{FFFD}');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 // ── bodies ───────────────────────────────────────────────────────
@@ -3054,6 +3249,242 @@ mod tests {
         // Upsert creates the row when missing (refresh path).
         set_mailbox_role(conn, "Nova", "custom", "").unwrap();
         assert!(list_mailboxes(conn).unwrap().iter().any(|r| r.name == "Nova"));
+    }
+
+    // ── Plan 23-01: body + attachment FTS, scope, ranking, cap ──
+
+    fn insert_full_msg(
+        conn: &Connection,
+        mb_id: u64,
+        uid: u32,
+        subject: &str,
+        from: &str,
+        date_utc: &str,
+        preview: &str,
+        body: Option<&str>,
+        attachments: &[&str],
+    ) -> u64 {
+        upsert_message(
+            conn, mb_id, uid, None, subject, from, "[]", "[]", date_utc, "[]", false, preview,
+        )
+        .unwrap();
+        let msg_id = find_message_id(conn, mb_id, uid).unwrap().unwrap();
+        if let Some(text) = body {
+            insert_body(conn, msg_id, Some(text), None).unwrap();
+        }
+        for (i, name) in attachments.iter().enumerate() {
+            insert_attachment_meta(conn, msg_id, &format!("{}", i + 1), name, "application/pdf", 10)
+                .unwrap();
+        }
+        msg_id
+    }
+
+    #[test]
+    fn fts_matches_body_text_and_attachment_filename_whole_account() {
+        // Tracer: ONE path end-to-end — body + attachment hits, mailbox=None.
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let mb = ensure_mailbox(conn, "INBOX").unwrap();
+        insert_full_msg(
+            conn, mb, 1, "Assunto comum", "a@x.com", "2024-01-01T00:00:00Z", "prev",
+            Some("texto distintivo do corpo girafa-azul"), &["relatorio.pdf"],
+        );
+        insert_full_msg(
+            conn, mb, 2, "Outro", "b@x.com", "2024-01-02T00:00:00Z", "prev",
+            Some("nada relevante aqui"), &["foto.png"],
+        );
+
+        let body_hits = fts_search(conn, None, "girafa-azul").unwrap();
+        assert_eq!(body_hits.len(), 1, "body text must be searchable");
+        assert_eq!(body_hits[0].uid, 1);
+
+        let att_hits = fts_search(conn, None, "relatorio.pdf").unwrap();
+        assert_eq!(att_hits.len(), 1, "attachment filename must be searchable");
+        assert_eq!(att_hits[0].uid, 1);
+    }
+
+    #[test]
+    fn fts_folder_set_scoping_filters() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let inbox = ensure_mailbox(conn, "INBOX").unwrap();
+        let sent = ensure_mailbox(conn, "Sent").unwrap();
+        insert_full_msg(
+            conn, inbox, 1, "Boletim mensal", "a@x.com", "2024-01-01T00:00:00Z", "p",
+            Some("corpo do boletim"), &[],
+        );
+        insert_full_msg(
+            conn, sent, 2, "Boletim resposta", "b@x.com", "2024-01-02T00:00:00Z", "p",
+            Some("outro boletim"), &[],
+        );
+
+        // None = whole account (existing contract preserved).
+        assert_eq!(fts_search_scoped(conn, None, "Boletim").unwrap().len(), 2);
+        // Single-folder set narrows.
+        let inbox_hits = fts_search_scoped(conn, Some(&["INBOX"]), "Boletim").unwrap();
+        assert_eq!(inbox_hits.len(), 1);
+        assert_eq!(inbox_hits[0].mailbox, "INBOX");
+        // Multi-folder set unions.
+        let both = fts_search_scoped(conn, Some(&["INBOX", "Sent"]), "Boletim").unwrap();
+        assert_eq!(both.len(), 2);
+        // Empty set matches nothing (narrowed to zero folders).
+        assert!(fts_search_scoped(conn, Some(&[]), "Boletim").unwrap().is_empty());
+        // Legacy single-mailbox wrapper keeps None-vs-Some semantics.
+        assert_eq!(fts_search(conn, Some("Sent"), "Boletim").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn fts_ranking_bm25_with_recent_first_tiebreak() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let mb = ensure_mailbox(conn, "INBOX").unwrap();
+        // Identical relevance text, different dates → equal BM25 rank.
+        insert_full_msg(
+            conn, mb, 1, "reunião pedagógica", "a@x.com", "2024-01-01T00:00:00Z", "p", None, &[],
+        );
+        insert_full_msg(
+            conn, mb, 2, "reunião pedagógica", "a@x.com", "2024-06-01T00:00:00Z", "p", None, &[],
+        );
+        let hits = fts_search(conn, None, "pedagógica").unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].uid, 2, "equal rank must tie-break recent-first");
+        assert_eq!(hits[1].uid, 1);
+    }
+
+    #[test]
+    fn fts_result_cap_is_200() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let mb = ensure_mailbox(conn, "INBOX").unwrap();
+        for i in 1..=205u32 {
+            upsert_message(
+                conn, mb, i, None, "captest lotação", "a@x.com", "[]", "[]",
+                "2024-01-01T00:00:00Z", "[]", false, "p",
+            )
+            .unwrap();
+        }
+        let hits = fts_search(conn, None, "captest").unwrap();
+        assert_eq!(hits.len(), SEARCH_RESULT_LIMIT as usize);
+        assert_eq!(SEARCH_RESULT_LIMIT, 200);
+    }
+
+    #[test]
+    fn fts_hides_pending_delete_body_and_attachment_matches() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let mb = ensure_mailbox(conn, "INBOX").unwrap();
+        insert_full_msg(
+            conn, mb, 1, "Visível", "a@x.com", "2024-01-01T00:00:00Z", "p",
+            Some("conteúdo ocultável"), &["secreto-anexo.pdf"],
+        );
+        assert_eq!(fts_search(conn, None, "ocultável").unwrap().len(), 1);
+        assert_eq!(fts_search(conn, None, "secreto-anexo.pdf").unwrap().len(), 1);
+        set_pending_delete(conn, mb, 1, true).unwrap();
+        assert!(fts_search(conn, None, "ocultável").unwrap().is_empty());
+        assert!(fts_search(conn, None, "secreto-anexo.pdf").unwrap().is_empty());
+    }
+
+    #[test]
+    fn fts_query_operators_are_literal_not_syntax() {
+        // T-23-01: FTS5 special chars must not alter query semantics.
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let mb = ensure_mailbox(conn, "INBOX").unwrap();
+        insert_full_msg(
+            conn, mb, 1, "Hello", "alice@example.com", "2024-01-01T00:00:00Z", "p", None, &[],
+        );
+        // None of these may error; none may match everything / leak rows.
+        for hostile in [
+            "\"",
+            "*",
+            "OR 1=1",
+            "NEAR(hello world)",
+            "subject:hello",
+            "(hello)",
+            "NOT hello",
+        ] {
+            let hits = fts_search(conn, None, hostile).unwrap();
+            assert!(
+                hits.len() <= 1,
+                "hostile query {hostile:?} must not widen matches (got {})",
+                hits.len()
+            );
+        }
+        // Empty / operator-only queries return empty, never an FTS syntax error.
+        assert!(fts_search(conn, None, "").unwrap().is_empty());
+        assert!(fts_search(conn, None, "   ").unwrap().is_empty());
+        assert!(fts_search(conn, None, "***").unwrap().is_empty());
+        // Plain token search still works after escaping.
+        assert_eq!(fts_search(conn, None, "alice").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn search_snippet_is_sanitized_text_without_secrets() {
+        // T-23-02: snippet from sanitized body text only, redaction applied.
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let mb = ensure_mailbox(conn, "INBOX").unwrap();
+        let msg_id = insert_full_msg(
+            conn, mb, 1, "Boleto", "f@x.com", "2024-01-01T00:00:00Z", "prev",
+            Some("Segue o boleto <b>importante</b> para pagamento, senha: Xk9#mQ2! fim."),
+            &[],
+        );
+        let snippet = search_snippet(conn, msg_id, "boleto").unwrap();
+        assert!(!snippet.is_empty(), "snippet must carry match context");
+        assert!(!snippet.contains('<') && !snippet.contains('>'), "no HTML tags: {snippet:?}");
+        assert!(!snippet.contains("Xk9#mQ2!"), "fixture secret must be redacted: {snippet:?}");
+        assert!(!snippet.contains("body_html") && !snippet.contains("<b>"));
+        // Unknown message id → empty, not an error.
+        assert_eq!(search_snippet(conn, 99999, "boleto").unwrap(), "");
+        // Empty query → empty snippet.
+        assert_eq!(search_snippet(conn, msg_id, "").unwrap(), "");
+    }
+
+    #[test]
+    fn fts_triggers_stay_fresh_on_body_and_attachment_writes() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let mb = ensure_mailbox(conn, "INBOX").unwrap();
+        // Message first (header-only), body + attachment arrive later.
+        upsert_message(
+            conn, mb, 1, None, "Tarde", "a@x.com", "[]", "[]",
+            "2024-01-01T00:00:00Z", "[]", false, "p",
+        )
+        .unwrap();
+        assert!(fts_search(conn, None, "frescor").unwrap().is_empty());
+        let msg_id = find_message_id(conn, mb, 1).unwrap().unwrap();
+        insert_body(conn, msg_id, Some("texto com frescor total"), None).unwrap();
+        assert_eq!(fts_search(conn, None, "frescor").unwrap().len(), 1);
+        // Body upsert (UPDATE leg) re-indexes too.
+        insert_body(conn, msg_id, Some("texto reescrito sem a palavra"), None).unwrap();
+        assert!(fts_search(conn, None, "frescor").unwrap().is_empty());
+        assert_eq!(fts_search(conn, None, "reescrito").unwrap().len(), 1);
+        // Attachment insert indexes the filename immediately.
+        insert_attachment_meta(conn, msg_id, "2", "anexo-tardio.pdf", "application/pdf", 5)
+            .unwrap();
+        assert_eq!(fts_search(conn, None, "anexo-tardio.pdf").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn search_path_is_local_sqlite_with_no_imap_leg() {
+        // Live-gate position: search runs against an in-memory store with no
+        // server, no session, no IMAP verb — this test constructs no
+        // SessionManager and performs no network I/O; the search path
+        // (`fts_search*` + `search_snippet`) opens no session and issues no
+        // FETCH/STORE/SEARCH verb (the module's only `imap::` use is the
+        // pre-existing `mutf7` display-name decoder plus the `imap_outbox`
+        // queue name — both local, verified by grep in plan verification).
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let mb = ensure_mailbox(conn, "INBOX").unwrap();
+        insert_full_msg(
+            conn, mb, 1, "Local", "a@x.com", "2024-01-01T00:00:00Z", "p",
+            Some("somente local"), &[],
+        );
+        let hits = fts_search(conn, None, "local").unwrap();
+        assert_eq!(hits.len(), 1);
+        let msg_id = find_message_id(conn, mb, 1).unwrap().unwrap();
+        assert!(!search_snippet(conn, msg_id, "local").unwrap().is_empty());
     }
 }
 
