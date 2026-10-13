@@ -543,6 +543,7 @@ pub fn run() {
             commands::classify::set_rule_priority,
             commands::classify::apply_rules,
             commands::classify::pending_rule_suggestions,
+            commands::classify::apply_rules_bulk,
             commands::classify::archive_run,
             commands::classify::get_archive_settings,
             commands::classify::set_archive_settings,

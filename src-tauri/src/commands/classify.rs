@@ -2999,3 +2999,395 @@ mod rule_evolv_tests {
         assert_eq!(queries::list_rules(conn).unwrap().len(), 2, "revalidate never drops rows");
     }
 }
+
+// ── Phase 25: journaled bulk apply_rules (25-02, RULE-02 bulk depth) ──
+//
+// Reuse-depth decision (CONTEXT agent discretion, prescribed here):
+// - THIN loop = `apply_rules` (above): few hits, one shot, dialog ON per
+//   hit through `confirm_suggestion`. No journal, no undo.
+// - JOURNALED bulk = `apply_rules_bulk` (below): whole-account (or folder)
+//   runs with progress events + undo. Reuses the Phase 20 machinery
+//   wholesale — `batch_runs`/`batch_items` journal, `journal_intent`/
+//   `journal_moved`/`journaled_ids`, per-chunk UIDVALIDITY re-check,
+//   cooperative cancel, and the EXISTING `undo_batch`/`batch_report`
+//   commands (both are generic over `batch_items`; `label_id` carries the
+//   rule id). No duplicate journal table, no new undo path.
+// Cutoff: the UI offers the thin path for scoped runs and the journaled
+// path for whole-account runs; both funnel hits through the same
+// `evaluate_rules` core and the same epoch-gated `move_one_uid`.
+
+use crate::classify::batch as rule_batch;
+
+/// Bulk progress event (`rule-progress` channel).
+#[derive(Debug, Clone, Serialize)]
+pub struct RuleBulkProgress {
+    pub run_id: i64,
+    pub done: usize,
+    pub total: usize,
+    pub moved: usize,
+    pub skipped: usize,
+    pub state: String,
+}
+
+/// Plannable bulk hit: rule hit + source wire for journaling. Pure —
+/// snapshot candidates, evaluate, attach current wires. Skips Auto/-sourced
+/// mail (already filed — same spirit as the batch collector).
+pub struct PlannedRuleHit {
+    pub hit: RuleHit,
+    pub from_folder: String,
+}
+
+pub fn plan_rule_bulk(
+    conn: &rusqlite::Connection,
+    mailbox: Option<&str>,
+) -> Result<Vec<PlannedRuleHit>, String> {
+    let cands = queries::rule_candidate_rows(conn, mailbox).map_err(|e| e.to_string())?;
+    let hits = evaluate_rules(conn, &cands);
+    let mut out = Vec::new();
+    for h in hits {
+        let loc = queries::message_location(conn, h.message_id)
+            .map_err(|e| e.to_string())?;
+        if let Some((mb, _)) = loc {
+            if mb == "Auto" || mb.starts_with("Auto/") || mb.starts_with("Auto.") {
+                continue;
+            }
+            out.push(PlannedRuleHit { hit: h, from_folder: mb });
+        }
+    }
+    Ok(out)
+}
+
+/// Journaled whole-account (or per-folder) rule run. One explicit op with
+/// progress + report + undo (via `batch_report`/`undo_batch`). Dialog OFF
+/// by design — the journal IS the backstop. Destinations are pre-ensured
+/// up front (dialog-off means no mid-run asks); a destination that needs
+/// an `Auto`-collision confirm is SKIPPED with its hits counted, never
+/// forced. Sent/Drafts auto-excluded from NOTHING here — bulk is manual
+/// intent (`apply_rules` semantics), served on demand. Returns the run id.
+#[tauri::command]
+pub async fn apply_rules_bulk(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    mailbox: Option<String>,
+) -> Result<i64, String> {
+    let store = state.store.clone();
+    let account_cfg = load_account_config(state.clone()).await?;
+    let manager = manager_for(&state, &account_cfg);
+    let cancel = state.batch_cancel.clone();
+    cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+    // Snapshot the plan (short lock, no awaits).
+    let planned = {
+        let guard = store.lock().unwrap();
+        plan_rule_bulk(guard.conn(), mailbox.as_deref())?
+    };
+    // Group by destination for one ensure per folder.
+    use std::collections::BTreeMap;
+    let mut by_dest: BTreeMap<(String, String), Vec<usize>> = BTreeMap::new();
+    for (i, p) in planned.iter().enumerate() {
+        by_dest
+            .entry((p.hit.dest_kind.clone(), p.hit.destination.clone()))
+            .or_default()
+            .push(i);
+    }
+    let tax = load_default().map_err(|e| e.to_string())?;
+    // Pre-ensure every destination (verbs here, never mid-run).
+    let mut wires: BTreeMap<(String, String), String> = BTreeMap::new();
+    let mut skipped_dest = 0usize;
+    for (key, _) in &by_dest {
+        let (kind, dest) = key;
+        let wire: Result<String, String> = if kind == "category" {
+            let (display, top, child) =
+                filing::auto_path_for_id(&tax, dest).map_err(|e| e.to_string())?;
+            let probe = filing::FilePlan {
+                message_id: 0,
+                mailbox: String::new(),
+                uid: 0,
+                dest_display: display,
+                top_name: top,
+                child_name: child,
+                threshold_used: 0.0,
+                confidence: 0.0,
+                needs_review: false,
+            };
+            filing::ensure_auto_tree(&manager, &store, &probe, true)
+                .await
+                .map_err(|e| e.to_string())
+        } else if let Some((top, child)) = split_auto_nest(dest) {
+            let probe = filing::FilePlan {
+                message_id: 0,
+                mailbox: String::new(),
+                uid: 0,
+                dest_display: dest.clone(),
+                top_name: top,
+                child_name: child,
+                threshold_used: 0.0,
+                confidence: 0.0,
+                needs_review: false,
+            };
+            filing::ensure_auto_tree(&manager, &store, &probe, true)
+                .await
+                .map_err(|e| e.to_string())
+        } else {
+            ensure_rule_folder(&manager, &store, dest).await
+        };
+        match wire {
+            Ok(w) => {
+                wires.insert(key.clone(), w);
+            }
+            Err(e) => {
+                // Collision-or-offline: skip the destination's hits loudly
+                // (counted, never forced, never half-ensured).
+                eprintln!("[SGE rules] bulk: destino ignorado ({dest}: {e})");
+                skipped_dest += by_dest[key].len();
+            }
+        }
+    }
+    // Journal intents BEFORE any verb (crash safety) + capture epochs.
+    let run_id = {
+        let guard = store.lock().unwrap();
+        crate::store::queries::create_batch_run(guard.conn()).map_err(|e| e.to_string())?
+    };
+    let epochs: std::collections::HashMap<String, u32> = {
+        let guard = store.lock().unwrap();
+        let rows: Vec<(String, u32)> = guard
+            .conn()
+            .prepare("SELECT name, uid_validity FROM mailboxes")
+            .map_err(|e| e.to_string())?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())?;
+        rows.into_iter().collect()
+    };
+    let total = planned.len();
+    // Keep only ensurable hits for the loop.
+    let mut jobs: Vec<(u64, String, String, String)> = Vec::new();
+    for p in &planned {
+        if let Some(w) = wires.get(&(p.hit.dest_kind.clone(), p.hit.destination.clone())) {
+            jobs.push((p.hit.message_id, p.from_folder.clone(), w.clone(), p.hit.rule_id.clone()));
+        }
+    }
+    {
+        let guard = store.lock().unwrap();
+        for (chunk_no, chunk) in jobs.chunks(rule_batch::BATCH_CHUNK).enumerate() {
+            for (mid, from_folder, to_wire, rule_id) in chunk {
+                let _ = rule_batch::journal_intent(
+                    guard.conn(),
+                    run_id,
+                    *mid,
+                    from_folder,
+                    to_wire,
+                    rule_id,
+                    chunk_no,
+                );
+            }
+        }
+    }
+    let app_h = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut done = 0usize;
+        let mut moved = 0usize;
+        let mut skipped = skipped_dest;
+        for chunk in jobs.chunks(rule_batch::BATCH_CHUNK) {
+            if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            for (mid, _from_folder, to_wire, rule_id) in chunk {
+                if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                // Current location (uid may have shifted) + per-chunk
+                // UIDVALIDITY re-check: abort-to-resync on shift.
+                let loc = {
+                    let guard = store.lock().unwrap();
+                    queries::message_location(guard.conn(), *mid).ok().flatten()
+                };
+                let Some((mb_now, uid_now)) = loc else {
+                    done += 1;
+                    skipped += 1;
+                    continue;
+                };
+                let epoch_now: u32 = {
+                    let guard = store.lock().unwrap();
+                    guard
+                        .conn()
+                        .query_row(
+                            "SELECT uid_validity FROM mailboxes WHERE name = ?1",
+                            rusqlite::params![mb_now],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(0)
+                };
+                if epochs.get(&mb_now).copied().unwrap_or(0) != epoch_now {
+                    done += 1;
+                    skipped += 1;
+                    continue;
+                }
+                if mb_now == *to_wire {
+                    let guard = store.lock().unwrap();
+                    let _ = rule_batch::journal_moved(guard.conn(), run_id, *mid);
+                    moved += 1;
+                    done += 1;
+                    continue;
+                }
+                match filing::move_one_uid(
+                    &manager,
+                    &store,
+                    &mb_now,
+                    uid_now,
+                    to_wire,
+                    "Arquivado por regra",
+                )
+                .await
+                {
+                    Ok(_) => {
+                        let guard = store.lock().unwrap();
+                        let _ = rule_batch::journal_moved(guard.conn(), run_id, *mid);
+                        let _ = queries::delete_rule_suggestion(guard.conn(), *mid);
+                        // Pin the outcome against re-fire (same as single).
+                        let dest = to_wire.clone();
+                        let _ = queries::log_override(guard.conn(), *mid, rule_id, &dest);
+                        moved += 1;
+                    }
+                    Err(_) => {
+                        skipped += 1;
+                    }
+                }
+                done += 1;
+            }
+            let _ = app_h.emit(
+                "rule-progress",
+                RuleBulkProgress {
+                    run_id,
+                    done,
+                    total,
+                    moved,
+                    skipped,
+                    state: "running".to_string(),
+                },
+            );
+        }
+        let interrupted = cancel.load(std::sync::atomic::Ordering::SeqCst);
+        let totals = serde_json::json!({
+            "kind": "rule-bulk", "done": done, "moved": moved, "skipped": skipped,
+        })
+        .to_string();
+        {
+            let guard = store.lock().unwrap();
+            let _ = crate::store::queries::finish_batch_run(
+                guard.conn(),
+                run_id,
+                if interrupted { "interrupted" } else { "done" },
+                &totals,
+            );
+        }
+        let _ = app_h.emit(
+            "rule-progress",
+            RuleBulkProgress {
+                run_id,
+                done,
+                total,
+                moved,
+                skipped,
+                state: if interrupted { "interrupted".to_string() } else { "done".to_string() },
+            },
+        );
+    });
+    Ok(run_id)
+}
+
+#[cfg(test)]
+mod rule_bulk_tests {
+    use super::*;
+    use crate::store::Store;
+
+    fn seed_db() -> Store {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        conn.execute(
+            "INSERT INTO mailboxes (name, uid_validity, uid_next, delimiter) \
+             VALUES ('INBOX', 77, 10, '/'), ('Arquivo', 77, 10, '/'), \
+                     ('Auto/Finanças', 77, 10, '/')",
+            [],
+        )
+        .unwrap();
+        let inbox: i64 = conn
+            .query_row("SELECT id FROM mailboxes WHERE name = 'INBOX'", [], |r| r.get(0))
+            .unwrap();
+        let filed: i64 = conn
+            .query_row("SELECT id FROM mailboxes WHERE name = 'Auto/Finanças'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        for (mb, uid, subject, from, preview) in [
+            (inbox, 1u32, "Fatura de energia", "contas@utfpr.edu.br", "boleto de outubro"),
+            (inbox, 2, "Reunião quinta", "chefe@empresa.com", "pauta"),
+            (filed, 1u32, "Fatura antiga", "contas@utfpr.edu.br", "boleto antigo"),
+        ] {
+            queries::upsert_message(
+                conn, mb as u64, uid, None, subject, from, "[]", "[]",
+                "2024-01-01T00:00:00Z", "[]", false, preview,
+            )
+            .unwrap();
+        }
+        queries::insert_rule(
+            conn,
+            &RuleRow {
+                id: "r-1".to_string(),
+                name: "Boletos".to_string(),
+                priority: 10,
+                conditions_json: r#"{"sender_domain":"utfpr.edu.br"}"#.to_string(),
+                dest_kind: "folder".to_string(),
+                destination: "Arquivo".to_string(),
+                scope_json: "[]".to_string(),
+                enabled: true,
+            },
+        )
+        .unwrap();
+        store
+    }
+
+    #[test]
+    fn rule_bulk_plan_skips_filed_pinned_labeled() {
+        let store = seed_db();
+        let conn = store.conn();
+        // Filed mail under Auto/ never bulk-moves (already filed).
+        let planned = plan_rule_bulk(conn, None).unwrap();
+        assert_eq!(planned.len(), 1, "only the INBOX hit plans, got {}", planned.len());
+        assert_eq!(planned[0].from_folder, "INBOX");
+        assert_eq!(planned[0].hit.rule_id, "r-1");
+        // Pin it: plan empties (override wins even in bulk).
+        let mid = planned[0].hit.message_id;
+        queries::log_override(conn, mid, "r-1", "Arquivo").unwrap();
+        assert!(plan_rule_bulk(conn, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rule_bulk_journal_reuses_batch_machinery_with_undo() {
+        // The bulk journal IS batch_items (label_id carries the rule id):
+        // intent → moved → journaled_ids → undo_batch reverses via the
+        // same rows `batch_report` reads. Proves reuse, no duplicate table.
+        let store = seed_db();
+        let conn = store.conn();
+        let planned = plan_rule_bulk(conn, None).unwrap();
+        assert_eq!(planned.len(), 1);
+        let run = queries::create_batch_run(conn).unwrap();
+        let p = &planned[0];
+        rule_batch::journal_intent(conn, run, p.hit.message_id, &p.from_folder, "Arquivo", "r-1", 0)
+            .unwrap();
+        rule_batch::journal_moved(conn, run, p.hit.message_id).unwrap();
+        assert_eq!(rule_batch::journaled_ids(conn, run).unwrap(), vec![p.hit.message_id]);
+        // Report reads the same journal generically.
+        let per: Vec<(String, usize)> = conn
+            .prepare(
+                "SELECT label_id, count(*) FROM batch_items WHERE run_id = ?1 AND moved = 1 GROUP BY label_id",
+            )
+            .unwrap()
+            .query_map(rusqlite::params![run], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as usize)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(per, vec![("r-1".to_string(), 1)]);
+        queries::finish_batch_run(conn, run, "done", r#"{"kind":"rule-bulk"}"#).unwrap();
+    }
+}
