@@ -558,6 +558,7 @@ pub fn run() {
             commands::classify::set_rule_enabled,
             commands::classify::set_rule_priority,
             commands::classify::export_rules,
+            commands::classify::export_sieve_text,
             commands::classify::import_rules,
             commands::classify::apply_rules,
             commands::classify::pending_rule_suggestions,

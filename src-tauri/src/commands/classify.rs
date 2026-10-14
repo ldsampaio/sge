@@ -528,6 +528,30 @@ pub async fn set_confidence_threshold(
         .map_err(|e| e.to_string())
 }
 
+/// Sieve text export (SIEVE-01, Phase 31): pure function over stored rules + taxonomy.
+/// Transient return — never writes to filesystem / DB (download = frontend Blob).
+#[tauri::command]
+pub async fn export_sieve_text(
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    // Read stored rules via existing query path (same source as export_rules).
+    let guard = state.store.lock().unwrap();
+    let conn = guard.conn();
+    let tax = crate::classify::taxonomy::load_default().map_err(|e| e.to_string())?;
+    // Pull rules via existing export logic (rules_io) to avoid duplicating store logic.
+    let rules_json = crate::classify::rules_io::export_rules(&state.store.clone())
+        .map_err(|e| format!("export_rules: {e}"))?;
+    let envelope: crate::classify::rules_io::RuleExport = serde_json::from_str(&rules_json)
+        .map_err(|e| format!("parse envelope: {e}"))?;
+    drop(guard); // brief hold
+    use crate::classify::sieve::{generate_sieve, redaction_filter};
+    let (text_raw, warnings) = generate_sieve(&envelope.rules, &tax);
+    // Redaction filter on surface (defense-in-depth, metadata-only guarantee).
+    let text = redaction_filter(&text_raw);
+    // Transient return only — no persistence.
+    Ok(serde_json::json!({"text": text, "warnings_count": warnings}))
+}
+
 /// Review list rows for the `A Classificar` view.
 #[tauri::command]
 pub async fn review_list(
