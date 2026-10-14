@@ -28,7 +28,6 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -44,6 +43,14 @@ pub const EXPORT_VERSION: u32 = 1;
 /// Priority bounds enforced on import (CONTEXT D-02).
 pub const PRIORITY_MIN: i64 = 1;
 pub const PRIORITY_MAX: i64 = 999;
+
+/// Cap on the raw import payload: rules are metadata-only, so 1 MiB is
+/// generous (WR-02). Checked before parsing, before any lock is taken.
+pub const MAX_IMPORT_BYTES: usize = 1_048_576;
+
+/// Cap on the rule count per file (WR-02). Bounds validation + write work
+/// before the store lock is ever acquired.
+pub const MAX_IMPORT_RULES: usize = 500;
 
 /// Reserved rule names (case-insensitive) — rejected on import.
 const RESERVED_NAMES: [&str; 2] = ["system", "auto"];
@@ -234,11 +241,26 @@ fn scope_folders_of(item: &RuleExportItem) -> Vec<String> {
 /// are hypothetical, but nothing is written. `commit = true` upserts by
 /// id (new → insert, existing → overwrite + `rule_version` bump) and
 /// rejects name collisions against a *different* id.
+///
+/// Atomicity (CR-01): validation runs fully BEFORE any write. Items that
+/// fail validation are skipped with per-item reasons (partial-valid-subset
+/// contract — WR-04); the surviving staged rows then apply inside ONE
+/// rusqlite transaction, so a mid-apply DB failure rolls everything back
+/// instead of leaving a half-applied file.
+///
+/// Locking (WR-06): the store Mutex is held only for two short windows —
+/// the duplicate/folder snapshot read, and the commit transaction. All
+/// structural validation runs lock-free in between, so a large import
+/// never starves sync/classify.
 pub fn import_rules(
     store: &Arc<Mutex<Store>>,
     json: &str,
     commit: bool,
 ) -> Result<ImportResult, String> {
+    // WR-02: bound the payload before parsing, before any lock.
+    if json.len() > MAX_IMPORT_BYTES {
+        return Err("rules file too large (max 1 MiB)".to_string());
+    }
     let envelope: RuleExport =
         serde_json::from_str(json).map_err(|e| plain_parse_error(&e))?;
     if envelope.version != EXPORT_VERSION {
@@ -247,67 +269,74 @@ pub fn import_rules(
             envelope.version
         ));
     }
+    if envelope.rules.len() > MAX_IMPORT_RULES {
+        return Err(format!("too many rules (max {MAX_IMPORT_RULES})"));
+    }
 
-    let guard = store.lock().map_err(|e| format!("store lock: {e}"))?;
-    let conn = guard.conn();
+    // Snapshot window #1 (short lock): duplicate + warn-but-allow inputs.
+    // The guard is dropped at the end of this block — everything below
+    // until the commit transaction runs lock-free.
+    let snap = {
+        let guard = store.lock().map_err(|e| format!("store lock: {e}"))?;
+        let conn = guard.conn();
+        let names: Vec<(String, String)> = queries::get_all_rule_names(conn)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .collect();
+        let cached_folders: Vec<String> = conn
+            .prepare("SELECT name FROM mailboxes")
+            .and_then(|mut st| {
+                st.query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap_or_default();
+        let cached_display: Vec<String> = conn
+            .prepare("SELECT display_name FROM mailboxes")
+            .and_then(|mut st| {
+                st.query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap_or_default();
+        let known_category_ids: HashSet<String> = conn
+            .prepare("SELECT json FROM taxonomy WHERE id = 1")
+            .and_then(|mut st| {
+                st.query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|j| {
+                serde_json::from_str::<crate::classify::taxonomy::Taxonomy>(&j)
+                    .map(|t| t.categories.into_iter().map(|c| c.id).collect::<Vec<_>>())
+                    .unwrap_or_default()
+            })
+            .collect();
+        ImportSnapshot { names, cached_folders, cached_display, known_category_ids }
+    };
 
-    // Snapshot for duplicate detection: (lowercased name → id).
-    let known: Vec<(String, String)> = queries::get_all_rule_names(conn)
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .collect();
-    let known_ids: HashSet<&str> = known.iter().map(|(id, _)| id.as_str()).collect();
-
-    // Cached folder-tree names for warn-but-allow existence checks.
-    let cached_folders: Vec<String> = conn
-        .prepare("SELECT name FROM mailboxes")
-        .and_then(|mut st| {
-            st.query_map([], |r| r.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .unwrap_or_default();
-    let known_category_ids: HashSet<String> = conn
-        .prepare("SELECT json FROM taxonomy WHERE id = 1")
-        .and_then(|mut st| {
-            st.query_map([], |r| r.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .unwrap_or_default()
-        .into_iter()
-        .flat_map(|j| {
-            serde_json::from_str::<crate::classify::taxonomy::Taxonomy>(&j)
-                .map(|t| t.categories.into_iter().map(|c| c.id).collect::<Vec<_>>())
-                .unwrap_or_default()
-        })
-        .collect();
-
-    let mut imported = 0u32;
-    let mut updated = 0u32;
+    // Phase 1 (lock-free): validate every item. The working duplicate map
+    // is seeded from the store snapshot and updated as rows stage, so a
+    // rename earlier in the same file frees its old name for later items
+    // (CR-01 stale-snapshot fix). One map covers both within-file and
+    // against-store collisions — no divergent `seen` vs `known` sources.
+    let mut working: std::collections::HashMap<String, String> =
+        snap.names.iter().map(|(id, n)| (n.to_lowercase(), id.clone())).collect();
+    let mut staged: Vec<RuleRow> = Vec::new();
     let mut warnings = Vec::new();
     let mut errors = Vec::new();
-    // Names claimed by this file (lowercased) → first id that claimed them.
-    let mut seen: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
 
     for item in &envelope.rules {
         let label = if item.name.trim().is_empty() { item.id.clone() } else { item.name.clone() };
         let (mut item_errors, mut item_warnings) = validate_item_structure(item);
 
-        // Duplicate within the file (case-insensitive, like validate_rule).
+        // Duplicate names (case-insensitive, like validate_rule): checked
+        // against `working`, which already includes rows staged earlier in
+        // this same file.
         let lname = item.name.trim().to_lowercase();
         if !lname.is_empty() {
-            if let Some(first) = seen.get(&lname) {
-                if first != &item.id {
+            if let Some(owner) = working.get(&lname) {
+                if owner != &item.id {
                     item_errors.push(format!("duplicate name: {}", item.name.trim()));
-                }
-            } else {
-                seen.insert(lname.clone(), item.id.clone());
-            }
-            // Duplicate against the store under a DIFFERENT id → reject.
-            for (kid, kname) in &known {
-                if kname.to_lowercase() == lname && kid != &item.id {
-                    item_errors.push(format!("duplicate name: {}", item.name.trim()));
-                    break;
                 }
             }
         }
@@ -319,27 +348,20 @@ pub fn import_rules(
             continue;
         }
 
-        // Warn-but-allow existence checks (CONTEXT D-03).
+        // Warn-but-allow existence checks (CONTEXT D-03) against the snapshot.
         for folder in scope_folders_of(item) {
-            if !cached_folders.iter().any(|n| n == &folder) {
+            if !snap.cached_folders.iter().any(|n| n == &folder) {
                 item_warnings.push(format!("folder not found: {folder}"));
             }
         }
         if item.dest_kind == "folder" {
             let d = item.destination.trim();
-            let cached_display: Vec<String> = conn
-                .prepare("SELECT display_name FROM mailboxes")
-                .and_then(|mut st| {
-                    st.query_map([], |r| r.get::<_, String>(0))?
-                        .collect::<Result<Vec<_>, _>>()
-                })
-                .unwrap_or_default();
-            let known_folder = cached_display.iter().any(|n| n.eq_ignore_ascii_case(d))
-                || cached_folders.iter().any(|n| n.eq_ignore_ascii_case(d));
+            let known_folder = snap.cached_display.iter().any(|n| n.eq_ignore_ascii_case(d))
+                || snap.cached_folders.iter().any(|n| n.eq_ignore_ascii_case(d));
             if !known_folder {
                 item_warnings.push(format!("folder not found: {d}"));
             }
-        } else if !known_category_ids.contains(item.destination.trim()) {
+        } else if !snap.known_category_ids.contains(item.destination.trim()) {
             item_warnings
                 .push(format!("category not found: {}", item.destination.trim()));
         }
@@ -347,21 +369,81 @@ pub fn import_rules(
         warnings.extend(item_warnings);
 
         let row = item_to_row(item)?;
-        if commit {
-            let was_update = queries::upsert_rule_import(conn, &row).map_err(|e| e.to_string())?;
+        // Stage: this id now owns `lname`; a rename frees whatever name
+        // this id previously held (visible to later items in this file).
+        if !lname.is_empty() {
+            working.retain(|_, owner| owner != &item.id);
+            working.insert(lname, item.id.clone());
+        }
+        staged.push(row);
+    }
+
+    // Dry run: counts only, nothing written.
+    if !commit {
+        let known_ids: HashSet<&str> = snap.names.iter().map(|(id, _)| id.as_str()).collect();
+        let (mut imported, mut updated) = (0u32, 0u32);
+        for row in &staged {
+            if known_ids.contains(row.id.as_str()) {
+                updated += 1;
+            } else {
+                imported += 1;
+            }
+        }
+        return Ok(ImportResult { imported, updated, warnings, errors });
+    }
+
+    // Snapshot window #2 (commit transaction): re-verify duplicates against
+    // FRESH store state inside the tx — a concurrent writer may have landed
+    // between the snapshot and now. Any conflict aborts with zero writes
+    // (tx drops uncommitted). Staged ids overwrite their own rows, so a
+    // fresh row owned by an id this import also stages is not a conflict.
+    let mut guard = store.lock().map_err(|e| format!("store lock: {e}"))?;
+    let tx = guard.conn_mut().transaction().map_err(|e| e.to_string())?;
+    {
+        let fresh: Vec<(String, String)> =
+            queries::get_all_rule_names(&tx).map_err(|e| e.to_string())?;
+        let staged_ids: HashSet<&str> = staged.iter().map(|r| r.id.as_str()).collect();
+        for row in &staged {
+            let lname = row.name.to_lowercase();
+            for (fid, fname) in &fresh {
+                if fname.to_lowercase() == lname
+                    && fid != &row.id
+                    && !staged_ids.contains(fid.as_str())
+                {
+                    return Err(format!(
+                        "rule “{}”: duplicate name (store changed during import)",
+                        row.name
+                    ));
+                }
+            }
+        }
+        let mut imported = 0u32;
+        let mut updated = 0u32;
+        for row in &staged {
+            let was_update =
+                queries::upsert_rule_import(&tx, row).map_err(|e| e.to_string())?;
             if was_update {
                 updated += 1;
             } else {
                 imported += 1;
             }
-        } else if known_ids.contains(row.id.as_str()) {
-            updated += 1;
-        } else {
-            imported += 1;
         }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(ImportResult { imported, updated, warnings, errors })
     }
+}
 
-    Ok(ImportResult { imported, updated, warnings, errors })
+/// Short-lived snapshot inputs for import validation (WR-06): read under
+/// one brief lock, then used lock-free for the whole validation pass.
+struct ImportSnapshot {
+    /// `(id, name)` pairs for duplicate detection.
+    names: Vec<(String, String)>,
+    /// Cached folder-tree internal names (`mailboxes.name`).
+    cached_folders: Vec<String>,
+    /// Cached folder-tree display names (`mailboxes.display_name`).
+    cached_display: Vec<String>,
+    /// Known taxonomy category ids.
+    known_category_ids: HashSet<String>,
 }
 
 /// Map serde parse failures to the plan's plain-language vocabulary where
@@ -379,6 +461,15 @@ fn plain_parse_error(e: &serde_json::Error) -> String {
 /// so this always returns `true`; the authoritative enforcement stays in
 /// [`import_rules`]/[`export_rules`] validation. Kept as a function (not
 /// a constant) so a future server-gated revision has one call site.
+///
+/// IN-01: retained (not deleted) — see note below.
+///
+/// NOTE (IN-01): `import_export_available` (this stub) and `folder_known`
+/// (deleted below) had zero non-test callers; the import path inlines its
+/// own snapshot queries. `import_export_available` is KEPT as the single
+/// documented UI-gate call site for a future server-gated revision;
+/// `folder_known` was REMOVED because its exact-match `name` check was
+/// weaker than the inlined display-name-aware check and would rot.
 pub fn import_export_available() -> bool {
     true
 }
@@ -393,34 +484,43 @@ pub fn idle_allowed_from_profile(path: &std::path::Path) -> bool {
 fn read_idle_atom(path: &std::path::Path) -> Option<bool> {
     let text = std::fs::read_to_string(path).ok()?;
     let v: Value = serde_json::from_str(&text).ok()?;
-    v.get("accounts")?
-        .as_array()?
-        .first()?
-        .get("atoms")?
-        .get("IDLE")?
-        .as_bool()
+    let accounts = v.get("accounts")?.as_array()?;
+    // WR-03: consult EVERY account, not just accounts[0]. The watcher may
+    // spawn when any account advertises IDLE; poll-only holds only when no
+    // account carries a `true` atom (absent atom → abstain, fail-closed).
+    let mut any_present = false;
+    let mut any_idle = false;
+    for a in accounts {
+        if let Some(idle) = a
+            .get("atoms")
+            .and_then(|at| at.get("IDLE"))
+            .and_then(|i| i.as_bool())
+        {
+            any_present = true;
+            any_idle = any_idle || idle;
+        }
+    }
+    if any_present {
+        Some(any_idle)
+    } else {
+        None
+    }
 }
 
-/// Default profile location: `SGE_CAPABILITY_PROFILE` wins, else the
-/// repo-relative probe artifact (dev/test). Production Tauri runs from a
-/// bundle dir where the file is absent → `false` (poll-only).
+/// Default profile location: the repo-relative probe artifact (dev/test).
+/// Production Tauri runs from a bundle dir where the file is absent →
+/// `false` (poll-only).
+///
+/// IN-04: `SGE_CAPABILITY_PROFILE` is a dev/test escape hatch only —
+/// honored in debug builds, IGNORED in release/bundled builds, so a
+/// crafted profile file cannot force IDLE spawn via the environment (the
+/// gate chooses whether to open a persistent connection).
 pub fn default_profile_path() -> std::path::PathBuf {
+    #[cfg(debug_assertions)]
     if let Ok(p) = std::env::var("SGE_CAPABILITY_PROFILE") {
         return std::path::PathBuf::from(p);
     }
     std::path::PathBuf::from(".planning/probes/capability-profile.json")
-}
-
-/// Folder-existence helper for warn-but-allow checks (unit-testable).
-pub fn folder_known(conn: &Connection, folder: &str) -> bool {
-    conn.prepare("SELECT name FROM mailboxes")
-        .and_then(|mut st| {
-            st.query_map([], |r| r.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .unwrap_or_default()
-        .iter()
-        .any(|n| n == folder)
 }
 
 #[cfg(test)]
@@ -431,7 +531,7 @@ mod tests {
         Arc::new(Mutex::new(Store::open_in_memory().unwrap()))
     }
 
-    fn seed_rule(conn: &Connection, id: &str, name: &str) {
+    fn seed_rule(conn: &rusqlite::Connection, id: &str, name: &str) {
         conn.execute(
             "INSERT INTO mailboxes (name, uid_validity, uid_next) VALUES ('INBOX', 1, 1)",
             [],
@@ -605,6 +705,66 @@ mod tests {
     }
 
     #[test]
+    fn import_rejects_oversize_and_overcount() {
+        // WR-02: absurd payloads fail BEFORE parsing/locking, loudly.
+        let big = format!("{{\"version\":1,\"rules\":[]}}{}", "x".repeat(MAX_IMPORT_BYTES));
+        let r = import_rules(&test_store(), &big, false);
+        assert!(r.as_ref().is_err_and(|e| e.contains("too large")), "got {r:?}");
+        let many: Vec<String> =
+            (0..MAX_IMPORT_RULES + 1).map(|i| rule_obj(&format!("r-{i}"), &format!("N{i}"), 100)).collect();
+        let crowded = format!("{{\"version\":1,\"rules\":[{}]}}", many.join(","));
+        let r2 = import_rules(&test_store(), &crowded, true);
+        assert!(r2.as_ref().is_err_and(|e| e.contains("too many rules")), "got {r2:?}");
+        // Boundary: exactly MAX_IMPORT_RULES is accepted (dry run).
+        let exact: Vec<String> =
+            (0..MAX_IMPORT_RULES).map(|i| rule_obj(&format!("r-{i}"), &format!("N{i}"), 100)).collect();
+        let ok = format!("{{\"version\":1,\"rules\":[{}]}}", exact.join(","));
+        let r3 = import_rules(&test_store(), &ok, false).unwrap();
+        assert_eq!(r3.imported as usize, MAX_IMPORT_RULES, "got {r3:?}");
+        assert!(r3.errors.is_empty(), "got {:?}", r3.errors);
+    }
+
+    #[test]
+    fn import_same_file_rename_frees_name() {
+        // CR-01 stale-snapshot fix: a rename earlier in the same file frees
+        // its old name — a later item claiming it must NOT be a duplicate.
+        let store = test_store();
+        seed_rule(store.lock().unwrap().conn(), "r-a", "Antigo");
+        let file = format!(
+            "{{\"version\":1,\"rules\":[{}, {}]}}",
+            rule_obj("r-a", "Novo", 100),
+            rule_obj("r-b", "Antigo", 100),
+        );
+        let r = import_rules(&store, &file, true).unwrap();
+        assert!(r.errors.is_empty(), "rename must free the old name: {:?}", r.errors);
+        assert_eq!((r.imported, r.updated), (1, 1), "got {r:?}");
+    }
+
+    #[test]
+    fn import_commit_counts_match_dry_run() {
+        // Validate-all-then-apply: preview counts must equal commit counts
+        // for the same file (no write happens before validation completes).
+        let store = test_store();
+        seed_rule(store.lock().unwrap().conn(), "r-old", "Boletos");
+        let file = format!(
+            "{{\"version\":1,\"rules\":[{}, {}, {}]}}",
+            rule_obj("r-old", "Boletos", 200),
+            rule_obj("r-new", "Nova", 100),
+            rule_obj("r-bad", "", 100),
+        );
+        let preview = import_rules(&store, &file, false).unwrap();
+        assert_eq!((preview.imported, preview.updated), (1, 1), "got {preview:?}");
+        assert_eq!(preview.errors.len(), 1, "got {:?}", preview.errors);
+        let committed = import_rules(&store, &file, true).unwrap();
+        assert_eq!(
+            (committed.imported, committed.updated),
+            (preview.imported, preview.updated),
+            "commit must apply exactly the previewed subset"
+        );
+        assert_eq!(committed.errors, preview.errors);
+    }
+
+    #[test]
     fn import_existing_id_updates_and_bumps_version() {
         let store = test_store();
         seed_rule(store.lock().unwrap().conn(), "r-1", "Boletos");
@@ -664,5 +824,37 @@ mod tests {
         assert!(!idle_allowed_from_profile(dir.join("sge-29-does-not-exist.json").as_path()));
         let _ = std::fs::remove_file(&off);
         let _ = std::fs::remove_file(&on);
+    }
+
+    #[test]
+    fn idle_gate_consults_every_account() {
+        // WR-03: the gate must not read only accounts[0]. A capable second
+        // account allows spawn; all-false refuses; absent atoms abstain
+        // (fail-closed to poll-only).
+        let dir = std::env::temp_dir();
+        let second = dir.join("sge-29-idle-second.json");
+        std::fs::write(
+            &second,
+            r#"{"accounts":[{"atoms":{"IDLE":false}},{"atoms":{"IDLE":true}}]}"#,
+        )
+        .unwrap();
+        assert!(idle_allowed_from_profile(&second));
+        let none = dir.join("sge-29-idle-none.json");
+        std::fs::write(
+            &none,
+            r#"{"accounts":[{"atoms":{"IDLE":false}},{"atoms":{"IDLE":false}}]}"#,
+        )
+        .unwrap();
+        assert!(!idle_allowed_from_profile(&none));
+        let noatoms = dir.join("sge-29-idle-noatoms.json");
+        std::fs::write(&noatoms, r#"{"accounts":[{}]}"#).unwrap();
+        assert!(!idle_allowed_from_profile(&noatoms));
+        let empty = dir.join("sge-29-idle-empty.json");
+        std::fs::write(&empty, r#"{"accounts":[]}"#).unwrap();
+        assert!(!idle_allowed_from_profile(&empty));
+        let _ = std::fs::remove_file(&second);
+        let _ = std::fs::remove_file(&none);
+        let _ = std::fs::remove_file(&noatoms);
+        let _ = std::fs::remove_file(&empty);
     }
 }
