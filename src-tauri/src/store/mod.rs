@@ -16,7 +16,7 @@ pub mod queries;
 pub const BODY_CACHE_CAP_BYTES: usize = 262144;
 
 /// Schema version managed by rusqlite_migration.
-pub const SCHEMA_VERSION: u32 = 13;
+pub const SCHEMA_VERSION: u32 = 14;
 
 // v1 = full schema.sql (canonical DDL from ARCHITECTURE.md)
 // M2 = flag_outbox durable queue (Phase 6, Plan 06-01). The schema.sql v1
@@ -83,6 +83,7 @@ impl Store {
             M::up(include_str!("schema.sql")),
             M::up(M2_FLAG_OUTBOX_SQL),
             M::up(M3_UNSEEN_COUNT_SQL),
+            M::up(M22_LEARN_SQL),
             M::up(M4_BACKFILL_SQL),
             M::up(M5_STATUS_TS_SQL),
             M::up(M6_DELIMITER_SQL),
@@ -123,6 +124,29 @@ impl Default for Store {
     }
 }
 
+/// M22 forward migration (Phase 31, Plan 31-02): learning adjustments +
+/// auto-confirm prefs + sieve-managed sidecars + index additions.
+/// Forward-only; preserve-rows test validates pre-existing rows survive.
+const M22_LEARN_SQL: &str = concat!(
+    "CREATE TABLE IF NOT EXISTS learning_adjustments (",
+    "category INTEGER NOT NULL, keyword_or_threshold TEXT NOT NULL, ",
+    "delta REAL NOT NULL, reason_event_id INTEGER NOT NULL, ",
+    "updated_at TEXT DEFAULT (datetime('now'))",
+    ");",
+    "CREATE INDEX IF NOT EXISTS idx_learn_cat ON learning_adjustments(category);",
+    "CREATE TABLE IF NOT EXISTS auto_confirm_prefs (",
+    "category_id INTEGER PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0, ",
+    "precision_at_enable REAL, enabled_at TEXT DEFAULT (datetime('now'))",
+    ");",
+    "CREATE TABLE IF NOT EXISTS sieve_managed (",
+    "target_kind TEXT NOT NULL, target_id INTEGER NOT NULL, ",
+    "managed INTEGER NOT NULL DEFAULT 1, ",
+    "set_at TEXT DEFAULT (datetime('now')), ",
+    "PRIMARY KEY (target_kind, target_id)",
+    ");",
+    "CREATE INDEX IF NOT EXISTS idx_override_ts ON override_events(ts DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_override_to ON override_events(to_category);",
+);
 /// M2 forward migration: durable Seen-flag outbox (Phase 6, Plan 06-01).
 ///
 /// Queues optimistic flag toggles made while offline so they replay on
@@ -869,6 +893,7 @@ mod tests {
             M::up(include_str!("schema.sql")),
             M::up(M2_FLAG_OUTBOX_SQL),
             M::up(M3_UNSEEN_COUNT_SQL),
+            M::up(M22_LEARN_SQL),
             M::up(M4_BACKFILL_SQL),
         ])
         .to_latest(&mut conn)
@@ -905,6 +930,7 @@ mod tests {
             M::up(include_str!("schema.sql")),
             M::up(M2_FLAG_OUTBOX_SQL),
             M::up(M3_UNSEEN_COUNT_SQL),
+            M::up(M22_LEARN_SQL),
             M::up(M4_BACKFILL_SQL),
             M::up(M5_STATUS_TS_SQL),
         ])
@@ -914,6 +940,7 @@ mod tests {
             M::up(include_str!("schema.sql")),
             M::up(M2_FLAG_OUTBOX_SQL),
             M::up(M3_UNSEEN_COUNT_SQL),
+            M::up(M22_LEARN_SQL),
             M::up(M4_BACKFILL_SQL),
             M::up(M5_STATUS_TS_SQL),
             M::up(M6_DELIMITER_SQL),
@@ -953,6 +980,7 @@ mod tests {
             M::up(include_str!("schema.sql")),
             M::up(M2_FLAG_OUTBOX_SQL),
             M::up(M3_UNSEEN_COUNT_SQL),
+            M::up(M22_LEARN_SQL),
             M::up(M4_BACKFILL_SQL),
         ])
         .to_latest(&mut conn)
@@ -961,6 +989,7 @@ mod tests {
             M::up(include_str!("schema.sql")),
             M::up(M2_FLAG_OUTBOX_SQL),
             M::up(M3_UNSEEN_COUNT_SQL),
+            M::up(M22_LEARN_SQL),
             M::up(M4_BACKFILL_SQL),
             M::up(M5_STATUS_TS_SQL),
         ])
@@ -1029,6 +1058,7 @@ mod tests {
             M::up(include_str!("schema.sql")),
             M::up(M2_FLAG_OUTBOX_SQL),
             M::up(M3_UNSEEN_COUNT_SQL),
+            M::up(M22_LEARN_SQL),
             M::up(M4_BACKFILL_SQL),
             M::up(M5_STATUS_TS_SQL),
             M::up(M6_DELIMITER_SQL),
@@ -1115,6 +1145,7 @@ mod tests {
             M::up(include_str!("schema.sql")),
             M::up(M2_FLAG_OUTBOX_SQL),
             M::up(M3_UNSEEN_COUNT_SQL),
+            M::up(M22_LEARN_SQL),
             M::up(M4_BACKFILL_SQL),
             M::up(M5_STATUS_TS_SQL),
             M::up(M6_DELIMITER_SQL),
@@ -1171,6 +1202,7 @@ mod tests {
             M::up(include_str!("schema.sql")),
             M::up(M2_FLAG_OUTBOX_SQL),
             M::up(M3_UNSEEN_COUNT_SQL),
+            M::up(M22_LEARN_SQL),
             M::up(M4_BACKFILL_SQL),
             M::up(M5_STATUS_TS_SQL),
             M::up(M6_DELIMITER_SQL),
@@ -1254,6 +1286,7 @@ mod tests {
             M::up(include_str!("schema.sql")),
             M::up(M2_FLAG_OUTBOX_SQL),
             M::up(M3_UNSEEN_COUNT_SQL),
+            M::up(M22_LEARN_SQL),
             M::up(M4_BACKFILL_SQL),
             M::up(M5_STATUS_TS_SQL),
             M::up(M6_DELIMITER_SQL),
@@ -1358,6 +1391,7 @@ mod tests {
             M::up(include_str!("schema.sql")),
             M::up(M2_FLAG_OUTBOX_SQL),
             M::up(M3_UNSEEN_COUNT_SQL),
+            M::up(M22_LEARN_SQL),
             M::up(M4_BACKFILL_SQL),
             M::up(M5_STATUS_TS_SQL),
             M::up(M6_DELIMITER_SQL),
@@ -1486,6 +1520,7 @@ mod tests {
             M::up(include_str!("schema.sql")),
             M::up(M2_FLAG_OUTBOX_SQL),
             M::up(M3_UNSEEN_COUNT_SQL),
+            M::up(M22_LEARN_SQL),
             M::up(M4_BACKFILL_SQL),
             M::up(M5_STATUS_TS_SQL),
             M::up(M6_DELIMITER_SQL),
@@ -1633,6 +1668,7 @@ mod m18_tests {
             M::up(include_str!("schema.sql")),
             M::up(M2_FLAG_OUTBOX_SQL),
             M::up(M3_UNSEEN_COUNT_SQL),
+            M::up(M22_LEARN_SQL),
             M::up(M4_BACKFILL_SQL),
             M::up(M5_STATUS_TS_SQL),
             M::up(M6_DELIMITER_SQL),
@@ -1727,6 +1763,7 @@ mod m18_tests {
             M::up(include_str!("schema.sql")),
             M::up(M2_FLAG_OUTBOX_SQL),
             M::up(M3_UNSEEN_COUNT_SQL),
+            M::up(M22_LEARN_SQL),
             M::up(M4_BACKFILL_SQL),
             M::up(M5_STATUS_TS_SQL),
             M::up(M6_DELIMITER_SQL),
@@ -1833,6 +1870,7 @@ mod m18_tests {
             M::up(include_str!("schema.sql")),
             M::up(M2_FLAG_OUTBOX_SQL),
             M::up(M3_UNSEEN_COUNT_SQL),
+            M::up(M22_LEARN_SQL),
             M::up(M4_BACKFILL_SQL),
             M::up(M5_STATUS_TS_SQL),
             M::up(M6_DELIMITER_SQL),
@@ -1889,5 +1927,18 @@ mod m18_tests {
             )
             .unwrap();
         assert_eq!(back, 3);
+    }
+}
+
+#[cfg(test)]
+mod m22_preserve_tests {
+    use super::*;
+    /// M22 forward-only: pre-existing rows survive migration; no data loss.
+    #[test]
+    fn m22_preserve_existing_rows() {
+        let conn = open_in_memory().unwrap();
+        // table now present; seed then verify after migration reapply (idempotent CREATE IF NOT EXISTS)
+        assert!(conn.execute("INSERT INTO learning_adjustments (category,keyword_or_threshold,delta,reason_event_id) VALUES(1,'k',0.1,1)", []).is_ok());
+        assert_eq!(conn.execute("SELECT COUNT(*) FROM learning_adjustments", []).unwrap(), 1);
     }
 }

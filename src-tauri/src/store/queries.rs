@@ -4728,3 +4728,75 @@ mod filter_tests {
         assert!(apply_saved_filter(conn, scoped.id).unwrap().is_empty());
     }
 }
+
+// ══ Phase 31-02 HIST-01 / LEARN-01 shared aggregation (31-02) ══
+
+/// Per-category stats: ONE shared SQL fed to stats UI + CONF-01 + learner.
+/// Precision = confirms / (confirms + overrides); dismiss excluded fully.
+/// Divide-by-zero (zero overrides) => NULL, never NaN.
+#[derive(Debug, Clone, Serialize)]
+pub struct CategoryStatsRow {
+    pub category: String,
+    pub confirms: i64,
+    pub overrides: i64,
+    pub dismisses: i64,
+    pub batch: i64,
+    pub precision: Option<f64>, // NULL when overrides==0
+}
+
+pub fn history_stats(conn: &Connection) -> StoreResult<Vec<CategoryStatsRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT to_category AS category,
+                SUM(CASE WHEN action='confirm' THEN 1 ELSE 0 END) AS confirms,
+                SUM(CASE WHEN action='override' THEN 1 ELSE 0 END) AS overrides,
+                SUM(CASE WHEN action='dismiss' THEN 1 ELSE 0 END) AS dismisses,
+                SUM(CASE WHEN action='batch' THEN 1 ELSE 0 END) AS batch
+         FROM override_events
+         WHERE to_category IS NOT NULL
+         GROUP BY to_category"
+    )?;
+    let rows = stmt.query_map([], |r| {
+        let confirms: i64 = r.get(1)?;
+        let overrides: i64 = r.get(2)?;
+        let precision = if overrides == 0 { None } else {
+            Some(confirms as f64 / (confirms as f64 + overrides as f64))
+        };
+        Ok(CategoryStatsRow {
+            category: r.get(0)?,
+            confirms, overrides, dismisses: r.get(3)?, batch: r.get(4)?,
+            precision,
+        })
+    })?.collect::<Result<Vec<_>,_>>().map_err(super::StoreError::Sql)?;
+    Ok(rows)
+}
+
+/// Read-only newest-first paginated history (redacted: IDs only).
+#[derive(Debug, Clone, Serialize)]
+pub struct HistoryRow {
+    pub id: i64,
+    pub ts: String,
+    pub action: String,
+    pub message_id: String,
+    pub from_category: Option<String>,
+    pub to_category: Option<String>,
+    pub confidence: Option<f64>,
+    pub batch_run_id: Option<String>,
+}
+
+pub fn history_list(conn: &Connection, limit: usize, offset: usize) -> StoreResult<Vec<HistoryRow>> {
+    let sql = concat!(
+        "SELECT id, ts, action, message_id, from_category, to_category, ",
+        "confidence, batch_run_id FROM override_events ",
+        "ORDER BY ts DESC, id DESC LIMIT ?1 OFFSET ?2"
+    );
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(rusqlite::params![limit as i64, offset as i64], |r| {
+        Ok(HistoryRow {
+            id: r.get(0)?, ts: r.get(1)?, action: r.get(2)?,
+            message_id: r.get(3)?, from_category: r.get(4)?,
+            to_category: r.get(5)?, confidence: r.get(6)?,
+            batch_run_id: r.get(7)?,
+        })
+    })?.collect::<Result<Vec<_>,_>>().map_err(super::StoreError::Sql)?;
+    Ok(rows)
+}
