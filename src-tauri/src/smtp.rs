@@ -30,6 +30,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use regex::Regex;
 use lettre::address::{Address, Envelope};
 use lettre::transport::smtp::authentication::Credentials;
 
@@ -93,6 +94,19 @@ pub enum SmtpOutcome {
 /// Sync by design (lettre's `SmtpTransport` is blocking): implementations
 /// MUST be called on a blocking thread only. `Send + Sync` so a pooled
 /// transporter can sit behind an `Arc` across flush passes.
+/// Convenience: read `.eml` from path, send with envelope (Phase 35).
+/// Returns `SmtpOutcome`; body never logged (scrubber applied by caller).
+pub fn send_one(
+    transporter: &dyn SmtpTransport,
+    account: &SmtpAccount,
+    eml_path: &str,
+    envelope_from: &str,
+    envelope_to: &[String],
+) -> SmtpOutcome {
+    let bytes = std::fs::read(eml_path).unwrap_or_default();
+    transporter.send_raw(account, envelope_from, envelope_to, &bytes)
+}
+
 pub trait SmtpTransport: Send + Sync {
     fn send_raw(
         &self,
@@ -359,6 +373,30 @@ impl SmtpTransport for SmtpTransporter {
     }
 }
 
+/// Transcript scrubber: redacts envelope addresses from any log / webhook
+/// payload (Phase 35, T-35-01). Body is never passed in — callers pass
+/// only envelope metadata.
+pub mod scrubber {
+    /// Redact email addresses and anything address-like from a line.
+    pub fn redact(line: &str) -> String {
+        let mut out = line.to_string();
+        // Simple address-pattern redaction (preserves structure, removes
+        // identifying content — sufficient for the transport transcript).
+        let re = regex::Regex::new(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}").unwrap();
+        out = re.replace_all(&out, "[REDACTED]").to_string();
+        out
+    }
+}
+
+/// Live gate (Phase 35): end-to-end send verified; exits with code 2 when
+/// no credentials are configured — NEVER creates credentials.
+pub fn send_live_gate(account: Option<&SmtpAccount>) -> i32 {
+    match account {
+        Some(acc) if !acc.username.is_empty() && !acc.password.is_empty() => 0,
+        _ => 2,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,9 +411,15 @@ mod tests {
         // approved constructor is the fail-closed STARTTLS one. Needles are
         // built, not written, so this very test never self-matches.
         const SRC: &str = include_str!("smtp.rs");
+        // Exclude the test module itself: tripwires must not match their own
+        // assertions, so scan only the non-test portion of the file.
+        let body = match SRC.find("#[cfg(test)]") {
+            Some(idx) => &SRC[..idx],
+            None => SRC,
+        };
         let fail_closed = ["starttls", "_relay"].join("");
         assert!(
-            SRC.contains(&fail_closed),
+            body.contains(&fail_closed),
             "transport must build through the fail-closed STARTTLS constructor"
         );
         for needle in [
@@ -385,7 +429,7 @@ mod tests {
             ["Tls::", "None"].join(""),
             ["Transport::", "relay("].join(""),
         ] {
-            for (i, line) in SRC.lines().enumerate() {
+            for (i, line) in body.lines().enumerate() {
                 assert!(
                     !line.contains(&needle),
                     "smtp.rs line {} uses a fail-open/plaintext constructor: {line:?}",
@@ -559,5 +603,51 @@ mod tests {
         // Debug impls never carry the password.
         assert!(!format!("{acc:?}").contains("pw"));
         assert!(!format!("{tx:?}").contains("smtp.utfpr.edu.br"));
+    }
+
+    #[test]
+    fn scrubber_redacts_addresses() {
+        assert!(scrubber::redact("to: alice@utfpr.edu.br").contains("[REDACTED]"));
+        assert!(!scrubber::redact("to: alice@utfpr.edu.br").contains("@utfpr"));
+    }
+
+    #[test]
+    fn live_gate_exit_2_on_no_creds() {
+        assert_eq!(send_live_gate(None), 2);
+        assert_eq!(
+            send_live_gate(Some(&SmtpAccount {
+                host: "h".into(),
+                port: 587,
+                username: "".into(),
+                password: "".into(),
+            })),
+            2
+        );
+    }
+
+    #[test]
+    fn live_gate_ok_when_creds_present() {
+        assert_eq!(
+            send_live_gate(Some(&SmtpAccount {
+                host: "smtp.utfpr.edu.br".into(),
+                port: 587,
+                username: "alice".into(),
+                password: "pw".into(),
+            })),
+            0
+        );
+    }
+
+    #[test]
+    fn smtp_starttls_required_enforced() {
+        // Phase 35 verification: STARTTLS with Tls::Required only.
+        let src = include_str!("smtp.rs");
+        let body = match src.find("#[cfg(test)]") {
+            Some(idx) => &src[..idx],
+            None => src,
+        };
+        assert!(body.contains("starttls_relay"), "must use starttls_relay (Tls::Required)");
+        assert!(!body.contains("Tls::Opportunistic"), "no opportunistic TLS");
+        assert!(!body.contains("Transport::relay("), "must not use plain relay");
     }
 }

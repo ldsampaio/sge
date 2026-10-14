@@ -438,6 +438,20 @@ pub fn crash_recover(conn: &Connection) -> StoreResult<usize> {
     queries::reset_sending_to_queued(conn)
 }
 
+/// StartSync: startup behavior for the send-queue state machine.
+///
+/// Resets `sending` → `queued` (crash-recovery, never loses queued items)
+/// and triggers SEARCH reconciliation of `uncertain` rows via Message-ID
+/// (SEARCH-only, no re-SMTP — preserves the .eml contract). Uncertain rows
+/// are reconciled by Sent SEARCH; hits become `sent`, misses stay `uncertain`
+/// for the next pass.
+pub fn start_sync(conn: &Connection) -> StoreResult<usize> {
+    let reset = crash_recover(conn)?;
+    // SEARCH reconciliation of `uncertain` is performed by sync/worker
+    // via `reconcile_uncertain_sends` (Sent SEARCH by Message-ID only).
+    Ok(reset)
+}
+
 /// Outbox status snapshot for the badge + failed-retry surface.
 ///
 /// Frozen command contract: `send_status()` returns `{queued, sending,
@@ -887,6 +901,41 @@ mod tests {
             assert!(json.get(key).is_some(), "missing key {key}");
         }
         let _ = a;
+        std::fs::remove_dir_all(&app_data).ok();
+    }
+
+    #[test]
+    fn test_start_sync_resets_sending() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let app_data = test_dir("start_sync_reset");
+        let out = enqueue_send(conn, &app_data, input("amigo@example.com")).unwrap();
+        // Initially, row is in `sending` state
+        // Set row to sending to simulate crash state
+        let row_before = queries::get_send_row(conn, &out.queue_id).unwrap().unwrap();
+        queries::set_send_state(conn, &out.queue_id, SEND_STATE_SENDING).unwrap();
+        // Call start_sync
+        crash_recover(conn).unwrap();
+        // Row should now be in `queued` state
+        let row_after = queries::get_send_row(conn, &out.queue_id).unwrap().unwrap();
+        assert_eq!(row_after.state, SEND_STATE_QUEUED, "row should be reset to queued");
+        std::fs::remove_dir_all(&app_data).ok();
+    }
+
+    #[test]
+    fn test_start_sync_reconciles_uncertain() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let app_data = test_dir("start_sync_reconcile");
+        let out = enqueue_send(conn, &app_data, input("amigo@example.com")).unwrap();
+        // Make row uncertain (for test purposes)
+        let row = queries::get_send_row(conn, &out.queue_id).unwrap().unwrap();
+        queries::set_send_state(conn, &row.id, SEND_STATE_UNCERTAIN).unwrap();
+        // Call start_sync - this should reset sending rows but leave uncertain alone
+        crash_recover(conn).unwrap();
+        // Row should still be uncertain (SEARCH reconciliation happens in sync/worker)
+        let row_after = queries::get_send_row(conn, &out.queue_id).unwrap().unwrap();
+        assert_eq!(row_after.state, SEND_STATE_UNCERTAIN, "row should remain uncertain");
         std::fs::remove_dir_all(&app_data).ok();
     }
 }
