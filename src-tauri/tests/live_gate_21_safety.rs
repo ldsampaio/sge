@@ -105,6 +105,7 @@ impl SyncSession for FakeSession {
                             flags: "[]".to_string(),
                             has_attachments: false,
                             preview: String::new(),
+                            modseq: None,
                         });
                     }
                 }
@@ -298,6 +299,20 @@ impl SyncSession for FakeSession {
                 messages: self.messages.len() as u32,
             })
         })
+    }
+
+    fn select_condstore(
+        &mut self,
+    ) -> sge_lib::imap::PinBox<'_, Result<bool, SyncError>> {
+        Box::pin(async move { Ok(false) })
+    }
+
+    fn condstore_fetch_changedsince<'a>(
+        &'a mut self,
+        _range: &'a str,
+        _modseq: u64,
+    ) -> sge_lib::imap::PinBox<'a, Result<Vec<MessageHeader>, SyncError>> {
+        Box::pin(async move { Ok(Vec::new()) })
     }
 
     fn logout(&mut self) -> sge_lib::imap::PinBox<'_, Result<(), SyncError>> {
@@ -984,10 +999,10 @@ fn live_gate_21_safety_report_covers_steps_and_checklist() {
     assert!(report.contains("REPORT-STEP 10/12 draft-send: FAIL"), "steps:\n{report}");
     assert!(report.contains("REPORT autosave-branch: 1 INBOX UID"), "branch:\n{report}");
     assert!(
-        report.contains("REPORT draft-send binary verdict: FAIL BY DESIGN"),
+        report.contains("REPORT gate=draft-send verdict=SKIP reason=prod-flush-performs-no-delete_draft-local-or-server"),
         "draft verdict:\n{report}"
     );
-    assert!(report.contains("DRAFT-03 GAP"), "gap note:\n{report}");
+    assert!(report.contains("prod-flush-performs-no-delete_draft-local-or-server"), "gap note:\n{report}");
     assert!(report.contains("REPORT-CALLS leg=arrival delta=1 expected=1 ok=true"), "calls:\n{report}");
     for id in ["A-01", "A-02", "A-03", "A-04", "A-05", "A-06", "A-07", "A-08", "A-09"] {
         assert!(report.contains(id), "checklist {id} missing:\n{report}");

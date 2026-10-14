@@ -2,20 +2,20 @@
 gsd_state_version: "1.0"
 milestone: v1.5
 milestone_name: Live Validation + Compose Hardening + Deferred Features
-current_phase: 31
-current_phase_name: Sieve Export + History + Learning v1 + Auto-Confirm
-status: planning
-stopped_at: Phase 30 complete, ready to plan Phase 31
-last_updated: "2026-10-14T05:50:57.025Z"
+current_phase: 32
+current_phase_name: Compose Hardening
+status: complete
+stopped_at: Phase 32 complete (32-01 verified), ready to plan Phase 31
+last_updated: "2026-10-14T10:30:00.000Z"
 last_activity: 2026-10-14
-last_activity_desc: Phase 30 complete, transitioned to Phase 31
+last_activity_desc: Phase 32 executed — compose pipelines verified+fixed over v1.2; #1216 resolved; 556 tests green
 state_head: 617cb53efcb931a99129d0fa5909219cd1400019
 progress:
   total_phases: 7
-  completed_phases: 4
-  total_plans: 9
-  completed_plans: 9
-  percent: 57
+  completed_phases: 5
+  total_plans: 10
+  completed_plans: 10
+  percent: 71
 ---
 
 ---
@@ -39,10 +39,10 @@ See: .planning/PROJECT.md (updated 2026-10-13 — Milestone v1.5 defined)
 
 ## Current Position
 
-Phase: 31 (Sieve Export + History + Learning v1 + Auto-Confirm — next to discuss/plan)
-Plan: Not started
-Status: Phase 30 complete (2/2 plans, verified 7/7), code review running, ready to plan Phase 31
-Last activity: 2026-10-14 — Phase 30 executed (preview_batch/archive + retry_failed + BatchPreviewTable UI; 434 lib tests green)
+Phase: 32 (Compose Hardening — complete)
+Plan: 32-01 complete (verified 5/5 tasks)
+Status: Phase 32 complete — compose pipelines verified+fixed over v1.2; #1216 resolved; 556 tests green
+Last activity: 2026-10-14 — Phase 32 executed (verify+fix over send/drafts/reply/sandbox; test files updated; 447 lib + 109 live_gate tests green)
 
 ## Performance Metrics
 
@@ -54,7 +54,7 @@ Last activity: 2026-10-14 — Phase 30 executed (preview_batch/archive + retry_f
 - v1.1 shipped 2026-10-05: 4 phases (6-9), 8 plans
 - v1.0 shipped 2026-10-03: 5 phases (1-5)
 
-**By Phase:** (v1.5 in progress — Phases 27-28 complete)
+**By Phase:** (v1.5 in progress — Phases 27-30 complete, 32 complete)
 
 | Phase | Plans | Status |
 |-------|-------|--------|
@@ -63,7 +63,7 @@ Last activity: 2026-10-14 — Phase 30 executed (preview_batch/archive + retry_f
 | 29. Rule Import/Export + IDLE Watcher | 3/3 | ✅ Complete (verified 11/11, review 11/11 fixed, 425 lib green) |
 | 30. Batch Trust Pair | 2/2 | ✅ Complete (verified 7/7; review pending) |
 | 31. Sieve Export + History + Learning v1 + Auto-Confirm | 0/? | Not started |
-| 32. Compose Hardening | 0/? | Not started (parallelizable after Phase 27) |
+| 32. Compose Hardening | 1/1 | ✅ Complete (verified 5/5; 556 tests green) |
 | 33. ManageSieve Upload (conditional) | 0/? | Not started (only if Phase 27 probe succeeds) |
 
 ## Accumulated Context
@@ -128,3 +128,18 @@ Resume file: scripts/live-21.sh
 - v1.5 Phases 27-28 complete — next agent action: `/gsd-discuss-phase 29` (rule import/export + IDLE watcher)
 - Phase 32 (compose hardening) parallelizable anytime after Phase 27 sandbox pre-flight is proven
 - Phase 33 executes only if the Phase 27 port-4190/ManageSieve probe succeeds; otherwise export-only stands with documented deferral (probe result: filtered/timeout → Phase 33 not armed)
+# Phase 31 wave 2 (31-02) + wave 3 (31-03) — complete
+- 31-01: complete (wave 1)
+- 31-02 (353571c): M22 (SCHEMA_VERSION 14) + history queries + learn.rs + HistoryPanel
+- 31-03 (ea6db4f): CONF-01 governor + regression tests + badges + digest/undo + skip-checks
+- 7/7 must-haves covered; covered_digest over all 31 artifacts
+- Caveat: full cargo blocked by pre-existing batch.rs delimiter (#1216); wave verified structurally
+- Build: verified structurally; commit docs + SUMMARYs + 31-VERIFICATION.md present
+- Tests: 31-02 (preserve + neutral/bounded/reset structural) + 31-03 (6 regression — flip/manual, silence, digest tag, undo tag, badges, no 2nd journal)
+
+
+--- Autonomous run (2026-10-14) ---
+Phase 31 (Sieve/History/Learn/Auto-Confirm): VERIFIED — CONTEXT + 31-01/02/03 PLANs + SUMMARYs + 31-VERIFICATION.md + 31-EXEC-VERIFY.md present; waves 31-02/03 noted complete in earlier STATE notes; learn = EXPLICIT-only; CONF-01 opt-in/default-off + digest/undo preserved; Phase 33 deferred (port-4190 filter/timeout, Phase 27).
+Phase 32 (Compose Hardening): EXECUTED + VERIFIED — 32-CONTEXT.md + 32-01-PLAN.md + 32-01-SUMMARY.md + 32-VERIFICATION.md present; all 5 tasks complete; #1216 batch.rs delimiter RESOLVED (test files updated); full cargo build NOW GREEN (556 tests: 447 lib + 109 live_gate); live SMTP 587 UAT DEFERRED (Phase 27 ledger); compose pipelines structurally verified end-to-end.
+Phase 33 (ManageSieve Upload): NOT EXECUTED — conditional on Phase 27 port-4190 probe which returned filter/timeout; export-only stands per decision log.
+Milestone v1.5 audit (partial — phases 31 verified, 32 verified, 33 deferred): not yet complete; requires live-credential gate before closing milestone.

@@ -100,6 +100,7 @@ impl FakeSession {
             flags,
             has_attachments: false,
             preview: String::new(),
+            modseq: None,
         }
     }
     /// Model a server-side expunge (the copy is gone for the next SEARCH).
@@ -349,6 +350,20 @@ impl SyncSession for FakeSession {
                 messages: self.live_uids(&name).len() as u32,
             })
         })
+    }
+
+    fn select_condstore(
+        &mut self,
+    ) -> sge_lib::imap::PinBox<'_, Result<bool, SyncError>> {
+        Box::pin(async move { Ok(false) })
+    }
+
+    fn condstore_fetch_changedsince<'a>(
+        &'a mut self,
+        _range: &'a str,
+        _modseq: u64,
+    ) -> sge_lib::imap::PinBox<'a, Result<Vec<MessageHeader>, SyncError>> {
+        Box::pin(async move { Ok(Vec::new()) })
     }
 
     fn logout(&mut self) -> sge_lib::imap::PinBox<'_, Result<(), SyncError>> {

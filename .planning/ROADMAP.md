@@ -350,7 +350,7 @@ Decimal phases appear between their surrounding integers in numeric order. v1.2 
   3. User can reply with correct threading headers (`In-Reply-To`, extended `References`, single `Re:`) and quoted body
   4. User can reply-all honoring Reply-To and excluding own identity — expanded-recipient allowlist enforced on the resolved list
 
-**Plans**: TBD
+**Plans**: 32-01-PLAN.md (verified 5/5 tasks)
 **UI hint**: yes
 
 ### Phase 33 (conditional): ManageSieve Upload
@@ -404,5 +404,5 @@ Decimal phases appear between their surrounding integers in numeric order. v1.2 
 | 29. Rule Import/Export + IDLE Watcher | v1.5 | 3/3 | Complete (425 lib green, verified 11/11, review 11/11 fixed) | 2026-10-14 |
 | 30. Batch Trust Pair | v1.5 | 2/2 | Complete (434 lib green, verified 7/7) | 2026-10-14 |
 | 31. Sieve Export + History + Learning v1 + Auto-Confirm | v1.5 | 0/? | Not started | - |
-| 32. Compose Hardening | v1.5 | 0/? | Not started (parallelizable after Phase 27) | - |
+| 32. Compose Hardening | v1.5 | 1/1 | Complete (verified 5/5; 556 tests green) | 2026-10-14 |
 | 33. ManageSieve Upload (conditional) | v1.5 | 0/? | Not started (only if Phase 27 port-4190 probe succeeds) | - |
