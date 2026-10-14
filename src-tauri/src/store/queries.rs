@@ -2712,7 +2712,7 @@ pub fn upsert_rule_import(conn: &Connection, row: &RuleRow) -> StoreResult<bool>
         .map_err(super::StoreError::Sql)?;
     match existing {
         None => {
-            let mut fresh = RuleRow {
+            let fresh = RuleRow {
                 id: row.id.clone(),
                 name: row.name.clone(),
                 priority: row.priority,
@@ -2728,7 +2728,7 @@ pub fn upsert_rule_import(conn: &Connection, row: &RuleRow) -> StoreResult<bool>
             Ok(false)
         }
         Some(old) => {
-            let mut updated = RuleRow {
+            let updated = RuleRow {
                 id: row.id.clone(),
                 name: row.name.clone(),
                 priority: row.priority,
