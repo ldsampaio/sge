@@ -69,6 +69,13 @@ jobs:
           EOF
           chmod +x binaries/sge-laya-x86_64-unknown-linux-gnu
 
+      # Create sidecar/weights directory for Tauri resources (CI doesn't have the real weights)
+      - name: Create dummy sidecar weights
+        working-directory: src-tauri
+        run: |
+          mkdir -p ../sidecar/weights
+          echo "dummy" > ../sidecar/weights/dummy.txt
+
       - name: Rust tests
         working-directory: src-tauri
         run: cargo test
