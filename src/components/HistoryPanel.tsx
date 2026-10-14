@@ -20,6 +20,8 @@ export const HistoryPanel: React.FC = () => (
       </tbody>
     </table>
     <button onClick={() => window.__SGE_RESET_LEARN?.()}>[Reset learning]</button>
+    <div className="digest-card">Digest card: counts per category · kind:"auto-confirm" · <button>[Undo]</button> (undo_batch)</div>
+    <span className="managed-badge">[Sieve-managed] — auto-confirm unavailable (managed)</span>
   </div>
 );
 

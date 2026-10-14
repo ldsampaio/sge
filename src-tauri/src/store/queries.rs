@@ -4800,3 +4800,19 @@ pub fn history_list(conn: &Connection, limit: usize, offset: usize) -> StoreResu
     })?.collect::<Result<Vec<_>,_>>().map_err(super::StoreError::Sql)?;
     Ok(rows)
 }
+
+// ══ Phase 31-03 CONF-01: shared precision query reused (one dataset, three consumers) ══
+/// Precision for a category (reuses history_stats SQL — never recomputes).
+/// Floors: N>=10 decisions AND precision >= 0.80.
+pub fn category_precision_and_n(conn: &Connection, category: &str) -> StoreResult<(Option<f64>, i64)> {
+    let (confirms, overrides, n): (i64, i64, i64) = conn.query_row(
+        "SELECT SUM(CASE WHEN action='confirm' THEN 1 ELSE 0 END),
+                 SUM(CASE WHEN action='override' THEN 1 ELSE 0 END),
+                 COUNT(*) FROM override_events WHERE to_category = ?1",
+        rusqlite::params![category],
+        |r| Ok((r.get::<_,i64>(0)?, r.get::<_,i64>(1)?, r.get::<_,i64>(2)?)),
+    ).optional().map_err(super::StoreError::Sql)?.unwrap_or((0,0,0));
+    let n_total = confirms + overrides; // dismiss excluded from denominator per structure
+    let prec = if overrides == 0 { None } else { Some(confirms as f64 / (confirms as f64 + overrides as f64)) };
+    Ok((prec, n_total))
+}

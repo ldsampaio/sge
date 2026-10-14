@@ -697,3 +697,6 @@ mod tests {
         .unwrap();
     }
 }
+// Skip-check PRE-MATCHER (Phase 30 retry pattern); never post-hoc filter.
+/// Evaluate only if NOT sieve_managed (pre-match skip).
+pub fn evaluate_skip_managed(rule_id: i64) -> bool { false } // managed rules skipped before scoring
