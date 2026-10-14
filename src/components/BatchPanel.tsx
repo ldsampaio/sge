@@ -206,12 +206,13 @@ export function BatchPanel({ onClose }: BatchPanelProps) {
 
   const undo = async () => {
     if (runId === null) return;
-    const archiveUndo = kindOf(report?.run_id ?? runId) === "archive";
+    const targetRunId = report?.run_id ?? runId;
+    const archiveUndo = kindOf(targetRunId) === "archive";
     if (!window.confirm(archiveUndo ? "Desfazer o arquivamento e restaurar os originais?" : "Desfazer a reorganização e restaurar os originais?")) return;
     try {
-      const n = (await invoke("undo_batch", { runId })) as number;
+      const n = (await invoke("undo_batch", { runId: targetRunId })) as number;
       setMessage(`${n} e-mails restaurados.`);
-      await loadReport(runId);
+      await loadReport(targetRunId);
     } catch (e) {
       setMessage(`Falha ao desfazer: ${e}`);
     }

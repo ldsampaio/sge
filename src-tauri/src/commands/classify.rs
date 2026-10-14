@@ -1420,6 +1420,12 @@ pub async fn batch_classify(
         batch::collect_candidates(guard.conn(), scope.as_deref())?
     };
     if resume_run.is_some() {
+        // Mutual exclusion with retry: an interrupted run with a running
+        // retry must complete before a new resume starts (WR-06).
+        if batch::try_claim_retry(resume_run.unwrap()) {
+            batch::release_retry(resume_run.unwrap());
+            return Err("repetição já em andamento — aguarde a conclusão".to_string());
+        }
         let guard = store.lock().unwrap();
         let done = batch::journaled_ids(guard.conn(), run_id)?;
         candidates.retain(|(mid, _, _)| !done.contains(mid));
@@ -1512,44 +1518,41 @@ pub async fn batch_classify(
                     ready.child_id.as_deref(),
                 );
                 let snap_epoch = epochs.get(&snap_mb).copied().unwrap_or(0);
-                let resolved = {
+                // Unify resolve → wire → journal under one lock (T-30-01):
+                // the MOVE verb takes ONLY this re-resolved pair.
+                let (res, dest_wire) = {
                     let guard = store.lock().unwrap();
-                    match batch::resolve_for_move(
-                        guard.conn(),
-                        mid,
-                        &snap_mb,
-                        snap_uid,
-                        snap_epoch,
+                    let conn = guard.conn();
+                    let res = match batch::resolve_for_move(
+                        conn, mid, &snap_mb, snap_uid, snap_epoch,
                     ) {
                         Ok(r) => r,
                         Err(_) => None,
+                    };
+                    if res.is_none() {
+                        (None, String::new())
+                    } else {
+                        let res = res.unwrap();
+                        let cached = crate::store::queries::list_mailboxes(conn).ok().unwrap_or_default();
+                        let delim = cached.first().map(|r| r.delimiter.clone()).unwrap_or_default();
+                        let w = if delim.is_empty() || delim == "/" {
+                            dest_display.clone()
+                        } else {
+                            let parts: Vec<&str> = dest_display.split('/').collect();
+                            let mut wire = String::new();
+                            for (i, p) in parts.iter().enumerate() {
+                                if i > 0 { wire.push_str(&delim); }
+                                wire.push_str(&crate::imap::mutf7::encode_modified_utf7(p));
+                            }
+                            wire
+                        };
+                        (Some(res), w)
                     }
                 };
-                let Some(res) = resolved else {
+                let Some(res) = res else {
                     stale_dropped += 1;
                     done += 1;
                     continue;
-                };
-                // Resolve wire from the re-resolved folder (delimiter from
-                // cache; leaves encoded like prepare_create_wire does).
-                let dest_wire = {
-                    let guard = store.lock().unwrap();
-                    let conn = guard.conn();
-                    let cached = crate::store::queries::list_mailboxes(conn).ok().unwrap_or_default();
-                    let delim = cached.first().map(|r| r.delimiter.clone()).unwrap_or_default();
-                    if delim.is_empty() {
-                        dest_display.replace('/', "/")
-                    } else {
-                        let parts: Vec<&str> = dest_display.split('/').collect();
-                        let mut w = String::new();
-                        for (i, p) in parts.iter().enumerate() {
-                            if i > 0 {
-                                w.push_str(&delim);
-                            }
-                            w.push_str(&crate::imap::mutf7::encode_modified_utf7(p));
-                        }
-                        w
-                    }
                 };
                 {
                     let guard = store.lock().unwrap();
@@ -1753,6 +1756,15 @@ pub struct RetryReport {
     pub failed_remaining: usize,
 }
 
+/// RAII guard: releases the retry lane when the claim goes out of
+/// scope (panic / cancel) so the lane never wedges (WR-07).
+struct RetryGuard(i64);
+impl Drop for RetryGuard {
+    fn drop(&mut self) {
+        batch::release_retry(self.0);
+    }
+}
+
 /// Retry only the failed items of a finished/interrupted run.
 #[tauri::command]
 pub async fn retry_failed(
@@ -1780,8 +1792,24 @@ pub async fn retry_failed(
             failed_remaining: remaining,
         });
     }
+    let guard = RetryGuard(run_id);
+    // Re-check entry inside execution (undo-to-undone mid-retry guard).
+    {
+        let guard_store = store.lock().unwrap();
+        if let Err(_) = batch::check_retry_entry(guard_store.conn(), run_id) {
+            // State flipped to undone / running / empty — refuse execution.
+            return Ok(RetryReport {
+                run_id,
+                state: "refused".to_string(),
+                retried: 0,
+                moved: 0,
+                skipped: 0,
+                failed_remaining: batch::failed_count(guard_store.conn(), run_id),
+            });
+        }
+    }
     let outcome = retry_failed_inner(&state, &store, run_id, failed).await;
-    batch::release_retry(run_id);
+    drop(guard); // explicit; Drop releases lane
     outcome
 }
 
@@ -1843,12 +1871,12 @@ async fn retry_failed_inner(
     let mut moved = 0usize;
     let mut skipped = 0usize;
     for (item, snap_loc) in snap {
-        retried += 1;
-        // Re-resolve per row in the journal lock section (T-30-01).
-        let resolved = {
+        // Unified lock: resolve, read current, and journal together
+        // (re-resolved pair must not change between resolve and verb).
+        let (resolved, current) = {
             let guard = store.lock().unwrap();
             let conn = guard.conn();
-            match &snap_loc {
+            let resolved = match &snap_loc {
                 Some((folder, uid, epoch)) => {
                     match batch::resolve_for_move(conn, item.message_id, folder, *uid, *epoch) {
                         Ok(r) => r,
@@ -1856,39 +1884,47 @@ async fn retry_failed_inner(
                     }
                 }
                 None => None,
-            }
-        };
-        let current = {
-            let guard = store.lock().unwrap();
-            queries::message_location(guard.conn(), item.message_id).ok().flatten()
+            };
+            let current = queries::message_location(conn, item.message_id).ok().flatten();
+            (resolved, current)
         };
         let Some(res) = resolved else {
             // Stale or vanished — but distinguish "already filed" (the
             // verb fired, the fact journal was lost to a crash): current
             // folder == destination means the move happened.
             if let Some((cur_folder, _)) = current {
-                if cur_folder == item.to_folder {
+                if crate::imap::mutf7::decode_modified_utf7(&cur_folder)
+                    == crate::imap::mutf7::decode_modified_utf7(&item.to_folder) {
                     let guard = store.lock().unwrap();
                     let _ = batch::journal_moved(guard.conn(), run_id, item.message_id);
                     moved += 1;
+                    // Already-filed recovery counts toward moved, not skipped.
+                    continue;
                 }
             }
             skipped += 1;
             continue;
         };
-        if res.from_folder == item.to_folder {
+        // Compare in canonical display domain (both sides decoded from
+        // wire encoding so delimiter / non-ASCII taxonomy names match).
+        let dest_display_decoded = crate::imap::mutf7::decode_modified_utf7(&item.to_folder);
+        let from_folder_decoded = crate::imap::mutf7::decode_modified_utf7(&res.from_folder);
+        if from_folder_decoded == dest_display_decoded {
             // Already at the destination: record the fact, no verb
             // (exactly-once — skip check precedes the verb, T-30-05).
             let guard = store.lock().unwrap();
             let _ = batch::journal_moved(guard.conn(), run_id, item.message_id);
             moved += 1;
-            skipped += 1;
             continue;
         }
+        retried += 1;
         // Fresh failure in its source folder: re-issue the verb with the
         // re-resolved pair (writes re-on for the failed subset ONLY).
         let ok = if is_archive {
-            archive::archive_one(&manager, store, &res.from_folder, res.uid, &item.to_folder, &item.to_folder)
+            archive::archive_one(
+                &manager, store, &res.from_folder, res.uid,
+                &item.to_folder, &crate::imap::mutf7::decode_modified_utf7(&item.to_folder),
+            )
                 .await
                 .is_ok()
         } else {
@@ -1927,23 +1963,31 @@ async fn retry_failed_inner(
     }
     // Report accumulates on the ORIGINAL run (no new run row): merge
     // retry_skipped into totals_json, keep the run state.
+    // Transactional merge: read-modify-write of totals_json inside
+    // BEGIN IMMEDIATE so crash + retry on one interrupted run are
+    // mutually excluded (last-writer-wins eliminated).
     let failed_remaining = {
         let guard = store.lock().unwrap();
         let conn = guard.conn();
-        let totals: String = conn
-            .query_row("SELECT totals_json FROM batch_runs WHERE id = ?1", rusqlite::params![run_id], |r| {
-                r.get(0)
-            })
-            .map_err(|e| e.to_string())?;
-        let mut v: serde_json::Value = serde_json::from_str(&totals).unwrap_or_default();
-        if !v.is_object() {
-            v = serde_json::json!({});
-        }
-        let prev = v.get("retry_skipped").and_then(|n| n.as_u64()).unwrap_or(0) as usize;
-        v["retry_skipped"] = serde_json::json!(prev + skipped);
-        let merged = v.to_string();
-        queries::finish_batch_run(conn, run_id, &run_state, &merged).map_err(|e| e.to_string())?;
-        batch::failed_count(conn, run_id)
+        conn.execute("BEGIN IMMEDIATE", []).map_err(|e| e.to_string())?;
+        let result = (|| -> Result<usize, String> {
+            let totals: String = conn
+                .query_row("SELECT totals_json FROM batch_runs WHERE id = ?1", rusqlite::params![run_id], |r| {
+                    r.get(0)
+                })
+                .map_err(|e| e.to_string())?;
+            let mut v: serde_json::Value = serde_json::from_str(&totals).unwrap_or_default();
+            if !v.is_object() {
+                v = serde_json::json!({});
+            }
+            let prev = v.get("retry_skipped").and_then(|n| n.as_u64()).unwrap_or(0) as usize;
+            v["retry_skipped"] = serde_json::json!(prev + skipped);
+            let merged = v.to_string();
+            queries::finish_batch_run(conn, run_id, &run_state, &merged).map_err(|e| e.to_string())?;
+            Ok(batch::failed_count(conn, run_id))
+        })();
+        let _ = conn.execute("COMMIT", []);
+        result?
     };
     Ok(RetryReport {
         run_id,
@@ -2120,6 +2164,12 @@ pub async fn archive_run(
         }
     };
     if resume_run.is_some() {
+        // Mutual exclusion with retry: an interrupted run with a running
+        // retry must complete before a new resume starts (WR-06).
+        if batch::try_claim_retry(resume_run.unwrap()) {
+            batch::release_retry(resume_run.unwrap());
+            return Err("repetição já em andamento — aguarde a conclusão".to_string());
+        }
         let guard = store.lock().unwrap();
         let done = batch::journaled_ids(guard.conn(), run_id)?;
         jobs.retain(|(mid, _, _, _)| !done.contains(mid));
