@@ -72,6 +72,15 @@ pub struct AppState {
     pub classify_gate: Arc<classify::worker::ClassifyGate>,
     /// Phase 20 cooperative batch-cancel flag (checked per chunk).
     pub batch_cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Phase 29 IDLE watcher slot: `None` in poll-only mode (capability
+    /// gate refused or never started). Holds the watcher handle (snapshot
+    /// polling + cooperative stop) and the task join handle.
+    pub idle: Mutex<
+        Option<(
+            imap::idle::IdleWatcherHandle,
+            tauri::async_runtime::JoinHandle<()>,
+        )>,
+    >,
 }
 
 /// In-memory credentials + server config for the connected session.
@@ -436,6 +445,7 @@ pub fn run() {
         sidecar_child: Mutex::new(None),
         classify_gate: Arc::new(classify::worker::ClassifyGate::default()),
         batch_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        idle: Mutex::new(None),
     };
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -494,6 +504,9 @@ pub fn run() {
             commands::sync::get_draft,
             commands::sync::discard_draft,
             commands::sync::cancel_sync,
+            commands::sync::idle_status,
+            commands::sync::idle_start,
+            commands::sync::idle_stop,
             commands::sync::list_messages,
             commands::sync::list_mailboxes,
             commands::sync::search_messages,
@@ -541,6 +554,8 @@ pub fn run() {
             commands::classify::delete_rule,
             commands::classify::set_rule_enabled,
             commands::classify::set_rule_priority,
+            commands::classify::export_rules,
+            commands::classify::import_rules,
             commands::classify::apply_rules,
             commands::classify::pending_rule_suggestions,
             commands::classify::apply_rules_bulk,

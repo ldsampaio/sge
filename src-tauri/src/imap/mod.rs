@@ -15,6 +15,7 @@
 pub mod bodies;
 pub mod errors;
 pub mod headers;
+pub mod idle;
 pub mod manager;
 pub mod mutf7;
 pub mod probe;

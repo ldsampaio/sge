@@ -1260,6 +1260,93 @@ pub async fn cancel_sync(state: State<'_, crate::AppState>) -> Result<(), String
     Ok(())
 }
 
+// ── Phase 29: IDLE watcher commands (IDLE-01) ─────────────────────
+//
+// `idle_status` is a pure read of the watcher snapshot (safe to poll).
+// `idle_start` capability-gates (Phase-27 profile IDLE atom — refusal
+// means poll-only, never an error the UI must retry) and spawns the
+// manager-independent watcher on a dedicated connection. `idle_stop`
+// asks the loop to quit (DONE on the in-flight IDLE within ~1s) and
+// drops the task handle. Wakeups NEVER sync here: the watcher only sets
+// the `SyncWake` dirty flag and emits `idle-wakeup`; the existing
+// `start_sync` poll entry (gate-enforced) stays the only sync path.
+
+/// Current push state for the sidebar (Push/Polling/Offline/Unavailable).
+#[tauri::command]
+pub async fn idle_status(
+    state: State<'_, crate::AppState>,
+) -> Result<crate::imap::idle::IdleStatus, String> {
+    use crate::classify::rules_io;
+    use crate::imap::idle::{status_of, IdleSnapshot};
+    let capable =
+        rules_io::idle_allowed_from_profile(&rules_io::default_profile_path());
+    let snap = state
+        .idle
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|(handle, _)| handle.snapshot())
+        .unwrap_or_default();
+    Ok(status_of(&snap, capable))
+}
+
+/// Start the IDLE watcher when the capability profile allows it.
+#[tauri::command]
+pub async fn idle_start(
+    state: State<'_, crate::AppState>,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    use crate::classify::rules_io;
+    use crate::imap::idle::spawn_if_allowed;
+    use crate::sync::SyncWake;
+    use tauri::Emitter;
+    if state.idle.lock().unwrap().is_some() {
+        return Ok("already running".to_string());
+    }
+    let profile = rules_io::default_profile_path();
+    if !rules_io::idle_allowed_from_profile(&profile) {
+        return Err(
+            "push indisponível no servidor — verificação automática (poll)".to_string(),
+        );
+    }
+    let account_cfg = load_account_config(state.clone()).await?;
+    let wake = Arc::new(SyncWake::new(state.sync_gate.clone()));
+    let app_h = app.clone();
+    let on_wake: Arc<dyn Fn() + Send + Sync> =
+        Arc::new(move || {
+            let _ = app_h.emit("idle-wakeup", ());
+        });
+    match spawn_if_allowed(account_cfg, wake, &profile, on_wake) {
+        Some((handle, join)) => {
+            *state.idle.lock().unwrap() = Some((handle, join));
+            eprintln!("[SGE idle] watcher started (dedicated connection)");
+            Ok("started".to_string())
+        }
+        None => Err(
+            "push indisponível no servidor — verificação automática (poll)".to_string(),
+        ),
+    }
+}
+
+/// Stop the IDLE watcher (DONE on the in-flight IDLE, then join abort).
+#[tauri::command]
+pub async fn idle_stop(state: State<'_, crate::AppState>) -> Result<(), String> {
+    // Take the slot under a short lock — never held across `.await`
+    // (the future must stay `Send`).
+    let taken = state.idle.lock().unwrap().take();
+    if let Some((handle, join)) = taken {
+        handle.stop();
+        // Give the loop ~1.5s to send DONE cooperatively (the live wait
+        // polls the stop flag every 1s); then abort — the server reclaims
+        // the half-open IDLE on its own timeout. No duplicate sync can
+        // result: wakeups only ever set the advisory dirty flag.
+        async_std::task::sleep(std::time::Duration::from_millis(1500)).await;
+        join.abort();
+        eprintln!("[SGE idle] watcher stopped");
+    }
+    Ok(())
+}
+
 /// Discover server folders and return cached per-folder triage rows (FOLD-01/02).
 ///
 /// Thin wrapper over [`refresh_mailbox_tree`]: `LIST "" "*"` via the
@@ -2182,6 +2269,49 @@ mod tests {
         map_create_error, map_folder_error, pending_depth, prepare_create_wire,
         DeleteDecision,
     };
+
+    /// `idle_status` command contract (IDLE-01 UI surface): with no
+    /// watcher spawned the snapshot defaults to Stopped — Offline when
+    /// the server is IDLE-capable, Polling when the gate refused.
+    /// (The Tauri `State` wrapper is thin plumbing over this mapping,
+    /// covered by `status_of` + the AppState default below.)
+    #[test]
+    fn idle_status_command() {
+        use crate::imap::idle::{status_of, IdleSnapshot};
+        let stopped = IdleSnapshot::default();
+        assert_eq!(stopped.state, crate::imap::idle::IdleState::Stopped);
+        let capable = status_of(&stopped, true);
+        assert_eq!(capable.status, "Offline");
+        let poll_only = status_of(&stopped, false);
+        assert_eq!(poll_only.status, "Polling");
+        // A spawned watcher idling reports Push; the gate still wins.
+        let mut idling = IdleSnapshot::default();
+        idling.state = crate::imap::idle::IdleState::Idling;
+        assert_eq!(status_of(&idling, true).status, "Push");
+        assert_eq!(status_of(&idling, false).status, "Polling");
+    }
+
+    /// Fresh `AppState` carries no watcher: first `idle_status` read is
+    /// Offline/Polling, never a phantom Push.
+    #[test]
+    fn app_state_starts_without_idle_watcher() {
+        use std::sync::{Arc, Mutex};
+        let state = crate::AppState {
+            store: Arc::new(Mutex::new(Store::open_in_memory().unwrap())),
+            active_account: Mutex::new(None),
+            session_manager: Mutex::new(None),
+            sync_gate: Arc::new(crate::sync::SyncGate::default()),
+            sync_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            trash_cache: Mutex::new(std::collections::HashMap::new()),
+            app_data: std::env::temp_dir().join("sge-29-idle-test"),
+            sidecar: Mutex::new(None),
+            sidecar_child: Mutex::new(None),
+            classify_gate: Arc::new(crate::classify::worker::ClassifyGate::default()),
+            batch_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            idle: Mutex::new(None),
+        };
+        assert!(state.idle.lock().unwrap().is_none());
+    }
 
     /// Verify the list_messages + search_messages query path against an
     /// in-memory store (same pattern as queries.rs tests but exercising

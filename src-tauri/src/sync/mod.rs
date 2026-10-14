@@ -128,6 +128,73 @@ impl Drop for SyncGuard<'_> {
     }
 }
 
+/// Advisory IDLE wakeup (Phase 29, IDLE-01).
+///
+/// The [`IdleWatcher`](crate::imap::idle::IdleWatcher) owns a dedicated
+/// read-only connection and must NEVER call sync directly: it signals
+/// through `request_sync`, and whoever drains (`dispatch`) still goes
+/// through [`SyncGate::try_begin`] — skip-if-busy, coalesced. A burst of
+/// EXISTS/RECENT untagged responses collapses to one pending wakeup
+/// (`dirty` flag); a dispatch that finds the gate busy leaves the flag
+/// set for the next idle moment instead of queueing work.
+pub struct SyncWake {
+    gate: Arc<SyncGate>,
+    dirty: std::sync::atomic::AtomicBool,
+    requests: std::sync::atomic::AtomicU64,
+    dispatched: std::sync::atomic::AtomicU64,
+}
+
+impl SyncWake {
+    pub fn new(gate: Arc<SyncGate>) -> Self {
+        Self {
+            gate,
+            dirty: std::sync::atomic::AtomicBool::new(false),
+            requests: std::sync::atomic::AtomicU64::new(0),
+            dispatched: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Advisory wakeup from the IDLE loop. Cheap, infallible, coalescing:
+    /// any number of calls before the next dispatch equal one pending sync.
+    pub fn request_sync(&self) {
+        self.requests
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.dirty.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// A wakeup is pending (set by `request_sync`, cleared by a
+    /// successful `dispatch`).
+    pub fn pending(&self) -> bool {
+        self.dirty.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Try to turn a pending wakeup into a pass. Returns `true` only when
+    /// the flag was set AND the gate opened — the caller then runs exactly
+    /// one sync pass and must let the returned guard drop at pass end.
+    /// A busy gate returns `false` with the flag INTACT (coalesced retry
+    /// later, never a queue, never an overlap).
+    pub fn dispatch(&self) -> Option<SyncGuard<'_>> {
+        if !self.dirty.load(std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
+        let guard = self.gate.try_begin()?;
+        self.dirty.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.dispatched
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Some(guard)
+    }
+
+    /// Total `request_sync` calls (diagnostics only — bursts are expected).
+    pub fn request_count(&self) -> u64 {
+        self.requests.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Passes actually opened through the gate.
+    pub fn dispatch_count(&self) -> u64 {
+        self.dispatched.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,6 +224,48 @@ mod tests {
             gate.try_begin().is_some(),
             "tick 3 after pass end must proceed"
         );
+    }
+
+    /// EXISTS bursts coalesce: N rapid `request_sync` calls open exactly
+    /// one pass through the gate.
+    #[test]
+    fn wake_burst_coalesces_to_single_dispatch() {
+        let gate = Arc::new(SyncGate::default());
+        let wake = SyncWake::new(gate);
+        for _ in 0..5 {
+            wake.request_sync();
+        }
+        assert!(wake.pending());
+        assert_eq!(wake.request_count(), 5);
+        let _pass = wake.dispatch().expect("one pass opens");
+        assert!(!wake.pending(), "dispatch clears the flag");
+        assert!(wake.dispatch().is_none(), "no second pass without new mail");
+        assert_eq!(wake.dispatch_count(), 1);
+    }
+
+    /// A busy gate keeps the wakeup pending — no queue, no overlap, the
+    /// next idle drain retries.
+    #[test]
+    fn wake_busy_gate_keeps_dirty_flag() {
+        let gate = Arc::new(SyncGate::default());
+        let wake = SyncWake::new(gate.clone());
+        wake.request_sync();
+        let _held = gate.try_begin().expect("hold the gate (a sync is running)");
+        assert!(wake.dispatch().is_none(), "busy gate must not open");
+        assert!(wake.pending(), "wakeup stays pending for later");
+        drop(_held);
+        assert!(wake.dispatch().is_some(), "freed gate dispatches");
+        assert!(!wake.pending());
+    }
+
+    /// No wakeup, no pass: idle loops with no mail never touch the gate.
+    #[test]
+    fn wake_quiet_idle_never_dispatches() {
+        let gate = Arc::new(SyncGate::default());
+        let wake = SyncWake::new(gate);
+        assert!(!wake.pending());
+        assert!(wake.dispatch().is_none());
+        assert_eq!(wake.dispatch_count(), 0);
     }
 }
 
