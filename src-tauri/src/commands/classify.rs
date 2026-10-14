@@ -3537,3 +3537,70 @@ mod rule_bulk_tests {
         queries::finish_batch_run(conn, run, "done", r#"{"kind":"rule-bulk"}"#).unwrap();
     }
 }
+
+#[cfg(test)]
+mod import_export_ui_flow_tests {
+    //! Backend half of the RulesPanel import/export flow (29-03): the
+    //! exact call sequence the UI drives — export → dry-run preview →
+    //! accept (commit) / reject (discard) → list refresh.
+    use std::sync::{Arc, Mutex};
+
+    use crate::classify::rules_io;
+    use crate::store::queries;
+    use crate::store::Store;
+
+    fn ui_store() -> Arc<Mutex<Store>> {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .conn()
+            .execute(
+                "INSERT INTO mailboxes (name, uid_validity, uid_next) VALUES ('INBOX', 1, 1)",
+                [],
+            )
+            .unwrap();
+        Arc::new(Mutex::new(store))
+    }
+
+    #[test]
+    fn import_export_ui_flow() {
+        let store = ui_store();
+        // 1. Export of an empty store: valid envelope, zero rules.
+        let empty = rules_io::export_rules(&store).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&empty).unwrap();
+        assert_eq!(v["version"], 1);
+        assert_eq!(v["rules"].as_array().unwrap().len(), 0);
+
+        // 2. Import an invalid file → preview shows errors, Accept would
+        // commit nothing ( UI disables Accept on errors).
+        let bad = r#"{"version":1,"rules":[{"id":"r-bad","name":"system","priority":0,"conditions_json":[],"dest_kind":"folder","destination":"Arquivo","scope_json":[],"enabled":true}]}"#;
+        let preview = rules_io::import_rules(&store, bad, false).unwrap();
+        assert!(!preview.errors.is_empty(), "preview must surface errors");
+        assert_eq!(preview.imported, 0);
+        // Reject path: nothing written (dry run never writes).
+        let n: i64 = store
+            .lock()
+            .unwrap()
+            .conn()
+            .query_row("SELECT COUNT(*) FROM folder_rules", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+
+        // 3. Valid file with a warning (unknown folder) → preview shows
+        // the warning, Accept stays enabled, commit imports with notice.
+        let good = r#"{"version":1,"rules":[{"id":"r-1","name":"Boletos","priority":100,"conditions_json":{"sender_domain":"utfpr.edu.br"},"dest_kind":"folder","destination":"PastaNova","scope_json":[],"enabled":true}]}"#;
+        let preview2 = rules_io::import_rules(&store, good, false).unwrap();
+        assert!(preview2.errors.is_empty(), "got {:?}", preview2.errors);
+        assert!(preview2.warnings.iter().any(|w| w.contains("folder not found")));
+        assert_eq!(preview2.imported, 1);
+        let committed = rules_io::import_rules(&store, good, true).unwrap();
+        assert_eq!((committed.imported, committed.updated), (1, 0));
+
+        // 4. List refresh shows the rule; export round-trips it.
+        let rows = queries::list_rules(store.lock().unwrap().conn()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "Boletos");
+        let re = rules_io::export_rules(&store).unwrap();
+        let committed2 = rules_io::import_rules(&store, &re, true).unwrap();
+        assert_eq!((committed2.imported, committed2.updated), (0, 1));
+    }
+}

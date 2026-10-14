@@ -220,8 +220,18 @@ export default function SyncStatus({ onSyncComplete, mailbox = "INBOX", mailboxe
         void requestSync("poll");
       }
     }, POLL_INTERVAL_MS);
+    // Phase 29 IDLE push: the watcher's advisory wakeup funnels through
+    // the SAME entry (backend SyncGate skips when busy, coalescing bursts
+    // into at most one extra pass — never a direct sync call).
+    const onIdleWake = () => {
+      if (!syncingRef.current) {
+        void requestSync("poll");
+      }
+    };
+    window.addEventListener("sge-idle-wakeup", onIdleWake);
     return () => {
       window.clearInterval(timer);
+      window.removeEventListener("sge-idle-wakeup", onIdleWake);
       if (retryTimerRef.current !== null) {
         window.clearTimeout(retryTimerRef.current);
       }

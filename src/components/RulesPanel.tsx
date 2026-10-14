@@ -43,6 +43,18 @@ interface RuleProgress {
   state: string;
 }
 
+/** Phase 29 rule portability (IMP-01): backend validation preview.
+ * The frontend never validates — this renders `import_rules`
+ * (commit=false) verbatim; Accept commits, Reject discards. */
+interface ImportPreview {
+  fileName: string;
+  json: string;
+  imported: number;
+  updated: number;
+  warnings: string[];
+  errors: string[];
+}
+
 interface RulesPanelProps {
   onClose: () => void;
 }
@@ -72,6 +84,10 @@ export function RulesPanel({ onClose }: RulesPanelProps) {
   const [progress, setProgress] = React.useState<RuleProgress | null>(null);
   const [lastRun, setLastRun] = React.useState<number | null>(null);
   const [thinResult, setThinResult] = React.useState<string | null>(null);
+  /** Phase 29: import validation preview (null = no import in flight). */
+  const [preview, setPreview] = React.useState<ImportPreview | null>(null);
+  const [portBusy, setPortBusy] = React.useState(false);
+  const fileRef = React.useRef<HTMLInputElement | null>(null);
 
   const reload = React.useCallback(async () => {
     try {
@@ -253,6 +269,84 @@ export function RulesPanel({ onClose }: RulesPanelProps) {
   const destLabel = (r: RuleView) =>
     r.destination.kind === "folder" ? r.destination.display : `categoria ${r.destination.id}`;
 
+  /** Phase 29: export all rules as versioned JSON download. */
+  const doExport = async () => {
+    setBusy(true);
+    setMessage(null);
+    try {
+      const json = (await invoke("export_rules")) as string;
+      const blob = new Blob([json], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      a.href = url;
+      a.download = `regras-${stamp}.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      const count = (rules ?? []).length;
+      setMessage(`${count} regra(s) exportada(s).`);
+    } catch (e) {
+      setMessage(`Falha ao exportar: ${e}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** Phase 29: file picked → backend dry-run validation → preview modal. */
+  const onFilePicked = async (file: File) => {
+    setPortBusy(true);
+    setMessage(null);
+    try {
+      const text = await file.text();
+      // May throw on malformed JSON — surface as a preview-level error.
+      let result: Omit<ImportPreview, "fileName" | "json">;
+      try {
+        result = (await invoke("import_rules", { json: text, commit: false })) as Omit<
+          ImportPreview,
+          "fileName" | "json"
+        >;
+      } catch (e) {
+        setPreview({
+          fileName: file.name,
+          json: text,
+          imported: 0,
+          updated: 0,
+          warnings: [],
+          errors: [`arquivo inválido: ${e}`],
+        });
+        return;
+      }
+      setPreview({ fileName: file.name, json: text, ...result });
+    } finally {
+      setPortBusy(false);
+      if (fileRef.current) fileRef.current.value = "";
+    }
+  };
+
+  /** Phase 29: Accept commits the valid subset; Reject discards everything. */
+  const acceptImport = async () => {
+    if (!preview || preview.errors.length > 0) return;
+    setPortBusy(true);
+    try {
+      const result = (await invoke("import_rules", {
+        json: preview.json,
+        commit: true,
+      })) as Omit<ImportPreview, "fileName" | "json">;
+      setMessage(
+        `${result.imported} importada(s), ${result.updated} atualizada(s)` +
+          (result.warnings.length > 0 ? `, ${result.warnings.length} aviso(s).` : "."),
+      );
+      setPreview(null);
+      await reload();
+    } catch (e) {
+      setMessage(`Falha ao importar: ${e}`);
+    } finally {
+      setPortBusy(false);
+    }
+  };
+
   return (
     <div
       role="dialog"
@@ -284,7 +378,8 @@ export function RulesPanel({ onClose }: RulesPanelProps) {
         <h2 style={{ marginTop: 0 }}>Regras de arquivamento</h2>
         <p style={{ color: "#94a3b8", fontSize: "0.85rem" }}>
           Destinos determinísticos avaliados após cada sync — nada se move sem confirmar.
-          Sem importação/exportação (a portabilidade é o JSON da taxonomia).
+          Leve suas regras entre máquinas: exporte o JSON versionado e importe com
+          pré-visualização de validação.
         </p>
         {message && (
           <div role="status" style={{ color: "#eab308", marginBottom: 8 }}>
@@ -363,6 +458,30 @@ export function RulesPanel({ onClose }: RulesPanelProps) {
               Desfazer lote
             </button>
           )}
+          {/* Phase 29 portability: export downloads versioned JSON;
+              import opens a picker → backend dry-run → preview modal. */}
+          <button type="button" className="btn btn-small" disabled={busy} onClick={() => void doExport()}>
+            Exportar regras
+          </button>
+          <button
+            type="button"
+            className="btn btn-small"
+            disabled={busy || portBusy}
+            onClick={() => fileRef.current?.click()}
+          >
+            Importar regras
+          </button>
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".json,application/json"
+            style={{ display: "none" }}
+            aria-label="Escolher arquivo JSON de regras"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) void onFilePicked(f);
+            }}
+          />
         </div>
         {thinResult && (
           <p style={{ color: "#94a3b8", fontSize: "0.85rem" }}>{thinResult}</p>
@@ -508,6 +627,94 @@ export function RulesPanel({ onClose }: RulesPanelProps) {
             Fechar
           </button>
         </div>
+        {/* Phase 29 import validation preview: backend ImportResult
+            verbatim — errors red, warnings amber, Accept commits the valid
+            subset (disabled while errors exist), Reject discards all. */}
+        {preview && (
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Pré-visualização da importação"
+            style={{
+              position: "fixed",
+              inset: 0,
+              background: "rgba(0,0,0,0.6)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              zIndex: 70,
+            }}
+            onClick={() => setPreview(null)}
+          >
+            <div
+              style={{
+                background: "var(--color-bg, #0f172a)",
+                borderRadius: 12,
+                padding: 20,
+                minWidth: 420,
+                maxWidth: 600,
+                maxHeight: "80vh",
+                overflow: "auto",
+              }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <h3 style={{ marginTop: 0 }}>Importar de {preview.fileName}</h3>
+              <p style={{ color: "#94a3b8", fontSize: "0.85rem" }} role="status">
+                {preview.imported} nova(s), {preview.updated} atualizada(s)
+                {preview.warnings.length > 0 && `, ${preview.warnings.length} aviso(s)`}
+                {preview.errors.length > 0 && `, ${preview.errors.length} erro(s)`}.
+              </p>
+              {preview.errors.length > 0 && (
+                <div style={{ marginBottom: 8 }}>
+                  <strong style={{ color: "#f87171" }}>Erros (estas regras serão ignoradas)</strong>
+                  <ul style={{ color: "#fca5a5", fontSize: "0.85rem" }}>
+                    {preview.errors.map((e, i) => (
+                      <li key={i}>{e}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {preview.warnings.length > 0 && (
+                <div style={{ marginBottom: 8 }}>
+                  <strong style={{ color: "#fbbf24" }}>Avisos (importa mesmo assim)</strong>
+                  <ul style={{ color: "#fcd34d", fontSize: "0.85rem" }}>
+                    {preview.warnings.map((w, i) => (
+                      <li key={i}>{w}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {preview.errors.length === 0 && preview.imported === 0 && preview.updated === 0 && (
+                <p style={{ color: "#94a3b8", fontSize: "0.85rem" }}>
+                  Nada a importar — o arquivo não traz regras novas.
+                </p>
+              )}
+              <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+                <button
+                  type="button"
+                  className="btn btn-small"
+                  disabled={portBusy || preview.errors.length > 0}
+                  title={
+                    preview.errors.length > 0
+                      ? "Corrija os erros no arquivo para aceitar"
+                      : "Confirmar importação"
+                  }
+                  onClick={() => void acceptImport()}
+                >
+                  Aceitar
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-small"
+                  disabled={portBusy}
+                  onClick={() => setPreview(null)}
+                >
+                  Rejeitar
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

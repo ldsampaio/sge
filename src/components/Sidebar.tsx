@@ -9,6 +9,7 @@ import { TaxonomyEditor } from "./TaxonomyEditor";
 import { RulesPanel } from "./RulesPanel";
 import { BatchPanel } from "./BatchPanel";
 import { ArchivePanel } from "./ArchivePanel";
+import { useIdleStatus } from "../hooks/useIdleStatus";
 import { IconBook, IconFolderPlus, IconInbox, IconMail, IconMove, IconTrash } from "./icons";
 import type { MailboxRow } from "../types";
 
@@ -149,6 +150,8 @@ export default function Sidebar({
   const [batchOpen, setBatchOpen] = useState(false);
   /** Phase 24 archive panel modal (rule editor + manual run). */
   const [archiveOpen, setArchiveOpen] = useState(false);
+  /** Phase 29 IDLE push status (honest Push/Polling/Offline). */
+  const push = useIdleStatus();
 
   useEffect(() => {
     let alive = true;
@@ -259,6 +262,35 @@ export default function Sidebar({
     <nav className="sidebar" aria-label="Trilha de estudos">
       <div className="sidebar-head">
         <h3>Minha trilha</h3>
+        {/* Phase 29: honest push status from the IdleWatcher (Push when
+            idling, Polling when IDLE-gated/reconnecting, Offline stopped).
+            Visual only — sync still flows through the single poll entry. */}
+        <span
+          className="sidebar-push"
+          role="status"
+          title={push.tooltip}
+          aria-label={`Estado da entrega: ${push.label}`}
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 6,
+            fontSize: "0.75rem",
+            color: "#94a3b8",
+            marginTop: 4,
+          }}
+        >
+          <span
+            aria-hidden="true"
+            style={{
+              width: 8,
+              height: 8,
+              borderRadius: "50%",
+              background: push.color,
+              display: "inline-block",
+            }}
+          />
+          {push.label}
+        </span>
       </div>
       <ul className="sidebar-list">
         {showMailboxItems ? (
