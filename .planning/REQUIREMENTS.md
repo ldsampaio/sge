@@ -17,7 +17,7 @@
 
 ### Sync Upgrades (capability-gated, poll stays fallback)
 
-- [ ] **IDLE-01**: User receives new INBOX mail via IDLE push through a manager-owned watcher connection with advisory wakeups funneled through SyncGate; poll remains as fallback + multi-folder sweeper
+- [x] **IDLE-01**: User receives new INBOX mail via IDLE push through a manager-owned watcher connection with advisory wakeups funneled through SyncGate; poll remains as fallback + multi-folder sweeper
 - [ ] **SYNC-01**: User's reconnects resync fast via CONDSTORE (MODSEQ deltas, UIDVALIDITY-scoped highestmodseq); UID range-diff remains as fallback
 
 ### Classifier Trust
@@ -25,7 +25,7 @@
 - [ ] **HIST-01**: User can browse override history with per-category stats (the dataset future learning consumes)
 - [ ] **LEARN-01**: App adapts keyword weights + confidence thresholds from explicit override signals only (no fine-tuning, no silence-as-approval)
 - [ ] **CONF-01**: User can enable per-category auto-confirm on earned precision with visible precision display and auto-disengage on override
-- [ ] **IMP-01**: User can import/export smart-folder rules as validated JSON (no empty patterns, no reserved names)
+- [x] **IMP-01**: User can import/export smart-folder rules as validated JSON (no empty patterns, no reserved names)
 
 ### Batch Trust (one run record)
 
@@ -74,8 +74,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 | UAT-01 | Phase 27 | Pending |
 | UAT-02 | Phase 27 | Pending |
 | SYNC-01 | Phase 28 | Pending |
-| IMP-01 | Phase 29 | Pending |
-| IDLE-01 | Phase 29 | Pending |
+| IMP-01 | Phase 29 | Complete |
+| IDLE-01 | Phase 29 | Complete |
 | BATCH-03 | Phase 30 | Pending |
 | BATCH-04 | Phase 30 | Pending |
 | SIEVE-01 | Phase 31 | Pending |
@@ -89,6 +89,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | SIEVE-02 | Phase 33 (conditional — only if Phase 27 port-4190 probe succeeds) | Pending |
 
 **Coverage:**
+
 - v1.5 requirements: 18 total
 - Mapped to phases: 18
 - Unmapped: 0

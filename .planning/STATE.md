@@ -2,15 +2,20 @@
 gsd_state_version: "1.0"
 milestone: v1.5
 milestone_name: Live Validation + Compose Hardening + Deferred Features
-status: executing
-last_updated: "2026-10-13T23:55:00.000Z"
-last_activity: 2026-10-13
+current_phase: 30
+current_phase_name: Batch Trust Pair
+status: planning
+stopped_at: Phase 29 complete, ready to plan Phase 30
+last_updated: "2026-10-14T05:37:11.632Z"
+last_activity: 2026-10-14
+last_activity_desc: Phase 29 complete (3/3 plans, verified 11/11, review 11/11 fixed), transitioned to Phase 30
+state_head: d27cf6ff6ab34f52109936ba2a9069c1b69845c7
 progress:
   total_phases: 7
-  completed_phases: 2
+  completed_phases: 3
   total_plans: 7
   completed_plans: 7
-  percent: 29
+  percent: 43
 ---
 
 ---
@@ -21,7 +26,7 @@ progress:
 See: .planning/PROJECT.md (updated 2026-10-13 — Milestone v1.5 defined)
 
 **Core value:** Connect to an IMAP server on Linux and read your mail locally in a fast Gmail-like UI.
-**Current focus:** v1.5 roadmap complete (Phases 27–33) — next: discuss/plan Phase 27
+**Current focus:** v1.5 roadmap (Phases 27–29 complete) — next: discuss/plan Phase 30
 
 ## Milestone Status
 
@@ -34,10 +39,10 @@ See: .planning/PROJECT.md (updated 2026-10-13 — Milestone v1.5 defined)
 
 ## Current Position
 
-Phase: 29 (Rule Import/Export + IDLE Watcher — next to discuss/plan)
-Plan: —
-Status: Phase 28 complete (5/5 plans, verification PASSED), awaiting Phase 29 planning
-Last activity: 2026-10-13 — Phase 28 executed (5 plans, verification passed)
+Phase: 30 (Batch Trust Pair — next to discuss/plan)
+Plan: Not started
+Status: Phase 29 complete (3/3 plans, verified 11/11, review 11/11 fixed), ready to plan Phase 30
+Last activity: 2026-10-14 — Phase 29 executed (rules_io + IdleWatcher + RulesPanel UI; 425 lib tests green)
 
 ## Performance Metrics
 
@@ -54,8 +59,8 @@ Last activity: 2026-10-13 — Phase 28 executed (5 plans, verification passed)
 | Phase | Plans | Status |
 |-------|-------|--------|
 | 27. Live-Validation Gate + Capability Probes | 2/2 | ✅ Complete (verified 9/9) |
-| 28. Override-Event Log + CONDSTORE Fast Path | 5/5 | ✅ Complete (verified) |
-| 29. Rule Import/Export + IDLE Watcher | 0/? | Not started |
+| 28. Override-Event Log + CONDSTORE Fast Path | 2/2 | ✅ Complete (verified) |
+| 29. Rule Import/Export + IDLE Watcher | 3/3 | ✅ Complete (verified 11/11, review 11/11 fixed, 425 lib green) |
 | 30. Batch Trust Pair | 0/? | Not started |
 | 31. Sieve Export + History + Learning v1 + Auto-Confirm | 0/? | Not started |
 | 32. Compose Hardening | 0/? | Not started (parallelizable after Phase 27) |
@@ -79,7 +84,7 @@ Decisions are logged in PROJECT.md Key Decisions table. v1.5 structural decision
 
 ### Pending Todos
 
-- v1.5: discuss/plan Phase 29 (rule import/export + IDLE watcher) — CONDSTORE fast path complete, capability profile available
+- v1.5 Phases 27-29 complete — next agent action: `/gsd-discuss-phase 30` (batch trust pair: dry-run preview + retry-only-failures)
 - Validate live when convenient: `/gsd-verify-work 6/7/8` (v1.1) + `/gsd-verify-work 12/13` (v1.2) — folded into Phase 27 scope, now in UAT-27.md deferred ledger
 
 ### Blockers/Concerns
@@ -107,9 +112,10 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-**Stopped at:** Phase 28 complete (5/5 plans, verification PASSED) — next: `/gsd-discuss-phase 29` then `/gsd-plan-phase 29` (2026-10-13)
+**Stopped at:** Phase 29 complete (3/3 plans, verified 11/11, review 11/11 fixed) — next: `/gsd-discuss-phase 30` then `/gsd-plan-phase 30` (2026-10-14)
 
 **Operator repairs 2026-10-13 (autonomous run pre-flight):**
+
 - `38bd940` restored 6 product files wrongly deleted by `04fe8ca` cleanup (`sync.rs` 2773 lines, `filing.rs`, MailboxView, TaxonomyEditor, package.json/lock) — tsc clean after restore
 - `fc2cd74` added `scripts/build-env.sh` (REQUIRED source before any cargo cmd: flatpak-SDK pkg-config + /tmp/opencode stub .pc/.so + host-only linking; never export LD_LIBRARY_PATH globally — segfaults cargo; sidecar binary path holds Phase-15 dev shim, weights dir empty stub, both git-ignored)
 

@@ -1,7 +1,7 @@
 {
   "contract": "1.0.0",
   "flavor": "core",
-  "milestone": "v1.5",
+  "milestone": "v1.5 — Live Validation + Compose Hardening + Deferred Features",
   "phases": [
     {
       "number": "1",
@@ -106,38 +106,73 @@
     {
       "number": "21",
       "name": "SMTP Send — Live Gate",
-      "status": "complete"
+      "status": "pending"
     },
     {
       "number": "22",
       "name": "Draft & Seen Round-Trip — Live Gate",
-      "status": "complete"
+      "status": "pending"
     },
     {
       "number": "23",
       "name": "Search + Filters",
-      "status": "complete"
+      "status": "pending"
     },
     {
       "number": "24",
       "name": "Auto-Archive",
-      "status": "complete"
+      "status": "pending"
     },
     {
       "number": "25",
       "name": "Smart Folder Rules",
-      "status": "complete"
+      "status": "pending"
     },
     {
       "number": "26",
       "name": "Live Validation Bundle",
+      "status": "pending"
+    },
+    {
+      "number": "27",
+      "name": "Live-Validation Gate + Capability Probes",
+      "status": "pending"
+    },
+    {
+      "number": "28",
+      "name": "Override-Event Log + CONDSTORE Fast Path",
+      "status": "pending"
+    },
+    {
+      "number": "29",
+      "name": "Rule Import/Export + IDLE Watcher",
       "status": "complete"
+    },
+    {
+      "number": "30",
+      "name": "Batch Trust Pair",
+      "status": "pending"
+    },
+    {
+      "number": "31",
+      "name": "Sieve Export + History + Learning v1 + Auto-Confirm",
+      "status": "pending"
+    },
+    {
+      "number": "32",
+      "name": "Compose Hardening",
+      "status": "pending"
+    },
+    {
+      "number": "33",
+      "name": "ManageSieve Upload (conditional)",
+      "status": "pending"
     }
   ],
   "next": {
-    "command": "/gsd:discuss-phase",
-    "label": "Discuss the first phase",
-    "reason": "Project initialized — plan your first phase"
+    "command": "/gsd:progress --next",
+    "label": "Advance to the next step (plan phase 27)",
+    "reason": "Phase 27 of 18 — needs a plan"
   },
-  "updated_at": "2026-10-13T22:31:45.093Z"
+  "updated_at": "2026-10-14T05:37:11.664Z"
 }
