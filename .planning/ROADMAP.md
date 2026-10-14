@@ -309,7 +309,10 @@ Decimal phases appear between their surrounding integers in numeric order. v1.2 
   2. User can retry only the failed items of a batch run with writes re-on for failures — already-executed rows execute exactly once (burst-EXISTS + double-click-retry stress: no double-replay)
   3. Stale previews re-resolve UIDs at confirm time — the confirmed run never files the wrong mail
 
-**Plans**: TBD
+**Plans**: 2 plans
+
+- [ ] 30-01-PLAN.md — shared dry-run preview core (preview_batch/preview_archive, writes off) + stale-preview re-resolution in confirm path (BATCH-03 backend)
+- [ ] 30-02-PLAN.md — retry-only-failures on same run_id with stress tests + BatchPanel/ArchivePanel preview + retry UI (BATCH-04 + surfaces)
 **UI hint**: yes
 
 ### Phase 31: Sieve Export + History + Learning v1 + Auto-Confirm
