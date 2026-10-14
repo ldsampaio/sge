@@ -294,11 +294,18 @@ export function RulesPanel({ onClose }: RulesPanelProps) {
     }
   };
 
-  /** Phase 29: file picked → backend dry-run validation → preview modal. */
+  /** Phase 29: file picked → backend dry-run validation → preview modal.
+   * WR-02: reject absurd files before touching the backend (rules are
+   * metadata-only — 1 MiB is generous; mirrors MAX_IMPORT_BYTES). */
+  const MAX_IMPORT_BYTES = 1 << 20; // 1 MiB
   const onFilePicked = async (file: File) => {
     setPortBusy(true);
     setMessage(null);
     try {
+      if (file.size > MAX_IMPORT_BYTES) {
+        setMessage("Arquivo grande demais para importar (máx. 1 MiB).");
+        return;
+      }
       const text = await file.text();
       // May throw on malformed JSON — surface as a preview-level error.
       let result: Omit<ImportPreview, "fileName" | "json">;
@@ -325,9 +332,11 @@ export function RulesPanel({ onClose }: RulesPanelProps) {
     }
   };
 
-  /** Phase 29: Accept commits the valid subset; Reject discards everything. */
+  /** Phase 29: Accept commits the valid subset (invalid entries are skipped
+   * with per-item reasons — WR-04 partial-import contract); Reject discards
+   * everything. Accept is enabled whenever at least one rule is committable. */
   const acceptImport = async () => {
-    if (!preview || preview.errors.length > 0) return;
+    if (!preview || preview.imported + preview.updated === 0) return;
     setPortBusy(true);
     try {
       const result = (await invoke("import_rules", {
@@ -629,7 +638,8 @@ export function RulesPanel({ onClose }: RulesPanelProps) {
         </div>
         {/* Phase 29 import validation preview: backend ImportResult
             verbatim — errors red, warnings amber, Accept commits the valid
-            subset (disabled while errors exist), Reject discards all. */}
+            subset (invalid entries skipped with reasons — WR-04), Reject
+            discards all. Accept needs ≥1 committable rule. */}
         {preview && (
           <div
             role="dialog"
@@ -693,11 +703,13 @@ export function RulesPanel({ onClose }: RulesPanelProps) {
                 <button
                   type="button"
                   className="btn btn-small"
-                  disabled={portBusy || preview.errors.length > 0}
+                  disabled={portBusy || preview.imported + preview.updated === 0}
                   title={
-                    preview.errors.length > 0
-                      ? "Corrija os erros no arquivo para aceitar"
-                      : "Confirmar importação"
+                    preview.imported + preview.updated === 0
+                      ? "Nada válido para importar"
+                      : preview.errors.length > 0
+                        ? `Confirmar importação das ${preview.imported + preview.updated} válida(s) (regras com erro serão ignoradas)`
+                        : "Confirmar importação"
                   }
                   onClick={() => void acceptImport()}
                 >
