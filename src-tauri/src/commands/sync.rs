@@ -15,20 +15,20 @@ use std::sync::Arc;
 use serde::Serialize;
 use tauri::{ipc::Channel, State};
 
-use crate::sync::worker::SyncWorker;
-use crate::sync::bodies;
-use crate::sync::{SyncEvent, SyncCallback};
 use crate::creds::{CredentialStore, KeyringStore, SavedCredentials, ServerConfig};
-use crate::imap::trash::{detect_trash, TrashResolution};
-use crate::imap::roles::{resolve_roles, Role};
-use crate::imap::{AccountConfig, MailboxInfo, SecurityMode, SyncError};
+use crate::imap::manager::SessionManager;
 use crate::imap::mutf7::{
     decode_modified_utf7, encode_modified_utf7, validate_leaf, FolderNameError,
 };
-use crate::imap::manager::SessionManager;
+use crate::imap::roles::{resolve_roles, Role};
 use crate::imap::session::connect_sync;
+use crate::imap::trash::{detect_trash, TrashResolution};
 use crate::imap::SyncSession;
+use crate::imap::{AccountConfig, MailboxInfo, SecurityMode, SyncError};
 use crate::store::queries;
+use crate::sync::bodies;
+use crate::sync::worker::SyncWorker;
+use crate::sync::{SyncCallback, SyncEvent};
 
 /// Load the active account config: prefer in-memory `active_account`
 /// (set by `connect_account`), fall back to the OS keyring so sync works
@@ -38,7 +38,10 @@ pub(crate) async fn load_account_config(
 ) -> Result<AccountConfig, String> {
     // In-memory first (works even when "remember me" is unchecked).
     if let Some(acc) = state.active_account.lock().unwrap().clone() {
-        eprintln!("[SGE sync] Using in-memory credentials for {}", acc.username);
+        eprintln!(
+            "[SGE sync] Using in-memory credentials for {}",
+            acc.username
+        );
         return Ok(AccountConfig {
             host: acc.host,
             port: acc.port,
@@ -66,7 +69,10 @@ pub(crate) async fn load_account_config(
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "No saved credentials -- log in first".to_string())?
     };
-    eprintln!("[SGE sync] Using keyring credentials for {}", creds.username);
+    eprintln!(
+        "[SGE sync] Using keyring credentials for {}",
+        creds.username
+    );
     Ok(AccountConfig {
         host: server_cfg.host,
         port: server_cfg.port,
@@ -119,7 +125,10 @@ pub async fn start_sync(
     // serialized against) destructive ops, never a fresh session per pass.
     let manager = manager_for(&state, &account_cfg);
 
-    eprintln!("[SGE sync] Connecting to {}:{}...", account_cfg.host, account_cfg.port);
+    eprintln!(
+        "[SGE sync] Connecting to {}:{}...",
+        account_cfg.host, account_cfg.port
+    );
 
     // Run sync on a dedicated blocking thread.
     let store = state.store.clone();
@@ -144,18 +153,24 @@ pub async fn start_sync(
             // Lease SELECTs `mailbox` on the owned session (connecting
             // lazily on first use); the worker borrows it for the pass.
             // `connect_sync` stays reserved for bootstrap/probe paths only.
-            let mut lease = manager.lease_for(&mailbox_owned).await
+            let mut lease = manager
+                .lease_for(&mailbox_owned)
+                .await
                 .map_err(|e| format!("IMAP lease: {e}"))?;
             eprintln!("[SGE sync] Leased session -- starting worker...");
-            let worker = SyncWorker::with_cancel(store, cancel_flag)
-                .with_attachment_root(app_data);
+            let worker = SyncWorker::with_cancel(store, cancel_flag).with_attachment_root(app_data);
             let cb: SyncCallback = Arc::new(move |event| {
                 let _ = on_event.send(event);
             });
-            let result = worker.sync_with_borrowed(lease.session(), &mailbox_owned, cb).await
+            let result = worker
+                .sync_with_borrowed(lease.session(), &mailbox_owned, cb)
+                .await
                 .map_err(|e| e.to_string());
             match &result {
-                Ok(s) => eprintln!("[SGE sync] Done: new={} updated={} deleted={}", s.new, s.updated, s.deleted),
+                Ok(s) => eprintln!(
+                    "[SGE sync] Done: new={} updated={} deleted={}",
+                    s.new, s.updated, s.deleted
+                ),
                 Err(e) => eprintln!("[SGE sync] Error: {e}"),
             }
             result
@@ -216,14 +231,13 @@ pub async fn set_seen(
             let (mailbox_id, epoch) = {
                 let guard = store.lock().unwrap();
                 let conn = guard.conn();
-                let mb = queries::ensure_mailbox(conn, &mailbox)
-                    .map_err(|e| format!("store: {e}"))?;
+                let mb =
+                    queries::ensure_mailbox(conn, &mailbox).map_err(|e| format!("store: {e}"))?;
                 let epoch = queries::get_sync_state(conn, &mailbox)
                     .map_err(|e| format!("store: {e}"))?
                     .map(|(v, _)| v)
                     .unwrap_or(0);
-                queries::set_local_seen(conn, mb, uid, seen)
-                    .map_err(|e| format!("store: {e}"))?;
+                queries::set_local_seen(conn, mb, uid, seen).map_err(|e| format!("store: {e}"))?;
                 queries::enqueue_outbox(conn, mb, uid, seen, epoch)
                     .map_err(|e| format!("store: {e}"))?;
                 (mb, epoch)
@@ -235,18 +249,13 @@ pub async fn set_seen(
             let fail_reason: Option<String> = match manager.set_seen_in(&mailbox, uid, seen).await {
                 Ok(()) => {
                     let guard = store.lock().unwrap();
-                    let _ =
-                        queries::delete_outbox_op(guard.conn(), mailbox_id, uid);
+                    let _ = queries::delete_outbox_op(guard.conn(), mailbox_id, uid);
                     None
                 }
                 Err(e) => {
                     let guard = store.lock().unwrap();
-                    let _ = queries::record_outbox_error(
-                        guard.conn(),
-                        mailbox_id,
-                        uid,
-                        &e.to_string(),
-                    );
+                    let _ =
+                        queries::record_outbox_error(guard.conn(), mailbox_id, uid, &e.to_string());
                     eprintln!(
                         "[SGE sync] set_seen uid {uid} not acknowledged ({e}) — stays queued"
                     );
@@ -315,19 +324,10 @@ async fn resolve_trash(
     manager: &Arc<SessionManager>,
     account_key: &str,
 ) -> Result<Option<String>, String> {
-    if let Some(cached) = state
-        .trash_cache
-        .lock()
-        .unwrap()
-        .get(account_key)
-        .cloned()
-    {
+    if let Some(cached) = state.trash_cache.lock().unwrap().get(account_key).cloned() {
         return Ok(Some(cached));
     }
-    let folders = manager
-        .list_mailboxes()
-        .await
-        .map_err(|e| e.to_string())?;
+    let folders = manager.list_mailboxes().await.map_err(|e| e.to_string())?;
     match detect_trash(&folders) {
         TrashResolution::Found(name) => {
             state
@@ -386,10 +386,7 @@ pub async fn delete_message(
     let trash = match resolve_trash(&state, &manager, &account_key).await? {
         Some(t) => t,
         None if create_trash.unwrap_or(false) => {
-            manager
-                .create_trash()
-                .await
-                .map_err(|e| e.to_string())?;
+            manager.create_trash().await.map_err(|e| e.to_string())?;
             let t = "Trash".to_string();
             state
                 .trash_cache
@@ -409,8 +406,8 @@ pub async fn delete_message(
             let (mailbox_id, _epoch) = {
                 let guard = store.lock().unwrap();
                 let conn = guard.conn();
-                let mb = queries::ensure_mailbox(conn, &mailbox)
-                    .map_err(|e| format!("store: {e}"))?;
+                let mb =
+                    queries::ensure_mailbox(conn, &mailbox).map_err(|e| format!("store: {e}"))?;
                 let epoch = queries::get_sync_state(conn, &mailbox)
                     .map_err(|e| format!("store: {e}"))?
                     .map(|(v, _)| v)
@@ -436,16 +433,13 @@ pub async fn delete_message(
             {
                 Ok(_) => {
                     let guard = store.lock().unwrap();
-                    let _ =
-                        queries::delete_imap_outbox_op(guard.conn(), mailbox_id, uid);
+                    let _ = queries::delete_imap_outbox_op(guard.conn(), mailbox_id, uid);
                     (true, format!("Mensagem movida para {trash}"))
                 }
                 Err(SyncError::Refused(msg)) => {
                     let guard = store.lock().unwrap();
-                    let _ =
-                        queries::delete_imap_outbox_op(guard.conn(), mailbox_id, uid);
-                    let _ =
-                        queries::set_pending_delete(guard.conn(), mailbox_id, uid, false);
+                    let _ = queries::delete_imap_outbox_op(guard.conn(), mailbox_id, uid);
+                    let _ = queries::set_pending_delete(guard.conn(), mailbox_id, uid, false);
                     (false, format!("IMAP refused: {msg}"))
                 }
                 Err(e) => {
@@ -456,9 +450,7 @@ pub async fn delete_message(
                         uid,
                         &e.to_string(),
                     );
-                    eprintln!(
-                        "[SGE sync] delete uid {uid} not acknowledged ({e}) — stays queued"
-                    );
+                    eprintln!("[SGE sync] delete uid {uid} not acknowledged ({e}) — stays queued");
                     (
                         false,
                         format!("Sem conexão — será enviada no próximo sync ({e})"),
@@ -508,8 +500,8 @@ pub async fn move_message(
             let mailbox_id = {
                 let guard = store.lock().unwrap();
                 let conn = guard.conn();
-                let mb = queries::ensure_mailbox(conn, &mailbox)
-                    .map_err(|e| format!("store: {e}"))?;
+                let mb =
+                    queries::ensure_mailbox(conn, &mailbox).map_err(|e| format!("store: {e}"))?;
                 let epoch = queries::get_sync_state(conn, &mailbox)
                     .map_err(|e| format!("store: {e}"))?
                     .map(|(v, _)| v)
@@ -535,8 +527,7 @@ pub async fn move_message(
             {
                 Ok(outcome) => {
                     let guard = store.lock().unwrap();
-                    let _ =
-                        queries::delete_imap_outbox_op(guard.conn(), mailbox_id, uid);
+                    let _ = queries::delete_imap_outbox_op(guard.conn(), mailbox_id, uid);
                     let via = if outcome.used_fallback {
                         " (via cópia)"
                     } else {
@@ -546,10 +537,8 @@ pub async fn move_message(
                 }
                 Err(SyncError::Refused(msg)) => {
                     let guard = store.lock().unwrap();
-                    let _ =
-                        queries::delete_imap_outbox_op(guard.conn(), mailbox_id, uid);
-                    let _ =
-                        queries::set_pending_delete(guard.conn(), mailbox_id, uid, false);
+                    let _ = queries::delete_imap_outbox_op(guard.conn(), mailbox_id, uid);
+                    let _ = queries::set_pending_delete(guard.conn(), mailbox_id, uid, false);
                     (false, format!("IMAP refused: {msg}"))
                 }
                 Err(e) => {
@@ -560,9 +549,7 @@ pub async fn move_message(
                         uid,
                         &e.to_string(),
                     );
-                    eprintln!(
-                        "[SGE sync] move uid {uid} not acknowledged ({e}) — stays queued"
-                    );
+                    eprintln!("[SGE sync] move uid {uid} not acknowledged ({e}) — stays queued");
                     (
                         false,
                         format!("Sem conexão — será enviada no próximo sync ({e})"),
@@ -635,8 +622,8 @@ pub async fn expunge_messages(
             let (mailbox_id, epoch, removed) = {
                 let guard = store.lock().unwrap();
                 let conn = guard.conn();
-                let mb = queries::ensure_mailbox(conn, &mailbox)
-                    .map_err(|e| format!("store: {e}"))?;
+                let mb =
+                    queries::ensure_mailbox(conn, &mailbox).map_err(|e| format!("store: {e}"))?;
                 let epoch = queries::get_sync_state(conn, &mailbox)
                     .map_err(|e| format!("store: {e}"))?
                     .map(|(v, _)| v)
@@ -662,10 +649,7 @@ pub async fn expunge_messages(
                 removed: removed.len(),
                 acked: true,
                 pending_count,
-                detail: format!(
-                    "{} mensagem(ns) apagada(s) para sempre",
-                    removed.len()
-                ),
+                detail: format!("{} mensagem(ns) apagada(s) para sempre", removed.len()),
             })
         })
     })
@@ -697,13 +681,13 @@ pub async fn undo_queued_op(
     tauri::async_runtime::spawn_blocking(move || {
         let guard = store.lock().unwrap();
         let conn = guard.conn();
-        let restored = match queries::mailbox_id(conn, &mailbox)
-            .map_err(|e| format!("store: {e}"))?
-        {
-            Some(mb) => queries::undo_pending_op(conn, mb, uid)
-                .map_err(|e| format!("store: {e}"))?,
-            None => false,
-        };
+        let restored =
+            match queries::mailbox_id(conn, &mailbox).map_err(|e| format!("store: {e}"))? {
+                Some(mb) => {
+                    queries::undo_pending_op(conn, mb, uid).map_err(|e| format!("store: {e}"))?
+                }
+                None => false,
+            };
         Ok(UndoResult {
             uid,
             restored,
@@ -782,12 +766,10 @@ async fn resolve_drafts_wire(
     if let Some(wire) = mailbox {
         return Ok(wire);
     }
-    let folders = manager
-        .list_mailboxes()
-        .await
-        .map_err(|e| e.to_string())?;
+    let folders = manager.list_mailboxes().await.map_err(|e| e.to_string())?;
     find_drafts_wire(&folders).ok_or_else(|| {
-        "drafts-missing: nenhuma pasta Rascunhos encontrada no servidor — confirme para criar".to_string()
+        "drafts-missing: nenhuma pasta Rascunhos encontrada no servidor — confirme para criar"
+            .to_string()
     })
 }
 
@@ -847,10 +829,8 @@ pub async fn save_draft(
             let (mailbox_id, message_id, old_uid, epoch) = {
                 let guard = store.lock().unwrap();
                 let conn = guard.conn();
-                let mb = queries::ensure_mailbox(conn, &wire)
-                    .map_err(|e| format!("store: {e}"))?;
-                let existing = queries::get_draft(conn, &id)
-                    .map_err(|e| format!("store: {e}"))?;
+                let mb = queries::ensure_mailbox(conn, &wire).map_err(|e| format!("store: {e}"))?;
+                let existing = queries::get_draft(conn, &id).map_err(|e| format!("store: {e}"))?;
                 let (msg_id, prev_uid) = match existing {
                     Some(row) => (row.message_id, row.server_uid),
                     None => (crate::drafts::new_message_id(&id), None),
@@ -864,7 +844,9 @@ pub async fn save_draft(
             };
 
             // 2. Render + APPEND-new + expunge-old; failure stays dirty.
-            let date = chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S +0000").to_string();
+            let date = chrono::Utc::now()
+                .format("%a, %d %b %Y %H:%M:%S +0000")
+                .to_string();
             let split = |s: &str| {
                 s.split(',')
                     .map(|p| p.trim().to_string())
@@ -881,22 +863,21 @@ pub async fn save_draft(
                 message_id: message_id.clone(),
             };
             let bytes = crate::drafts::render_draft_rfc5322(&fields, &date);
-            let (acked, server_uid) =
-                match manager.save_draft_copy_in(&wire, &message_id, &bytes, old_uid, epoch).await
-                {
-                    Ok(new_uid) => {
-                        let guard = store.lock().unwrap();
-                        let _ = queries::mark_draft_clean(guard.conn(), &id, new_uid);
-                        eprintln!("[SGE sync] save_draft {id} acknowledged as uid {new_uid}");
-                        (true, Some(new_uid))
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[SGE sync] save_draft {id} not acknowledged ({e}) — stays dirty"
-                        );
-                        (false, old_uid)
-                    }
-                };
+            let (acked, server_uid) = match manager
+                .save_draft_copy_in(&wire, &message_id, &bytes, old_uid, epoch)
+                .await
+            {
+                Ok(new_uid) => {
+                    let guard = store.lock().unwrap();
+                    let _ = queries::mark_draft_clean(guard.conn(), &id, new_uid);
+                    eprintln!("[SGE sync] save_draft {id} acknowledged as uid {new_uid}");
+                    (true, Some(new_uid))
+                }
+                Err(e) => {
+                    eprintln!("[SGE sync] save_draft {id} not acknowledged ({e}) — stays dirty");
+                    (false, old_uid)
+                }
+            };
 
             let (dirty, pending_count) = {
                 let guard = store.lock().unwrap();
@@ -947,10 +928,7 @@ pub async fn get_draft(
     let wire = resolve_drafts_wire(&manager, None).await?;
     tauri::async_runtime::spawn_blocking(move || {
         async_std::task::block_on(async {
-            let mut lease = manager
-                .lease_for(&wire)
-                .await
-                .map_err(|e| e.to_string())?;
+            let mut lease = manager.lease_for(&wire).await.map_err(|e| e.to_string())?;
             let msg_id = crate::drafts::new_message_id(&id);
             let mut hits = lease
                 .session()
@@ -958,9 +936,10 @@ pub async fn get_draft(
                 .await
                 .map_err(|e| e.to_string())?;
             hits.sort_unstable();
-            let uid = hits.into_iter().max().ok_or_else(|| {
-                "Rascunho não encontrado — nem local nem no servidor".to_string()
-            })?;
+            let uid = hits
+                .into_iter()
+                .max()
+                .ok_or_else(|| "Rascunho não encontrado — nem local nem no servidor".to_string())?;
             // BODY.PEEK-only: the fallback never sets `\Seen`.
             let raw = lease
                 .session()
@@ -982,7 +961,10 @@ pub async fn get_draft(
             };
             let (subject, body, to, cc, bcc) = (
                 parsed.subject().unwrap_or_default().to_string(),
-                parsed.body_text(0).map(|c| c.to_string()).unwrap_or_default(),
+                parsed
+                    .body_text(0)
+                    .map(|c| c.to_string())
+                    .unwrap_or_default(),
                 addr_list(parsed.to()),
                 addr_list(parsed.cc()),
                 addr_list(parsed.bcc()),
@@ -991,12 +973,10 @@ pub async fn get_draft(
             // the sender address is intentionally not extracted here.
             let guard = store.lock().unwrap();
             let conn = guard.conn();
-            let mb = queries::ensure_mailbox(conn, &wire)
-                .map_err(|e| format!("store: {e}"))?;
+            let mb = queries::ensure_mailbox(conn, &wire).map_err(|e| format!("store: {e}"))?;
             queries::upsert_draft(conn, &id, mb, &msg_id, &subject, &body, &to, &cc, &bcc)
                 .map_err(|e| format!("store: {e}"))?;
-            queries::mark_draft_clean(conn, &id, uid)
-                .map_err(|e| format!("store: {e}"))?;
+            queries::mark_draft_clean(conn, &id, uid).map_err(|e| format!("store: {e}"))?;
             queries::get_draft(conn, &id)
                 .map_err(|e| format!("store: {e}"))?
                 .ok_or_else(|| "Rascunho não encontrado após leitura do servidor".to_string())
@@ -1090,10 +1070,9 @@ pub async fn sync_status(
     tauri::async_runtime::spawn_blocking(move || {
         let guard = store.lock().unwrap();
         let conn = guard.conn();
-        let (last_sync_at, uidv, uid_next, count) =
-            queries::sync_status(conn, &mailbox)
-                .map_err(|e| format!("store: {e}"))?
-                .unwrap_or_default();
+        let (last_sync_at, uidv, uid_next, count) = queries::sync_status(conn, &mailbox)
+            .map_err(|e| format!("store: {e}"))?
+            .unwrap_or_default();
         let pending_count = queries::mailbox_id(conn, &mailbox)
             .map_err(|e| format!("store: {e}"))?
             .map(|mb| pending_depth(conn, mb))
@@ -1181,15 +1160,20 @@ pub async fn queue_send(
     let store = state.store.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let guard = store.lock().unwrap();
-        let out = crate::send_queue::enqueue_send(guard.conn(), &app_data, crate::send_queue::EnqueueInput {
-            from,
-            to,
-            cc,
-            bcc,
-            subject,
-            body,
-            draft_id,
-        }).map_err(|e| e.to_string())?;
+        let out = crate::send_queue::enqueue_send(
+            guard.conn(),
+            &app_data,
+            crate::send_queue::EnqueueInput {
+                from,
+                to,
+                cc,
+                bcc,
+                subject,
+                body,
+                draft_id,
+            },
+        )
+        .map_err(|e| e.to_string())?;
         Ok(out)
     })
     .await
@@ -1217,7 +1201,9 @@ pub async fn retry_send(
                 .unwrap();
             Ok(crate::send_queue::outcome_of(&row, false))
         } else {
-            Err("send-missing: unknown send '".to_string() + &queue_id + "' — it may already be sent")
+            Err("send-missing: unknown send '".to_string()
+                + &queue_id
+                + "' — it may already be sent")
         }
     })
     .await
@@ -1240,8 +1226,7 @@ pub async fn send_status(
     let store = state.store.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let guard = store.lock().unwrap();
-        crate::send_queue::send_status_snapshot(guard.conn())
-            .map_err(|e| e.to_string())
+        crate::send_queue::send_status_snapshot(guard.conn()).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("internal error: send_status task failed ({e})"))?
@@ -1278,8 +1263,7 @@ pub async fn idle_status(
 ) -> Result<crate::imap::idle::IdleStatus, String> {
     use crate::classify::rules_io;
     use crate::imap::idle::{status_of, IdleSnapshot};
-    let capable =
-        rules_io::idle_allowed_from_profile(&rules_io::default_profile_path());
+    let capable = rules_io::idle_allowed_from_profile(&rules_io::default_profile_path());
     let snap = state
         .idle
         .lock()
@@ -1305,26 +1289,21 @@ pub async fn idle_start(
     }
     let profile = rules_io::default_profile_path();
     if !rules_io::idle_allowed_from_profile(&profile) {
-        return Err(
-            "push indisponível no servidor — verificação automática (poll)".to_string(),
-        );
+        return Err("push indisponível no servidor — verificação automática (poll)".to_string());
     }
     let account_cfg = load_account_config(state.clone()).await?;
     let wake = Arc::new(SyncWake::new(state.sync_gate.clone()));
     let app_h = app.clone();
-    let on_wake: Arc<dyn Fn() + Send + Sync> =
-        Arc::new(move || {
-            let _ = app_h.emit("idle-wakeup", ());
-        });
+    let on_wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let _ = app_h.emit("idle-wakeup", ());
+    });
     match spawn_if_allowed(account_cfg, wake, &profile, on_wake) {
         Some((handle, join)) => {
             *state.idle.lock().unwrap() = Some((handle, join));
             eprintln!("[SGE idle] watcher started (dedicated connection)");
             Ok("started".to_string())
         }
-        None => Err(
-            "push indisponível no servidor — verificação automática (poll)".to_string(),
-        ),
+        None => Err("push indisponível no servidor — verificação automática (poll)".to_string()),
     }
 }
 
@@ -1391,7 +1370,10 @@ pub(crate) async fn refresh_mailbox_tree(
             if cached.is_empty() {
                 return Err(format!("LIST failed and no folders cached: {e}"));
             }
-            eprintln!("[SGE sync] LIST failed ({e}) — serving {n} cached folders", n = cached.len());
+            eprintln!(
+                "[SGE sync] LIST failed ({e}) — serving {n} cached folders",
+                n = cached.len()
+            );
             return Ok(cached);
         }
     };
@@ -1445,12 +1427,8 @@ pub(crate) async fn refresh_mailbox_tree(
             // Hierarchy delimiter for tree rendering (M6).
             let _ = queries::set_mailbox_delimiter(conn, &folder.name, &folder.delimiter);
             // Resolved role + raw attributes for the role-aware guards (M8).
-            let _ = queries::set_mailbox_role(
-                conn,
-                &folder.name,
-                role,
-                &folder.attributes.join(" "),
-            );
+            let _ =
+                queries::set_mailbox_role(conn, &folder.name, role, &folder.attributes.join(" "));
         }
     }
     let guard = store.lock().unwrap();
@@ -1549,8 +1527,7 @@ pub async fn create_folder(
             }
             // 3. Validate + join + encode + exists pre-check (pure — no
             // verb has fired if this returns Err).
-            let wire =
-                prepare_create_wire(&cached, parent_wire.as_deref(), &leaf, &delimiter)?;
+            let wire = prepare_create_wire(&cached, parent_wire.as_deref(), &leaf, &delimiter)?;
             // 4. Wire CREATE; online-only, no queue.
             if let Err(e) = manager.create_mailbox_in(&wire).await {
                 return Err(map_create_error(&e));
@@ -1572,9 +1549,9 @@ pub async fn create_folder(
 fn folder_name_error_copy(e: FolderNameError) -> String {
     match e {
         FolderNameError::Empty => "Dê um nome para a pasta.".to_string(),
-        FolderNameError::ContainsDelimiter(d) => format!(
-            "O nome não pode conter '{d}' — ele separa pastas. Crie uma pasta por vez."
-        ),
+        FolderNameError::ContainsDelimiter(d) => {
+            format!("O nome não pode conter '{d}' — ele separa pastas. Crie uma pasta por vez.")
+        }
         FolderNameError::ReservedInbox => {
             "INBOX é uma pasta reservada do servidor — escolha outro nome.".to_string()
         }
@@ -1659,7 +1636,11 @@ fn is_system_role(cached: &[queries::MailboxRow], name: &str) -> Option<&'static
             name: r.name.clone(),
             display_name: r.display_name.clone(),
             delimiter: r.delimiter.clone(),
-            attributes: r.attributes.split_whitespace().map(|s| s.to_string()).collect(),
+            attributes: r
+                .attributes
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect(),
         })
         .collect();
     system_role_label(&infos, name)
@@ -1787,7 +1768,10 @@ pub(crate) fn guard_delete(
         .collect();
     delimiters.push(row.delimiter.as_str());
     let has_children = cached.iter().any(|r| {
-        r.name != wire && delimiters.iter().any(|d| !d.is_empty() && r.name.starts_with(&format!("{wire}{d}")))
+        r.name != wire
+            && delimiters
+                .iter()
+                .any(|d| !d.is_empty() && r.name.starts_with(&format!("{wire}{d}")))
     });
     if has_children {
         return Err(format!(
@@ -1964,21 +1948,16 @@ pub async fn delete_folder(
             // 5. Pure guards — every refusal returns before any verb call.
             // The decision carries the canonical (wire, display) pair used
             // below, so no second lookup can drift.
-            let (target, display) = match guard_delete(
-                &cached,
-                &name,
-                messages,
-                confirmed,
-                typed_name.as_deref(),
-            )? {
-                DeleteDecision::NeedCount(n) => {
-                    return Err(format!("need_delete_confirm:{n}"));
-                }
-                DeleteDecision::NeedTyped(d) => {
-                    return Err(format!("need_typed_confirm:{d}"));
-                }
-                DeleteDecision::Proceed { wire, display } => (wire, display),
-            };
+            let (target, display) =
+                match guard_delete(&cached, &name, messages, confirmed, typed_name.as_deref())? {
+                    DeleteDecision::NeedCount(n) => {
+                        return Err(format!("need_delete_confirm:{n}"));
+                    }
+                    DeleteDecision::NeedTyped(d) => {
+                        return Err(format!("need_typed_confirm:{d}"));
+                    }
+                    DeleteDecision::Proceed { wire, display } => (wire, display),
+                };
             // 6. Wire DELETE, then cascade the cache in the same lock section.
             if let Err(e) = manager.delete_mailbox_in(&target).await {
                 return Err(map_folder_error(&e, "delete", &display));
@@ -2128,15 +2107,10 @@ pub async fn fetch_message(
                 let mb_id = crate::store::queries::ensure_mailbox(conn, &mailbox)
                     .map_err(|e| format!("store error: {e}"))?;
                 if let Some(msg_id) = crate::store::queries::find_message_id(conn, mb_id, uid)
-                    .map_err(|e| format!("store error: {e}"))? {
-                    let total = text
-                        .as_ref()
-                        .map(|s| s.len())
-                        .unwrap_or(0)
-                        + html
-                            .as_ref()
-                            .map(|s| s.len())
-                            .unwrap_or(0);
+                    .map_err(|e| format!("store error: {e}"))?
+                {
+                    let total = text.as_ref().map(|s| s.len()).unwrap_or(0)
+                        + html.as_ref().map(|s| s.len()).unwrap_or(0);
                     if total <= bodies::BODY_CACHE_CAP_BYTES {
                         let _ = crate::store::queries::insert_body(
                             conn,
@@ -2224,9 +2198,13 @@ pub async fn save_attachment(
             let mut session = connect_sync(&account_cfg)
                 .await
                 .map_err(|e| format!("IMAP connection failed: {e}"))?;
-            let _ = session.select_mailbox(&mailbox).await
+            let _ = session
+                .select_mailbox(&mailbox)
+                .await
                 .map_err(|e| format!("IMAP SELECT failed: {e}"))?;
-            let raw = session.fetch_body(uid).await
+            let raw = session
+                .fetch_body(uid)
+                .await
                 .map_err(|e| format!("IMAP fetch failed: {e}"))?;
             let _ = session.logout().await;
 
@@ -2247,8 +2225,7 @@ pub async fn save_attachment(
                 return Err("Invalid filename".to_string());
             }
 
-            std::fs::write(&file_path, &bytes)
-                .map_err(|e| format!("Write error: {e}"))?;
+            std::fs::write(&file_path, &bytes).map_err(|e| format!("Write error: {e}"))?;
 
             Ok(file_path)
         })
@@ -2259,15 +2236,14 @@ pub async fn save_attachment(
 
 #[cfg(test)]
 mod tests {
-    use crate::imap::SyncError;
     use crate::imap::MailboxInfo;
+    use crate::imap::SyncError;
     use crate::store::queries;
     use crate::store::Store;
 
     use super::{
         find_drafts_wire, guard_delete, guard_rename, has_noselect_attr, is_connectivity_error,
-        map_create_error, map_folder_error, pending_depth, prepare_create_wire,
-        DeleteDecision,
+        map_create_error, map_folder_error, pending_depth, prepare_create_wire, DeleteDecision,
     };
 
     /// `idle_status` command contract (IDLE-01 UI surface): with no
@@ -2325,29 +2301,62 @@ mod tests {
 
         // Insert 3 messages: 2 unread + 1 seen.
         queries::upsert_message(
-            conn, mb_id, 1, None, "Hello", "alice@example.com", "[]",
-            "[]", "2024-06-01T08:00:00Z", "[]", false, "preview one",
-        ).unwrap();
+            conn,
+            mb_id,
+            1,
+            None,
+            "Hello",
+            "alice@example.com",
+            "[]",
+            "[]",
+            "2024-06-01T08:00:00Z",
+            "[]",
+            false,
+            "preview one",
+        )
+        .unwrap();
         queries::upsert_message(
-            conn, mb_id, 2, None, "World", "bob@example.com", "[]",
-            "[]", "2024-06-02T08:00:00Z", "[]", false, "preview two",
-        ).unwrap();
+            conn,
+            mb_id,
+            2,
+            None,
+            "World",
+            "bob@example.com",
+            "[]",
+            "[]",
+            "2024-06-02T08:00:00Z",
+            "[]",
+            false,
+            "preview two",
+        )
+        .unwrap();
         queries::upsert_message(
-            conn, mb_id, 3, None, "Read", "carol@example.com", "[]",
-            "[]", "2024-06-03T08:00:00Z", r#"["\\Seen"]"#, false, "preview three",
-        ).unwrap();
+            conn,
+            mb_id,
+            3,
+            None,
+            "Read",
+            "carol@example.com",
+            "[]",
+            "[]",
+            "2024-06-03T08:00:00Z",
+            r#"["\\Seen"]"#,
+            false,
+            "preview three",
+        )
+        .unwrap();
 
         // list_messages -> 3 rows, newest first (date_utc DESC)
         let rows = queries::list_messages(conn, "INBOX", 100, 0).unwrap();
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].uid, 3);   // newest date first
+        assert_eq!(rows[0].uid, 3); // newest date first
         assert_eq!(rows[1].uid, 2);
         assert_eq!(rows[2].uid, 1);
 
         // Read/unread classification from flags
-        assert!(!queries::is_unread(&rows[0].flags));  // Seen
-        assert!(queries::is_unread(&rows[1].flags));   // unread
-        assert!(queries::is_unread(&rows[2].flags));   // unread
+        assert!(!queries::is_unread(&rows[0].flags)); // Seen
+        assert!(queries::is_unread(&rows[1].flags)); // unread
+        assert!(queries::is_unread(&rows[2].flags)); // unread
 
         // FTS search by sender term -> finds alice
         let results = queries::fts_search(conn, Some("INBOX"), "alice").unwrap();
@@ -2372,19 +2381,15 @@ mod tests {
         queries::enqueue_outbox(conn, mb_id, 1, true, 100).unwrap();
         assert_eq!(pending_depth(conn, mb_id), 1);
 
-        queries::enqueue_imap_outbox(
-            conn, mb_id, 2, queries::IMAP_OP_DELETE, Some("Trash"), 100,
-        )
-        .unwrap();
+        queries::enqueue_imap_outbox(conn, mb_id, 2, queries::IMAP_OP_DELETE, Some("Trash"), 100)
+            .unwrap();
         assert_eq!(pending_depth(conn, mb_id), 2);
 
         // Enqueueing the delete consumed no flag row here (different UID),
         // but same-UID enqueue collapses: flag row drops, imap row stands.
         queries::enqueue_outbox(conn, mb_id, 3, false, 100).unwrap();
-        queries::enqueue_imap_outbox(
-            conn, mb_id, 3, queries::IMAP_OP_MOVE, Some("Archive"), 100,
-        )
-        .unwrap();
+        queries::enqueue_imap_outbox(conn, mb_id, 3, queries::IMAP_OP_MOVE, Some("Archive"), 100)
+            .unwrap();
         assert_eq!(pending_depth(conn, mb_id), 3);
 
         // Other mailboxes are isolated.
@@ -2404,8 +2409,15 @@ mod tests {
         assert_eq!(pending_depth(conn, drafts_mb), 0);
 
         queries::upsert_draft(
-            conn, "compose-1", drafts_mb, "<compose-1@sge.local>",
-            "Subject", "Body", "to@example.com", "", "",
+            conn,
+            "compose-1",
+            drafts_mb,
+            "<compose-1@sge.local>",
+            "Subject",
+            "Body",
+            "to@example.com",
+            "",
+            "",
         )
         .unwrap();
         assert_eq!(pending_depth(conn, drafts_mb), 1);
@@ -2417,8 +2429,15 @@ mod tests {
         // Drafts in another mailbox never leak into this folder's depth.
         let other = queries::ensure_mailbox(conn, "INBOX").unwrap();
         queries::upsert_draft(
-            conn, "compose-2", other, "<compose-2@sge.local>",
-            "Subject", "Body", "to@example.com", "", "",
+            conn,
+            "compose-2",
+            other,
+            "<compose-2@sge.local>",
+            "Subject",
+            "Body",
+            "to@example.com",
+            "",
+            "",
         )
         .unwrap();
         assert_eq!(pending_depth(conn, other), 1);
@@ -2436,8 +2455,15 @@ mod tests {
         let drafts_mb = queries::ensure_mailbox(conn, "Drafts").unwrap();
 
         queries::upsert_draft(
-            conn, "compose-9", drafts_mb, "<compose-9@sge.local>",
-            "Subject", "Body", "to@example.com", "", "",
+            conn,
+            "compose-9",
+            drafts_mb,
+            "<compose-9@sge.local>",
+            "Subject",
+            "Body",
+            "to@example.com",
+            "",
+            "",
         )
         .unwrap();
         let row = queries::get_draft(conn, "compose-9").unwrap().unwrap();
@@ -2468,10 +2494,7 @@ mod tests {
             fixture_mailbox("INBOX", &[]),
             fixture_mailbox("Rascunhos", &["\\Drafts"]),
         ];
-        assert_eq!(
-            find_drafts_wire(&folders),
-            Some("Rascunhos".to_string())
-        );
+        assert_eq!(find_drafts_wire(&folders), Some("Rascunhos".to_string()));
     }
 
     /// No Drafts role anywhere → `None`, and the command layer turns that
@@ -2560,7 +2583,10 @@ mod tests {
         // Delimiter in leaf (hierarchy escape refused client-side).
         assert_eq!(
             prepare_create_wire(&tree, Some("Pai"), "A/B", "/"),
-            Err("O nome não pode conter '/' — ele separa pastas. Crie uma pasta por vez.".to_string())
+            Err(
+                "O nome não pode conter '/' — ele separa pastas. Crie uma pasta por vez."
+                    .to_string()
+            )
         );
         // INBOX variants reserved on any delimiter.
         for inbox in ["inbox", "INBOX", "Inbox"] {
@@ -2609,10 +2635,10 @@ mod tests {
         assert!(is_connectivity_error(&offline.to_string()));
         assert_eq!(
             map_create_error(&offline),
-            "Sem conexão — pastas só podem ser alteradas online. Tente de novo ao reconectar.".to_string()
+            "Sem conexão — pastas só podem ser alteradas online. Tente de novo ao reconectar."
+                .to_string()
         );
-        let exists =
-            SyncError::Protocol("CREATE Pai: NO Mailbox already exists".to_string());
+        let exists = SyncError::Protocol("CREATE Pai: NO Mailbox already exists".to_string());
         assert_eq!(
             map_create_error(&exists),
             "Já existe uma pasta com esse nome.".to_string()
@@ -2645,12 +2671,18 @@ mod tests {
         // Unknown folder: refuse, do not invent a server round-trip.
         assert_eq!(
             guard_rename(&tree, "Fantasma", "Nova"),
-            Err("Essa pasta não existe mais na lista — atualize a lista e tente de novo.".to_string())
+            Err(
+                "Essa pasta não existe mais na lista — atualize a lista e tente de novo."
+                    .to_string()
+            )
         );
         // New-leaf validation mirrors create (same delimiter rules).
         assert_eq!(
             guard_rename(&tree, "Pai", "A/B"),
-            Err("O nome não pode conter '/' — ele separa pastas. Crie uma pasta por vez.".to_string())
+            Err(
+                "O nome não pode conter '/' — ele separa pastas. Crie uma pasta por vez."
+                    .to_string()
+            )
         );
         assert_eq!(
             guard_rename(&tree, "Pai", "inbox"),
@@ -2697,7 +2729,10 @@ mod tests {
         );
         assert_eq!(
             guard_delete(&tree, "Fantasma", 0, false, None),
-            Err("Essa pasta não existe mais na lista — atualize a lista e tente de novo.".to_string())
+            Err(
+                "Essa pasta não existe mais na lista — atualize a lista e tente de novo."
+                    .to_string()
+            )
         );
         // System-role folders refuse backend-side too (same schema as
         // guard_rename — direct IPC invoke cannot delete Trash/Sent/Drafts).
@@ -2758,7 +2793,8 @@ mod tests {
         let offline = SyncError::Protocol("SessionManager reconnect: reset".to_string());
         assert_eq!(
             map_folder_error(&offline, "delete", "X"),
-            "Sem conexão — pastas só podem ser alteradas online. Tente de novo ao reconectar.".to_string()
+            "Sem conexão — pastas só podem ser alteradas online. Tente de novo ao reconectar."
+                .to_string()
         );
         let exists = SyncError::Protocol("RENAME a -> b: NO already exists".to_string());
         assert_eq!(
@@ -2771,12 +2807,10 @@ mod tests {
             "O servidor não permitiu excluir Velha: IMAP protocol error: DELETE Velha: NO cannot delete.".to_string()
         );
         let probe = SyncError::Protocol("LIST failed: boom".to_string());
-        assert!(
-            map_folder_error(&probe, "probe", "X").starts_with("Não foi possível ler as pastas do servidor:")
-        );
-        assert!(
-            map_folder_error(&probe, "rename", "X").starts_with("Não foi possível renomear a pasta:")
-        );
+        assert!(map_folder_error(&probe, "probe", "X")
+            .starts_with("Não foi possível ler as pastas do servidor:"));
+        assert!(map_folder_error(&probe, "rename", "X")
+            .starts_with("Não foi possível renomear a pasta:"));
     }
 
     /// Cached-tree fixture with a non-ASCII parent (RAW wire name, as the
@@ -2897,7 +2931,10 @@ mod tests {
         });
         assert_eq!(
             guard_rename(&tree, "A/B.C", "Novo"),
-            Err("Essa pasta não existe mais na lista — atualize a lista e tente de novo.".to_string())
+            Err(
+                "Essa pasta não existe mais na lista — atualize a lista e tente de novo."
+                    .to_string()
+            )
         );
     }
 }

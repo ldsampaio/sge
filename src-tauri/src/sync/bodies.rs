@@ -88,9 +88,7 @@ pub fn extract_attachments(msg: &Message<'_>) -> Vec<AttachmentInfo> {
         .enumerate()
         .filter_map(|(i, part)| {
             let cd = part.content_disposition();
-            let is_attachment = cd.is_some_and(|ct| {
-                ct.c_type.eq_ignore_ascii_case("attachment")
-            });
+            let is_attachment = cd.is_some_and(|ct| ct.c_type.eq_ignore_ascii_case("attachment"));
             let has_filename = part.attachment_name().is_some();
 
             if !is_attachment && !has_filename {
@@ -197,15 +195,10 @@ pub async fn fetch_message_detail(
     let attachments = extract_attachments(&msg);
 
     // Cache body if within cap.
-    let total = text.as_ref().map(|s| s.len()).unwrap_or(0)
-        + html.as_ref().map(|s| s.len()).unwrap_or(0);
+    let total =
+        text.as_ref().map(|s| s.len()).unwrap_or(0) + html.as_ref().map(|s| s.len()).unwrap_or(0);
     if total <= BODY_CACHE_CAP_BYTES {
-        crate::store::queries::insert_body(
-            conn,
-            message_id,
-            text.as_deref(),
-            html.as_deref(),
-        )?;
+        crate::store::queries::insert_body(conn, message_id, text.as_deref(), html.as_deref())?;
         for att in &attachments {
             let _ = crate::store::queries::insert_attachment_meta(
                 conn,
@@ -233,8 +226,7 @@ mod tests {
 
     #[test]
     fn sanitize_strips_script_and_iframe() {
-        let input =
-            r#"<script>alert(1)</script><p>hello</p><iframe srcdoc="evil"></iframe>"#;
+        let input = r#"<script>alert(1)</script><p>hello</p><iframe srcdoc="evil"></iframe>"#;
         let out = sanitize_html(input);
         assert!(!out.contains("<script"), "<script> tag should be stripped");
         assert!(!out.contains("iframe"), "<iframe> tag should be stripped");
@@ -254,8 +246,14 @@ mod tests {
         let input = r#"<p onclick="evil()">click</p><a href="javascript:alert(1)">link</a><img src=x onerror="alert(1)">"#;
         let out = sanitize_html(input);
         assert!(!out.contains("onclick"), "event handler should be stripped");
-        assert!(!out.contains("javascript:"), "javascript: URL should be stripped");
-        assert!(!out.contains("onerror"), "onerror handler should be stripped");
+        assert!(
+            !out.contains("javascript:"),
+            "javascript: URL should be stripped"
+        );
+        assert!(
+            !out.contains("onerror"),
+            "onerror handler should be stripped"
+        );
     }
 
     #[test]
@@ -287,7 +285,10 @@ mod tests {
             .parse(SAMPLE_MSG)
             .expect("sample message must parse");
         let text = extract_text(&msg);
-        assert_eq!(text.as_deref().map(|s| s.trim_end()), Some("Hello plain text world."));
+        assert_eq!(
+            text.as_deref().map(|s| s.trim_end()),
+            Some("Hello plain text world.")
+        );
         let html = extract_html(&msg);
         assert_eq!(
             html.as_deref().map(|s| s.trim_end()),

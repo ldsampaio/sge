@@ -16,8 +16,8 @@
 //! module formats the config, the password, or credentials.
 
 use super::{
-    choose_expunge_path, choose_move_path, chunk_uid_set, AccountConfig, ExpungePath,
-    MovePath, SyncError, SyncSession, DRAFT_FLAGS, SENT_FLAGS,
+    choose_expunge_path, choose_move_path, chunk_uid_set, AccountConfig, ExpungePath, MovePath,
+    SyncError, SyncSession, DRAFT_FLAGS, SENT_FLAGS,
 };
 use crate::imap::session::connect_sync;
 use std::collections::HashSet;
@@ -110,9 +110,8 @@ impl SessionManager {
                         guard.selected_validity = Some(summary.uid_validity);
                     }
                     Err(e) => {
-                        let err = SyncError::Protocol(format!(
-                            "SessionManager SELECT {mailbox}: {e}"
-                        ));
+                        let err =
+                            SyncError::Protocol(format!("SessionManager SELECT {mailbox}: {e}"));
                         if can_retry {
                             can_retry = false;
                             retried = true;
@@ -141,8 +140,7 @@ impl SessionManager {
                 match caps_outcome {
                     Ok(caps) => guard.cached_capabilities = Some(caps),
                     Err(e) => {
-                        let err =
-                            SyncError::Protocol(format!("SessionManager CAPABILITY: {e}"));
+                        let err = SyncError::Protocol(format!("SessionManager CAPABILITY: {e}"));
                         if can_retry {
                             can_retry = false;
                             retried = true;
@@ -176,9 +174,9 @@ impl SessionManager {
     /// Used after a failed write before the single retry.
     async fn reconnect(&self) -> Result<(), SyncError> {
         let mut guard = self.state.lock().await;
-        let session = connect_sync(&self.config).await.map_err(|e| {
-            SyncError::Protocol(format!("SessionManager reconnect: {e}"))
-        })?;
+        let session = connect_sync(&self.config)
+            .await
+            .map_err(|e| SyncError::Protocol(format!("SessionManager reconnect: {e}")))?;
         guard.session = Some(Box::new(session));
         guard.selected_mailbox = None;
         guard.selected_validity = None;
@@ -209,17 +207,14 @@ impl SessionManager {
     ///
     /// The write lands on `mailbox`: the lease SELECTs it first, so a
     /// `set_seen` for Sent never touches INBOX (FOLD-03).
-    pub async fn set_seen_in(
-        &self,
-        mailbox: &str,
-        uid: u32,
-        seen: bool,
-    ) -> Result<(), SyncError> {
+    pub async fn set_seen_in(&self, mailbox: &str, uid: u32, seen: bool) -> Result<(), SyncError> {
         let mut lease = self.lease_for(mailbox).await?;
         match lease.session().set_seen(uid, seen).await {
             Ok(()) => Ok(()),
             Err(first) => {
-                eprintln!("[SGE imap] set_seen {mailbox} uid {uid} failed ({first}) — reconnecting once");
+                eprintln!(
+                    "[SGE imap] set_seen {mailbox} uid {uid} failed ({first}) — reconnecting once"
+                );
                 drop(lease);
                 self.reconnect().await?;
                 let mut lease = self.lease_for(mailbox).await?;
@@ -470,9 +465,7 @@ impl SessionManager {
     ) -> Result<u32, SyncError> {
         let mut lease = self.lease_for(drafts_wire).await?;
         let mut effective_old = old_uid;
-        if let (Some(expected), Some(actual)) =
-            (expected_validity, lease.selected_validity())
-        {
+        if let (Some(expected), Some(actual)) = (expected_validity, lease.selected_validity()) {
             if expected != actual {
                 eprintln!(
                     "[SGE imap] save draft {drafts_wire}: UIDVALIDITY {expected} -> {actual} — tracked server_uid is stale, appending fresh"
@@ -484,7 +477,15 @@ impl SessionManager {
             Some(caps) => caps,
             None => lease.session().capabilities().await?,
         };
-        save_draft_on_session(lease.session(), drafts_wire, msg_id, bytes, effective_old, &caps).await
+        save_draft_on_session(
+            lease.session(),
+            drafts_wire,
+            msg_id,
+            bytes,
+            effective_old,
+            &caps,
+        )
+        .await
     }
 
     /// Retry-resume probe (MJ-03): SEARCH for the stable Message-ID without
@@ -517,9 +518,7 @@ impl SessionManager {
     ) -> Result<(), SyncError> {
         let mut lease = self.lease_for(drafts_wire).await?;
         let mut effective_old = old_uid;
-        if let (Some(expected), Some(actual)) =
-            (expected_validity, lease.selected_validity())
-        {
+        if let (Some(expected), Some(actual)) = (expected_validity, lease.selected_validity()) {
             if expected != actual {
                 eprintln!(
                     "[SGE imap] resume expunge-old {drafts_wire}: UIDVALIDITY {expected} -> {actual} — tracked server_uid is stale, skipping"
@@ -714,10 +713,7 @@ impl SessionManager {
     /// owned session (FOLD-02 triage signals + Plan 11-02 message count).
     /// Does not disturb the lease's SELECTed folder — STATUS works on any
     /// mailbox.
-    pub async fn mailbox_status(
-        &self,
-        mailbox: &str,
-    ) -> Result<super::MailboxStatus, SyncError> {
+    pub async fn mailbox_status(&self, mailbox: &str) -> Result<super::MailboxStatus, SyncError> {
         let mut lease = self.lease_for("INBOX").await?;
         lease.session().mailbox_status(mailbox).await
     }
@@ -821,9 +817,7 @@ pub async fn file_sent_on_session(
     if !hits.is_empty() {
         return Ok(true);
     }
-    session
-        .append_message(sent_wire, SENT_FLAGS, bytes)
-        .await?;
+    session.append_message(sent_wire, SENT_FLAGS, bytes).await?;
     Ok(false)
 }
 
@@ -1184,7 +1178,9 @@ mod tests {
                 f.select_calls.push(name.to_string());
                 if f.fail_select_once {
                     f.fail_select_once = false;
-                    Err(SyncError::Protocol(format!("SELECT {name}: io: unexpected EOF")))
+                    Err(SyncError::Protocol(format!(
+                        "SELECT {name}: io: unexpected EOF"
+                    )))
                 } else {
                     Ok(super::super::MailboxSummary {
                         selected_mailbox: name.to_string(),
@@ -1240,11 +1236,7 @@ mod tests {
             Box::pin(async move { Ok(()) })
         }
 
-        fn store_deleted(
-            &mut self,
-            uid: u32,
-            deleted: bool,
-        ) -> PinBox<'_, Result<(), SyncError>> {
+        fn store_deleted(&mut self, uid: u32, deleted: bool) -> PinBox<'_, Result<(), SyncError>> {
             let fail = {
                 let mut f = self.0.lock().unwrap();
                 f.deleted_calls.push((uid, deleted));
@@ -1260,7 +1252,9 @@ mod tests {
             };
             Box::pin(async move {
                 if fail {
-                    Err(SyncError::Protocol("fake store_deleted failure".to_string()))
+                    Err(SyncError::Protocol(
+                        "fake store_deleted failure".to_string(),
+                    ))
                 } else {
                     Ok(())
                 }
@@ -1320,15 +1314,10 @@ mod tests {
             })
         }
 
-        fn uid_copy_to(
-            &mut self,
-            uid_set: &str,
-            dest: &str,
-        ) -> PinBox<'_, Result<(), SyncError>> {
+        fn uid_copy_to(&mut self, uid_set: &str, dest: &str) -> PinBox<'_, Result<(), SyncError>> {
             let fail = {
                 let mut f = self.0.lock().unwrap();
-                f.copied_calls
-                    .push((uid_set.to_string(), dest.to_string()));
+                f.copied_calls.push((uid_set.to_string(), dest.to_string()));
                 f.fail_copy
             };
             Box::pin(async move {
@@ -1340,15 +1329,10 @@ mod tests {
             })
         }
 
-        fn uid_move_to(
-            &mut self,
-            uid_set: &str,
-            dest: &str,
-        ) -> PinBox<'_, Result<(), SyncError>> {
+        fn uid_move_to(&mut self, uid_set: &str, dest: &str) -> PinBox<'_, Result<(), SyncError>> {
             let fail = {
                 let mut f = self.0.lock().unwrap();
-                f.moved_calls
-                    .push((uid_set.to_string(), dest.to_string()));
+                f.moved_calls.push((uid_set.to_string(), dest.to_string()));
                 f.fail_move
             };
             Box::pin(async move {
@@ -1433,7 +1417,11 @@ mod tests {
             let status = {
                 let mut f = self.0.lock().unwrap();
                 f.status_calls += 1;
-                let validity = if f.bump_status_validity { 100 + f.status_calls as u32 } else { 100 };
+                let validity = if f.bump_status_validity {
+                    100 + f.status_calls as u32
+                } else {
+                    100
+                };
                 super::super::MailboxStatus {
                     uid_validity: validity,
                     uid_next: None,
@@ -1452,11 +1440,8 @@ mod tests {
         ) -> PinBox<'_, Result<(), SyncError>> {
             let fail = {
                 let mut f = self.0.lock().unwrap();
-                f.appended_calls.push((
-                    mailbox.to_string(),
-                    flags.to_string(),
-                    bytes.to_vec(),
-                ));
+                f.appended_calls
+                    .push((mailbox.to_string(), flags.to_string(), bytes.to_vec()));
                 f.fail_append
             };
             Box::pin(async move {
@@ -1543,7 +1528,10 @@ mod tests {
             manager.uid_expunge_in("Archive", "1").await.unwrap();
             let f = probe.lock().unwrap();
             assert_eq!(f.caps_calls, 1, "CAPABILITY re-queried: {:?}", f.caps_calls);
-            assert_eq!(f.select_calls, vec!["INBOX".to_string(), "Archive".to_string()]);
+            assert_eq!(
+                f.select_calls,
+                vec!["INBOX".to_string(), "Archive".to_string()]
+            );
         });
     }
 
@@ -1600,10 +1588,7 @@ mod tests {
             // APPEND carries mailbox + flags + byte-identical literal.
             assert_eq!(f.appended_calls.len(), 1);
             assert_eq!(f.appended_calls[0].0, "Drafts".to_string());
-            assert_eq!(
-                f.appended_calls[0].1,
-                super::super::DRAFT_FLAGS.to_string()
-            );
+            assert_eq!(f.appended_calls[0].1, super::super::DRAFT_FLAGS.to_string());
             assert_eq!(f.appended_calls[0].2, bytes);
             // Old copy marked + scoped-expunged; new copy never flagged.
             assert!(f.deleted_calls.contains(&(7, true)));
@@ -2032,8 +2017,14 @@ mod tests {
             // Offline the reconnect cannot succeed: the retry path surfaces
             // the reconnect error with exactly one verb call each.
             for err in [
-                manager.rename_mailbox_in("Pai", "Novo").await.expect_err("offline"),
-                manager.delete_mailbox_in("Velha").await.expect_err("offline"),
+                manager
+                    .rename_mailbox_in("Pai", "Novo")
+                    .await
+                    .expect_err("offline"),
+                manager
+                    .delete_mailbox_in("Velha")
+                    .await
+                    .expect_err("offline"),
             ] {
                 let msg = err.to_string().to_lowercase();
                 assert!(
@@ -2068,7 +2059,11 @@ mod tests {
                 "expected a State UIDVALIDITY error, got: {err}"
             );
             let f = probe.lock().unwrap();
-            assert_eq!(f.renamed_calls.len(), 1, "bump detected after the verb, not instead of it");
+            assert_eq!(
+                f.renamed_calls.len(),
+                1,
+                "bump detected after the verb, not instead of it"
+            );
         });
     }
 
@@ -2094,10 +2089,21 @@ mod tests {
             let fake = FakeHandle::new(&["IMAP4rev1", "UIDPLUS", "MOVE"], &[1, 2]);
             let probe = fake.0.clone();
             let manager = SessionManager::for_test_session(Box::new(fake));
-            let outcome = manager.move_message_in("INBOX", "1,2", "Trash").await.unwrap();
-            assert_eq!(outcome, MoveOutcome { used_fallback: false });
+            let outcome = manager
+                .move_message_in("INBOX", "1,2", "Trash")
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                MoveOutcome {
+                    used_fallback: false
+                }
+            );
             let f = probe.lock().unwrap();
-            assert_eq!(f.moved_calls, vec![("1,2".to_string(), "Trash".to_string())]);
+            assert_eq!(
+                f.moved_calls,
+                vec![("1,2".to_string(), "Trash".to_string())]
+            );
             assert!(f.copied_calls.is_empty());
             assert!(f.deleted_calls.is_empty());
             assert!(f.expunged_sets.is_empty());
@@ -2119,11 +2125,22 @@ mod tests {
                 probe.lock().unwrap().deleted.insert(9, true);
             }
             let manager = SessionManager::for_test_session(Box::new(fake));
-            let outcome = manager.move_message_in("INBOX", "1,2", "Archive").await.unwrap();
-            assert_eq!(outcome, MoveOutcome { used_fallback: true });
+            let outcome = manager
+                .move_message_in("INBOX", "1,2", "Archive")
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                MoveOutcome {
+                    used_fallback: true
+                }
+            );
             let f = probe.lock().unwrap();
             assert_eq!(f.moved_calls.len(), 0);
-            assert_eq!(f.copied_calls, vec![("1,2".to_string(), "Archive".to_string())]);
+            assert_eq!(
+                f.copied_calls,
+                vec![("1,2".to_string(), "Archive".to_string())]
+            );
             assert_eq!(f.deleted_calls, vec![(1, true), (2, true)]);
             assert_eq!(f.expunged_sets, vec!["1,2".to_string()]);
             assert_eq!(f.plain_expunge_calls, 0, "no bare EXPUNGE with UIDPLUS");
@@ -2143,18 +2160,41 @@ mod tests {
                 probe.lock().unwrap().deleted.insert(4, true);
             }
             let manager = SessionManager::for_test_session(Box::new(fake));
-            let outcome = manager.move_message_in("INBOX", "1,2", "Trash").await.unwrap();
-            assert_eq!(outcome, MoveOutcome { used_fallback: true });
+            let outcome = manager
+                .move_message_in("INBOX", "1,2", "Trash")
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                MoveOutcome {
+                    used_fallback: true
+                }
+            );
             let f = probe.lock().unwrap();
-            assert_eq!(f.copied_calls, vec![("1,2".to_string(), "Trash".to_string())]);
+            assert_eq!(
+                f.copied_calls,
+                vec![("1,2".to_string(), "Trash".to_string())]
+            );
             // Ours marked; foreign 4 unmarked then restored.
             assert!(f.deleted_calls.contains(&(1, true)));
             assert!(f.deleted_calls.contains(&(2, true)));
-            assert!(f.deleted_calls.contains(&(4, false)), "foreign unmarked: {:?}", f.deleted_calls);
-            assert!(f.deleted_calls.contains(&(4, true)), "foreign restored: {:?}", f.deleted_calls);
+            assert!(
+                f.deleted_calls.contains(&(4, false)),
+                "foreign unmarked: {:?}",
+                f.deleted_calls
+            );
+            assert!(
+                f.deleted_calls.contains(&(4, true)),
+                "foreign restored: {:?}",
+                f.deleted_calls
+            );
             assert_eq!(f.plain_expunge_calls, 1);
             assert!(f.expunged_sets.is_empty(), "no UID EXPUNGE without UIDPLUS");
-            assert_eq!(f.select_calls, vec!["INBOX".to_string()], "single SELECT held");
+            assert_eq!(
+                f.select_calls,
+                vec!["INBOX".to_string()],
+                "single SELECT held"
+            );
             assert_eq!(f.removed, vec![1, 2], "foreign UID 4 survives the dance");
             assert_eq!(f.deleted.get(&4), Some(&true), "foreign mark restored");
         });
@@ -2167,8 +2207,16 @@ mod tests {
             let fake = FakeHandle::new(&["IMAP4rev1", "MOVE"], &[1, 2]);
             let probe = fake.0.clone();
             let manager = SessionManager::for_test_session(Box::new(fake));
-            let outcome = manager.move_message_in("INBOX", "1,2", "Trash").await.unwrap();
-            assert_eq!(outcome, MoveOutcome { used_fallback: false });
+            let outcome = manager
+                .move_message_in("INBOX", "1,2", "Trash")
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                MoveOutcome {
+                    used_fallback: false
+                }
+            );
             let f = probe.lock().unwrap();
             assert_eq!(f.moved_calls.len(), 1);
             assert_eq!(f.plain_expunge_calls, 0);
@@ -2180,12 +2228,19 @@ mod tests {
     fn move_fallback_chunks_large_sets() {
         run(async {
             let uids: Vec<u32> = (1..=450).collect();
-            let set = uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+            let set = uids
+                .iter()
+                .map(|u| u.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
             // MOVE path: 200 + 200 + 50.
             let fake = FakeHandle::new(&["IMAP4rev1", "UIDPLUS", "MOVE"], &uids);
             let probe = fake.0.clone();
             let manager = SessionManager::for_test_session(Box::new(fake));
-            manager.move_message_in("INBOX", &set, "Trash").await.unwrap();
+            manager
+                .move_message_in("INBOX", &set, "Trash")
+                .await
+                .unwrap();
             {
                 let f = probe.lock().unwrap();
                 assert_eq!(f.moved_calls.len(), 3);
@@ -2196,7 +2251,10 @@ mod tests {
             let fake2 = FakeHandle::new(&["IMAP4rev1", "UIDPLUS"], &uids);
             let probe2 = fake2.0.clone();
             let manager2 = SessionManager::for_test_session(Box::new(fake2));
-            manager2.move_message_in("INBOX", &set, "Trash").await.unwrap();
+            manager2
+                .move_message_in("INBOX", &set, "Trash")
+                .await
+                .unwrap();
             let f2 = probe2.lock().unwrap();
             assert_eq!(f2.copied_calls.len(), 3);
             assert_eq!(f2.expunged_sets.len(), 3);
@@ -2211,7 +2269,10 @@ mod tests {
             let probe = fake.0.clone();
             let manager = SessionManager::for_test_session(Box::new(fake));
             assert!(manager.move_message_in("INBOX", "", "Trash").await.is_err());
-            assert!(manager.move_message_in("INBOX", "1,,2", "Trash").await.is_err());
+            assert!(manager
+                .move_message_in("INBOX", "1,,2", "Trash")
+                .await
+                .is_err());
             // Fail-closed: nothing reached the wire.
             let f = probe.lock().unwrap();
             assert!(f.moved_calls.is_empty());
@@ -2227,12 +2288,24 @@ mod tests {
             // — the lease is held across the whole sequence, so a second
             // SELECT can never drift the expunge to the wrong folder.
             let uids: Vec<u32> = (1..=450).collect();
-            let set = uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+            let set = uids
+                .iter()
+                .map(|u| u.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
             let fake = FakeHandle::new(&["IMAP4rev1", "UIDPLUS"], &uids);
             let probe = fake.0.clone();
             let manager = SessionManager::for_test_session(Box::new(fake));
-            let outcome = manager.move_message_in("INBOX", &set, "Archive").await.unwrap();
-            assert_eq!(outcome, MoveOutcome { used_fallback: true });
+            let outcome = manager
+                .move_message_in("INBOX", &set, "Archive")
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                MoveOutcome {
+                    used_fallback: true
+                }
+            );
             let f = probe.lock().unwrap();
             assert_eq!(f.copied_calls.len(), 3);
             assert_eq!(f.deleted_calls.len(), 450);
@@ -2312,7 +2385,10 @@ mod tests {
                 f.deleted.insert(10, true);
             }
             let manager = SessionManager::for_test_session(Box::new(fake));
-            manager.move_message_in("INBOX", "1,2", "Trash").await.unwrap();
+            manager
+                .move_message_in("INBOX", "1,2", "Trash")
+                .await
+                .unwrap();
             let f = probe.lock().unwrap();
             assert_eq!(f.removed, vec![1, 2]);
             assert_eq!(f.deleted.get(&9), Some(&true));

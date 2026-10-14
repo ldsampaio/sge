@@ -23,8 +23,8 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::store::queries::{
-    self, SEND_STATE_FAILED, SEND_STATE_QUEUED, SEND_STATE_SENDING, SEND_STATE_SENT,
-    SEND_STATE_UNCERTAIN, SendRow,
+    self, SendRow, SEND_STATE_FAILED, SEND_STATE_QUEUED, SEND_STATE_SENDING, SEND_STATE_SENT,
+    SEND_STATE_UNCERTAIN,
 };
 use crate::store::{StoreError, StoreResult};
 
@@ -390,11 +390,7 @@ pub fn enqueue_send(
 /// with capped+jittered backoff, stash the plain-language error. Returns the
 /// row's new attempt count. Never touches `state` — promotion to terminal
 /// `failed` (or `uncertain`) is an explicit separate step.
-pub fn record_send_failure(
-    conn: &Connection,
-    id: &str,
-    last_error: &str,
-) -> StoreResult<i64> {
+pub fn record_send_failure(conn: &Connection, id: &str, last_error: &str) -> StoreResult<i64> {
     let row = queries::get_send_row(conn, id)?.ok_or_else(|| {
         StoreError::Path(format!("send row '{id}' not found for attempt recording"))
     })?;
@@ -758,7 +754,9 @@ mod tests {
         let raw = std::fs::read(Path::new(&row.eml_path)).unwrap();
         let text = String::from_utf8_lossy(&raw);
         assert!(
-            !text.lines().any(|l| l.to_ascii_lowercase().starts_with("bcc:")),
+            !text
+                .lines()
+                .any(|l| l.to_ascii_lowercase().starts_with("bcc:")),
             "rendered headers must never carry Bcc:\n{text}"
         );
         assert!(

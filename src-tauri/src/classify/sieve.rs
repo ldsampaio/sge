@@ -45,7 +45,10 @@ pub fn generate_sieve(rules: &[RuleExportItem], tax: &Taxonomy) -> (String, u32)
     for (idx, item) in ordered.iter().enumerate() {
         let name = item.name.trim();
         let label = if name.is_empty() { &item.id } else { name };
-        out.push_str(&format!("# Rule: {} (id={}) priority={}\n", label, item.id, item.priority));
+        out.push_str(&format!(
+            "# Rule: {} (id={}) priority={}\n",
+            label, item.id, item.priority
+        ));
 
         // Parse conditions_json.
         let conds: Option<crate::classify::rules::RuleConditions> =
@@ -53,7 +56,10 @@ pub fn generate_sieve(rules: &[RuleExportItem], tax: &Taxonomy) -> (String, u32)
 
         // Scope restriction comment + warning (Sieve has no local scope).
         let scope_folders: Vec<String> = match &item.scope_json {
-            Value::Array(arr) => arr.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+            Value::Array(arr) => arr
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect(),
             _ => vec![],
         };
         if !scope_folders.is_empty() {
@@ -122,7 +128,10 @@ pub fn generate_sieve(rules: &[RuleExportItem], tax: &Taxonomy) -> (String, u32)
             out.push_str(&format!("\n    {};\n", cond_str));
         } else {
             // No expressible conditions → comment + count.
-            out.push_str(&format!("# WARNING: {} — no expressible conditions (no test emitted)\n", label));
+            out.push_str(&format!(
+                "# WARNING: {} — no expressible conditions (no test emitted)\n",
+                label
+            ));
             warnings += 1;
         }
 
@@ -130,15 +139,23 @@ pub fn generate_sieve(rules: &[RuleExportItem], tax: &Taxonomy) -> (String, u32)
         if item.dest_kind == "folder" {
             // Plain folder — fileinto the display name (upload-ready if under Auto/).
             let dest = item.destination.trim();
-            out.push_str(&format!("    fileinto \"{}\";\n", dest.replace('"', "\\\"")));
+            out.push_str(&format!(
+                "    fileinto \"{}\";\n",
+                dest.replace('"', "\\\"")
+            ));
         } else {
             // Taxonomy category — resolve via leaf keywords; fileinto Auto/Top/Child.
             let cat_id = item.destination.trim();
             // Lookup leaf category for filing path.
             let folder_path = if let Some(cat) = leaf_by_id.get(cat_id) {
                 let parent = cat.parent.as_ref();
-                let top_name = parent.as_ref()
-                    .and_then(|pid| tax.categories.iter().find(|c| c.id.as_str() == pid.as_str()))
+                let top_name = parent
+                    .as_ref()
+                    .and_then(|pid| {
+                        tax.categories
+                            .iter()
+                            .find(|c| c.id.as_str() == pid.as_str())
+                    })
                     .map(|c| c.name.trim().to_string())
                     .unwrap_or_else(|| "Top".into());
                 let child_name = cat.name.trim().to_string();
@@ -211,8 +228,11 @@ mod tests {
         // Check only top-level imports (lines starting with "use crate::").
         let src = include_str!("sieve.rs");
         assert!(
-            !src.lines().any(|l| l.trim_start().starts_with("use crate::imap"))
-                && !src.lines().any(|l| l.trim_start().starts_with("use crate::sync")),
+            !src.lines()
+                .any(|l| l.trim_start().starts_with("use crate::imap"))
+                && !src
+                    .lines()
+                    .any(|l| l.trim_start().starts_with("use crate::sync")),
             "sieve.rs must import NOTHING from imap or sync"
         );
     }
@@ -261,7 +281,10 @@ mod tests {
         };
         let (txt, w) = generate_sieve(&[item], &tax);
         assert!(txt.contains("body :contains"), "body test missing");
-        assert!(w == 0 || txt.contains("capability"), "body capability note should appear if needed");
+        assert!(
+            w == 0 || txt.contains("capability"),
+            "body capability note should appear if needed"
+        );
     }
 
     #[test]
@@ -270,12 +293,21 @@ mod tests {
         // We only assert existence + that they contain the header; the
         // full byte-compare is done by external golden-file test harness
         // (this unit verifies the generator produces the fixtures).
-        for name in ["sieve_rules_only.sieve", "sieve_taxonomy_filing.sieve", "sieve_mixed_warnings.sieve"] {
+        for name in [
+            "sieve_rules_only.sieve",
+            "sieve_taxonomy_filing.sieve",
+            "sieve_mixed_warnings.sieve",
+        ] {
             let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("src/classify/fixtures").join(name);
+                .join("src/classify/fixtures")
+                .join(name);
             assert!(path.exists(), "fixture missing: {}", name);
             let content = std::fs::read_to_string(&path).unwrap();
-            assert!(content.contains("require \"fileinto\""), "fixture {} missing header", name);
+            assert!(
+                content.contains("require \"fileinto\""),
+                "fixture {} missing header",
+                name
+            );
         }
     }
 

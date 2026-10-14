@@ -25,7 +25,7 @@ pub mod trash;
 
 pub use errors::ImapError;
 
-use crate::imap::headers::{format_flags, body_has_attachments, parse_fetch_attributes};
+use crate::imap::headers::{body_has_attachments, format_flags, parse_fetch_attributes};
 use async_imap::imap_proto::types::AttributeValue;
 use futures::TryStreamExt;
 
@@ -213,8 +213,14 @@ pub struct MailboxInfo {
 /// Trait objects cannot contain multiple non-auto traits, so we bundle
 /// the async-imap bound behind a sealed marker trait and erase to
 /// `Box<dyn AsyncStream>`.
-pub trait AsyncStream: futures::AsyncRead + futures::AsyncWrite + Unpin + std::fmt::Debug + Send {}
-impl<T: futures::AsyncRead + futures::AsyncWrite + Unpin + std::fmt::Debug + Send> AsyncStream for T {}
+pub trait AsyncStream:
+    futures::AsyncRead + futures::AsyncWrite + Unpin + std::fmt::Debug + Send
+{
+}
+impl<T: futures::AsyncRead + futures::AsyncWrite + Unpin + std::fmt::Debug + Send> AsyncStream
+    for T
+{
+}
 
 /// A fully typed IMAP session over a [`BoxedStream`] — the concrete type
 /// the sync engine owns and drives through [`SyncSession`].
@@ -224,7 +230,8 @@ pub type BoxedSession = async_imap::Session<BoxedStream>;
 /// Pinned boxed future alias consumed by [`SyncSession`] trait methods.
 /// The trait stays object-safe because every method returns this
 /// concrete `Pin<Box<dyn Future …>>` rather than `impl Future`.
-pub type PinBox<'a, T> = std::pin::Pin<std::boxed::Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+pub type PinBox<'a, T> =
+    std::pin::Pin<std::boxed::Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 /// Errors from the sync-path IMAP layer (Phase 2+).
 ///
@@ -288,10 +295,7 @@ impl From<async_imap::error::Error> for SyncError {
 pub trait SyncSession: Unpin + Send {
     /// `SELECT <mailbox>` — selects any mailbox by name and returns
     /// UIDVALIDITY / UIDNEXT / exists counts.
-    fn select_mailbox(
-        &mut self,
-        name: &str,
-    ) -> PinBox<'_, Result<MailboxSummary, SyncError>>;
+    fn select_mailbox(&mut self, name: &str) -> PinBox<'_, Result<MailboxSummary, SyncError>>;
 
     /// `SELECT INBOX` — convenience delegating to [`select_mailbox`](Self::select_mailbox)
     /// with `"INBOX"`.
@@ -351,9 +355,7 @@ pub trait SyncSession: Unpin + Send {
     /// `SELECT <mailbox> (CONDSTORE)` — selects mailbox with CONDSTORE
     /// parameter. Returns true if server acknowledged CONDSTORE
     /// (HIGHESTMODSEQ present in SELECT response), false otherwise.
-    fn select_condstore(
-        &mut self,
-    ) -> PinBox<'_, Result<bool, SyncError>>;
+    fn select_condstore(&mut self) -> PinBox<'_, Result<bool, SyncError>>;
 
     /// `UID FETCH <range> (UID FLAGS INTERNALDATE ENVELOPE BODYSTRUCTURE MODSEQ) CHANGEDSINCE <modseq>`
     /// — fetch only messages whose MODSEQ is higher than the given value.
@@ -554,10 +556,7 @@ fn name_attribute_to_string(attr: &async_imap::types::NameAttribute) -> String {
 }
 
 impl SyncSession for BoxedSession {
-    fn select_mailbox(
-        &mut self,
-        name: &str,
-    ) -> PinBox<'_, Result<MailboxSummary, SyncError>> {
+    fn select_mailbox(&mut self, name: &str) -> PinBox<'_, Result<MailboxSummary, SyncError>> {
         let mailbox_name = name.to_string();
         Box::pin(async move {
             let mailbox = self
@@ -695,9 +694,7 @@ impl SyncSession for BoxedSession {
         Box::pin(async move {
             self.uid_copy(&set, &dest_owned)
                 .await
-                .map_err(|e| {
-                    SyncError::Protocol(format!("UID COPY {set} -> {dest_owned}: {e}"))
-                })?;
+                .map_err(|e| SyncError::Protocol(format!("UID COPY {set} -> {dest_owned}: {e}")))?;
             Ok(())
         })
     }
@@ -708,9 +705,7 @@ impl SyncSession for BoxedSession {
         Box::pin(async move {
             self.uid_mv(&set, &dest_owned)
                 .await
-                .map_err(|e| {
-                    SyncError::Protocol(format!("UID MOVE {set} -> {dest_owned}: {e}"))
-                })?;
+                .map_err(|e| SyncError::Protocol(format!("UID MOVE {set} -> {dest_owned}: {e}")))?;
             Ok(())
         })
     }
@@ -732,9 +727,7 @@ impl SyncSession for BoxedSession {
         })
     }
 
-    fn select_condstore(
-        &mut self,
-    ) -> PinBox<'_, Result<bool, SyncError>> {
+    fn select_condstore(&mut self) -> PinBox<'_, Result<bool, SyncError>> {
         Box::pin(async move {
             // async-imap 0.11.3: select with CONDSTORE parameter
             // We need a mailbox name - use the currently selected mailbox
@@ -770,7 +763,9 @@ impl SyncSession for BoxedSession {
                     .await
                     .map_err(|e| SyncError::Protocol(format!("FETCH CHANGEDSINCE read: {e}")))?;
                 let Some(rd) = rd else {
-                    return Err(SyncError::Protocol("connection closed during FETCH CHANGEDSINCE".into()));
+                    return Err(SyncError::Protocol(
+                        "connection closed during FETCH CHANGEDSINCE".into(),
+                    ));
                 };
                 let (is_done, done_ok) = match rd.parsed() {
                     async_imap::imap_proto::Response::Done { tag: t, status, .. } if *t == tag => {
@@ -809,9 +804,9 @@ impl SyncSession for BoxedSession {
             // Vendored async-imap 0.11.3 names confirmed via `cargo fetch`
             // source inspection (Plan 11-02 compile gate): `rename(from, to)`
             // and `delete(mailbox_name)` — no delta.
-            self.rename(&old_owned, &new_owned)
-                .await
-                .map_err(|e| SyncError::Protocol(format!("RENAME {old_owned} -> {new_owned}: {e}")))?;
+            self.rename(&old_owned, &new_owned).await.map_err(|e| {
+                SyncError::Protocol(format!("RENAME {old_owned} -> {new_owned}: {e}"))
+            })?;
             Ok(())
         })
     }
@@ -835,11 +830,14 @@ impl SyncSession for BoxedSession {
         let (mailbox_owned, flags_owned, bytes_owned) =
             (mailbox.to_string(), flags.to_string(), bytes.to_vec());
         Box::pin(async move {
-            self.append(&mailbox_owned, Some(flags_owned.as_str()), None, &bytes_owned)
-                .await
-                .map_err(|e| {
-                    SyncError::Protocol(format!("APPEND {mailbox_owned}: {e}"))
-                })?;
+            self.append(
+                &mailbox_owned,
+                Some(flags_owned.as_str()),
+                None,
+                &bytes_owned,
+            )
+            .await
+            .map_err(|e| SyncError::Protocol(format!("APPEND {mailbox_owned}: {e}")))?;
             Ok(())
         })
     }
@@ -884,10 +882,7 @@ impl SyncSession for BoxedSession {
                 out.push(MailboxInfo {
                     display_name: mutf7::decode_modified_utf7(&raw),
                     name: raw,
-                    delimiter: name
-                        .delimiter()
-                        .map(|d| d.to_string())
-                        .unwrap_or_default(),
+                    delimiter: name.delimiter().map(|d| d.to_string()).unwrap_or_default(),
                     attributes: name
                         .attributes()
                         .iter()
@@ -908,9 +903,7 @@ impl SyncSession for BoxedSession {
                 .map_err(|e| SyncError::Protocol(format!("STATUS {mailbox_name}: {e}")))?;
             Ok(MailboxStatus {
                 uid_validity: mailbox.uid_validity.ok_or_else(|| {
-                    SyncError::State(format!(
-                        "STATUS {mailbox_name} did not return UIDVALIDITY"
-                    ))
+                    SyncError::State(format!("STATUS {mailbox_name} did not return UIDVALIDITY"))
                 })?,
                 uid_next: mailbox.uid_next,
                 // STATUS UNSEEN datum = count of messages without \Seen.
@@ -1089,8 +1082,14 @@ mod tests {
         // be smuggled into the flag expression.
         for seen in [true, false] {
             let arg = seen_store_arg(seen);
-            assert!(!arg.contains("UID"), "flag arg must not name identifiers: {arg}");
-            assert!(arg.ends_with("(\\Seen)"), "canonical backslash-Seen form: {arg}");
+            assert!(
+                !arg.contains("UID"),
+                "flag arg must not name identifiers: {arg}"
+            );
+            assert!(
+                arg.ends_with("(\\Seen)"),
+                "canonical backslash-Seen form: {arg}"
+            );
         }
     }
 
@@ -1103,12 +1102,19 @@ mod tests {
     }
 
     #[test]
-    fn deleted_store_arg_never_sequence_addressed() {        // Same purity contract as `seen_store_arg`: no identifier in the
+    fn deleted_store_arg_never_sequence_addressed() {
+        // Same purity contract as `seen_store_arg`: no identifier in the
         // flag expression, canonical backslash-Deleted form.
         for deleted in [true, false] {
             let arg = deleted_store_arg(deleted);
-            assert!(!arg.contains("UID"), "flag arg must not name identifiers: {arg}");
-            assert!(arg.ends_with("(\\Deleted)"), "canonical backslash-Deleted form: {arg}");
+            assert!(
+                !arg.contains("UID"),
+                "flag arg must not name identifiers: {arg}"
+            );
+            assert!(
+                arg.ends_with("(\\Deleted)"),
+                "canonical backslash-Deleted form: {arg}"
+            );
         }
     }
 
@@ -1175,7 +1181,10 @@ mod tests {
             ExpungePath::UidExpunge
         );
         // Refuse is the runtime loud-failure upgrade, never the pure pick.
-        assert_ne!(choose_expunge_path(&caps(&["IMAP4rev1"])), ExpungePath::Refuse);
+        assert_ne!(
+            choose_expunge_path(&caps(&["IMAP4rev1"])),
+            ExpungePath::Refuse
+        );
     }
 
     #[test]

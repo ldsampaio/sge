@@ -78,15 +78,15 @@ fn parse_args() -> Result<Args, String> {
             "--username" | "-u" => a.username = Some(it.next().ok_or("--username needs a value")?),
             "--sample" => {
                 let v = it.next().ok_or("--sample needs a value")?;
-                let n: usize = v
-                    .parse()
-                    .map_err(|_| format!("bad --sample {v:?}"))?;
+                let n: usize = v.parse().map_err(|_| format!("bad --sample {v:?}"))?;
                 a.sample = n.min(20);
             }
             "--raw-fetch" => a.raw_fetch = Some(it.next().ok_or("--raw-fetch needs a value")?),
             "--attrs" => a.attrs = it.next().ok_or("--attrs needs a value")?,
             "--password" | "-p" => {
-                eprintln!("refusing: pass the password via SGE_IMAP_PASSWORD (argv is visible via ps)");
+                eprintln!(
+                    "refusing: pass the password via SGE_IMAP_PASSWORD (argv is visible via ps)"
+                );
                 std::process::exit(2);
             }
             "--help" | "-h" => {
@@ -185,7 +185,10 @@ fn main() -> ExitCode {
             uids.last()
         );
         if uids.is_empty() {
-            println!("DIAG RESULT: SEARCH empty while SELECT exists={} — server inconsistency", summary.exists);
+            println!(
+                "DIAG RESULT: SEARCH empty while SELECT exists={} — server inconsistency",
+                summary.exists
+            );
             let _ = session.logout().await;
             return ExitCode::SUCCESS;
         }
@@ -223,7 +226,12 @@ fn main() -> ExitCode {
                     }
                 };
                 match rd.parsed() {
-                    Response::Done { tag, status, code, information } => {
+                    Response::Done {
+                        tag,
+                        status,
+                        code,
+                        information,
+                    } => {
                         println!("DIAG RAW S(done): tag={tag:?} status={status:?} code={code:?} info={information:?}");
                         if *tag == id {
                             break;

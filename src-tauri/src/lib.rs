@@ -4,16 +4,16 @@
 // IMAP INBOX session. Its signature MUST NOT change in later plans; the body
 // delegates to `imap::probe` (filled in Plan 01-02, extended by later phases).
 
+pub mod classify;
+pub mod commands;
 pub mod creds;
 pub mod drafts;
 pub mod imap;
 pub mod send_queue;
 pub mod sidecar;
 pub mod smtp;
-pub mod classify;
 pub mod store;
 pub mod sync;
-pub mod commands;
 
 use std::sync::{Arc, Mutex};
 
@@ -66,8 +66,7 @@ pub struct AppState {
     pub trash_cache: Mutex<std::collections::HashMap<String, String>>,
     pub app_data: std::path::PathBuf,
     pub sidecar: Mutex<Option<Arc<sidecar::SidecarSupervisor>>>,
-    pub sidecar_child:
-        Mutex<Option<tauri_plugin_shell::process::CommandChild>>,
+    pub sidecar_child: Mutex<Option<tauri_plugin_shell::process::CommandChild>>,
     /// Phase 17 single-flight drain guard (shared by hook + commands).
     pub classify_gate: Arc<classify::worker::ClassifyGate>,
     /// Phase 20 cooperative batch-cancel flag (checked per chunk).
@@ -245,11 +244,9 @@ async fn clear_credentials() -> Result<(), String> {
 /// never surfaces a plaintext fallback (WR-02).
 #[tauri::command]
 async fn load_server_config() -> Result<Option<ServerConfig>, String> {
-    let stored = tauri::async_runtime::spawn_blocking(|| {
-        KeyringStore::new().load_server_config()
-    })
-    .await
-    .map_err(|e| format!("internal error: keyring task failed ({e})"))?;
+    let stored = tauri::async_runtime::spawn_blocking(|| KeyringStore::new().load_server_config())
+        .await
+        .map_err(|e| format!("internal error: keyring task failed ({e})"))?;
 
     match stored {
         Ok(opt) => Ok(opt),
@@ -283,10 +280,7 @@ async fn sidecar_status(
 /// Background supervision loop: probe until healthy, restart on crash with
 /// backoff, give up after [`sidecar::MAX_RESTARTS`] (status `Down`).
 /// Never blocks window creation — runs on a detached async task.
-async fn supervise_sidecar(
-    app: tauri::AppHandle,
-    supervisor: Arc<sidecar::SidecarSupervisor>,
-) {
+async fn supervise_sidecar(app: tauri::AppHandle, supervisor: Arc<sidecar::SidecarSupervisor>) {
     // Initial settle: give the frozen Python runtime a moment before the
     // first probe (cold-start seconds are measured spawn → first 200).
     let mut attempts: u32 = 0;
@@ -345,7 +339,9 @@ fn weights_extra_env(weights: &std::path::Path) -> Vec<(String, String)> {
             "LAYA_EXTRA_MODELS".to_string(),
             format!(
                 "{{\"multilingual\": \"{}\"}}",
-                ckpt.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"")
+                ckpt.to_string_lossy()
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
             ),
         ));
     }
@@ -418,7 +414,8 @@ fn app_data_dir() -> Option<std::path::PathBuf> {
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| {
-            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local").join("share"))
+            std::env::var_os("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".local").join("share"))
         })?;
     Some(base.join("sge"))
 }
@@ -428,8 +425,7 @@ pub fn run() {
     let store_instance = default_db_path()
         .and_then(|path| crate::store::Store::open(&path).ok())
         .unwrap_or_else(|| {
-            crate::store::Store::open_in_memory()
-                .expect("in-memory store should always succeed")
+            crate::store::Store::open_in_memory().expect("in-memory store should always succeed")
         });
     let store = Arc::new(Mutex::new(store_instance));
     let app_data = app_data_dir().unwrap_or_else(|| std::env::temp_dir().join("sge"));

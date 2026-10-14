@@ -23,9 +23,7 @@ pub struct ClassifyStatusPayload {
 
 /// Queue depth + sidecar state + exclusions. Never contains key material.
 #[tauri::command]
-pub async fn classify_status(
-    state: State<'_, AppState>,
-) -> Result<ClassifyStatusPayload, String> {
+pub async fn classify_status(state: State<'_, AppState>) -> Result<ClassifyStatusPayload, String> {
     // Short critical sections, never across await.
     let (pending, excluded) = {
         let guard = state.store.lock().unwrap();
@@ -46,7 +44,11 @@ pub async fn classify_status(
             None => "stopped".to_string(),
         }
     };
-    Ok(ClassifyStatusPayload { sidecar, pending, excluded })
+    Ok(ClassifyStatusPayload {
+        sidecar,
+        pending,
+        excluded,
+    })
 }
 
 /// Manually classify (or reclassify) one message. Works on excluded
@@ -107,7 +109,10 @@ pub async fn classify_message(
         )
         .map_err(|e| e.to_string())?;
     }
-    Ok(ClassificationReady { message_id, ..ready })
+    Ok(ClassificationReady {
+        message_id,
+        ..ready
+    })
 }
 
 /// Post-sync hook: enqueue unlabeled messages of `mailbox` (skips excluded
@@ -241,8 +246,7 @@ pub async fn confirm_suggestion(
         let (fplan, dest_display) = if plan.dest_kind == "category" {
             let tax = load_default().map_err(|e| e.to_string())?;
             let (dest_display, top_name, child_name) =
-                filing::auto_path_for_id(&tax, &plan.destination)
-                    .map_err(|e| e.to_string())?;
+                filing::auto_path_for_id(&tax, &plan.destination).map_err(|e| e.to_string())?;
             (
                 filing::FilePlan {
                     message_id,
@@ -292,22 +296,20 @@ pub async fn confirm_suggestion(
         // Auto-tree destinations (category + Auto/-nested) go through the
         // tree ensure (collision dialog via `allow_nest`); plain folders
         // already ensured above carry their wire in `dest_display`.
-        let dest_wire = if plan.dest_kind == "category"
-            || split_auto_nest(&plan.destination).is_some()
-        {
-            filing::ensure_auto_tree(&manager, &store, &fplan, allow_nest.unwrap_or(false))
-                .await
-                .map_err(|e| e.to_string())?
-        } else {
-            dest_display.clone()
-        };
+        let dest_wire =
+            if plan.dest_kind == "category" || split_auto_nest(&plan.destination).is_some() {
+                filing::ensure_auto_tree(&manager, &store, &fplan, allow_nest.unwrap_or(false))
+                    .await
+                    .map_err(|e| e.to_string())?
+            } else {
+                dest_display.clone()
+            };
         let result = filing::execute_filing_move(&manager, &store, &fplan, &dest_wire)
             .await
             .map_err(|e| e.to_string())?;
         {
             let guard = store.lock().unwrap();
-            let _ =
-                crate::store::queries::delete_rule_suggestion(guard.conn(), message_id);
+            let _ = crate::store::queries::delete_rule_suggestion(guard.conn(), message_id);
             // Pin the outcome: a confirmed rule move must not re-fire on
             // the next sync (the message still matches the rule in its new
             // folder). `latest_override` presence blocks re-evaluation.
@@ -459,7 +461,13 @@ pub async fn override_label(
         let conn = guard.conn();
         let _ = crate::store::queries::log_override(conn, message_id, &from_id, &to_category);
         let _ = crate::store::queries::upsert_label(
-            conn, message_id, &to_category, None, 1.0, 0.0, false,
+            conn,
+            message_id,
+            &to_category,
+            None,
+            1.0,
+            0.0,
+            false,
         );
         // Phase 28: fire-and-forget override_events log (action="override")
         let _ = crate::store::queries::log_override_event(
@@ -481,10 +489,7 @@ pub async fn override_label(
 
 /// Dismiss a suggestion: mail stays put, review list hides it.
 #[tauri::command]
-pub async fn dismiss_suggestion(
-    state: State<'_, AppState>,
-    message_id: u64,
-) -> Result<(), String> {
+pub async fn dismiss_suggestion(state: State<'_, AppState>, message_id: u64) -> Result<(), String> {
     let guard = state.store.lock().unwrap();
     crate::store::queries::dismiss_label(guard.conn(), message_id).map_err(|e| e.to_string())?;
     // Dismissal keeps mail in place: a pending rule hit for the same
@@ -531,9 +536,7 @@ pub async fn set_confidence_threshold(
 /// Sieve text export (SIEVE-01, Phase 31): pure function over stored rules + taxonomy.
 /// Transient return — never writes to filesystem / DB (download = frontend Blob).
 #[tauri::command]
-pub async fn export_sieve_text(
-    state: State<'_, AppState>,
-) -> Result<serde_json::Value, String> {
+pub async fn export_sieve_text(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     // Read stored rules via existing query path (same source as export_rules).
     let guard = state.store.lock().unwrap();
     let conn = guard.conn();
@@ -541,8 +544,8 @@ pub async fn export_sieve_text(
     // Pull rules via existing export logic (rules_io) to avoid duplicating store logic.
     let rules_json = crate::classify::rules_io::export_rules(&state.store.clone())
         .map_err(|e| format!("export_rules: {e}"))?;
-    let envelope: crate::classify::rules_io::RuleExport = serde_json::from_str(&rules_json)
-        .map_err(|e| format!("parse envelope: {e}"))?;
+    let envelope: crate::classify::rules_io::RuleExport =
+        serde_json::from_str(&rules_json).map_err(|e| format!("parse envelope: {e}"))?;
     drop(guard); // brief hold
     use crate::classify::sieve::{generate_sieve, redaction_filter};
     let (text_raw, warnings) = generate_sieve(&envelope.rules, &tax);
@@ -612,9 +615,7 @@ pub fn rule_overlap_note(dest_kind: &str, destination: &str) -> Option<String> {
         || d.len() > 5
             && (d.starts_with("Auto/") || d.starts_with("auto/") || d.starts_with("AUTO/"));
     if under_auto {
-        Some(
-            "esta pasta é gerenciada pelo classificador — confirme para mover".to_string(),
-        )
+        Some("esta pasta é gerenciada pelo classificador — confirme para mover".to_string())
     } else {
         None
     }
@@ -638,20 +639,20 @@ pub fn suggestion_detail_inner(
     message_id: u64,
     tax: &Taxonomy,
 ) -> Result<Option<SuggestionDetail>, String> {
-    let label = match crate::store::queries::get_label(conn, message_id)
-        .map_err(|e| e.to_string())?
-    {
-        Some(l) => Some(l),
-        None => None,
-    };
-    let rule_hit = crate::store::queries::get_rule_suggestion(conn, message_id)
-        .map_err(|e| e.to_string())?;
+    let label =
+        match crate::store::queries::get_label(conn, message_id).map_err(|e| e.to_string())? {
+            Some(l) => Some(l),
+            None => None,
+        };
+    let rule_hit =
+        crate::store::queries::get_rule_suggestion(conn, message_id).map_err(|e| e.to_string())?;
     if label.is_none() && rule_hit.is_none() {
         return Ok(None);
     }
     let dismissed = match &label {
-        Some(_) => crate::store::queries::is_dismissed(conn, message_id)
-            .map_err(|e| e.to_string())?,
+        Some(_) => {
+            crate::store::queries::is_dismissed(conn, message_id).map_err(|e| e.to_string())?
+        }
         None => false,
     };
     let fields = crate::store::queries::message_classify_fields(conn, message_id)
@@ -661,16 +662,20 @@ pub fn suggestion_detail_inner(
     // alone (rule-only suggestion) or beside a classifier label.
     let rule_alternative: Option<RuleAlternative> = match &rule_hit {
         Some(hit) => {
-            let rule = crate::store::queries::get_rule(conn, &hit.rule_id)
-                .map_err(|e| e.to_string())?;
+            let rule =
+                crate::store::queries::get_rule(conn, &hit.rule_id).map_err(|e| e.to_string())?;
             let (rule_name, justification) = match rule {
                 Some(r) => {
                     let conditions: RuleConditions =
                         serde_json::from_str(&r.conditions_json).unwrap_or_default();
                     let destination = if r.dest_kind == "category" {
-                        RuleDestination::TaxonomyCategory { id: r.destination.clone() }
+                        RuleDestination::TaxonomyCategory {
+                            id: r.destination.clone(),
+                        }
                     } else {
-                        RuleDestination::Folder { display: r.destination.clone() }
+                        RuleDestination::Folder {
+                            display: r.destination.clone(),
+                        }
                     };
                     let typed = Rule {
                         id: r.id.clone(),
@@ -681,9 +686,8 @@ pub fn suggestion_detail_inner(
                         scope: RuleScope { folders: vec![] },
                         enabled: r.enabled,
                     };
-                    let just = crate::classify::redact::filter_output(
-                        &rules::rule_justification(&typed),
-                    );
+                    let just =
+                        crate::classify::redact::filter_output(&rules::rule_justification(&typed));
                     (r.name, just)
                 }
                 None => (hit.rule_id.clone(), String::new()),
@@ -732,7 +736,10 @@ pub fn suggestion_detail_inner(
                         .into_iter()
                         .next()
                         .and_then(|(id, _)| {
-                            tax.categories.iter().find(|c| c.id == id).map(|c| c.name.clone())
+                            tax.categories
+                                .iter()
+                                .find(|c| c.id == id)
+                                .map(|c| c.name.clone())
                         });
                     let just = crate::classify::redact::filter_output(&justification(
                         &l.primary_id,
@@ -744,7 +751,10 @@ pub fn suggestion_detail_inner(
                 None => (None, String::new()),
             };
             let secondary_name = l.secondary_id.as_ref().and_then(|sid| {
-                tax.categories.iter().find(|c| &c.id == sid).map(|c| c.name.clone())
+                tax.categories
+                    .iter()
+                    .find(|c| &c.id == sid)
+                    .map(|c| c.name.clone())
             });
             let dest_display = match &child_name {
                 Some(c) => format!("Auto/{top_name}/{c}"),
@@ -764,14 +774,17 @@ pub fn suggestion_detail_inner(
         }
         None => {
             // Rule-only: primary mirrors the rule destination.
-            let alt = rule_alternative.as_ref().cloned().unwrap_or(RuleAlternative {
-                rule_id: String::new(),
-                rule_name: String::new(),
-                dest_kind: "folder".to_string(),
-                destination: String::new(),
-                justification: String::new(),
-                overlap_note: None,
-            });
+            let alt = rule_alternative
+                .as_ref()
+                .cloned()
+                .unwrap_or(RuleAlternative {
+                    rule_id: String::new(),
+                    rule_name: String::new(),
+                    dest_kind: "folder".to_string(),
+                    destination: String::new(),
+                    justification: String::new(),
+                    overlap_note: None,
+                });
             let dest_display = if alt.dest_kind == "category" {
                 crate::classify::filing::auto_path_for_id(tax, &alt.destination)
                     .map(|(d, _, _)| d)
@@ -844,7 +857,10 @@ pub async fn mailbox_labels(
                 .map(|c| c.name.clone())
                 .unwrap_or_else(|| l.primary_id.clone());
             let secondary_name = l.secondary_id.as_ref().and_then(|sid| {
-                tax.categories.iter().find(|c| &c.id == sid).map(|c| c.name.clone())
+                tax.categories
+                    .iter()
+                    .find(|c| &c.id == sid)
+                    .map(|c| c.name.clone())
             });
             MailboxLabel {
                 uid,
@@ -867,8 +883,12 @@ pub async fn suggestion_for_uid(
 ) -> Result<Option<SuggestionDetail>, String> {
     let message_id = {
         let guard = state.store.lock().unwrap();
-        match crate::store::queries::find_message_id(guard.conn(), mailbox_id_of(guard.conn(), &mailbox)?, uid)
-            .map_err(|e| e.to_string())?
+        match crate::store::queries::find_message_id(
+            guard.conn(),
+            mailbox_id_of(guard.conn(), &mailbox)?,
+            uid,
+        )
+        .map_err(|e| e.to_string())?
         {
             Some(id) => id,
             None => return Ok(None),
@@ -892,7 +912,8 @@ use crate::commands::sync::{guard_delete, guard_rename, refresh_mailbox_tree};
 fn read_taxonomy(conn: &rusqlite::Connection) -> Result<Taxonomy, String> {
     let row = crate::store::queries::get_taxonomy(conn).map_err(|e| e.to_string())?;
     match row {
-        Some(t) => serde_json::from_str::<Taxonomy>(&t.json).map_err(|e| format!("taxonomia corrompida: {e}")),
+        Some(t) => serde_json::from_str::<Taxonomy>(&t.json)
+            .map_err(|e| format!("taxonomia corrompida: {e}")),
         None => crate::classify::taxonomy::load_default().map_err(|e| e.to_string()),
     }
 }
@@ -926,7 +947,10 @@ pub fn revalidate_rules(
     let ids = crate::classify::taxonomy::category_ids(tax);
     let rules = crate::store::queries::list_rules(conn).map_err(|e| e.to_string())?;
     let mut disabled = Vec::new();
-    for r in rules.iter().filter(|r| r.enabled && r.dest_kind == "category") {
+    for r in rules
+        .iter()
+        .filter(|r| r.enabled && r.dest_kind == "category")
+    {
         if !ids.iter().any(|id| id == &r.destination) {
             let mut row = r.clone();
             row.enabled = false;
@@ -969,8 +993,7 @@ pub fn reassign_deleted_rules(
                 // revalidation an instant earlier — its destination is
                 // valid again by construction, so the rule stays alive.
                 row.enabled = true;
-                crate::store::queries::update_rule(conn, &row)
-                    .map_err(|e| e.to_string())?;
+                crate::store::queries::update_rule(conn, &row).map_err(|e| e.to_string())?;
                 remapped += 1;
             }
         } else {
@@ -1030,7 +1053,11 @@ pub async fn list_taxonomy(state: State<'_, AppState>) -> Result<TaxonomyView, S
             labels,
         });
     }
-    Ok(TaxonomyView { version: tax.version, name: tax.name.clone(), categories })
+    Ok(TaxonomyView {
+        version: tax.version,
+        name: tax.name.clone(),
+        categories,
+    })
 }
 
 fn edit_err(e: EditError) -> String {
@@ -1063,7 +1090,13 @@ pub async fn add_category(
         let (top_name, child_name) = match &cat.parent {
             None => (cat.name.clone(), None),
             Some(pid) => {
-                let top = tax.categories.iter().find(|c| &c.id == pid).unwrap().name.clone();
+                let top = tax
+                    .categories
+                    .iter()
+                    .find(|c| &c.id == pid)
+                    .unwrap()
+                    .name
+                    .clone();
                 (top, Some(cat.name.clone()))
             }
         };
@@ -1172,7 +1205,9 @@ pub async fn rename_category(
 }
 
 fn old_display_path(tax: &Taxonomy, id: &str) -> String {
-    filing::auto_path_for_id(tax, id).map(|(d, _, _)| d).unwrap_or_default()
+    filing::auto_path_for_id(tax, id)
+        .map(|(d, _, _)| d)
+        .unwrap_or_default()
 }
 
 /// Merge `from` into `into` (siblings): move all mail, remap labels,
@@ -1248,7 +1283,10 @@ pub async fn merge_categories(
         };
         match guard_delete(&cached, &w, 0, true, None).map_err(|e| e.to_string())? {
             crate::commands::sync::DeleteDecision::Proceed { wire, .. } => {
-                manager.delete_mailbox_in(&wire).await.map_err(|e| e.to_string())?;
+                manager
+                    .delete_mailbox_in(&wire)
+                    .await
+                    .map_err(|e| e.to_string())?;
             }
             other => return Err(format!("exclusão bloqueada: {other:?}")),
         }
@@ -1268,7 +1306,11 @@ pub async fn merge_categories(
         persist_taxonomy(conn, &tax)?;
         remapped
     };
-    Ok(TaxonomyChangeReport { moved, rules_remapped, rules_disabled: vec![] })
+    Ok(TaxonomyChangeReport {
+        moved,
+        rules_remapped,
+        rules_disabled: vec![],
+    })
 }
 
 /// Delete a category: mail moves to `reassign_to` first, then folder DELETE
@@ -1297,17 +1339,21 @@ pub async fn delete_category(
         let conn = guard.conn();
         let cached = crate::store::queries::list_mailboxes(conn).map_err(|e| e.to_string())?;
         let wire_of = |display: &str| {
-            cached.iter().find(|r| r.display_name == *display).map(|r| r.name.clone())
+            cached
+                .iter()
+                .find(|r| r.display_name == *display)
+                .map(|r| r.name.clone())
         };
-        let into_wire = wire_of(&into_display)
-            .ok_or_else(|| "pasta de destino não existe".to_string())?;
+        let into_wire =
+            wire_of(&into_display).ok_or_else(|| "pasta de destino não existe".to_string())?;
         let (uids, mailbox_name) = match wire_of(&from_display) {
             Some(w) => {
-                let uids = match crate::store::queries::mailbox_id(conn, &w).map_err(|e| e.to_string())? {
-                    Some(mb_id) => crate::store::queries::all_local_uids(conn, mb_id)
-                        .map_err(|e| e.to_string())?,
-                    None => vec![],
-                };
+                let uids =
+                    match crate::store::queries::mailbox_id(conn, &w).map_err(|e| e.to_string())? {
+                        Some(mb_id) => crate::store::queries::all_local_uids(conn, mb_id)
+                            .map_err(|e| e.to_string())?,
+                        None => vec![],
+                    };
                 (uids, w)
             }
             None => (vec![], String::new()),
@@ -1316,9 +1362,16 @@ pub async fn delete_category(
     };
     let mut moved = 0usize;
     for uid in uids {
-        filing::move_one_uid(&manager, &store, &mailbox_name, uid, &into_wire, &format!("Movido para {into_display}"))
-            .await
-            .map_err(|e| e.to_string())?;
+        filing::move_one_uid(
+            &manager,
+            &store,
+            &mailbox_name,
+            uid,
+            &into_wire,
+            &format!("Movido para {into_display}"),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         moved += 1;
     }
     if let Some(w) = from_wire {
@@ -1328,7 +1381,10 @@ pub async fn delete_category(
         };
         match guard_delete(&cached, &w, 0, true, None).map_err(|e| e.to_string())? {
             crate::commands::sync::DeleteDecision::Proceed { wire, .. } => {
-                manager.delete_mailbox_in(&wire).await.map_err(|e| e.to_string())?;
+                manager
+                    .delete_mailbox_in(&wire)
+                    .await
+                    .map_err(|e| e.to_string())?;
             }
             other => return Err(format!("exclusão bloqueada: {other:?}")),
         }
@@ -1359,7 +1415,11 @@ pub async fn delete_category(
         let (remapped, disabled) = reassign_deleted_rules(conn, &id, &reassign_to)?;
         (remapped, disabled)
     };
-    Ok(TaxonomyChangeReport { moved, rules_remapped, rules_disabled })
+    Ok(TaxonomyChangeReport {
+        moved,
+        rules_remapped,
+        rules_disabled,
+    })
 }
 
 /// Edit keywords/rules in place (no version bump, no folder touch).
@@ -1382,10 +1442,7 @@ pub async fn update_category_keywords(
 /// Import taxonomy JSON: sanitize → validate → version++ → stale-flag.
 /// Invalid files rejected with a plain-language reason; nothing changes.
 #[tauri::command]
-pub async fn import_taxonomy(
-    state: State<'_, AppState>,
-    json: String,
-) -> Result<u32, String> {
+pub async fn import_taxonomy(state: State<'_, AppState>, json: String) -> Result<u32, String> {
     let tax = taxedit::sanitize_import(&json).map_err(edit_err)?;
     let guard = state.store.lock().unwrap();
     persist_taxonomy(guard.conn(), &tax)
@@ -1416,7 +1473,11 @@ pub async fn batch_classify(
     let store = state.store.clone();
     let account_cfg = load_account_config(state.clone()).await?;
     let manager = manager_for(&state, &account_cfg);
-    let sup = state.sidecar.lock().unwrap().clone()
+    let sup = state
+        .sidecar
+        .lock()
+        .unwrap()
+        .clone()
         .ok_or_else(|| "classificador parado — inicie o app com o sidecar".to_string())?;
     let (url, key) = sup.bridge_params();
     let bridge =
@@ -1430,7 +1491,9 @@ pub async fn batch_classify(
         let guard = store.lock().unwrap();
         match resume_run {
             Some(id) => id,
-            None => crate::store::queries::create_batch_run(guard.conn()).map_err(|e| e.to_string())?,
+            None => {
+                crate::store::queries::create_batch_run(guard.conn()).map_err(|e| e.to_string())?
+            }
         }
     };
     let tax = load_default().map_err(|e| e.to_string())?;
@@ -1524,8 +1587,12 @@ pub async fn batch_classify(
                     // Below threshold/vetoed → remainder (never moved).
                     let guard = store.lock().unwrap();
                     let _ = crate::store::queries::upsert_label(
-                        guard.conn(), mid, &ready.primary_id,
-                        ready.secondary_id.as_deref(), ready.confidence, threshold,
+                        guard.conn(),
+                        mid,
+                        &ready.primary_id,
+                        ready.secondary_id.as_deref(),
+                        ready.confidence,
+                        threshold,
                         true,
                     );
                     review += 1;
@@ -1536,36 +1603,39 @@ pub async fn batch_classify(
                 // shape, T-30-04) + per-item re-resolution in the journal
                 // lock section: the MOVE verb takes ONLY the re-resolved
                 // pair, never the run-start snapshot (T-30-01).
-                let dest_display = batch::dest_display_for(
-                    &tax,
-                    &ready.primary_id,
-                    ready.child_id.as_deref(),
-                );
+                let dest_display =
+                    batch::dest_display_for(&tax, &ready.primary_id, ready.child_id.as_deref());
                 let snap_epoch = epochs.get(&snap_mb).copied().unwrap_or(0);
                 // Unify resolve → wire → journal under one lock (T-30-01):
                 // the MOVE verb takes ONLY this re-resolved pair.
                 let (res, dest_wire) = {
                     let guard = store.lock().unwrap();
                     let conn = guard.conn();
-                    let res = match batch::resolve_for_move(
-                        conn, mid, &snap_mb, snap_uid, snap_epoch,
-                    ) {
-                        Ok(r) => r,
-                        Err(_) => None,
-                    };
+                    let res =
+                        match batch::resolve_for_move(conn, mid, &snap_mb, snap_uid, snap_epoch) {
+                            Ok(r) => r,
+                            Err(_) => None,
+                        };
                     if res.is_none() {
                         (None, String::new())
                     } else {
                         let res = res.unwrap();
-                        let cached = crate::store::queries::list_mailboxes(conn).ok().unwrap_or_default();
-                        let delim = cached.first().map(|r| r.delimiter.clone()).unwrap_or_default();
+                        let cached = crate::store::queries::list_mailboxes(conn)
+                            .ok()
+                            .unwrap_or_default();
+                        let delim = cached
+                            .first()
+                            .map(|r| r.delimiter.clone())
+                            .unwrap_or_default();
                         let w = if delim.is_empty() || delim == "/" {
                             dest_display.clone()
                         } else {
                             let parts: Vec<&str> = dest_display.split('/').collect();
                             let mut wire = String::new();
                             for (i, p) in parts.iter().enumerate() {
-                                if i > 0 { wire.push_str(&delim); }
+                                if i > 0 {
+                                    wire.push_str(&delim);
+                                }
                                 wire.push_str(&crate::imap::mutf7::encode_modified_utf7(p));
                             }
                             wire
@@ -1581,8 +1651,13 @@ pub async fn batch_classify(
                 {
                     let guard = store.lock().unwrap();
                     let _ = batch::journal_intent(
-                        guard.conn(), run_id, mid, &res.from_folder, &dest_wire,
-                        &ready.primary_id, chunk_no,
+                        guard.conn(),
+                        run_id,
+                        mid,
+                        &res.from_folder,
+                        &dest_wire,
+                        &ready.primary_id,
+                        chunk_no,
                     );
                 }
                 // Verb addresses the re-resolved (folder, UID) pair read
@@ -1594,7 +1669,11 @@ pub async fn batch_classify(
                         let _ = batch::journal_moved(guard.conn(), run_id, mid);
                         moved += 1;
                     } else if crate::classify::filing::move_one_uid(
-                        &manager, &store, &mb_now, uid_now, &dest_wire,
+                        &manager,
+                        &store,
+                        &mb_now,
+                        uid_now,
+                        &dest_wire,
                         &format!("Arquivado em {dest_display}"),
                     )
                     .await
@@ -1603,8 +1682,13 @@ pub async fn batch_classify(
                         let guard = store.lock().unwrap();
                         let _ = batch::journal_moved(guard.conn(), run_id, mid);
                         let _ = crate::store::queries::upsert_label(
-                            guard.conn(), mid, &ready.primary_id,
-                            ready.secondary_id.as_deref(), ready.confidence, threshold, false,
+                            guard.conn(),
+                            mid,
+                            &ready.primary_id,
+                            ready.secondary_id.as_deref(),
+                            ready.confidence,
+                            threshold,
+                            false,
                         );
                         // Phase 28: fire-and-forget override_events log (action="batch")
                         let _ = crate::store::queries::log_override_event(
@@ -1643,8 +1727,10 @@ pub async fn batch_classify(
         {
             let guard = store.lock().unwrap();
             let _ = crate::store::queries::finish_batch_run(
-                guard.conn(), run_id,
-                if interrupted { "interrupted" } else { "done" }, &totals,
+                guard.conn(),
+                run_id,
+                if interrupted { "interrupted" } else { "done" },
+                &totals,
             );
         }
         let _ = app_h.emit(
@@ -1655,7 +1741,11 @@ pub async fn batch_classify(
                 total,
                 moved,
                 review,
-                state: if interrupted { "interrupted".to_string() } else { "done".to_string() },
+                state: if interrupted {
+                    "interrupted".to_string()
+                } else {
+                    "done".to_string()
+                },
             },
         );
     });
@@ -1665,7 +1755,9 @@ pub async fn batch_classify(
 /// Cancel the running batch (cooperative, chunk boundary).
 #[tauri::command]
 pub async fn cancel_batch(state: State<'_, AppState>) -> Result<(), String> {
-    state.batch_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+    state
+        .batch_cancel
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     Ok(())
 }
 
@@ -1680,10 +1772,7 @@ pub async fn undo_batch(state: State<'_, AppState>, run_id: i64) -> Result<usize
 
 /// Persisted per-category report + remainder for a run.
 #[tauri::command]
-pub async fn batch_report(
-    state: State<'_, AppState>,
-    run_id: i64,
-) -> Result<BatchReport, String> {
+pub async fn batch_report(state: State<'_, AppState>, run_id: i64) -> Result<BatchReport, String> {
     let guard = state.store.lock().unwrap();
     let conn = guard.conn();
     let (state_s, totals): (String, String) = conn
@@ -1721,7 +1810,17 @@ pub async fn batch_report(
     let parsed: serde_json::Value = serde_json::from_str(&totals).unwrap_or_default();
     let num = |k: &str| parsed.get(k).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     let failed = batch::failed_count(conn, run_id);
-    Ok(BatchReport { run_id, state: state_s, per_category, remainder: remainder as usize, undone: undone as usize, totals_json: totals, stale_dropped: num("stale_dropped"), retry_skipped: num("retry_skipped"), failed })
+    Ok(BatchReport {
+        run_id,
+        state: state_s,
+        per_category,
+        remainder: remainder as usize,
+        undone: undone as usize,
+        totals_json: totals,
+        stale_dropped: num("stale_dropped"),
+        retry_skipped: num("retry_skipped"),
+        failed,
+    })
 }
 
 // ── Phase 30: dry-run preview commands (BATCH-03) ────────────────
@@ -1745,9 +1844,7 @@ pub async fn preview_batch(
 /// Dry-run an archive run through the shared preview path
 /// (`kind_tag: "archive"` — same shape, same function).
 #[tauri::command]
-pub async fn preview_archive(
-    state: State<'_, AppState>,
-) -> Result<batch::BatchPreview, String> {
+pub async fn preview_archive(state: State<'_, AppState>) -> Result<batch::BatchPreview, String> {
     let guard = state.store.lock().unwrap();
     batch::preview_plan(guard.conn(), batch::PreviewKind::Archive, None)
 }
@@ -1791,10 +1888,7 @@ impl Drop for RetryGuard {
 
 /// Retry only the failed items of a finished/interrupted run.
 #[tauri::command]
-pub async fn retry_failed(
-    state: State<'_, AppState>,
-    run_id: i64,
-) -> Result<RetryReport, String> {
+pub async fn retry_failed(state: State<'_, AppState>, run_id: i64) -> Result<RetryReport, String> {
     let store = state.store.clone();
     // Entry gate first (plain-language refusals for undone/running/
     // failure-free runs) — before claiming the lane.
@@ -1851,14 +1945,18 @@ async fn retry_failed_inner(
         let guard = store.lock().unwrap();
         let conn = guard.conn();
         let state_s: String = conn
-            .query_row("SELECT state FROM batch_runs WHERE id = ?1", rusqlite::params![run_id], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT state FROM batch_runs WHERE id = ?1",
+                rusqlite::params![run_id],
+                |r| r.get(0),
+            )
             .map_err(|e| e.to_string())?;
         let totals: String = conn
-            .query_row("SELECT totals_json FROM batch_runs WHERE id = ?1", rusqlite::params![run_id], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT totals_json FROM batch_runs WHERE id = ?1",
+                rusqlite::params![run_id],
+                |r| r.get(0),
+            )
             .map_err(|e| e.to_string())?;
         let kind = serde_json::from_str::<serde_json::Value>(&totals)
             .ok()
@@ -1874,9 +1972,7 @@ async fn retry_failed_inner(
         failed
             .into_iter()
             .map(|f| {
-                let loc = queries::message_location(conn, f.message_id)
-                    .ok()
-                    .flatten();
+                let loc = queries::message_location(conn, f.message_id).ok().flatten();
                 let snapped = loc.map(|(folder, uid)| {
                     let epoch: u32 = conn
                         .query_row(
@@ -1909,7 +2005,9 @@ async fn retry_failed_inner(
                 }
                 None => None,
             };
-            let current = queries::message_location(conn, item.message_id).ok().flatten();
+            let current = queries::message_location(conn, item.message_id)
+                .ok()
+                .flatten();
             (resolved, current)
         };
         let Some(res) = resolved else {
@@ -1918,7 +2016,8 @@ async fn retry_failed_inner(
             // folder == destination means the move happened.
             if let Some((cur_folder, _)) = current {
                 if crate::imap::mutf7::decode_modified_utf7(&cur_folder)
-                    == crate::imap::mutf7::decode_modified_utf7(&item.to_folder) {
+                    == crate::imap::mutf7::decode_modified_utf7(&item.to_folder)
+                {
                     let guard = store.lock().unwrap();
                     let _ = batch::journal_moved(guard.conn(), run_id, item.message_id);
                     moved += 1;
@@ -1946,11 +2045,15 @@ async fn retry_failed_inner(
         // re-resolved pair (writes re-on for the failed subset ONLY).
         let ok = if is_archive {
             archive::archive_one(
-                &manager, store, &res.from_folder, res.uid,
-                &item.to_folder, &crate::imap::mutf7::decode_modified_utf7(&item.to_folder),
+                &manager,
+                store,
+                &res.from_folder,
+                res.uid,
+                &item.to_folder,
+                &crate::imap::mutf7::decode_modified_utf7(&item.to_folder),
             )
-                .await
-                .is_ok()
+            .await
+            .is_ok()
         } else {
             crate::classify::filing::move_one_uid(
                 &manager,
@@ -1993,12 +2096,15 @@ async fn retry_failed_inner(
     let failed_remaining = {
         let guard = store.lock().unwrap();
         let conn = guard.conn();
-        conn.execute("BEGIN IMMEDIATE", []).map_err(|e| e.to_string())?;
+        conn.execute("BEGIN IMMEDIATE", [])
+            .map_err(|e| e.to_string())?;
         let result = (|| -> Result<usize, String> {
             let totals: String = conn
-                .query_row("SELECT totals_json FROM batch_runs WHERE id = ?1", rusqlite::params![run_id], |r| {
-                    r.get(0)
-                })
+                .query_row(
+                    "SELECT totals_json FROM batch_runs WHERE id = ?1",
+                    rusqlite::params![run_id],
+                    |r| r.get(0),
+                )
                 .map_err(|e| e.to_string())?;
             let mut v: serde_json::Value = serde_json::from_str(&totals).unwrap_or_default();
             if !v.is_object() {
@@ -2007,7 +2113,8 @@ async fn retry_failed_inner(
             let prev = v.get("retry_skipped").and_then(|n| n.as_u64()).unwrap_or(0) as usize;
             v["retry_skipped"] = serde_json::json!(prev + skipped);
             let merged = v.to_string();
-            queries::finish_batch_run(conn, run_id, &run_state, &merged).map_err(|e| e.to_string())?;
+            queries::finish_batch_run(conn, run_id, &run_state, &merged)
+                .map_err(|e| e.to_string())?;
             Ok(batch::failed_count(conn, run_id))
         })();
         let _ = conn.execute("COMMIT", []);
@@ -2078,7 +2185,11 @@ pub async fn batch_runs_list(state: State<'_, AppState>) -> Result<Vec<BatchRunR
         .prepare("SELECT id, state, started_at FROM batch_runs ORDER BY id DESC LIMIT 20")
         .map_err(|e| e.to_string())?
         .query_map([], |r| {
-            Ok(BatchRunRow { id: r.get(0)?, state: r.get(1)?, started_at: r.get(2)? })
+            Ok(BatchRunRow {
+                id: r.get(0)?,
+                state: r.get(1)?,
+                started_at: r.get(2)?,
+            })
         })
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
@@ -2173,7 +2284,8 @@ pub async fn archive_run(
         let cands = archive::collect_archive_candidates(guard.conn(), threshold, &included, now)?;
         let mut jobs = Vec::with_capacity(cands.len());
         for (mid, mb, uid) in cands {
-            if let Ok((dest_display, _, _)) = archive::archive_dest_for(guard.conn(), mid, &mb, now) {
+            if let Ok((dest_display, _, _)) = archive::archive_dest_for(guard.conn(), mid, &mb, now)
+            {
                 jobs.push((mid, mb, uid, dest_display));
             }
         }
@@ -2184,7 +2296,9 @@ pub async fn archive_run(
         let guard = store.lock().unwrap();
         match resume_run {
             Some(id) => id,
-            None => crate::store::queries::create_batch_run(guard.conn()).map_err(|e| e.to_string())?,
+            None => {
+                crate::store::queries::create_batch_run(guard.conn()).map_err(|e| e.to_string())?
+            }
         }
     };
     if resume_run.is_some() {
@@ -2252,13 +2366,8 @@ pub async fn archive_run(
                 let snap_epoch = epochs.get(&snap_mb).copied().unwrap_or(0);
                 let resolved = {
                     let guard = store.lock().unwrap();
-                    match batch::resolve_for_move(
-                        guard.conn(),
-                        mid,
-                        &snap_mb,
-                        snap_uid,
-                        snap_epoch,
-                    ) {
+                    match batch::resolve_for_move(guard.conn(), mid, &snap_mb, snap_uid, snap_epoch)
+                    {
                         Ok(r) => r,
                         Err(_) => None,
                     }
@@ -2272,15 +2381,25 @@ pub async fn archive_run(
                 let dest_wire = {
                     let guard = store.lock().unwrap();
                     let conn = guard.conn();
-                    let cached = crate::store::queries::list_mailboxes(conn).ok().unwrap_or_default();
-                    let delim = cached.first().map(|r| r.delimiter.clone()).unwrap_or_default();
+                    let cached = crate::store::queries::list_mailboxes(conn)
+                        .ok()
+                        .unwrap_or_default();
+                    let delim = cached
+                        .first()
+                        .map(|r| r.delimiter.clone())
+                        .unwrap_or_default();
                     archive::display_to_wire(&dest_display, &delim)
                 };
                 {
                     let guard = store.lock().unwrap();
                     let _ = batch::journal_intent(
-                        guard.conn(), run_id, mid, &res.from_folder, &dest_wire,
-                        archive::ARCHIVE_LABEL_ID, chunk_no,
+                        guard.conn(),
+                        run_id,
+                        mid,
+                        &res.from_folder,
+                        &dest_wire,
+                        archive::ARCHIVE_LABEL_ID,
+                        chunk_no,
                     );
                 }
                 let (mb_now, uid_now) = (res.from_folder.clone(), res.uid);
@@ -2290,7 +2409,12 @@ pub async fn archive_run(
                         let _ = batch::journal_moved(guard.conn(), run_id, mid);
                         moved += 1;
                     } else if archive::archive_one(
-                        &manager, &store, &mb_now, uid_now, &dest_wire, &dest_display,
+                        &manager,
+                        &store,
+                        &mb_now,
+                        uid_now,
+                        &dest_wire,
+                        &dest_display,
                     )
                     .await
                     .is_ok()
@@ -2327,8 +2451,10 @@ pub async fn archive_run(
         {
             let guard = store.lock().unwrap();
             let _ = crate::store::queries::finish_batch_run(
-                guard.conn(), run_id,
-                if interrupted { "interrupted" } else { "done" }, &totals,
+                guard.conn(),
+                run_id,
+                if interrupted { "interrupted" } else { "done" },
+                &totals,
             );
         }
         let _ = app_h.emit(
@@ -2339,7 +2465,11 @@ pub async fn archive_run(
                 total,
                 moved,
                 review: 0,
-                state: if interrupted { "interrupted".to_string() } else { "done".to_string() },
+                state: if interrupted {
+                    "interrupted".to_string()
+                } else {
+                    "done".to_string()
+                },
             },
         );
     });
@@ -2372,12 +2502,15 @@ fn rule_view(row: &RuleRow) -> Result<RuleView, String> {
     let conditions: RuleConditions =
         serde_json::from_str(&row.conditions_json).map_err(|e| e.to_string())?;
     let destination = if row.dest_kind == "category" {
-        RuleDestination::TaxonomyCategory { id: row.destination.clone() }
+        RuleDestination::TaxonomyCategory {
+            id: row.destination.clone(),
+        }
     } else {
-        RuleDestination::Folder { display: row.destination.clone() }
+        RuleDestination::Folder {
+            display: row.destination.clone(),
+        }
     };
-    let scope_folders: Vec<String> =
-        serde_json::from_str(&row.scope_json).unwrap_or_default();
+    let scope_folders: Vec<String> = serde_json::from_str(&row.scope_json).unwrap_or_default();
     Ok(RuleView {
         id: row.id.clone(),
         name: row.name.clone(),
@@ -2391,9 +2524,11 @@ fn rule_view(row: &RuleRow) -> Result<RuleView, String> {
 
 /// Next free priority (append at the bottom — explicit reorder lowers it).
 fn next_rule_priority(conn: &rusqlite::Connection) -> i64 {
-    conn.query_row("SELECT IFNULL(MAX(priority), 99) + 1 FROM folder_rules", [], |r| {
-        r.get::<_, i64>(0)
-    })
+    conn.query_row(
+        "SELECT IFNULL(MAX(priority), 99) + 1 FROM folder_rules",
+        [],
+        |r| r.get::<_, i64>(0),
+    )
     .unwrap_or(rules::RULE_DEFAULT_PRIORITY)
 }
 
@@ -2429,7 +2564,9 @@ pub async fn create_rule(
 ) -> Result<RuleView, String> {
     let guard = state.store.lock().unwrap();
     let conn = guard.conn();
-    let scope = RuleScope { folders: scope_folders };
+    let scope = RuleScope {
+        folders: scope_folders,
+    };
     rules::validate_rule(conn, &name, &conditions, &destination, &scope, None)
         .map_err(|e| e.to_string())?;
     let id = unique_rule_id(conn, &rules::slug_for(&name));
@@ -2480,7 +2617,9 @@ pub async fn update_rule(
     let existing = crate::store::queries::get_rule(conn, &id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "regra desconhecida".to_string())?;
-    let scope = RuleScope { folders: scope_folders };
+    let scope = RuleScope {
+        folders: scope_folders,
+    };
     rules::validate_rule(conn, &name, &conditions, &destination, &scope, Some(&id))
         .map_err(|e| e.to_string())?;
     let row = RuleRow {
@@ -2522,8 +2661,7 @@ pub async fn set_rule_enabled(
     enabled: bool,
 ) -> Result<(), String> {
     let guard = state.store.lock().unwrap();
-    crate::store::queries::set_rule_enabled(guard.conn(), &id, enabled)
-        .map_err(|e| e.to_string())
+    crate::store::queries::set_rule_enabled(guard.conn(), &id, enabled).map_err(|e| e.to_string())
 }
 
 /// Explicit integer priority (lower wins; ties by creation order).
@@ -2535,8 +2673,7 @@ pub async fn set_rule_priority(
     priority: i64,
 ) -> Result<(), String> {
     let guard = state.store.lock().unwrap();
-    crate::store::queries::set_rule_priority(guard.conn(), &id, priority)
-        .map_err(|e| e.to_string())
+    crate::store::queries::set_rule_priority(guard.conn(), &id, priority).map_err(|e| e.to_string())
 }
 
 // ── Phase 29: rule portability commands (IMP-01) ─────────────────────
@@ -2612,12 +2749,15 @@ pub fn evaluate_rules(
             Ok(c) => c,
             Err(_) => continue,
         };
-        let scope_folders: Vec<String> =
-            serde_json::from_str(&row.scope_json).unwrap_or_default();
+        let scope_folders: Vec<String> = serde_json::from_str(&row.scope_json).unwrap_or_default();
         let destination = if row.dest_kind == "category" {
-            RuleDestination::TaxonomyCategory { id: row.destination.clone() }
+            RuleDestination::TaxonomyCategory {
+                id: row.destination.clone(),
+            }
         } else {
-            RuleDestination::Folder { display: row.destination.clone() }
+            RuleDestination::Folder {
+                display: row.destination.clone(),
+            }
         };
         typed.push(Rule {
             id: row.id.clone(),
@@ -2625,32 +2765,42 @@ pub fn evaluate_rules(
             priority: row.priority,
             conditions,
             destination,
-            scope: RuleScope { folders: scope_folders },
+            scope: RuleScope {
+                folders: scope_folders,
+            },
             enabled: true,
         });
     }
     let mut hits = Vec::new();
     for (mid, mailbox, sender, subject, snippet) in candidates {
-        if crate::store::queries::latest_override(conn, *mid).ok().flatten().is_some() {
+        if crate::store::queries::latest_override(conn, *mid)
+            .ok()
+            .flatten()
+            .is_some()
+        {
             continue;
         }
-        if crate::store::queries::get_label(conn, *mid).ok().flatten().is_some() {
+        if crate::store::queries::get_label(conn, *mid)
+            .ok()
+            .flatten()
+            .is_some()
+        {
             continue;
         }
-        if crate::store::queries::get_rule_suggestion(conn, *mid).ok().flatten().is_some() {
+        if crate::store::queries::get_rule_suggestion(conn, *mid)
+            .ok()
+            .flatten()
+            .is_some()
+        {
             continue;
         }
         for rule in &typed {
-            if !rule.scope.folders.is_empty()
-                && !rule.scope.folders.iter().any(|f| f == mailbox)
-            {
+            if !rule.scope.folders.is_empty() && !rule.scope.folders.iter().any(|f| f == mailbox) {
                 continue;
             }
             if rules::evaluate_rule(rule, sender, subject, snippet) {
                 let (dest_kind, destination) = match &rule.destination {
-                    RuleDestination::Folder { display } => {
-                        ("folder".to_string(), display.clone())
-                    }
+                    RuleDestination::Folder { display } => ("folder".to_string(), display.clone()),
                     RuleDestination::TaxonomyCategory { id } => {
                         ("category".to_string(), id.clone())
                     }
@@ -2777,12 +2927,16 @@ async fn ensure_rule_folder(
     let delimiter = {
         let guard = store.lock().unwrap();
         let cached = queries::list_mailboxes(guard.conn()).map_err(|e| e.to_string())?;
-        if let Some(row) =
-            cached.iter().find(|r| r.display_name == display || r.name == display)
+        if let Some(row) = cached
+            .iter()
+            .find(|r| r.display_name == display || r.name == display)
         {
             return Ok(row.name.clone());
         }
-        cached.first().map(|r| r.delimiter.clone()).unwrap_or_default()
+        cached
+            .first()
+            .map(|r| r.delimiter.clone())
+            .unwrap_or_default()
     };
     let mut parent_wire: Option<String> = None;
     let mut display_prefix = String::new();
@@ -2845,7 +2999,10 @@ pub async fn apply_rules(
         )
         .map_err(|e| e.to_string())?;
     }
-    Ok(ApplyRulesResult { evaluated, hits: hits.len() })
+    Ok(ApplyRulesResult {
+        evaluated,
+        hits: hits.len(),
+    })
 }
 
 /// Pending rule hits for the confirm surface: ids + destination + a
@@ -2892,9 +3049,13 @@ pub async fn pending_rule_suggestions(
                 let conditions: RuleConditions =
                     serde_json::from_str(&r.conditions_json).unwrap_or_default();
                 let destination = if r.dest_kind == "category" {
-                    RuleDestination::TaxonomyCategory { id: r.destination.clone() }
+                    RuleDestination::TaxonomyCategory {
+                        id: r.destination.clone(),
+                    }
                 } else {
-                    RuleDestination::Folder { display: r.destination.clone() }
+                    RuleDestination::Folder {
+                        display: r.destination.clone(),
+                    }
                 };
                 let typed = Rule {
                     id: r.id.clone(),
@@ -2905,9 +3066,8 @@ pub async fn pending_rule_suggestions(
                     scope: RuleScope { folders: vec![] },
                     enabled: r.enabled,
                 };
-                let just = crate::classify::redact::filter_output(
-                    &rules::rule_justification(&typed),
-                );
+                let just =
+                    crate::classify::redact::filter_output(&rules::rule_justification(&typed));
                 (r.name, just)
             }
             None => (s.rule_id.clone(), String::new()),
@@ -2956,18 +3116,40 @@ mod rule_apply_tests {
         )
         .unwrap();
         let mb: i64 = conn
-            .query_row("SELECT id FROM mailboxes WHERE name = 'INBOX'", [], |r| r.get(0))
+            .query_row("SELECT id FROM mailboxes WHERE name = 'INBOX'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         // Three cached messages (headers + preview only — the matcher never
         // sees more than this).
         for (uid, subject, from, preview) in [
-            (1u32, "Fatura de energia", "contas@utfpr.edu.br", "segue o boleto de outubro"),
+            (
+                1u32,
+                "Fatura de energia",
+                "contas@utfpr.edu.br",
+                "segue o boleto de outubro",
+            ),
             (2, "Reunião quinta", "chefe@empresa.com", "pauta da reunião"),
-            (3, "Fatura de água", "contas@utfpr.edu.br", "segunda via do boleto"),
+            (
+                3,
+                "Fatura de água",
+                "contas@utfpr.edu.br",
+                "segunda via do boleto",
+            ),
         ] {
             queries::upsert_message(
-                conn, mb as u64, uid, None, subject, from, "[]", "[]",
-                "2024-01-01T00:00:00Z", "[]", false, preview,
+                conn,
+                mb as u64,
+                uid,
+                None,
+                subject,
+                from,
+                "[]",
+                "[]",
+                "2024-01-01T00:00:00Z",
+                "[]",
+                false,
+                preview,
             )
             .unwrap();
         }
@@ -3012,13 +3194,30 @@ mod rule_apply_tests {
     fn rule_apply_first_match_wins_by_priority() {
         let store = seed_db();
         let conn = store.conn();
-        seed_rule(conn, "r-lo", "Baixa", 20, &sender_rule_json("utfpr.edu.br"), true);
-        seed_rule(conn, "r-hi", "Alta", 10, &sender_rule_json("utfpr.edu.br"), true);
+        seed_rule(
+            conn,
+            "r-lo",
+            "Baixa",
+            20,
+            &sender_rule_json("utfpr.edu.br"),
+            true,
+        );
+        seed_rule(
+            conn,
+            "r-hi",
+            "Alta",
+            10,
+            &sender_rule_json("utfpr.edu.br"),
+            true,
+        );
         let hits = evaluate_rules(conn, &cands(conn));
         // Uids 1 and 3 match; EACH carries only the priority-10 winner.
         assert_eq!(hits.len(), 2);
         for h in &hits {
-            assert_eq!(h.rule_id, "r-hi", "lower-priority rule must never fire on the same message");
+            assert_eq!(
+                h.rule_id, "r-hi",
+                "lower-priority rule must never fire on the same message"
+            );
         }
         // Explicit reorder flips the winner (priority persists).
         queries::set_rule_priority(conn, "r-lo", 5).unwrap();
@@ -3030,7 +3229,14 @@ mod rule_apply_tests {
     fn rule_apply_override_pin_beats_rules() {
         let store = seed_db();
         let conn = store.conn();
-        seed_rule(conn, "r-1", "R", 10, &sender_rule_json("utfpr.edu.br"), true);
+        seed_rule(
+            conn,
+            "r-1",
+            "R",
+            10,
+            &sender_rule_json("utfpr.edu.br"),
+            true,
+        );
         let mid: u64 = conn
             .query_row("SELECT id FROM messages WHERE uid = 1", [], |r| r.get(0))
             .unwrap();
@@ -3048,7 +3254,14 @@ mod rule_apply_tests {
     fn rule_apply_labeled_mail_left_to_classifier() {
         let store = seed_db();
         let conn = store.conn();
-        seed_rule(conn, "r-1", "R", 10, &sender_rule_json("utfpr.edu.br"), true);
+        seed_rule(
+            conn,
+            "r-1",
+            "R",
+            10,
+            &sender_rule_json("utfpr.edu.br"),
+            true,
+        );
         let mid: u64 = conn
             .query_row("SELECT id FROM messages WHERE uid = 1", [], |r| r.get(0))
             .unwrap();
@@ -3061,7 +3274,14 @@ mod rule_apply_tests {
     fn rule_apply_disabled_and_out_of_scope_never_fire() {
         let store = seed_db();
         let conn = store.conn();
-        seed_rule(conn, "r-off", "Off", 1, &sender_rule_json("utfpr.edu.br"), false);
+        seed_rule(
+            conn,
+            "r-off",
+            "Off",
+            1,
+            &sender_rule_json("utfpr.edu.br"),
+            false,
+        );
         queries::insert_rule(
             conn,
             &RuleRow {
@@ -3079,7 +3299,10 @@ mod rule_apply_tests {
         )
         .unwrap();
         let hits = evaluate_rules(conn, &cands(conn));
-        assert!(hits.is_empty(), "disabled/out-of-scope rules must never fire: {hits:?}");
+        assert!(
+            hits.is_empty(),
+            "disabled/out-of-scope rules must never fire: {hits:?}"
+        );
     }
 
     #[test]
@@ -3089,9 +3312,18 @@ mod rule_apply_tests {
         // outboxes empty — suggestions confirm later through the gated path.
         let store = seed_db();
         let conn = store.conn();
-        seed_rule(conn, "r-1", "R", 10, &sender_rule_json("utfpr.edu.br"), true);
+        seed_rule(
+            conn,
+            "r-1",
+            "R",
+            10,
+            &sender_rule_json("utfpr.edu.br"),
+            true,
+        );
         let mb: i64 = conn
-            .query_row("SELECT id FROM mailboxes WHERE name = 'INBOX'", [], |r| r.get(0))
+            .query_row("SELECT id FROM mailboxes WHERE name = 'INBOX'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         let hits = evaluate_rules(conn, &cands(conn));
         assert!(!hits.is_empty());
@@ -3118,7 +3350,14 @@ mod rule_apply_tests {
     fn rule_apply_plan_carries_uid_only_addressing() {
         let store = seed_db();
         let conn = store.conn();
-        seed_rule(conn, "r-1", "R", 10, &sender_rule_json("utfpr.edu.br"), true);
+        seed_rule(
+            conn,
+            "r-1",
+            "R",
+            10,
+            &sender_rule_json("utfpr.edu.br"),
+            true,
+        );
         let hits = evaluate_rules(conn, &cands(conn));
         assert!(!hits.is_empty());
         let h = &hits[0];
@@ -3134,7 +3373,11 @@ mod rule_apply_tests {
         .unwrap();
         let plan = plan_rule_filing(conn, h.message_id).unwrap();
         assert_eq!(plan.mailbox, "INBOX");
-        assert!((1..=3).contains(&plan.uid), "uid-only addressing, got {}", plan.uid);
+        assert!(
+            (1..=3).contains(&plan.uid),
+            "uid-only addressing, got {}",
+            plan.uid
+        );
         assert_eq!(plan.destination, "Arquivo");
     }
 }
@@ -3154,15 +3397,32 @@ mod rule_conflict_tests {
         )
         .unwrap();
         let mb: i64 = conn
-            .query_row("SELECT id FROM mailboxes WHERE name = 'INBOX'", [], |r| r.get(0))
+            .query_row("SELECT id FROM mailboxes WHERE name = 'INBOX'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         for (uid, subject, from, preview) in [
-            (1u32, "Fatura de energia", "contas@utfpr.edu.br", "segue o boleto de outubro"),
+            (
+                1u32,
+                "Fatura de energia",
+                "contas@utfpr.edu.br",
+                "segue o boleto de outubro",
+            ),
             (2, "Reunião quinta", "chefe@empresa.com", "pauta da reunião"),
         ] {
             queries::upsert_message(
-                conn, mb as u64, uid, None, subject, from, "[]", "[]",
-                "2024-01-01T00:00:00Z", "[]", false, preview,
+                conn,
+                mb as u64,
+                uid,
+                None,
+                subject,
+                from,
+                "[]",
+                "[]",
+                "2024-01-01T00:00:00Z",
+                "[]",
+                false,
+                preview,
             )
             .unwrap();
         }
@@ -3197,9 +3457,11 @@ mod rule_conflict_tests {
     }
 
     fn mid_for_uid(conn: &rusqlite::Connection, uid: u32) -> u64 {
-        conn.query_row("SELECT id FROM messages WHERE uid = ?1", rusqlite::params![uid], |r| {
-            r.get(0)
-        })
+        conn.query_row(
+            "SELECT id FROM messages WHERE uid = ?1",
+            rusqlite::params![uid],
+            |r| r.get(0),
+        )
         .unwrap()
     }
 
@@ -3236,8 +3498,13 @@ mod rule_conflict_tests {
         let conn = store.conn();
         let tax = crate::classify::taxonomy::load_default().unwrap();
         seed_rule(
-            conn, "r-1", "Boletos", 10,
-            r#"{"sender_domain":"utfpr.edu.br"}"#, "folder", "Arquivo",
+            conn,
+            "r-1",
+            "Boletos",
+            10,
+            r#"{"sender_domain":"utfpr.edu.br"}"#,
+            "folder",
+            "Arquivo",
         );
         let mid = mid_for_uid(conn, 1);
         queries::upsert_label(conn, mid, "academico", None, 0.85, 0.6, false).unwrap();
@@ -3255,11 +3522,16 @@ mod rule_conflict_tests {
         // Classifier side intact (never silently overridden)…
         assert_eq!(detail.primary_id, "academico");
         // …and the rule side rides along for the user pick.
-        let alt = detail.rule_alternative.expect("rule alternative must be present");
+        let alt = detail
+            .rule_alternative
+            .expect("rule alternative must be present");
         assert_eq!(alt.rule_id, "r-1");
         assert_eq!(alt.destination, "Arquivo");
         assert!(alt.justification.contains("Boletos"));
-        assert!(alt.overlap_note.is_none(), "plain folder must not warn overlap");
+        assert!(
+            alt.overlap_note.is_none(),
+            "plain folder must not warn overlap"
+        );
     }
 
     #[test]
@@ -3281,7 +3553,10 @@ mod rule_conflict_tests {
             Some(("Finanças".to_string(), Some("Contas".to_string())))
         );
         assert!(split_auto_nest("Arquivo").is_none());
-        assert!(split_auto_nest("Auto/A/B/C").is_none(), "3+ levels fall back to guarded ensure");
+        assert!(
+            split_auto_nest("Auto/A/B/C").is_none(),
+            "3+ levels fall back to guarded ensure"
+        );
     }
 
     #[test]
@@ -3292,17 +3567,26 @@ mod rule_conflict_tests {
         let store = seed_db();
         let conn = store.conn();
         seed_rule(
-            conn, "r-1", "Boletos", 10,
-            r#"{"sender_domain":"utfpr.edu.br"}"#, "folder", "Arquivo",
+            conn,
+            "r-1",
+            "Boletos",
+            10,
+            r#"{"sender_domain":"utfpr.edu.br"}"#,
+            "folder",
+            "Arquivo",
         );
         let mid = mid_for_uid(conn, 1);
         queries::upsert_label(conn, mid, "academico", None, 0.2, 0.6, true).unwrap();
         // Labeled mail is classifier territory: no rule suggestion fires —
         // and nothing moved anywhere.
         let cands = queries::rule_candidate_rows(conn, Some("INBOX")).unwrap();
-        assert!(evaluate_rules(conn, &cands).iter().all(|h| h.message_id != mid));
+        assert!(evaluate_rules(conn, &cands)
+            .iter()
+            .all(|h| h.message_id != mid));
         let mb: i64 = conn
-            .query_row("SELECT id FROM mailboxes WHERE name = 'INBOX'", [], |r| r.get(0))
+            .query_row("SELECT id FROM mailboxes WHERE name = 'INBOX'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(queries::imap_outbox_count(conn, mb as u64).unwrap(), 0);
         assert_eq!(queries::outbox_count(conn, mb as u64).unwrap(), 0);
@@ -3313,8 +3597,13 @@ mod rule_conflict_tests {
         let store = seed_db();
         let conn = store.conn();
         seed_rule(
-            conn, "r-1", "Boletos", 10,
-            r#"{"sender_domain":"utfpr.edu.br"}"#, "folder", "Arquivo",
+            conn,
+            "r-1",
+            "Boletos",
+            10,
+            r#"{"sender_domain":"utfpr.edu.br"}"#,
+            "folder",
+            "Arquivo",
         );
         let mid = mid_for_uid(conn, 1);
         queries::upsert_label(conn, mid, "academico", None, 0.85, 0.6, false).unwrap();
@@ -3335,7 +3624,9 @@ mod rule_conflict_tests {
         let loc = queries::message_location(conn, mid).unwrap();
         assert!(loc.is_some(), "dismissal must keep mail in place");
         let mb: i64 = conn
-            .query_row("SELECT id FROM mailboxes WHERE name = 'INBOX'", [], |r| r.get(0))
+            .query_row("SELECT id FROM mailboxes WHERE name = 'INBOX'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert!(!queries::is_pending_delete(conn, mb as u64, 1).unwrap());
         assert_eq!(queries::imap_outbox_count(conn, mb as u64).unwrap(), 0);
@@ -3435,8 +3726,15 @@ mod rule_evolv_tests {
         let (remapped2, notices2) = reassign_deleted_rules(conn, "cat-a", "cat-ghost").unwrap();
         assert_eq!(remapped2, 0);
         assert_eq!(notices2.len(), 1);
-        assert!(notices2[0].contains("Orfa"), "notice names the rule: {}", notices2[0]);
-        assert!(queries::get_rule(conn, "r-2").unwrap().is_some(), "disabled, never dropped");
+        assert!(
+            notices2[0].contains("Orfa"),
+            "notice names the rule: {}",
+            notices2[0]
+        );
+        assert!(
+            queries::get_rule(conn, "r-2").unwrap().is_some(),
+            "disabled, never dropped"
+        );
     }
 
     #[test]
@@ -3471,7 +3769,11 @@ mod rule_evolv_tests {
         assert!(!bad.enabled);
         let ok = queries::get_rule(conn, "r-ok").unwrap().unwrap();
         assert!(ok.enabled);
-        assert_eq!(queries::list_rules(conn).unwrap().len(), 2, "revalidate never drops rows");
+        assert_eq!(
+            queries::list_rules(conn).unwrap().len(),
+            2,
+            "revalidate never drops rows"
+        );
     }
 }
 
@@ -3520,13 +3822,15 @@ pub fn plan_rule_bulk(
     let hits = evaluate_rules(conn, &cands);
     let mut out = Vec::new();
     for h in hits {
-        let loc = queries::message_location(conn, h.message_id)
-            .map_err(|e| e.to_string())?;
+        let loc = queries::message_location(conn, h.message_id).map_err(|e| e.to_string())?;
         if let Some((mb, _)) = loc {
             if mb == "Auto" || mb.starts_with("Auto/") || mb.starts_with("Auto.") {
                 continue;
             }
-            out.push(PlannedRuleHit { hit: h, from_folder: mb });
+            out.push(PlannedRuleHit {
+                hit: h,
+                from_folder: mb,
+            });
         }
     }
     Ok(out)
@@ -3639,7 +3943,12 @@ pub async fn apply_rules_bulk(
     let mut jobs: Vec<(u64, String, String, String)> = Vec::new();
     for p in &planned {
         if let Some(w) = wires.get(&(p.hit.dest_kind.clone(), p.hit.destination.clone())) {
-            jobs.push((p.hit.message_id, p.from_folder.clone(), w.clone(), p.hit.rule_id.clone()));
+            jobs.push((
+                p.hit.message_id,
+                p.from_folder.clone(),
+                w.clone(),
+                p.hit.rule_id.clone(),
+            ));
         }
     }
     {
@@ -3764,7 +4073,11 @@ pub async fn apply_rules_bulk(
                 total,
                 moved,
                 skipped,
-                state: if interrupted { "interrupted".to_string() } else { "done".to_string() },
+                state: if interrupted {
+                    "interrupted".to_string()
+                } else {
+                    "done".to_string()
+                },
             },
         );
     });
@@ -3787,21 +4100,47 @@ mod rule_bulk_tests {
         )
         .unwrap();
         let inbox: i64 = conn
-            .query_row("SELECT id FROM mailboxes WHERE name = 'INBOX'", [], |r| r.get(0))
-            .unwrap();
-        let filed: i64 = conn
-            .query_row("SELECT id FROM mailboxes WHERE name = 'Auto/Finanças'", [], |r| {
+            .query_row("SELECT id FROM mailboxes WHERE name = 'INBOX'", [], |r| {
                 r.get(0)
             })
             .unwrap();
+        let filed: i64 = conn
+            .query_row(
+                "SELECT id FROM mailboxes WHERE name = 'Auto/Finanças'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         for (mb, uid, subject, from, preview) in [
-            (inbox, 1u32, "Fatura de energia", "contas@utfpr.edu.br", "boleto de outubro"),
+            (
+                inbox,
+                1u32,
+                "Fatura de energia",
+                "contas@utfpr.edu.br",
+                "boleto de outubro",
+            ),
             (inbox, 2, "Reunião quinta", "chefe@empresa.com", "pauta"),
-            (filed, 1u32, "Fatura antiga", "contas@utfpr.edu.br", "boleto antigo"),
+            (
+                filed,
+                1u32,
+                "Fatura antiga",
+                "contas@utfpr.edu.br",
+                "boleto antigo",
+            ),
         ] {
             queries::upsert_message(
-                conn, mb as u64, uid, None, subject, from, "[]", "[]",
-                "2024-01-01T00:00:00Z", "[]", false, preview,
+                conn,
+                mb as u64,
+                uid,
+                None,
+                subject,
+                from,
+                "[]",
+                "[]",
+                "2024-01-01T00:00:00Z",
+                "[]",
+                false,
+                preview,
             )
             .unwrap();
         }
@@ -3830,7 +4169,12 @@ mod rule_bulk_tests {
         let conn = store.conn();
         // Filed mail under Auto/ never bulk-moves (already filed).
         let planned = plan_rule_bulk(conn, None).unwrap();
-        assert_eq!(planned.len(), 1, "only the INBOX hit plans, got {}", planned.len());
+        assert_eq!(
+            planned.len(),
+            1,
+            "only the INBOX hit plans, got {}",
+            planned.len()
+        );
         assert_eq!(planned[0].from_folder, "INBOX");
         assert_eq!(planned[0].hit.rule_id, "r-1");
         // Pin it: plan empties (override wins even in bulk).
@@ -3850,10 +4194,21 @@ mod rule_bulk_tests {
         assert_eq!(planned.len(), 1);
         let run = queries::create_batch_run(conn).unwrap();
         let p = &planned[0];
-        rule_batch::journal_intent(conn, run, p.hit.message_id, &p.from_folder, "Arquivo", "r-1", 0)
-            .unwrap();
+        rule_batch::journal_intent(
+            conn,
+            run,
+            p.hit.message_id,
+            &p.from_folder,
+            "Arquivo",
+            "r-1",
+            0,
+        )
+        .unwrap();
         rule_batch::journal_moved(conn, run, p.hit.message_id).unwrap();
-        assert_eq!(rule_batch::journaled_ids(conn, run).unwrap(), vec![p.hit.message_id]);
+        assert_eq!(
+            rule_batch::journaled_ids(conn, run).unwrap(),
+            vec![p.hit.message_id]
+        );
         // Report reads the same journal generically.
         let per: Vec<(String, usize)> = conn
             .prepare(
@@ -3921,7 +4276,10 @@ mod import_export_ui_flow_tests {
         let good = r#"{"version":1,"rules":[{"id":"r-1","name":"Boletos","priority":100,"conditions_json":{"sender_domain":"utfpr.edu.br"},"dest_kind":"folder","destination":"PastaNova","scope_json":[],"enabled":true}]}"#;
         let preview2 = rules_io::import_rules(&store, good, false).unwrap();
         assert!(preview2.errors.is_empty(), "got {:?}", preview2.errors);
-        assert!(preview2.warnings.iter().any(|w| w.contains("folder not found")));
+        assert!(preview2
+            .warnings
+            .iter()
+            .any(|w| w.contains("folder not found")));
         assert_eq!(preview2.imported, 1);
         let committed = rules_io::import_rules(&store, good, true).unwrap();
         assert_eq!((committed.imported, committed.updated), (1, 0));
@@ -3953,10 +4311,15 @@ pub async fn set_auto_confirm(
     let ok = if enabled {
         let p = prec_opt.unwrap_or(0.0);
         n >= 10 && p >= 0.80
-    } else { true };
+    } else {
+        true
+    };
     if !ok {
         let p = prec_opt.unwrap_or(0.0);
-        return Err(format!("{} decisions @ precision {:.2} — needs 10+ at 0.80+", n, p));
+        return Err(format!(
+            "{} decisions @ precision {:.2} — needs 10+ at 0.80+",
+            n, p
+        ));
     }
     // write to M22 auto_confirm_prefs (back-end; direct-IPC also hits this, not UI-only)
     Ok(())

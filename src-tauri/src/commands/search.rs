@@ -9,9 +9,7 @@
 
 use tauri::State;
 
-use crate::store::queries::{
-    self, SavedFilter, SearchHit, SearchState, SORT_RANK,
-};
+use crate::store::queries::{self, SavedFilter, SearchHit, SearchState, SORT_RANK};
 
 /// Save a named filter query. `folders = None` = whole account;
 /// `Some(set)` narrows to those folders. `sort` defaults to `"rank"`.
@@ -42,9 +40,7 @@ pub async fn save_filter(
 
 /// List all saved filters ordered by name.
 #[tauri::command]
-pub async fn list_filters(
-    state: State<'_, crate::AppState>,
-) -> Result<Vec<SavedFilter>, String> {
+pub async fn list_filters(state: State<'_, crate::AppState>) -> Result<Vec<SavedFilter>, String> {
     let store = state.store.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let guard = store.lock().unwrap();

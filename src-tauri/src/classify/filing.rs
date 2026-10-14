@@ -91,13 +91,16 @@ pub fn plan_filing(
     let is_reply = subject.to_lowercase().starts_with("re:");
     let evidence = build_evidence(&subject, &snippet, domain, has_attachments, is_reply);
     let kids: Vec<&super::taxonomy::Category> = children_of(tax, &top.id);
-    let child = match_keywords(&evidence, &kids).into_iter().next().map(|(id, _)| {
-        tax.categories
-            .iter()
-            .find(|c| c.id == id)
-            .map(|c| c.name.clone())
-            .unwrap_or(id)
-    });
+    let child = match_keywords(&evidence, &kids)
+        .into_iter()
+        .next()
+        .map(|(id, _)| {
+            tax.categories
+                .iter()
+                .find(|c| c.id == id)
+                .map(|c| c.name.clone())
+                .unwrap_or(id)
+        });
     let dest_display = match &child {
         Some(c) => format!("Auto/{}/{}", top.name, c),
         None => format!("Auto/{}", top.name),
@@ -135,8 +138,8 @@ pub async fn ensure_auto_tree(
     let (cached, delimiter, marked) = {
         let guard = store.lock().unwrap();
         let conn = guard.conn();
-        let cached = queries::list_mailboxes(conn)
-            .map_err(|e| FilingError::Store(e.to_string()))?;
+        let cached =
+            queries::list_mailboxes(conn).map_err(|e| FilingError::Store(e.to_string()))?;
         let delimiter = cached
             .iter()
             .find(|r| r.name == plan.mailbox)
@@ -173,11 +176,10 @@ pub async fn ensure_auto_tree(
     }
     // Level-by-level: Auto → Top → Child?.
     let mut parent_wire = root_wire.clone();
-    if !live.iter().any(|m| m.name == parent_wire)
-        && !cached.iter().any(|r| r.name == parent_wire)
+    if !live.iter().any(|m| m.name == parent_wire) && !cached.iter().any(|r| r.name == parent_wire)
     {
-        let wire = prepare_create_wire(&cached, None, "Auto", &delimiter)
-            .map_err(FilingError::Imap)?;
+        let wire =
+            prepare_create_wire(&cached, None, "Auto", &delimiter).map_err(FilingError::Imap)?;
         manager
             .create_mailbox_in(&wire)
             .await
@@ -187,10 +189,12 @@ pub async fn ensure_auto_tree(
     for level in std::iter::once(&plan.top_name).chain(plan.child_name.as_ref()) {
         let cached_now = {
             let guard = store.lock().unwrap();
-            queries::list_mailboxes(guard.conn())
-                .map_err(|e| FilingError::Store(e.to_string()))?
+            queries::list_mailboxes(guard.conn()).map_err(|e| FilingError::Store(e.to_string()))?
         };
-        if cached_now.iter().any(|r| r.name == join(&[&parent_wire, level])) {
+        if cached_now
+            .iter()
+            .any(|r| r.name == join(&[&parent_wire, level]))
+        {
             parent_wire = join(&[&parent_wire, level]);
             continue;
         }
@@ -257,15 +261,8 @@ pub async fn move_one_uid(
             .unwrap_or(0);
         queries::set_pending_delete(conn, mb, uid, true)
             .map_err(|e| FilingError::Store(e.to_string()))?;
-        queries::enqueue_imap_outbox(
-            conn,
-            mb,
-            uid,
-            queries::IMAP_OP_MOVE,
-            Some(dest_wire),
-            epoch,
-        )
-        .map_err(|e| FilingError::Store(e.to_string()))?;
+        queries::enqueue_imap_outbox(conn, mb, uid, queries::IMAP_OP_MOVE, Some(dest_wire), epoch)
+            .map_err(|e| FilingError::Store(e.to_string()))?;
         mb
     };
     match manager
@@ -341,7 +338,10 @@ mod tests {
         let tax = load_default().unwrap();
         let (dest, top, child) = auto_path_for_id(&tax, "financeiro.cobrancas").unwrap();
         assert_eq!(dest, "Auto/Financeiro/Boletos e Cobranças");
-        assert_eq!((top.as_str(), child.as_deref()), ("Financeiro", Some("Boletos e Cobranças")));
+        assert_eq!(
+            (top.as_str(), child.as_deref()),
+            ("Financeiro", Some("Boletos e Cobranças"))
+        );
         let (dest2, _, child2) = auto_path_for_id(&tax, "comunidade").unwrap();
         assert_eq!(dest2, "Auto/Comunidade");
         assert_eq!(child2, None);
@@ -358,10 +358,7 @@ mod tests {
 
     #[test]
     fn collision_error_is_distinct() {
-        assert_eq!(
-            FilingError::CollisionNeedsConfirm.to_string(),
-            "COLLISION"
-        );
+        assert_eq!(FilingError::CollisionNeedsConfirm.to_string(), "COLLISION");
     }
 }
 
@@ -376,8 +373,21 @@ mod plan_tests {
         let store = Store::open_in_memory().unwrap();
         let conn = store.conn();
         let mb = ensure_mailbox(conn, "INBOX").unwrap();
-        upsert_message(conn, mb, 7, None, "Boleto", "fin@utfpr.edu.br", "[]", "[]",
-            "2026-10-10T00:00:00Z", "[]", false, "fatura e pagamento do boleto").unwrap();
+        upsert_message(
+            conn,
+            mb,
+            7,
+            None,
+            "Boleto",
+            "fin@utfpr.edu.br",
+            "[]",
+            "[]",
+            "2026-10-10T00:00:00Z",
+            "[]",
+            false,
+            "fatura e pagamento do boleto",
+        )
+        .unwrap();
         store
     }
 

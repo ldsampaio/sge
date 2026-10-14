@@ -5,16 +5,16 @@
 // orphan labels or break the classifier contract (cycles, dup IDs,
 // Auto-root collision, flat-choice budget overflow).
 
-pub mod learn;
 pub mod archive;
 pub mod batch;
 pub mod bridge;
 pub mod evidence;
 pub mod filing;
+pub mod learn;
 pub mod redact;
 pub mod rules;
-pub mod sieve;
 pub mod rules_io;
+pub mod sieve;
 pub mod suggest;
 pub mod taxedit;
 pub mod taxonomy;

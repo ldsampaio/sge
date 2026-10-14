@@ -179,7 +179,11 @@ pub fn rule_justification(rule: &Rule) -> String {
     if let Some(p) = c.subject_keyword.as_ref().filter(|s| !s.trim().is_empty()) {
         bits.push(format!("assunto contém “{}”", p.trim()));
     }
-    if c.subject_regex.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false) {
+    if c.subject_regex
+        .as_ref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+    {
         bits.push("assunto casa com a expressão".to_string());
     }
     if let Some(p) = c.snippet_keyword.as_ref().filter(|s| !s.trim().is_empty()) {
@@ -216,24 +220,36 @@ impl std::fmt::Display for RuleError {
         match self {
             RuleError::EmptyName => write!(f, "dê um nome para a regra"),
             RuleError::NameTooLong => {
-                write!(f, "nome de regra longo demais (máx. {RULE_NAME_MAX} caracteres)")
+                write!(
+                    f,
+                    "nome de regra longo demais (máx. {RULE_NAME_MAX} caracteres)"
+                )
             }
             RuleError::NameInjection(n) => {
                 write!(f, "nome de regra inválido: '{n}' contém caractere proibido")
             }
             RuleError::DuplicateName(n) => write!(f, "já existe uma regra chamada '{n}'"),
             RuleError::EmptyConditions => {
-                write!(f, "a regra precisa de ao menos uma condição (remetente, assunto ou trecho)")
+                write!(
+                    f,
+                    "a regra precisa de ao menos uma condição (remetente, assunto ou trecho)"
+                )
             }
             RuleError::PatternTooLong => {
-                write!(f, "expressão longa demais (máx. {RULE_REGEX_MAX} caracteres)")
+                write!(
+                    f,
+                    "expressão longa demais (máx. {RULE_REGEX_MAX} caracteres)"
+                )
             }
             RuleError::BadRegex(e) => write!(f, "expressão inválida: {e}"),
             RuleError::ReservedDestination(d) => {
                 write!(f, "pasta reservada: '{d}' não pode ser destino de regra")
             }
             RuleError::UnknownDestination(d) => {
-                write!(f, "destino desconhecido: '{d}' não existe nem pode ser criado")
+                write!(
+                    f,
+                    "destino desconhecido: '{d}' não existe nem pode ser criado"
+                )
             }
             RuleError::UnknownScopeFolder(d) => {
                 write!(f, "pasta desconhecida no escopo: '{d}'")
@@ -358,10 +374,7 @@ pub fn validate_rule(
                         .collect::<Result<Vec<_>, _>>()
                 })
                 .unwrap_or_default();
-            if let Some((_, attrs)) = cached
-                .iter()
-                .find(|(n, _)| n.eq_ignore_ascii_case(d))
-            {
+            if let Some((_, attrs)) = cached.iter().find(|(n, _)| n.eq_ignore_ascii_case(d)) {
                 if attrs.contains("Noselect") || attrs.contains("Noinferiors") {
                     return Err(RuleError::ReservedDestination(d.to_string()));
                 }
@@ -436,7 +449,9 @@ mod tests {
             name: "T".into(),
             priority: 100,
             conditions: cond,
-            destination: RuleDestination::Folder { display: "Arquivo".into() },
+            destination: RuleDestination::Folder {
+                display: "Arquivo".into(),
+            },
             scope: RuleScope::default(),
             enabled: true,
         }
@@ -452,9 +467,24 @@ mod tests {
         c.sender_substring = Some("utfpr".into());
         c.subject_keyword = Some("reunião".into());
         let r = rule_with(c);
-        assert!(evaluate_rule(&r, "Colegiado <c@utfpr.edu.br>", "Reunião quinta", "oi"));
-        assert!(!evaluate_rule(&r, "Colegiado <c@gmail.com>", "Reunião quinta", "oi"));
-        assert!(!evaluate_rule(&r, "Colegiado <c@utfpr.edu.br>", "Festa sexta", "oi"));
+        assert!(evaluate_rule(
+            &r,
+            "Colegiado <c@utfpr.edu.br>",
+            "Reunião quinta",
+            "oi"
+        ));
+        assert!(!evaluate_rule(
+            &r,
+            "Colegiado <c@gmail.com>",
+            "Reunião quinta",
+            "oi"
+        ));
+        assert!(!evaluate_rule(
+            &r,
+            "Colegiado <c@utfpr.edu.br>",
+            "Festa sexta",
+            "oi"
+        ));
     }
 
     #[test]
@@ -516,10 +546,15 @@ mod tests {
             }
         }
         assert!(!code.contains("EXPUNGE"), "rules.rs must not emit EXPUNGE");
-        assert!(!code.contains("\\Deleted"), "rules.rs must not set \\Deleted");
+        assert!(
+            !code.contains("\\Deleted"),
+            "rules.rs must not set \\Deleted"
+        );
         assert!(!code.contains("expunge"), "rules.rs must not emit expunge");
         // The destination model has exactly the two MOVE variants.
-        let folder = RuleDestination::Folder { display: "X".into() };
+        let folder = RuleDestination::Folder {
+            display: "X".into(),
+        };
         let cat = RuleDestination::TaxonomyCategory { id: "y".into() };
         assert_ne!(
             serde_json::to_string(&folder).unwrap(),
@@ -551,7 +586,9 @@ mod tests {
     }
 
     fn dest_folder(display: &str) -> RuleDestination {
-        RuleDestination::Folder { display: display.to_string() }
+        RuleDestination::Folder {
+            display: display.to_string(),
+        }
     }
 
     fn sender_cond() -> RuleConditions {
@@ -564,8 +601,12 @@ mod tests {
     fn rule_valid_empty_patterns_rejected() {
         let store = valid_test_db();
         let err = validate_rule(
-            store.conn(), "Sem condição", &cond(), &dest_folder("Arquivo"),
-            &RuleScope::default(), None,
+            store.conn(),
+            "Sem condição",
+            &cond(),
+            &dest_folder("Arquivo"),
+            &RuleScope::default(),
+            None,
         )
         .unwrap_err();
         assert_eq!(err, RuleError::EmptyConditions);
@@ -577,8 +618,12 @@ mod tests {
         let mut c = cond();
         c.subject_regex = Some("([aberto".into());
         let err = validate_rule(
-            store.conn(), "Regex ruim", &c, &dest_folder("Arquivo"),
-            &RuleScope::default(), None,
+            store.conn(),
+            "Regex ruim",
+            &c,
+            &dest_folder("Arquivo"),
+            &RuleScope::default(),
+            None,
         )
         .unwrap_err();
         assert!(matches!(err, RuleError::BadRegex(_)), "got {err:?}");
@@ -586,8 +631,12 @@ mod tests {
         c2.subject_regex = Some("a".repeat(RULE_REGEX_MAX + 1));
         assert_eq!(
             validate_rule(
-                store.conn(), "Regex longa", &c2, &dest_folder("Arquivo"),
-                &RuleScope::default(), None
+                store.conn(),
+                "Regex longa",
+                &c2,
+                &dest_folder("Arquivo"),
+                &RuleScope::default(),
+                None
             )
             .unwrap_err(),
             RuleError::PatternTooLong
@@ -599,20 +648,36 @@ mod tests {
         let store = valid_test_db();
         for reserved in ["Auto", "auto", "INBOX", "inbox"] {
             let err = validate_rule(
-                store.conn(), "R", &sender_cond(), &dest_folder(reserved),
-                &RuleScope::default(), None,
+                store.conn(),
+                "R",
+                &sender_cond(),
+                &dest_folder(reserved),
+                &RuleScope::default(),
+                None,
             )
             .unwrap_err();
-            assert_eq!(err, RuleError::ReservedDestination(reserved.to_string()), "for {reserved}");
+            assert_eq!(
+                err,
+                RuleError::ReservedDestination(reserved.to_string()),
+                "for {reserved}"
+            );
         }
         // Destructive resolutions rejected structurally (T-25-03).
         for bad in ["\\Deleted", "expunge"] {
             let err = validate_rule(
-                store.conn(), "R", &sender_cond(), &dest_folder(bad),
-                &RuleScope::default(), None,
+                store.conn(),
+                "R",
+                &sender_cond(),
+                &dest_folder(bad),
+                &RuleScope::default(),
+                None,
             )
             .unwrap_err();
-            assert_eq!(err, RuleError::DestructiveDestination(bad.to_string()), "for {bad}");
+            assert_eq!(
+                err,
+                RuleError::DestructiveDestination(bad.to_string()),
+                "for {bad}"
+            );
         }
     }
 
@@ -626,8 +691,7 @@ mod tests {
             RuleError::EmptyName
         );
         assert_eq!(
-            validate_rule(store.conn(), &"n".repeat(81), &sender_cond(), &d, &s, None)
-                .unwrap_err(),
+            validate_rule(store.conn(), &"n".repeat(81), &sender_cond(), &d, &s, None).unwrap_err(),
             RuleError::NameTooLong
         );
         assert!(matches!(
@@ -646,10 +710,17 @@ mod tests {
     #[test]
     fn rule_valid_unknown_scope_folder_rejected() {
         let store = valid_test_db();
-        let scope = RuleScope { folders: vec!["PastaFantasma".into()] };
+        let scope = RuleScope {
+            folders: vec!["PastaFantasma".into()],
+        };
         assert_eq!(
             validate_rule(
-                store.conn(), "R", &sender_cond(), &dest_folder("Arquivo"), &scope, None
+                store.conn(),
+                "R",
+                &sender_cond(),
+                &dest_folder("Arquivo"),
+                &scope,
+                None
             )
             .unwrap_err(),
             RuleError::UnknownScopeFolder("PastaFantasma".to_string())
@@ -659,10 +730,17 @@ mod tests {
     #[test]
     fn rule_valid_taxonomy_category_must_exist() {
         let store = valid_test_db();
-        let missing = RuleDestination::TaxonomyCategory { id: "nao-existe".into() };
+        let missing = RuleDestination::TaxonomyCategory {
+            id: "nao-existe".into(),
+        };
         assert_eq!(
             validate_rule(
-                store.conn(), "R", &sender_cond(), &missing, &RuleScope::default(), None
+                store.conn(),
+                "R",
+                &sender_cond(),
+                &missing,
+                &RuleScope::default(),
+                None
             )
             .unwrap_err(),
             RuleError::UnknownDestination("nao-existe".to_string())
@@ -678,7 +756,12 @@ mod tests {
         let mut c = cond();
         c.subject_keyword = Some("d'água \"especial\"; DROP TABLE folder_rules;--".into());
         validate_rule(
-            store.conn(), "Aspas", &c, &dest_folder("Arquivo"), &RuleScope::default(), None,
+            store.conn(),
+            "Aspas",
+            &c,
+            &dest_folder("Arquivo"),
+            &RuleScope::default(),
+            None,
         )
         .unwrap();
         let n: i64 = store
@@ -699,4 +782,6 @@ mod tests {
 }
 // Skip-check PRE-MATCHER (Phase 30 retry pattern); never post-hoc filter.
 /// Evaluate only if NOT sieve_managed (pre-match skip).
-pub fn evaluate_skip_managed(rule_id: i64) -> bool { false } // managed rules skipped before scoring
+pub fn evaluate_skip_managed(rule_id: i64) -> bool {
+    false
+} // managed rules skipped before scoring

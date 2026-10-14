@@ -123,10 +123,8 @@ impl KeyringStore {
     }
 
     fn entry_for(&self, account: &str) -> Result<keyring::Entry, CredsError> {
-        keyring::Entry::new(&self.service, account).map_err(|e| {
-            CredsError::StoreUnavailable {
-                detail: e.to_string(),
-            }
+        keyring::Entry::new(&self.service, account).map_err(|e| CredsError::StoreUnavailable {
+            detail: e.to_string(),
         })
     }
 }

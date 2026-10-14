@@ -31,9 +31,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::classify::rules::{
-    self, RuleConditions, RULE_NAME_MAX, RULE_REGEX_MAX,
-};
+use crate::classify::rules::{self, RuleConditions, RULE_NAME_MAX, RULE_REGEX_MAX};
 use crate::store::queries::{self, RuleRow};
 use crate::store::Store;
 
@@ -99,15 +97,16 @@ pub fn export_rules(store: &Arc<Mutex<Store>>) -> Result<String, String> {
     for row in &rows {
         rules.push(row_to_item(row)?);
     }
-    let envelope = RuleExport { version: EXPORT_VERSION, rules };
+    let envelope = RuleExport {
+        version: EXPORT_VERSION,
+        rules,
+    };
     serde_json::to_string_pretty(&envelope).map_err(|e| e.to_string())
 }
 
 fn row_to_item(row: &RuleRow) -> Result<RuleExportItem, String> {
-    let conditions_json: Value =
-        serde_json::from_str(&row.conditions_json).map_err(|e| {
-            format!("rule “{}” has corrupt conditions_json: {e}", row.name)
-        })?;
+    let conditions_json: Value = serde_json::from_str(&row.conditions_json)
+        .map_err(|e| format!("rule “{}” has corrupt conditions_json: {e}", row.name))?;
     let scope_json: Value = serde_json::from_str(&row.scope_json)
         .map_err(|e| format!("rule “{}” has corrupt scope_json: {e}", row.name))?;
     Ok(RuleExportItem {
@@ -127,8 +126,7 @@ fn item_to_row(item: &RuleExportItem) -> Result<RuleRow, String> {
         id: item.id.trim().to_string(),
         name: item.name.trim().to_string(),
         priority: item.priority,
-        conditions_json: serde_json::to_string(&item.conditions_json)
-            .map_err(|e| e.to_string())?,
+        conditions_json: serde_json::to_string(&item.conditions_json).map_err(|e| e.to_string())?,
         dest_kind: item.dest_kind.clone(),
         destination: item.destination.trim().to_string(),
         scope_json: serde_json::to_string(&item.scope_json).map_err(|e| e.to_string())?,
@@ -200,18 +198,36 @@ fn conditions_of(item: &RuleExportItem) -> Result<Option<RuleConditions>, String
     if !item.conditions_json.is_object() {
         return Err("empty pattern not allowed".to_string());
     }
-    let conds: RuleConditions =
-        serde_json::from_value(item.conditions_json.clone())
-            .map_err(|e| format!("invalid conditions: {e}"))?;
-    let any = conds.sender_substring.as_ref().is_some_and(|s| !s.trim().is_empty())
-        || conds.sender_domain.as_ref().is_some_and(|s| !s.trim().is_empty())
-        || conds.subject_keyword.as_ref().is_some_and(|s| !s.trim().is_empty())
-        || conds.subject_regex.as_ref().is_some_and(|s| !s.trim().is_empty())
-        || conds.snippet_keyword.as_ref().is_some_and(|s| !s.trim().is_empty());
+    let conds: RuleConditions = serde_json::from_value(item.conditions_json.clone())
+        .map_err(|e| format!("invalid conditions: {e}"))?;
+    let any = conds
+        .sender_substring
+        .as_ref()
+        .is_some_and(|s| !s.trim().is_empty())
+        || conds
+            .sender_domain
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty())
+        || conds
+            .subject_keyword
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty())
+        || conds
+            .subject_regex
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty())
+        || conds
+            .snippet_keyword
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty());
     if !any {
         return Ok(None);
     }
-    if let Some(p) = conds.subject_regex.as_ref().filter(|s| !s.trim().is_empty()) {
+    if let Some(p) = conds
+        .subject_regex
+        .as_ref()
+        .filter(|s| !s.trim().is_empty())
+    {
         if p.chars().count() > RULE_REGEX_MAX {
             return Err(format!(
                 "pattern too long (max {RULE_REGEX_MAX} characters)"
@@ -261,8 +277,7 @@ pub fn import_rules(
     if json.len() > MAX_IMPORT_BYTES {
         return Err("rules file too large (max 1 MiB)".to_string());
     }
-    let envelope: RuleExport =
-        serde_json::from_str(json).map_err(|e| plain_parse_error(&e))?;
+    let envelope: RuleExport = serde_json::from_str(json).map_err(|e| plain_parse_error(&e))?;
     if envelope.version != EXPORT_VERSION {
         return Err(format!(
             "unsupported rules version {} (expected {EXPORT_VERSION})",
@@ -311,7 +326,12 @@ pub fn import_rules(
                     .unwrap_or_default()
             })
             .collect();
-        ImportSnapshot { names, cached_folders, cached_display, known_category_ids }
+        ImportSnapshot {
+            names,
+            cached_folders,
+            cached_display,
+            known_category_ids,
+        }
     };
 
     // Phase 1 (lock-free): validate every item. The working duplicate map
@@ -319,14 +339,21 @@ pub fn import_rules(
     // rename earlier in the same file frees its old name for later items
     // (CR-01 stale-snapshot fix). One map covers both within-file and
     // against-store collisions — no divergent `seen` vs `known` sources.
-    let mut working: std::collections::HashMap<String, String> =
-        snap.names.iter().map(|(id, n)| (n.to_lowercase(), id.clone())).collect();
+    let mut working: std::collections::HashMap<String, String> = snap
+        .names
+        .iter()
+        .map(|(id, n)| (n.to_lowercase(), id.clone()))
+        .collect();
     let mut staged: Vec<RuleRow> = Vec::new();
     let mut warnings = Vec::new();
     let mut errors = Vec::new();
 
     for item in &envelope.rules {
-        let label = if item.name.trim().is_empty() { item.id.clone() } else { item.name.clone() };
+        let label = if item.name.trim().is_empty() {
+            item.id.clone()
+        } else {
+            item.name.clone()
+        };
         let (mut item_errors, mut item_warnings) = validate_item_structure(item);
 
         // Duplicate names (case-insensitive, like validate_rule): checked
@@ -356,14 +383,19 @@ pub fn import_rules(
         }
         if item.dest_kind == "folder" {
             let d = item.destination.trim();
-            let known_folder = snap.cached_display.iter().any(|n| n.eq_ignore_ascii_case(d))
-                || snap.cached_folders.iter().any(|n| n.eq_ignore_ascii_case(d));
+            let known_folder = snap
+                .cached_display
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(d))
+                || snap
+                    .cached_folders
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(d));
             if !known_folder {
                 item_warnings.push(format!("folder not found: {d}"));
             }
         } else if !snap.known_category_ids.contains(item.destination.trim()) {
-            item_warnings
-                .push(format!("category not found: {}", item.destination.trim()));
+            item_warnings.push(format!("category not found: {}", item.destination.trim()));
         }
 
         warnings.extend(item_warnings);
@@ -389,7 +421,12 @@ pub fn import_rules(
                 imported += 1;
             }
         }
-        return Ok(ImportResult { imported, updated, warnings, errors });
+        return Ok(ImportResult {
+            imported,
+            updated,
+            warnings,
+            errors,
+        });
     }
 
     // Snapshot window #2 (commit transaction): re-verify duplicates against
@@ -420,8 +457,7 @@ pub fn import_rules(
         let mut imported = 0u32;
         let mut updated = 0u32;
         for row in &staged {
-            let was_update =
-                queries::upsert_rule_import(&tx, row).map_err(|e| e.to_string())?;
+            let was_update = queries::upsert_rule_import(&tx, row).map_err(|e| e.to_string())?;
             if was_update {
                 updated += 1;
             } else {
@@ -429,7 +465,12 @@ pub fn import_rules(
             }
         }
         tx.commit().map_err(|e| e.to_string())?;
-        Ok(ImportResult { imported, updated, warnings, errors })
+        Ok(ImportResult {
+            imported,
+            updated,
+            warnings,
+            errors,
+        })
     }
 }
 
@@ -610,10 +651,22 @@ mod tests {
         let json = item_json("r-1", "Vazia", 100, "[]", "folder", "Arquivo");
         let r = import_rules(&test_store(), &json, true).unwrap();
         assert_eq!(r.imported, 0);
-        assert!(r.errors.iter().any(|e| e.contains("empty pattern not allowed")), "got {:?}", r.errors);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.contains("empty pattern not allowed")),
+            "got {:?}",
+            r.errors
+        );
         let json2 = item_json("r-1", "Vazia", 100, "{}", "folder", "Arquivo");
         let r2 = import_rules(&test_store(), &json2, true).unwrap();
-        assert!(r2.errors.iter().any(|e| e.contains("empty pattern not allowed")), "got {:?}", r2.errors);
+        assert!(
+            r2.errors
+                .iter()
+                .any(|e| e.contains("empty pattern not allowed")),
+            "got {:?}",
+            r2.errors
+        );
     }
 
     #[test]
@@ -628,7 +681,11 @@ mod tests {
                 "Arquivo",
             );
             let r = import_rules(&test_store(), &json, true).unwrap();
-            assert!(r.errors.iter().any(|e| e.contains("reserved name")), "for {reserved}: {:?}", r.errors);
+            assert!(
+                r.errors.iter().any(|e| e.contains("reserved name")),
+                "for {reserved}: {:?}",
+                r.errors
+            );
         }
     }
 
@@ -641,13 +698,24 @@ mod tests {
             rule_obj("r-2", "Dup", 200),
         );
         let r = import_rules(&test_store(), &both, true).unwrap();
-        assert!(r.errors.iter().any(|e| e.contains("duplicate name")), "got {:?}", r.errors);
+        assert!(
+            r.errors.iter().any(|e| e.contains("duplicate name")),
+            "got {:?}",
+            r.errors
+        );
         // Against the store under a different id.
         let store = test_store();
         seed_rule(store.lock().unwrap().conn(), "r-old", "Boletos");
-        let clash = format!("{{\"version\":1,\"rules\":[{}]}}", rule_obj("r-new", "Boletos", 100));
+        let clash = format!(
+            "{{\"version\":1,\"rules\":[{}]}}",
+            rule_obj("r-new", "Boletos", 100)
+        );
         let r2 = import_rules(&store, &clash, true).unwrap();
-        assert!(r2.errors.iter().any(|e| e.contains("duplicate name")), "got {:?}", r2.errors);
+        assert!(
+            r2.errors.iter().any(|e| e.contains("duplicate name")),
+            "got {:?}",
+            r2.errors
+        );
     }
 
     fn rule_obj(id: &str, name: &str, priority: i64) -> String {
@@ -661,15 +729,23 @@ mod tests {
     #[test]
     fn validation_priority_range() {
         for bad in [0, 1000, -5] {
-            let json = format!("{{\"version\":1,\"rules\":[{}]}}", rule_obj("r-1", "P", bad));
+            let json = format!(
+                "{{\"version\":1,\"rules\":[{}]}}",
+                rule_obj("r-1", "P", bad)
+            );
             let r = import_rules(&test_store(), &json, true).unwrap();
             assert!(
-                r.errors.iter().any(|e| e.contains("priority must be between 1 and 999")),
+                r.errors
+                    .iter()
+                    .any(|e| e.contains("priority must be between 1 and 999")),
                 "for {bad}: {:?}",
                 r.errors
             );
         }
-        let ok = format!("{{\"version\":1,\"rules\":[{}]}}", rule_obj("r-1", "P", 999));
+        let ok = format!(
+            "{{\"version\":1,\"rules\":[{}]}}",
+            rule_obj("r-1", "P", 999)
+        );
         let r = import_rules(&test_store(), &ok, true).unwrap();
         assert!(r.errors.is_empty(), "got {:?}", r.errors);
     }
@@ -685,7 +761,11 @@ mod tests {
             "Arquivo",
         );
         let r = import_rules(&test_store(), &json, true).unwrap();
-        assert!(r.errors.iter().any(|e| e.contains("invalid dest_kind")), "got {:?}", r.errors);
+        assert!(
+            r.errors.iter().any(|e| e.contains("invalid dest_kind")),
+            "got {:?}",
+            r.errors
+        );
     }
 
     #[test]
@@ -700,24 +780,39 @@ mod tests {
         );
         let r = import_rules(&test_store(), &json, true).unwrap();
         assert_eq!(r.imported, 1, "warn-but-allow must import: {r:?}");
-        assert!(r.warnings.iter().any(|w| w.contains("folder not found")), "got {:?}", r.warnings);
+        assert!(
+            r.warnings.iter().any(|w| w.contains("folder not found")),
+            "got {:?}",
+            r.warnings
+        );
         assert!(r.errors.is_empty(), "got {:?}", r.errors);
     }
 
     #[test]
     fn import_rejects_oversize_and_overcount() {
         // WR-02: absurd payloads fail BEFORE parsing/locking, loudly.
-        let big = format!("{{\"version\":1,\"rules\":[]}}{}", "x".repeat(MAX_IMPORT_BYTES));
+        let big = format!(
+            "{{\"version\":1,\"rules\":[]}}{}",
+            "x".repeat(MAX_IMPORT_BYTES)
+        );
         let r = import_rules(&test_store(), &big, false);
-        assert!(r.as_ref().is_err_and(|e| e.contains("too large")), "got {r:?}");
-        let many: Vec<String> =
-            (0..MAX_IMPORT_RULES + 1).map(|i| rule_obj(&format!("r-{i}"), &format!("N{i}"), 100)).collect();
+        assert!(
+            r.as_ref().is_err_and(|e| e.contains("too large")),
+            "got {r:?}"
+        );
+        let many: Vec<String> = (0..MAX_IMPORT_RULES + 1)
+            .map(|i| rule_obj(&format!("r-{i}"), &format!("N{i}"), 100))
+            .collect();
         let crowded = format!("{{\"version\":1,\"rules\":[{}]}}", many.join(","));
         let r2 = import_rules(&test_store(), &crowded, true);
-        assert!(r2.as_ref().is_err_and(|e| e.contains("too many rules")), "got {r2:?}");
+        assert!(
+            r2.as_ref().is_err_and(|e| e.contains("too many rules")),
+            "got {r2:?}"
+        );
         // Boundary: exactly MAX_IMPORT_RULES is accepted (dry run).
-        let exact: Vec<String> =
-            (0..MAX_IMPORT_RULES).map(|i| rule_obj(&format!("r-{i}"), &format!("N{i}"), 100)).collect();
+        let exact: Vec<String> = (0..MAX_IMPORT_RULES)
+            .map(|i| rule_obj(&format!("r-{i}"), &format!("N{i}"), 100))
+            .collect();
         let ok = format!("{{\"version\":1,\"rules\":[{}]}}", exact.join(","));
         let r3 = import_rules(&test_store(), &ok, false).unwrap();
         assert_eq!(r3.imported as usize, MAX_IMPORT_RULES, "got {r3:?}");
@@ -736,7 +831,11 @@ mod tests {
             rule_obj("r-b", "Antigo", 100),
         );
         let r = import_rules(&store, &file, true).unwrap();
-        assert!(r.errors.is_empty(), "rename must free the old name: {:?}", r.errors);
+        assert!(
+            r.errors.is_empty(),
+            "rename must free the old name: {:?}",
+            r.errors
+        );
         assert_eq!((r.imported, r.updated), (1, 1), "got {r:?}");
     }
 
@@ -753,7 +852,11 @@ mod tests {
             rule_obj("r-bad", "", 100),
         );
         let preview = import_rules(&store, &file, false).unwrap();
-        assert_eq!((preview.imported, preview.updated), (1, 1), "got {preview:?}");
+        assert_eq!(
+            (preview.imported, preview.updated),
+            (1, 1),
+            "got {preview:?}"
+        );
         assert_eq!(preview.errors.len(), 1, "got {:?}", preview.errors);
         let committed = import_rules(&store, &file, true).unwrap();
         assert_eq!(
@@ -779,7 +882,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(v0, 1);
-        let json = format!("{{\"version\":1,\"rules\":[{}]}}", rule_obj("r-1", "Boletos", 200));
+        let json = format!(
+            "{{\"version\":1,\"rules\":[{}]}}",
+            rule_obj("r-1", "Boletos", 200)
+        );
         let r = import_rules(&store, &json, true).unwrap();
         assert_eq!((r.imported, r.updated), (0, 1), "got {r:?}");
         let v1: i64 = store
@@ -812,16 +918,14 @@ mod tests {
     fn idle_gate_reads_profile_atom() {
         let dir = std::env::temp_dir();
         let off = dir.join("sge-29-idle-off.json");
-        std::fs::write(
-            &off,
-            r#"{"accounts":[{"atoms":{"IDLE":false}}]}"#,
-        )
-        .unwrap();
+        std::fs::write(&off, r#"{"accounts":[{"atoms":{"IDLE":false}}]}"#).unwrap();
         assert!(!idle_allowed_from_profile(&off));
         let on = dir.join("sge-29-idle-on.json");
         std::fs::write(&on, r#"{"accounts":[{"atoms":{"IDLE":true}}]}"#).unwrap();
         assert!(idle_allowed_from_profile(&on));
-        assert!(!idle_allowed_from_profile(dir.join("sge-29-does-not-exist.json").as_path()));
+        assert!(!idle_allowed_from_profile(
+            dir.join("sge-29-does-not-exist.json").as_path()
+        ));
         let _ = std::fs::remove_file(&off);
         let _ = std::fs::remove_file(&on);
     }

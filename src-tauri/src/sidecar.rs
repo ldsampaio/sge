@@ -110,7 +110,9 @@ pub enum SidecarError {
     HealthTimeout,
     #[error("classifier answered the health check with an error (status {0})")]
     HealthFailed(u16),
-    #[error("classifier keeps crashing and was stopped; mail stays unclassified until the app restarts")]
+    #[error(
+        "classifier keeps crashing and was stopped; mail stays unclassified until the app restarts"
+    )]
     RestartExhausted,
     #[error("sidecar I/O fault: {0}")]
     Io(String),
@@ -480,12 +482,9 @@ mod tests {
 
     #[test]
     fn status_payload_has_no_key_material() {
-        let sup = SidecarSupervisor::new(SidecarConfig::new(
-            "127.0.0.1",
-            43121,
-            "payload-secret-999".to_string(),
-        )
-        .unwrap());
+        let sup = SidecarSupervisor::new(
+            SidecarConfig::new("127.0.0.1", 43121, "payload-secret-999".to_string()).unwrap(),
+        );
         sup.record_healthy();
         let payload = SidecarStatusPayload::from_supervisor(&sup);
         let json = serde_json::to_string(&payload).unwrap();

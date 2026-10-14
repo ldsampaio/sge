@@ -184,11 +184,7 @@ pub fn set_mailbox_status(
 
 /// Record a folder's LIST hierarchy delimiter (`/`, `.`, …) for tree
 /// rendering (M6). Empty means flat/unknown.
-pub fn set_mailbox_delimiter(
-    conn: &Connection,
-    mailbox: &str,
-    delimiter: &str,
-) -> StoreResult<()> {
+pub fn set_mailbox_delimiter(conn: &Connection, mailbox: &str, delimiter: &str) -> StoreResult<()> {
     conn.execute(
         "INSERT INTO mailboxes (name, uid_validity, uid_next, delimiter)
          VALUES (?1, 0, 0, ?2)
@@ -408,11 +404,7 @@ pub fn all_local_uids(conn: &Connection, mailbox_id: u64) -> StoreResult<Vec<u32
 /// Record one empty-FETCH strike for a UID; returns the new strike count.
 /// A UID that FETCHes successfully must have its tombstone cleared via
 /// [`clear_tombstone`] instead.
-pub fn record_fetch_strike(
-    conn: &Connection,
-    mailbox_id: u64,
-    uid: u32,
-) -> StoreResult<i64> {
+pub fn record_fetch_strike(conn: &Connection, mailbox_id: u64, uid: u32) -> StoreResult<i64> {
     conn.execute(
         "INSERT INTO fetch_tombstones (mailbox_id, uid, strikes)
          VALUES (?1, ?2, 1)
@@ -441,14 +433,12 @@ pub fn clear_tombstone(conn: &Connection, mailbox_id: u64, uid: u32) -> StoreRes
 /// UIDs at or above [`TOMBSTONE_STRIKES`]: excluded from future sweeps
 /// until pruned (vanished from SEARCH) or recovered (periodic full sweep).
 pub fn tombstoned_uids(conn: &Connection, mailbox_id: u64) -> StoreResult<Vec<u32>> {
-    let mut stmt = conn.prepare(
-        "SELECT uid FROM fetch_tombstones WHERE mailbox_id = ?1 AND strikes >= ?2",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT uid FROM fetch_tombstones WHERE mailbox_id = ?1 AND strikes >= ?2")?;
     let rows = stmt
-        .query_map(
-            rusqlite::params![mailbox_id, TOMBSTONE_STRIKES],
-            |row| row.get::<_, u32>(0),
-        )?
+        .query_map(rusqlite::params![mailbox_id, TOMBSTONE_STRIKES], |row| {
+            row.get::<_, u32>(0)
+        })?
         .collect::<Result<Vec<_>, _>>()
         .map_err(StoreError::Sql)?;
     Ok(rows)
@@ -456,11 +446,7 @@ pub fn tombstoned_uids(conn: &Connection, mailbox_id: u64) -> StoreResult<Vec<u3
 
 /// Drop tombstones for UIDs no longer on the server (expunged — Step 6
 /// deletes their messages, so the strike record is stale).
-pub fn prune_tombstones(
-    conn: &Connection,
-    mailbox_id: u64,
-    live_uids: &[u32],
-) -> StoreResult<()> {
+pub fn prune_tombstones(conn: &Connection, mailbox_id: u64, live_uids: &[u32]) -> StoreResult<()> {
     if live_uids.is_empty() {
         conn.execute(
             "DELETE FROM fetch_tombstones WHERE mailbox_id = ?1",
@@ -470,9 +456,8 @@ pub fn prune_tombstones(
     }
     let placeholders = "?,".repeat(live_uids.len());
     let in_clause = &placeholders[..placeholders.len() - 1];
-    let sql = format!(
-        "DELETE FROM fetch_tombstones WHERE mailbox_id = ?1 AND uid NOT IN ({in_clause})"
-    );
+    let sql =
+        format!("DELETE FROM fetch_tombstones WHERE mailbox_id = ?1 AND uid NOT IN ({in_clause})");
     let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(live_uids.len() + 1);
     params.push(&mailbox_id);
     for uid in live_uids {
@@ -493,11 +478,7 @@ pub fn sweeps_since_full(conn: &Connection, mailbox_id: u64) -> StoreResult<i64>
 }
 
 /// Reset (full sweep ran) or bump (converged skip) the sweep counter.
-pub fn set_sweeps_since_full(
-    conn: &Connection,
-    mailbox_id: u64,
-    value: i64,
-) -> StoreResult<()> {
+pub fn set_sweeps_since_full(conn: &Connection, mailbox_id: u64, value: i64) -> StoreResult<()> {
     conn.execute(
         "UPDATE mailboxes SET sweeps_since_full = ?1 WHERE id = ?2",
         rusqlite::params![value, mailbox_id],
@@ -685,19 +666,13 @@ pub fn delete_missing_uids(
 /// Return the set of UIDs from `uids` that already exist for `mailbox_id`.
 /// Used by the sync worker to distinguish new vs updated messages in a
 /// batch. Empty input short-circuits to an empty vec.
-pub fn existing_uids(
-    conn: &Connection,
-    mailbox_id: u64,
-    uids: &[u32],
-) -> StoreResult<Vec<u32>> {
+pub fn existing_uids(conn: &Connection, mailbox_id: u64, uids: &[u32]) -> StoreResult<Vec<u32>> {
     if uids.is_empty() {
         return Ok(Vec::new());
     }
     let placeholders = "?,".repeat(uids.len());
     let in_clause = &placeholders[..placeholders.len() - 1];
-    let sql = format!(
-        "SELECT uid FROM messages WHERE mailbox_id = ?1 AND uid IN ({in_clause})"
-    );
+    let sql = format!("SELECT uid FROM messages WHERE mailbox_id = ?1 AND uid IN ({in_clause})");
     let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(uids.len() + 1);
     params.push(&mailbox_id);
     for uid in uids {
@@ -712,11 +687,7 @@ pub fn existing_uids(
 
 /// Current `flags` JSON for a message row, if it exists.
 /// Used by the pending-wins reconcile gate to keep optimistic local flags.
-pub fn message_flags(
-    conn: &Connection,
-    mailbox_id: u64,
-    uid: u32,
-) -> StoreResult<Option<String>> {
+pub fn message_flags(conn: &Connection, mailbox_id: u64, uid: u32) -> StoreResult<Option<String>> {
     match conn.query_row(
         "SELECT flags FROM messages WHERE mailbox_id = ?1 AND uid = ?2",
         rusqlite::params![mailbox_id, uid],
@@ -729,11 +700,7 @@ pub fn message_flags(
 }
 
 /// Look up the integer `messages.id` for a given mailbox + IMAP UID.
-pub fn find_message_id(
-    conn: &Connection,
-    mailbox_id: u64,
-    uid: u32,
-) -> StoreResult<Option<u64>> {
+pub fn find_message_id(conn: &Connection, mailbox_id: u64, uid: u32) -> StoreResult<Option<u64>> {
     match conn.query_row(
         "SELECT id FROM messages WHERE mailbox_id = ?1 AND uid = ?2",
         rusqlite::params![mailbox_id, uid],
@@ -747,11 +714,7 @@ pub fn find_message_id(
 
 /// RFC822 Message-ID display field for a cached row (dest-side Seen
 /// resolution matches on it after a move assigns a new UID). Never a key.
-pub fn message_rfc_id(
-    conn: &Connection,
-    mailbox_id: u64,
-    uid: u32,
-) -> StoreResult<Option<String>> {
+pub fn message_rfc_id(conn: &Connection, mailbox_id: u64, uid: u32) -> StoreResult<Option<String>> {
     match conn.query_row(
         "SELECT message_id FROM messages WHERE mailbox_id = ?1 AND uid = ?2",
         rusqlite::params![mailbox_id, uid],
@@ -809,10 +772,7 @@ pub struct AttachmentInfo {
 }
 
 /// List attachment metadata for a message (Phase 4 reader cache).
-pub fn list_attachments(
-    conn: &Connection,
-    message_id: u64,
-) -> StoreResult<Vec<AttachmentInfo>> {
+pub fn list_attachments(conn: &Connection, message_id: u64) -> StoreResult<Vec<AttachmentInfo>> {
     let mut stmt = conn.prepare_cached(
         "SELECT part_number, filename, mime_type, size_bytes \
          FROM attachment_parts WHERE message_id = ?1",
@@ -976,11 +936,7 @@ pub fn fts_search_scoped(
 /// text) and the Phase 16 redaction sanitizer
 /// ([`crate::classify::redact::redact_input`]) runs before return, so no
 /// secret-shaped text reaches the UI.
-pub fn search_snippet(
-    conn: &Connection,
-    message_id: u64,
-    query: &str,
-) -> StoreResult<String> {
+pub fn search_snippet(conn: &Connection, message_id: u64, query: &str) -> StoreResult<String> {
     let tokens: Vec<String> = query
         .split_whitespace()
         .map(|t| t.to_lowercase())
@@ -1035,9 +991,17 @@ fn excerpt_around_hit(text: &str, tokens: &[String]) -> Option<String> {
     let mut end = end_byte;
     while end < text.len()
         && end < start_byte + WINDOW + 20
-        && !text[end..].chars().next().map(|c| c.is_whitespace()).unwrap_or(true)
+        && !text[end..]
+            .chars()
+            .next()
+            .map(|c| c.is_whitespace())
+            .unwrap_or(true)
     {
-        end += text[end..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        end += text[end..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(1);
     }
     let mut out = String::new();
     if start_byte > 0 {
@@ -1200,9 +1164,7 @@ pub fn pending_uids(conn: &Connection, mailbox_id: u64) -> StoreResult<Vec<u32>>
     let mut stmt =
         conn.prepare("SELECT uid FROM flag_outbox WHERE mailbox_id = ?1 ORDER BY uid")?;
     let rows = stmt
-        .query_map(rusqlite::params![mailbox_id], |row| {
-            row.get::<_, u32>(0)
-        })?
+        .query_map(rusqlite::params![mailbox_id], |row| row.get::<_, u32>(0))?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -1231,11 +1193,7 @@ pub fn list_outbox(conn: &Connection, mailbox_id: u64) -> StoreResult<Vec<Outbox
 
 /// Delete the queued op for `mailbox_id` + `uid` (server acknowledged).
 /// Returns the number of rows deleted.
-pub fn delete_outbox_op(
-    conn: &Connection,
-    mailbox_id: u64,
-    uid: u32,
-) -> StoreResult<usize> {
+pub fn delete_outbox_op(conn: &Connection, mailbox_id: u64, uid: u32) -> StoreResult<usize> {
     conn.execute(
         "DELETE FROM flag_outbox WHERE mailbox_id = ?1 AND uid = ?2",
         rusqlite::params![mailbox_id, uid],
@@ -1364,9 +1322,7 @@ pub fn pending_imap_uids(conn: &Connection, mailbox_id: u64) -> StoreResult<Vec<
     let mut stmt =
         conn.prepare("SELECT uid FROM imap_outbox WHERE mailbox_id = ?1 ORDER BY uid")?;
     let rows = stmt
-        .query_map(rusqlite::params![mailbox_id], |row| {
-            row.get::<_, u32>(0)
-        })?
+        .query_map(rusqlite::params![mailbox_id], |row| row.get::<_, u32>(0))?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -1397,11 +1353,7 @@ pub fn list_imap_outbox(conn: &Connection, mailbox_id: u64) -> StoreResult<Vec<I
 
 /// Delete the queued delete/move for `mailbox_id` + `uid` (acknowledged or
 /// undone). Returns the number of rows deleted.
-pub fn delete_imap_outbox_op(
-    conn: &Connection,
-    mailbox_id: u64,
-    uid: u32,
-) -> StoreResult<usize> {
+pub fn delete_imap_outbox_op(conn: &Connection, mailbox_id: u64, uid: u32) -> StoreResult<usize> {
     conn.execute(
         "DELETE FROM imap_outbox WHERE mailbox_id = ?1 AND uid = ?2",
         rusqlite::params![mailbox_id, uid],
@@ -1411,10 +1363,7 @@ pub fn delete_imap_outbox_op(
 
 /// Drop the whole mailbox delete/move queue (UIDVALIDITY-bump path, RFC 4549).
 /// Returns the number of rows deleted.
-pub fn drop_imap_outbox_for_mailbox(
-    conn: &Connection,
-    mailbox_id: u64,
-) -> StoreResult<usize> {
+pub fn drop_imap_outbox_for_mailbox(conn: &Connection, mailbox_id: u64) -> StoreResult<usize> {
     conn.execute(
         "DELETE FROM imap_outbox WHERE mailbox_id = ?1",
         rusqlite::params![mailbox_id],
@@ -1471,11 +1420,7 @@ pub fn set_pending_delete(
 
 /// `true` when the row carries the optimistic hidden flag (or the row is
 /// gone — callers treat missing as not-pending).
-pub fn is_pending_delete(
-    conn: &Connection,
-    mailbox_id: u64,
-    uid: u32,
-) -> StoreResult<bool> {
+pub fn is_pending_delete(conn: &Connection, mailbox_id: u64, uid: u32) -> StoreResult<bool> {
     match conn.query_row(
         "SELECT pending_delete FROM messages WHERE mailbox_id = ?1 AND uid = ?2",
         rusqlite::params![mailbox_id, uid],
@@ -1490,11 +1435,7 @@ pub fn is_pending_delete(
 /// Undo a still-queued delete/move: clear the hidden flag and drop the
 /// outbox row. Valid only while the op is still queued (until next sync);
 /// returns `true` when an op was pending and the row was restored.
-pub fn undo_pending_op(
-    conn: &Connection,
-    mailbox_id: u64,
-    uid: u32,
-) -> StoreResult<bool> {
+pub fn undo_pending_op(conn: &Connection, mailbox_id: u64, uid: u32) -> StoreResult<bool> {
     let had_op: bool = conn.query_row(
         "SELECT COUNT(*) FROM imap_outbox WHERE mailbox_id = ?1 AND uid = ?2",
         rusqlite::params![mailbox_id, uid],
@@ -1531,9 +1472,8 @@ pub fn expunge_uids_local(
         params.push(uid);
     }
     let existing: Vec<u32> = {
-        let sql = format!(
-            "SELECT uid FROM messages WHERE mailbox_id = ?1 AND uid IN ({in_clause})"
-        );
+        let sql =
+            format!("SELECT uid FROM messages WHERE mailbox_id = ?1 AND uid IN ({in_clause})");
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map(params.as_slice(), |row| row.get::<_, u32>(0))?
@@ -1558,19 +1498,20 @@ pub fn expunge_uids_local(
              (SELECT m.id FROM messages m WHERE m.mailbox_id = ?1 AND m.uid IN ({in_clause}))"
         )
     };
-    conn.execute(&rm_sql("attachment_parts", "message_id"), rm_params.as_slice())?;
-    conn.execute(&rm_sql("message_bodies", "message_id"), rm_params.as_slice())?;
-    let del_sql = format!(
-        "DELETE FROM messages WHERE mailbox_id = ?1 AND uid IN ({in_clause})"
-    );
+    conn.execute(
+        &rm_sql("attachment_parts", "message_id"),
+        rm_params.as_slice(),
+    )?;
+    conn.execute(
+        &rm_sql("message_bodies", "message_id"),
+        rm_params.as_slice(),
+    )?;
+    let del_sql = format!("DELETE FROM messages WHERE mailbox_id = ?1 AND uid IN ({in_clause})");
     conn.execute(&del_sql, rm_params.as_slice())?;
-    let op_sql = format!(
-        "DELETE FROM flag_outbox WHERE mailbox_id = ?1 AND uid IN ({in_clause})"
-    );
+    let op_sql = format!("DELETE FROM flag_outbox WHERE mailbox_id = ?1 AND uid IN ({in_clause})");
     conn.execute(&op_sql, rm_params.as_slice())?;
-    let imap_sql = format!(
-        "DELETE FROM imap_outbox WHERE mailbox_id = ?1 AND uid IN ({in_clause})"
-    );
+    let imap_sql =
+        format!("DELETE FROM imap_outbox WHERE mailbox_id = ?1 AND uid IN ({in_clause})");
     conn.execute(&imap_sql, rm_params.as_slice())?;
     Ok(existing)
 }
@@ -1582,12 +1523,7 @@ pub fn expunge_uids_local(
 /// Optimistic-write half of `set_seen`: the row keeps every other flag
 /// and only the `\Seen` membership changes. Missing rows are a no-op
 /// (the message may have been expunged between tap and write).
-pub fn set_local_seen(
-    conn: &Connection,
-    mailbox_id: u64,
-    uid: u32,
-    seen: bool,
-) -> StoreResult<()> {
+pub fn set_local_seen(conn: &Connection, mailbox_id: u64, uid: u32, seen: bool) -> StoreResult<()> {
     let current: Option<String> = match conn.query_row(
         "SELECT flags FROM messages WHERE mailbox_id = ?1 AND uid = ?2",
         rusqlite::params![mailbox_id, uid],
@@ -1717,11 +1653,7 @@ pub fn list_dirty_drafts(conn: &Connection) -> StoreResult<Vec<DraftRow>> {
 
 /// Mark a session clean after its server copy is confirmed: `dirty = 0`,
 /// `server_uid` updated to the reconciled UID.
-pub fn mark_draft_clean(
-    conn: &Connection,
-    id: &str,
-    server_uid: u32,
-) -> StoreResult<()> {
+pub fn mark_draft_clean(conn: &Connection, id: &str, server_uid: u32) -> StoreResult<()> {
     conn.execute(
         "UPDATE drafts SET dirty = 0, server_uid = ?1 WHERE id = ?2",
         rusqlite::params![server_uid, id],
@@ -2011,7 +1943,12 @@ pub struct LabelRow {
 }
 
 /// Install (or replace) the taxonomy singleton + version.
-pub fn install_taxonomy(conn: &Connection, version: u32, name: &str, json: &str) -> StoreResult<()> {
+pub fn install_taxonomy(
+    conn: &Connection,
+    version: u32,
+    name: &str,
+    json: &str,
+) -> StoreResult<()> {
     conn.execute(
         "INSERT INTO taxonomy (id, version, name, json) VALUES (1, ?1, ?2, ?3)
          ON CONFLICT (id) DO UPDATE SET version = excluded.version,
@@ -2232,9 +2169,15 @@ pub fn dequeue_classify(conn: &Connection, limit: usize) -> StoreResult<Vec<(u64
         })?
         .collect::<Result<_, _>>()?;
     for (id, _, _) in &rows {
-        conn.execute("UPDATE classify_queue SET status = 'processing' WHERE id = ?1", rusqlite::params![id])?;
+        conn.execute(
+            "UPDATE classify_queue SET status = 'processing' WHERE id = ?1",
+            rusqlite::params![id],
+        )?;
     }
-    Ok(rows.into_iter().map(|(_, mid, folder)| (mid, folder)).collect())
+    Ok(rows
+        .into_iter()
+        .map(|(_, mid, folder)| (mid, folder))
+        .collect())
 }
 
 pub fn set_queue_state(
@@ -2355,7 +2298,11 @@ pub fn seed_default_exclusions(conn: &Connection) -> StoreResult<()> {
         }
     }
     for name in names {
-        exclude_folder(conn, &name, "default opt-out (Sent/Drafts never auto-filed)")?;
+        exclude_folder(
+            conn,
+            &name,
+            "default opt-out (Sent/Drafts never auto-filed)",
+        )?;
     }
     Ok(())
 }
@@ -2571,10 +2518,7 @@ pub fn message_classify_fields(
 
 /// (mailbox wire name, uid) for a cached message id. Needed to address
 /// IMAP verbs (UID-only) from classifier flows (id-addressed).
-pub fn message_location(
-    conn: &Connection,
-    message_id: u64,
-) -> StoreResult<Option<(String, u32)>> {
+pub fn message_location(conn: &Connection, message_id: u64) -> StoreResult<Option<(String, u32)>> {
     conn.query_row(
         "SELECT mb.name, m.uid FROM messages m
          JOIN mailboxes mb ON m.mailbox_id = mb.id WHERE m.id = ?1",
@@ -2666,9 +2610,16 @@ pub fn update_rule(conn: &Connection, row: &RuleRow) -> StoreResult<()> {
          rule_version = ?9, rule_etag = ?10, \
          updated_at = datetime('now') WHERE id = ?1",
         rusqlite::params![
-            row.id, row.name, row.priority, row.conditions_json,
-            row.dest_kind, row.destination, row.scope_json, row.enabled as i64,
-            row.rule_version, row.rule_etag,
+            row.id,
+            row.name,
+            row.priority,
+            row.conditions_json,
+            row.dest_kind,
+            row.destination,
+            row.scope_json,
+            row.enabled as i64,
+            row.rule_version,
+            row.rule_etag,
         ],
     )?;
     Ok(())
@@ -2677,7 +2628,10 @@ pub fn update_rule(conn: &Connection, row: &RuleRow) -> StoreResult<()> {
 /// Immediate delete (rules hold no mail — no confirm, mirrors Phase 23
 /// filter-delete semantics). Cascades pending suggestion rows.
 pub fn delete_rule(conn: &Connection, id: &str) -> StoreResult<usize> {
-    let n = conn.execute("DELETE FROM folder_rules WHERE id = ?1", rusqlite::params![id])?;
+    let n = conn.execute(
+        "DELETE FROM folder_rules WHERE id = ?1",
+        rusqlite::params![id],
+    )?;
     Ok(n)
 }
 
@@ -3496,7 +3450,9 @@ mod tests {
 
         let removed = expunge_uids_local(conn, mb_id, &[1, 999]).unwrap();
         assert_eq!(removed, vec![1], "only present UIDs report removed");
-        assert!(fts_search(conn, Some("INBOX"), "GoneSoon").unwrap().is_empty());
+        assert!(fts_search(conn, Some("INBOX"), "GoneSoon")
+            .unwrap()
+            .is_empty());
         let bodies: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM message_bodies WHERE message_id = ?1",
@@ -3516,7 +3472,10 @@ mod tests {
         // Queued ops for the expunged UID drop with it.
         assert!(pending_imap_uids(conn, mb_id).unwrap().is_empty());
         // Survivor untouched.
-        assert_eq!(fts_search(conn, Some("INBOX"), "StaysHere").unwrap().len(), 1);
+        assert_eq!(
+            fts_search(conn, Some("INBOX"), "StaysHere").unwrap().len(),
+            1
+        );
         assert!(expunge_uids_local(conn, mb_id, &[]).unwrap().is_empty());
     }
 
@@ -3539,7 +3498,12 @@ mod tests {
 
         // Wipe path (UIDVALIDITY bump): rows + dependents + imap queue go.
         delete_missing_uids(conn, mb_id, &[]).unwrap();
-        for table in ["messages", "message_bodies", "attachment_parts", "imap_outbox"] {
+        for table in [
+            "messages",
+            "message_bodies",
+            "attachment_parts",
+            "imap_outbox",
+        ] {
             let n: i64 = conn
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
                 .unwrap();
@@ -3581,16 +3545,26 @@ mod tests {
 
         // id / uid_validity / messages untouched (UIDs preserved, no refetch).
         let novo_id: u64 = conn
-            .query_row("SELECT id FROM mailboxes WHERE name = 'Novo'", [], |r| r.get(0))
+            .query_row("SELECT id FROM mailboxes WHERE name = 'Novo'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(novo_id, pai);
         let validity: u32 = conn
-            .query_row("SELECT uid_validity FROM mailboxes WHERE name = 'Novo'", [], |r| r.get(0))
+            .query_row(
+                "SELECT uid_validity FROM mailboxes WHERE name = 'Novo'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(validity, 100);
         assert_eq!(count_messages(conn, novo_id), 1);
         let sub_id: u64 = conn
-            .query_row("SELECT id FROM mailboxes WHERE name = 'Novo/Sub'", [], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM mailboxes WHERE name = 'Novo/Sub'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(sub_id, sub);
         assert_eq!(count_messages(conn, sub_id), 1);
@@ -3640,7 +3614,11 @@ mod tests {
 
         // Row gone, messages cascaded, both outbox rows dropped.
         let gone: i64 = conn
-            .query_row("SELECT COUNT(*) FROM mailboxes WHERE name = 'Velha'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM mailboxes WHERE name = 'Velha'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(gone, 0);
         assert_eq!(count_messages(conn, mb_id), 0);
@@ -3694,7 +3672,10 @@ mod tests {
 
         // Upsert creates the row when missing (refresh path).
         set_mailbox_role(conn, "Nova", "custom", "").unwrap();
-        assert!(list_mailboxes(conn).unwrap().iter().any(|r| r.name == "Nova"));
+        assert!(list_mailboxes(conn)
+            .unwrap()
+            .iter()
+            .any(|r| r.name == "Nova"));
     }
 
     // ── Plan 23-01: body + attachment FTS, scope, ranking, cap ──
@@ -3719,8 +3700,15 @@ mod tests {
             insert_body(conn, msg_id, Some(text), None).unwrap();
         }
         for (i, name) in attachments.iter().enumerate() {
-            insert_attachment_meta(conn, msg_id, &format!("{}", i + 1), name, "application/pdf", 10)
-                .unwrap();
+            insert_attachment_meta(
+                conn,
+                msg_id,
+                &format!("{}", i + 1),
+                name,
+                "application/pdf",
+                10,
+            )
+            .unwrap();
         }
         msg_id
     }
@@ -3732,12 +3720,26 @@ mod tests {
         let conn = store.conn();
         let mb = ensure_mailbox(conn, "INBOX").unwrap();
         insert_full_msg(
-            conn, mb, 1, "Assunto comum", "a@x.com", "2024-01-01T00:00:00Z", "prev",
-            Some("texto distintivo do corpo girafa-azul"), &["relatorio.pdf"],
+            conn,
+            mb,
+            1,
+            "Assunto comum",
+            "a@x.com",
+            "2024-01-01T00:00:00Z",
+            "prev",
+            Some("texto distintivo do corpo girafa-azul"),
+            &["relatorio.pdf"],
         );
         insert_full_msg(
-            conn, mb, 2, "Outro", "b@x.com", "2024-01-02T00:00:00Z", "prev",
-            Some("nada relevante aqui"), &["foto.png"],
+            conn,
+            mb,
+            2,
+            "Outro",
+            "b@x.com",
+            "2024-01-02T00:00:00Z",
+            "prev",
+            Some("nada relevante aqui"),
+            &["foto.png"],
         );
 
         let body_hits = fts_search(conn, None, "girafa-azul").unwrap();
@@ -3756,12 +3758,26 @@ mod tests {
         let inbox = ensure_mailbox(conn, "INBOX").unwrap();
         let sent = ensure_mailbox(conn, "Sent").unwrap();
         insert_full_msg(
-            conn, inbox, 1, "Boletim mensal", "a@x.com", "2024-01-01T00:00:00Z", "p",
-            Some("corpo do boletim"), &[],
+            conn,
+            inbox,
+            1,
+            "Boletim mensal",
+            "a@x.com",
+            "2024-01-01T00:00:00Z",
+            "p",
+            Some("corpo do boletim"),
+            &[],
         );
         insert_full_msg(
-            conn, sent, 2, "Boletim resposta", "b@x.com", "2024-01-02T00:00:00Z", "p",
-            Some("outro boletim"), &[],
+            conn,
+            sent,
+            2,
+            "Boletim resposta",
+            "b@x.com",
+            "2024-01-02T00:00:00Z",
+            "p",
+            Some("outro boletim"),
+            &[],
         );
 
         // None = whole account (existing contract preserved).
@@ -3774,7 +3790,9 @@ mod tests {
         let both = fts_search_scoped(conn, Some(&["INBOX", "Sent"]), "Boletim").unwrap();
         assert_eq!(both.len(), 2);
         // Empty set matches nothing (narrowed to zero folders).
-        assert!(fts_search_scoped(conn, Some(&[]), "Boletim").unwrap().is_empty());
+        assert!(fts_search_scoped(conn, Some(&[]), "Boletim")
+            .unwrap()
+            .is_empty());
         // Legacy single-mailbox wrapper keeps None-vs-Some semantics.
         assert_eq!(fts_search(conn, Some("Sent"), "Boletim").unwrap().len(), 1);
     }
@@ -3786,10 +3804,26 @@ mod tests {
         let mb = ensure_mailbox(conn, "INBOX").unwrap();
         // Identical relevance text, different dates → equal BM25 rank.
         insert_full_msg(
-            conn, mb, 1, "reunião pedagógica", "a@x.com", "2024-01-01T00:00:00Z", "p", None, &[],
+            conn,
+            mb,
+            1,
+            "reunião pedagógica",
+            "a@x.com",
+            "2024-01-01T00:00:00Z",
+            "p",
+            None,
+            &[],
         );
         insert_full_msg(
-            conn, mb, 2, "reunião pedagógica", "a@x.com", "2024-06-01T00:00:00Z", "p", None, &[],
+            conn,
+            mb,
+            2,
+            "reunião pedagógica",
+            "a@x.com",
+            "2024-06-01T00:00:00Z",
+            "p",
+            None,
+            &[],
         );
         let hits = fts_search(conn, None, "pedagógica").unwrap();
         assert_eq!(hits.len(), 2);
@@ -3804,8 +3838,18 @@ mod tests {
         let mb = ensure_mailbox(conn, "INBOX").unwrap();
         for i in 1..=205u32 {
             upsert_message(
-                conn, mb, i, None, "captest lotação", "a@x.com", "[]", "[]",
-                "2024-01-01T00:00:00Z", "[]", false, "p",
+                conn,
+                mb,
+                i,
+                None,
+                "captest lotação",
+                "a@x.com",
+                "[]",
+                "[]",
+                "2024-01-01T00:00:00Z",
+                "[]",
+                false,
+                "p",
             )
             .unwrap();
         }
@@ -3820,14 +3864,26 @@ mod tests {
         let conn = store.conn();
         let mb = ensure_mailbox(conn, "INBOX").unwrap();
         insert_full_msg(
-            conn, mb, 1, "Visível", "a@x.com", "2024-01-01T00:00:00Z", "p",
-            Some("conteúdo ocultável"), &["secreto-anexo.pdf"],
+            conn,
+            mb,
+            1,
+            "Visível",
+            "a@x.com",
+            "2024-01-01T00:00:00Z",
+            "p",
+            Some("conteúdo ocultável"),
+            &["secreto-anexo.pdf"],
         );
         assert_eq!(fts_search(conn, None, "ocultável").unwrap().len(), 1);
-        assert_eq!(fts_search(conn, None, "secreto-anexo.pdf").unwrap().len(), 1);
+        assert_eq!(
+            fts_search(conn, None, "secreto-anexo.pdf").unwrap().len(),
+            1
+        );
         set_pending_delete(conn, mb, 1, true).unwrap();
         assert!(fts_search(conn, None, "ocultável").unwrap().is_empty());
-        assert!(fts_search(conn, None, "secreto-anexo.pdf").unwrap().is_empty());
+        assert!(fts_search(conn, None, "secreto-anexo.pdf")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -3837,7 +3893,15 @@ mod tests {
         let conn = store.conn();
         let mb = ensure_mailbox(conn, "INBOX").unwrap();
         insert_full_msg(
-            conn, mb, 1, "Hello", "alice@example.com", "2024-01-01T00:00:00Z", "p", None, &[],
+            conn,
+            mb,
+            1,
+            "Hello",
+            "alice@example.com",
+            "2024-01-01T00:00:00Z",
+            "p",
+            None,
+            &[],
         );
         // None of these may error; none may match everything / leak rows.
         for hostile in [
@@ -3871,14 +3935,26 @@ mod tests {
         let conn = store.conn();
         let mb = ensure_mailbox(conn, "INBOX").unwrap();
         let msg_id = insert_full_msg(
-            conn, mb, 1, "Boleto", "f@x.com", "2024-01-01T00:00:00Z", "prev",
+            conn,
+            mb,
+            1,
+            "Boleto",
+            "f@x.com",
+            "2024-01-01T00:00:00Z",
+            "prev",
             Some("Segue o boleto <b>importante</b> para pagamento, senha: Xk9#mQ2! fim."),
             &[],
         );
         let snippet = search_snippet(conn, msg_id, "boleto").unwrap();
         assert!(!snippet.is_empty(), "snippet must carry match context");
-        assert!(!snippet.contains('<') && !snippet.contains('>'), "no HTML tags: {snippet:?}");
-        assert!(!snippet.contains("Xk9#mQ2!"), "fixture secret must be redacted: {snippet:?}");
+        assert!(
+            !snippet.contains('<') && !snippet.contains('>'),
+            "no HTML tags: {snippet:?}"
+        );
+        assert!(
+            !snippet.contains("Xk9#mQ2!"),
+            "fixture secret must be redacted: {snippet:?}"
+        );
         assert!(!snippet.contains("body_html") && !snippet.contains("<b>"));
         // Unknown message id → empty, not an error.
         assert_eq!(search_snippet(conn, 99999, "boleto").unwrap(), "");
@@ -3893,8 +3969,18 @@ mod tests {
         let mb = ensure_mailbox(conn, "INBOX").unwrap();
         // Message first (header-only), body + attachment arrive later.
         upsert_message(
-            conn, mb, 1, None, "Tarde", "a@x.com", "[]", "[]",
-            "2024-01-01T00:00:00Z", "[]", false, "p",
+            conn,
+            mb,
+            1,
+            None,
+            "Tarde",
+            "a@x.com",
+            "[]",
+            "[]",
+            "2024-01-01T00:00:00Z",
+            "[]",
+            false,
+            "p",
         )
         .unwrap();
         assert!(fts_search(conn, None, "frescor").unwrap().is_empty());
@@ -3924,8 +4010,15 @@ mod tests {
         let conn = store.conn();
         let mb = ensure_mailbox(conn, "INBOX").unwrap();
         insert_full_msg(
-            conn, mb, 1, "Local", "a@x.com", "2024-01-01T00:00:00Z", "p",
-            Some("somente local"), &[],
+            conn,
+            mb,
+            1,
+            "Local",
+            "a@x.com",
+            "2024-01-01T00:00:00Z",
+            "p",
+            Some("somente local"),
+            &[],
         );
         let hits = fts_search(conn, None, "local").unwrap();
         assert_eq!(hits.len(), 1);
@@ -3943,8 +4036,21 @@ mod classify_tests {
 
     fn seeded_msg(conn: &Connection) -> u64 {
         let mb = ensure_mailbox(conn, "INBOX").unwrap();
-        upsert_message(conn, mb, 1, None, "Prova", "prof@utfpr.edu.br", "[]", "[]",
-            "2026-10-10T00:00:00Z", "[]", false, "prev").unwrap();
+        upsert_message(
+            conn,
+            mb,
+            1,
+            None,
+            "Prova",
+            "prof@utfpr.edu.br",
+            "[]",
+            "[]",
+            "2026-10-10T00:00:00Z",
+            "[]",
+            false,
+            "prev",
+        )
+        .unwrap();
         find_message_id(conn, mb, 1).unwrap().unwrap()
     }
 
@@ -3966,7 +4072,16 @@ mod classify_tests {
         let conn = store.conn();
         let mid = seeded_msg(conn);
         assert!(get_label(conn, mid).unwrap().is_none());
-        upsert_label(conn, mid, "academico.avaliacoes", Some("academico.aulas"), 0.81, 0.6, false).unwrap();
+        upsert_label(
+            conn,
+            mid,
+            "academico.avaliacoes",
+            Some("academico.aulas"),
+            0.81,
+            0.6,
+            false,
+        )
+        .unwrap();
         let l = get_label(conn, mid).unwrap().unwrap();
         assert_eq!(l.primary_id, "academico.avaliacoes");
         assert_eq!(l.secondary_id.as_deref(), Some("academico.aulas"));
@@ -3974,8 +4089,10 @@ mod classify_tests {
         // Reclassify overwrites (no duplicate rows).
         upsert_label(conn, mid, "financeiro.bolsas", None, 0.9, 0.6, false).unwrap();
         let l2 = get_label(conn, mid).unwrap().unwrap();
-        assert_eq!((l2.primary_id.as_str(), l2.secondary_id, l2.confidence),
-            ("financeiro.bolsas", None, 0.9));
+        assert_eq!(
+            (l2.primary_id.as_str(), l2.secondary_id, l2.confidence),
+            ("financeiro.bolsas", None, 0.9)
+        );
     }
 
     #[test]
@@ -3984,8 +4101,21 @@ mod classify_tests {
         let conn = store.conn();
         let a = seeded_msg(conn);
         let mb = mailbox_id(conn, "INBOX").unwrap().unwrap();
-        upsert_message(conn, mb, 2, None, "x", "y", "[]", "[]",
-            "2026-10-10T00:00:00Z", "[]", false, "").unwrap();
+        upsert_message(
+            conn,
+            mb,
+            2,
+            None,
+            "x",
+            "y",
+            "[]",
+            "[]",
+            "2026-10-10T00:00:00Z",
+            "[]",
+            false,
+            "",
+        )
+        .unwrap();
         let b = find_message_id(conn, mb, 2).unwrap().unwrap();
         upsert_label(conn, a, "academico.aulas", None, 0.7, 0.6, false).unwrap();
         upsert_label(conn, b, "removida.xyz", None, 0.7, 0.6, true).unwrap();
@@ -4003,7 +4133,10 @@ mod classify_tests {
         assert!(latest_override(conn, mid).unwrap().is_none());
         log_override(conn, mid, "academico.aulas", "academico.avaliacoes").unwrap();
         log_override(conn, mid, "academico.avaliacoes", "financeiro.bolsas").unwrap();
-        assert_eq!(latest_override(conn, mid).unwrap().as_deref(), Some("financeiro.bolsas"));
+        assert_eq!(
+            latest_override(conn, mid).unwrap().as_deref(),
+            Some("financeiro.bolsas")
+        );
     }
 
     #[test]
@@ -4031,10 +4164,17 @@ mod classify_tests {
         let conn = store.conn();
         let run = create_batch_run(conn).unwrap();
         finish_batch_run(conn, run, "done", r#"{"moved":3}"#).unwrap();
-        let (state, totals): (String, String) = conn.query_row(
-            "SELECT state, totals_json FROM batch_runs WHERE id = ?1",
-            rusqlite::params![run], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
-        assert_eq!((state.as_str(), totals.as_str()), ("done", r#"{"moved":3}"#));
+        let (state, totals): (String, String) = conn
+            .query_row(
+                "SELECT state, totals_json FROM batch_runs WHERE id = ?1",
+                rusqlite::params![run],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (state.as_str(), totals.as_str()),
+            ("done", r#"{"moved":3}"#)
+        );
     }
 }
 
@@ -4055,11 +4195,8 @@ mod taxroundtrip_tests {
         assert_eq!(tax["version"], 1);
         assert_eq!(tax["categories"].as_array().unwrap().len(), 23);
         // Re-import bumps version + stale-flags nothing (ids match).
-        let n = mark_stale_unknown(
-            conn,
-            &["academico", "financeiro", "academico.aulas", "x"],
-        )
-        .unwrap();
+        let n =
+            mark_stale_unknown(conn, &["academico", "financeiro", "academico.aulas", "x"]).unwrap();
         assert_eq!(n, 0); // no labels yet — nothing to flag
     }
 
@@ -4068,10 +4205,32 @@ mod taxroundtrip_tests {
         let store = Store::open_in_memory().unwrap();
         let conn = store.conn();
         let mb = ensure_mailbox(conn, "INBOX").unwrap();
-        upsert_message(conn, mb, 1, None, "s", "f", "[]", "[]",
-            "2026-10-10T00:00:00Z", "[]", false, "").unwrap();
+        upsert_message(
+            conn,
+            mb,
+            1,
+            None,
+            "s",
+            "f",
+            "[]",
+            "[]",
+            "2026-10-10T00:00:00Z",
+            "[]",
+            false,
+            "",
+        )
+        .unwrap();
         let mid = find_message_id(conn, mb, 1).unwrap().unwrap();
-        upsert_label(conn, mid, "financeiro.bolsas", Some("financeiro.cobrancas"), 0.8, 0.6, false).unwrap();
+        upsert_label(
+            conn,
+            mid,
+            "financeiro.bolsas",
+            Some("financeiro.cobrancas"),
+            0.8,
+            0.6,
+            false,
+        )
+        .unwrap();
         let touched = remap_label_ids(conn, "financeiro.bolsas", "financeiro.cobrancas").unwrap();
         assert_eq!(touched, 1);
         assert_eq!(labels_using(conn, "financeiro.bolsas").unwrap(), 0);
@@ -4236,11 +4395,13 @@ fn filter_from_row(row: &rusqlite::Row<'_>) -> Result<SavedFilter, rusqlite::Err
     let scope_raw: String = row.get(3)?;
     // Row mapping never fails the list: validated at write time, so a
     // corrupt row here means manual DB edits — surface plainly.
-    let folders = decode_scope(&scope_raw).map_err(|_| rusqlite::Error::InvalidColumnType(
-        3,
-        "folder_scope".to_string(),
-        rusqlite::types::Type::Text,
-    ))?;
+    let folders = decode_scope(&scope_raw).map_err(|_| {
+        rusqlite::Error::InvalidColumnType(
+            3,
+            "folder_scope".to_string(),
+            rusqlite::types::Type::Text,
+        )
+    })?;
     Ok(SavedFilter {
         id: row.get(0)?,
         name: row.get(1)?,
@@ -4364,12 +4525,8 @@ pub fn search_scoped_with_snippets(
     let rows = fts_search_scoped(conn, folders, query)?;
     let mut hits: Vec<SearchHit> = Vec::with_capacity(rows.len());
     for row in rows {
-        let msg_id = find_message_id(
-            conn,
-            mailbox_id(conn, &row.mailbox)?.unwrap_or(0),
-            row.uid,
-        )?
-        .unwrap_or(0);
+        let msg_id = find_message_id(conn, mailbox_id(conn, &row.mailbox)?.unwrap_or(0), row.uid)?
+            .unwrap_or(0);
         let snippet = if msg_id == 0 {
             String::new()
         } else {
@@ -4389,11 +4546,7 @@ pub fn search_scoped_with_snippets(
         });
     }
     if sort == SORT_DATE {
-        hits.sort_by(|a, b| {
-            b.date_utc
-                .cmp(&a.date_utc)
-                .then_with(|| b.uid.cmp(&a.uid))
-        });
+        hits.sort_by(|a, b| b.date_utc.cmp(&a.date_utc).then_with(|| b.uid.cmp(&a.uid)));
     }
     Ok(hits)
 }
@@ -4403,16 +4556,12 @@ pub fn search_scoped_with_snippets(
 /// same parameter-bound MATCH path as a live query (T-23-05); the sync
 /// worker has zero references to this function. Local SQLite only — no
 /// IMAP leg (live-gate: filters are local-only).
-pub fn apply_saved_filter(
-    conn: &Connection,
-    id: i64,
-) -> Result<Vec<SearchHit>, FilterError> {
+pub fn apply_saved_filter(conn: &Connection, id: i64) -> Result<Vec<SearchHit>, FilterError> {
     let filter = get_filter(conn, id)?;
-    let folders: Option<Vec<String>> = decode_scope(
-        &encode_scope(filter.folders.as_deref())?,
-    )?;
-    let folder_refs: Option<Vec<&str>> =
-        folders.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+    let folders: Option<Vec<String>> = decode_scope(&encode_scope(filter.folders.as_deref())?)?;
+    let folder_refs: Option<Vec<&str>> = folders
+        .as_ref()
+        .map(|v| v.iter().map(|s| s.as_str()).collect());
     search_scoped_with_snippets(conn, folder_refs.as_deref(), &filter.query, &filter.sort)
         .map_err(FilterError::from)
 }
@@ -4473,8 +4622,18 @@ mod filter_tests {
     fn seed_inbox(conn: &Connection) -> u64 {
         let mb = ensure_mailbox(conn, "INBOX").unwrap();
         upsert_message(
-            conn, mb, 1, None, "Boleto mensal", "escola@example.com", "[]", "[]",
-            "2024-01-01T00:00:00Z", "[]", false, "prev",
+            conn,
+            mb,
+            1,
+            None,
+            "Boleto mensal",
+            "escola@example.com",
+            "[]",
+            "[]",
+            "2024-01-01T00:00:00Z",
+            "[]",
+            false,
+            "prev",
         )
         .unwrap();
         let mid = find_message_id(conn, mb, 1).unwrap().unwrap();
@@ -4506,7 +4665,10 @@ mod filter_tests {
             assert_eq!(live.len(), 1);
             let saved = create_filter(conn, "Boletos", "boleto", None, SORT_RANK).unwrap();
             filter_id = saved.id;
-            assert_eq!((saved.name.as_str(), saved.query.as_str()), ("Boletos", "boleto"));
+            assert_eq!(
+                (saved.name.as_str(), saved.query.as_str()),
+                ("Boletos", "boleto")
+            );
             assert_eq!(saved.folders, None);
         }
         // Restart analogue: drop + re-open the file database.
@@ -4554,12 +4716,18 @@ mod filter_tests {
         // Duplicates rejected (trimmed names compare).
         create_filter(conn, "Duplo", "a", None, SORT_RANK).unwrap();
         let err = create_filter(conn, "  Duplo  ", "b", None, SORT_RANK).unwrap_err();
-        assert_eq!(err.to_string(), "Já existe um filtro com esse nome — escolha outro.");
+        assert_eq!(
+            err.to_string(),
+            "Já existe um filtro com esse nome — escolha outro."
+        );
         // Rename onto a sibling name rejected.
         let a = create_filter(conn, "Alfa", "a", None, SORT_RANK).unwrap();
         let b = create_filter(conn, "Beta", "b", None, SORT_RANK).unwrap();
         let err = rename_filter(conn, b.id, "Alfa").unwrap_err();
-        assert_eq!(err.to_string(), "Já existe um filtro com esse nome — escolha outro.");
+        assert_eq!(
+            err.to_string(),
+            "Já existe um filtro com esse nome — escolha outro."
+        );
         // Rename to empty rejected; successful rename round-trips.
         assert!(rename_filter(conn, b.id, "  ").is_err());
         let renamed = rename_filter(conn, b.id, "Gama").unwrap();
@@ -4580,7 +4748,9 @@ mod filter_tests {
         );
         // Bad sort rejected at the boundary.
         assert_eq!(
-            create_filter(conn, "Ordem", "q", None, "bogus").unwrap_err().to_string(),
+            create_filter(conn, "Ordem", "q", None, "bogus")
+                .unwrap_err()
+                .to_string(),
             "A ordenação desse filtro é inválida."
         );
     }
@@ -4609,9 +4779,12 @@ mod filter_tests {
         );
         assert_eq!(get_filter(conn, set.id).unwrap().folders, set.folders);
         // Blank folder entries rejected plainly (strict schema, T-23-05).
-        let err = create_filter(conn, "Ruim", "q", Some(&[" ".to_string()]), SORT_RANK)
-            .unwrap_err();
-        assert_eq!(err.to_string(), "As pastas desse filtro são inválidas — edite o filtro.");
+        let err =
+            create_filter(conn, "Ruim", "q", Some(&[" ".to_string()]), SORT_RANK).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "As pastas desse filtro são inválidas — edite o filtro."
+        );
         // Malformed stored JSON is rejected plainly at apply time.
         conn.execute(
             "INSERT INTO saved_filters (name, query, folder_scope) VALUES ('X', 'q', 'não-json')",
@@ -4640,14 +4813,23 @@ mod filter_tests {
             // Never saved → None (caller renders the normal folder list).
             assert_eq!(load_search_state(store.conn()).unwrap(), None);
             save_search_state(store.conn(), &state).unwrap();
-            assert_eq!(load_search_state(store.conn()).unwrap(), Some(state.clone()));
+            assert_eq!(
+                load_search_state(store.conn()).unwrap(),
+                Some(state.clone())
+            );
             // Reconnect analogue: a second load returns the same view.
-            assert_eq!(load_search_state(store.conn()).unwrap(), Some(state.clone()));
+            assert_eq!(
+                load_search_state(store.conn()).unwrap(),
+                Some(state.clone())
+            );
         }
         // Restart analogue: state survives store re-open (SQLite, not localStorage).
         {
             let store = Store::open(&path).unwrap();
-            assert_eq!(load_search_state(store.conn()).unwrap(), Some(state.clone()));
+            assert_eq!(
+                load_search_state(store.conn()).unwrap(),
+                Some(state.clone())
+            );
             // Empty restored query = normal folder list branch (no stale pane).
             let empty = SearchState {
                 query: "".to_string(),
@@ -4708,11 +4890,13 @@ mod filter_tests {
             )
             .unwrap();
         }
-        let by_date =
-            create_filter(conn, "Recentes", "reunião", None, SORT_DATE).unwrap();
+        let by_date = create_filter(conn, "Recentes", "reunião", None, SORT_DATE).unwrap();
         let hits = apply_saved_filter(conn, by_date.id).unwrap();
         assert_eq!(hits.len(), 2);
-        assert!(hits[0].date_utc > hits[1].date_utc, "date sort newest-first");
+        assert!(
+            hits[0].date_utc > hits[1].date_utc,
+            "date sort newest-first"
+        );
         let by_rank = create_filter(conn, "Rank", "reunião", None, SORT_RANK).unwrap();
         assert_eq!(apply_saved_filter(conn, by_rank.id).unwrap().len(), 2);
         // Scoped filter only hits its folders.
@@ -4753,20 +4937,28 @@ pub fn history_stats(conn: &Connection) -> StoreResult<Vec<CategoryStatsRow>> {
                 SUM(CASE WHEN action='batch' THEN 1 ELSE 0 END) AS batch
          FROM override_events
          WHERE to_category IS NOT NULL
-         GROUP BY to_category"
+         GROUP BY to_category",
     )?;
-    let rows = stmt.query_map([], |r| {
-        let confirms: i64 = r.get(1)?;
-        let overrides: i64 = r.get(2)?;
-        let precision = if overrides == 0 { None } else {
-            Some(confirms as f64 / (confirms as f64 + overrides as f64))
-        };
-        Ok(CategoryStatsRow {
-            category: r.get(0)?,
-            confirms, overrides, dismisses: r.get(3)?, batch: r.get(4)?,
-            precision,
-        })
-    })?.collect::<Result<Vec<_>,_>>().map_err(super::StoreError::Sql)?;
+    let rows = stmt
+        .query_map([], |r| {
+            let confirms: i64 = r.get(1)?;
+            let overrides: i64 = r.get(2)?;
+            let precision = if overrides == 0 {
+                None
+            } else {
+                Some(confirms as f64 / (confirms as f64 + overrides as f64))
+            };
+            Ok(CategoryStatsRow {
+                category: r.get(0)?,
+                confirms,
+                overrides,
+                dismisses: r.get(3)?,
+                batch: r.get(4)?,
+                precision,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(super::StoreError::Sql)?;
     Ok(rows)
 }
 
@@ -4783,36 +4975,64 @@ pub struct HistoryRow {
     pub batch_run_id: Option<String>,
 }
 
-pub fn history_list(conn: &Connection, limit: usize, offset: usize) -> StoreResult<Vec<HistoryRow>> {
+pub fn history_list(
+    conn: &Connection,
+    limit: usize,
+    offset: usize,
+) -> StoreResult<Vec<HistoryRow>> {
     let sql = concat!(
         "SELECT id, ts, action, message_id, from_category, to_category, ",
         "confidence, batch_run_id FROM override_events ",
         "ORDER BY ts DESC, id DESC LIMIT ?1 OFFSET ?2"
     );
     let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(rusqlite::params![limit as i64, offset as i64], |r| {
-        Ok(HistoryRow {
-            id: r.get(0)?, ts: r.get(1)?, action: r.get(2)?,
-            message_id: r.get(3)?, from_category: r.get(4)?,
-            to_category: r.get(5)?, confidence: r.get(6)?,
-            batch_run_id: r.get(7)?,
-        })
-    })?.collect::<Result<Vec<_>,_>>().map_err(super::StoreError::Sql)?;
+    let rows = stmt
+        .query_map(rusqlite::params![limit as i64, offset as i64], |r| {
+            Ok(HistoryRow {
+                id: r.get(0)?,
+                ts: r.get(1)?,
+                action: r.get(2)?,
+                message_id: r.get(3)?,
+                from_category: r.get(4)?,
+                to_category: r.get(5)?,
+                confidence: r.get(6)?,
+                batch_run_id: r.get(7)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(super::StoreError::Sql)?;
     Ok(rows)
 }
 
 // ══ Phase 31-03 CONF-01: shared precision query reused (one dataset, three consumers) ══
 /// Precision for a category (reuses history_stats SQL — never recomputes).
 /// Floors: N>=10 decisions AND precision >= 0.80.
-pub fn category_precision_and_n(conn: &Connection, category: &str) -> StoreResult<(Option<f64>, i64)> {
-    let (confirms, overrides, n): (i64, i64, i64) = conn.query_row(
-        "SELECT SUM(CASE WHEN action='confirm' THEN 1 ELSE 0 END),
+pub fn category_precision_and_n(
+    conn: &Connection,
+    category: &str,
+) -> StoreResult<(Option<f64>, i64)> {
+    let (confirms, overrides, n): (i64, i64, i64) = conn
+        .query_row(
+            "SELECT SUM(CASE WHEN action='confirm' THEN 1 ELSE 0 END),
                  SUM(CASE WHEN action='override' THEN 1 ELSE 0 END),
                  COUNT(*) FROM override_events WHERE to_category = ?1",
-        rusqlite::params![category],
-        |r| Ok((r.get::<_,i64>(0)?, r.get::<_,i64>(1)?, r.get::<_,i64>(2)?)),
-    ).optional().map_err(super::StoreError::Sql)?.unwrap_or((0,0,0));
+            rusqlite::params![category],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(super::StoreError::Sql)?
+        .unwrap_or((0, 0, 0));
     let n_total = confirms + overrides; // dismiss excluded from denominator per structure
-    let prec = if overrides == 0 { None } else { Some(confirms as f64 / (confirms as f64 + overrides as f64)) };
+    let prec = if overrides == 0 {
+        None
+    } else {
+        Some(confirms as f64 / (confirms as f64 + overrides as f64))
+    };
     Ok((prec, n_total))
 }

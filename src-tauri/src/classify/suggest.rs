@@ -142,7 +142,14 @@ mod tests {
     #[test]
     fn low_confidence_routes_to_review_but_keeps_guess() {
         let tax = load_default().unwrap();
-        let s = suggest("academico", 0.42, Some("comunidade"), &tax, "texto vago", 0.6);
+        let s = suggest(
+            "academico",
+            0.42,
+            Some("comunidade"),
+            &tax,
+            "texto vago",
+            0.6,
+        );
         assert!(!s.auto_routable);
         assert_eq!(s.primary_id, "academico");
     }

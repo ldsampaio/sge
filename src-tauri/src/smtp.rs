@@ -499,10 +499,12 @@ mod tests {
             f.code = f.code.map(|c| sanitize_code(&c));
             cases.push(classify_fault(&f));
         }
-        cases.push(build_envelope(password, &[username.to_string()]).map_or_else(
-            |message| SmtpOutcome::Permanent { message },
-            |_| SmtpOutcome::Sent,
-        ));
+        cases.push(
+            build_envelope(password, &[username.to_string()]).map_or_else(
+                |message| SmtpOutcome::Permanent { message },
+                |_| SmtpOutcome::Sent,
+            ),
+        );
         for outcome in &cases {
             let text = format!("{outcome:?}");
             assert!(!text.contains(password), "secret leaked: {text}");

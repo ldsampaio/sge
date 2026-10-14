@@ -4,8 +4,8 @@
 //! an IMAP session through the [`SyncSession`] trait (real
 //! `BoxedSession` in production, `MockSession` in tests).
 
-use std::sync::Arc;
 use serde::Serialize;
+use std::sync::Arc;
 
 /// Progress event emitted at each stage of a sync pass.
 #[derive(Debug, Clone, Serialize)]
@@ -17,7 +17,13 @@ pub enum SyncEvent {
     MessageSynced { uid: u32, flag: SyncFlag },
 
     /// A sweep batch finished.
-    BatchCompleted { new: usize, updated: usize, deleted: usize, moved: usize, expunged: usize },
+    BatchCompleted {
+        new: usize,
+        updated: usize,
+        deleted: usize,
+        moved: usize,
+        expunged: usize,
+    },
 
     /// The full pass completed.
     SyncCompleted { summary: SyncSummary },
@@ -269,5 +275,5 @@ mod tests {
     }
 }
 
-pub mod worker;
 pub mod bodies;
+pub mod worker;

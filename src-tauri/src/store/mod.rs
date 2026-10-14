@@ -209,8 +209,7 @@ const M4_BACKFILL_SQL: &str = concat!(
 /// showing the server UNSEEN datum. `status_synced_at` records STATUS
 /// freshness; `last_sync_at` is now stamped only by message syncs
 /// (`set_sync_state`), and the badge gates on it.
-const M5_STATUS_TS_SQL: &str =
-    "ALTER TABLE mailboxes ADD COLUMN status_synced_at TEXT;";
+const M5_STATUS_TS_SQL: &str = "ALTER TABLE mailboxes ADD COLUMN status_synced_at TEXT;";
 
 /// M6 forward migration: hierarchy delimiter per folder (folder tree).
 ///
@@ -854,7 +853,10 @@ mod tests {
                 |r| r.get(0),
             )
             .expect("query should succeed");
-        assert_eq!(unseen_cols, 1, "mailboxes.unseen_count should exist at schema v6");
+        assert_eq!(
+            unseen_cols, 1,
+            "mailboxes.unseen_count should exist at schema v6"
+        );
         let role_cols: i64 = conn
             .query_row(
                 "SELECT count(*) FROM pragma_table_info('mailboxes') WHERE name IN ('role', 'attributes')",
@@ -862,7 +864,10 @@ mod tests {
                 |r| r.get(0),
             )
             .expect("query should succeed");
-        assert_eq!(role_cols, 2, "mailboxes.role + attributes should exist at schema v8");
+        assert_eq!(
+            role_cols, 2,
+            "mailboxes.role + attributes should exist at schema v8"
+        );
         let send_check: String = conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'send_queue'",
@@ -917,7 +922,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(cols, 1, "mailboxes.sweeps_since_full should exist at schema v6");
+        assert_eq!(
+            cols, 1,
+            "mailboxes.sweeps_since_full should exist at schema v6"
+        );
     }
 
     #[test]
@@ -1182,7 +1190,10 @@ mod tests {
             .unwrap();
         assert_eq!(name, "Pai/Sub");
         assert_eq!(delim, "/", "M6 delimiter values survive the M8 upgrade");
-        assert_eq!(role, "", "role defaults empty (not-yet-resolved, never assumed)");
+        assert_eq!(
+            role, "",
+            "role defaults empty (not-yet-resolved, never assumed)"
+        );
         assert_eq!(attrs, "");
     }
 
@@ -1450,7 +1461,13 @@ mod tests {
             assert_eq!(n, 1, "{kind} {name} should exist at schema v12");
         }
         // Fresh classify tables start empty.
-        for table in ["taxonomy", "labels", "label_overrides", "classify_queue", "batch_runs"] {
+        for table in [
+            "taxonomy",
+            "labels",
+            "label_overrides",
+            "classify_queue",
+            "batch_runs",
+        ] {
             let n: i64 = conn
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
                 .unwrap();
@@ -1646,7 +1663,7 @@ mod tests {
 #[cfg(test)]
 mod m18_tests {
     use super::*;
-    use rusqlite_migration::{M, Migrations};
+    use rusqlite_migration::{Migrations, M};
 
     #[test]
     fn m18_adds_filters_and_ui_state_preserving_rows() {
@@ -1726,8 +1743,7 @@ mod m18_tests {
             .query_row("SELECT COUNT(*) FROM saved_filters", [], |r| r.get(0))
             .unwrap();
         assert_eq!(filters, 0);
-        crate::store::queries::create_filter(&conn, "Pós-migração", "old", None, "rank")
-            .unwrap();
+        crate::store::queries::create_filter(&conn, "Pós-migração", "old", None, "rank").unwrap();
         crate::store::queries::save_search_state(
             &conn,
             &crate::store::queries::SearchState {
@@ -1738,7 +1754,9 @@ mod m18_tests {
             },
         )
         .unwrap();
-        let back = crate::store::queries::load_search_state(&conn).unwrap().unwrap();
+        let back = crate::store::queries::load_search_state(&conn)
+            .unwrap()
+            .unwrap();
         assert_eq!(back.query, "old");
     }
 
@@ -1926,7 +1944,11 @@ mod m22_preserve_tests {
         let conn = store.conn();
         // table now present; seed then verify after migration reapply (idempotent CREATE IF NOT EXISTS)
         assert!(conn.execute("INSERT INTO learning_adjustments (category,keyword_or_threshold,delta,reason_event_id) VALUES(1,'k',0.1,1)", []).is_ok());
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM learning_adjustments", [], |r| r.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM learning_adjustments", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_eq!(count, 1);
     }
 }

@@ -9,8 +9,8 @@
 //! ([`reap_processing`]); UIDVALIDITY shifts drop the folder's rows
 //! ([`Store`](crate::store::queries) epoch helper).
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use serde::Serialize;
 
@@ -90,7 +90,10 @@ pub async fn classify_one(
         ready.needs_review,
     )
     .map_err(BridgeError::Io)?;
-    Ok(ClassificationReady { message_id, ..ready })
+    Ok(ClassificationReady {
+        message_id,
+        ..ready
+    })
 }
 
 /// Bridge round-trip without any store access (pure async step).
@@ -103,13 +106,8 @@ pub async fn suggest_label(
     is_reply: bool,
     threshold: f64,
 ) -> Result<ClassificationReady, BridgeError> {
-    let evidence = super::evidence::build_evidence(
-        subject,
-        snippet,
-        from_domain,
-        has_attachments,
-        is_reply,
-    );
+    let evidence =
+        super::evidence::build_evidence(subject, snippet, from_domain, has_attachments, is_reply);
     let tax = load_default().map_err(|e| BridgeError::Io(e.to_string()))?;
     let tops = top_level(&tax);
     let mut criteria = std::collections::HashMap::new();
@@ -132,11 +130,9 @@ pub async fn suggest_label(
         .map(|t| t.id.clone())
         .unwrap_or_else(|| outcome.choice.clone());
     let runner_name = outcome.runner_up();
-    let runner_id = runner_name.as_ref().and_then(|n| {
-        tops.iter()
-            .find(|t| &t.name == n)
-            .map(|t| t.id.clone())
-    });
+    let runner_id = runner_name
+        .as_ref()
+        .and_then(|n| tops.iter().find(|t| &t.name == n).map(|t| t.id.clone()));
     let s = suggest(
         &top_id,
         outcome.confidence,
@@ -230,13 +226,11 @@ async fn drain_inner(
             let _ = queries::set_queue_state(guard.conn(), message_id, &folder, "done");
             continue;
         };
-        match suggest_label(bridge, &subject, &snippet, &domain, atts, reply, threshold).await
-        {
+        match suggest_label(bridge, &subject, &snippet, &domain, atts, reply, threshold).await {
             Ok(ready) => {
                 let guard = store.lock().unwrap();
                 let ok = worker_persist(&guard, message_id, &ready, threshold).is_ok()
-                    && queries::set_queue_state(guard.conn(), message_id, &folder, "done")
-                        .is_ok();
+                    && queries::set_queue_state(guard.conn(), message_id, &folder, "done").is_ok();
                 if ok {
                     labeled += 1;
                 }
@@ -307,11 +301,25 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let conn = store.conn();
         let mb = ensure_mailbox(conn, "INBOX").unwrap();
-        upsert_message(conn, mb, 1, None, "s", "f", "[]", "[]",
-            "2026-10-10T00:00:00Z", "[]", false, "").unwrap();
+        upsert_message(
+            conn,
+            mb,
+            1,
+            None,
+            "s",
+            "f",
+            "[]",
+            "[]",
+            "2026-10-10T00:00:00Z",
+            "[]",
+            false,
+            "",
+        )
+        .unwrap();
         let mid = find_message_id(conn, mb, 1).unwrap().unwrap();
         enqueue_classify(conn, mid, "INBOX", 1).unwrap();
-        conn.execute("UPDATE classify_queue SET status = 'processing'", []).unwrap();
+        conn.execute("UPDATE classify_queue SET status = 'processing'", [])
+            .unwrap();
         assert_eq!(reap_processing(&store), 1);
         assert_eq!(queue_depth(conn).unwrap(), 1);
     }

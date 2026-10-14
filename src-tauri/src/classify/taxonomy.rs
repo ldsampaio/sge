@@ -91,10 +91,7 @@ pub fn validate(tax: &Taxonomy) -> Result<(), TaxonomyError> {
     for cat in &tax.categories {
         if let Some(parent) = &cat.parent {
             if !by_id.contains_key(parent.as_str()) {
-                return Err(TaxonomyError::MissingParent(
-                    cat.id.clone(),
-                    parent.clone(),
-                ));
+                return Err(TaxonomyError::MissingParent(cat.id.clone(), parent.clone()));
             }
         }
     }
@@ -125,11 +122,7 @@ pub fn validate(tax: &Taxonomy) -> Result<(), TaxonomyError> {
         }
     }
     // Top-level cap.
-    let tops = tax
-        .categories
-        .iter()
-        .filter(|c| c.parent.is_none())
-        .count();
+    let tops = tax.categories.iter().filter(|c| c.parent.is_none()).count();
     if tops > MAX_TOP_LEVEL {
         return Err(TaxonomyError::TooManyTopLevel(tops));
     }
@@ -150,7 +143,10 @@ pub fn validate(tax: &Taxonomy) -> Result<(), TaxonomyError> {
 
 /// Top-level categories (routing choices for the classifier, Phase 17).
 pub fn top_level<'a>(tax: &'a Taxonomy) -> Vec<&'a Category> {
-    tax.categories.iter().filter(|c| c.parent.is_none()).collect()
+    tax.categories
+        .iter()
+        .filter(|c| c.parent.is_none())
+        .collect()
 }
 
 /// Children of a category id.
@@ -300,7 +296,10 @@ mod tests {
             keywords: vec![],
             rule: String::new(),
         });
-        assert_eq!(validate(&tax), Err(TaxonomyError::DuplicateId("top".to_string())));
+        assert_eq!(
+            validate(&tax),
+            Err(TaxonomyError::DuplicateId("top".to_string()))
+        );
     }
 
     #[test]
@@ -327,7 +326,10 @@ mod tests {
     fn rejects_self_parent() {
         let mut tax = minimal_valid();
         tax.categories[0].parent = Some("top".to_string());
-        assert_eq!(validate(&tax), Err(TaxonomyError::SelfParent("top".to_string())));
+        assert_eq!(
+            validate(&tax),
+            Err(TaxonomyError::SelfParent("top".to_string()))
+        );
     }
 
     #[test]

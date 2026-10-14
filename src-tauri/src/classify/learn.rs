@@ -2,7 +2,10 @@
 //! Consumes ONLY confirm/override rows (structural, via WHERE action IN ...).
 //! Dismiss + silence = zero adaptation (training-neutrality is arithmetic).
 
-use crate::store::{queries::{history_stats, CategoryStatsRow}, StoreResult};
+use crate::store::{
+    queries::{history_stats, CategoryStatsRow},
+    StoreResult,
+};
 use rusqlite::Connection;
 
 pub const BATCH_DISCOUNT: f64 = 0.25;
@@ -27,7 +30,9 @@ pub fn apply_learning(conn: &Connection) -> StoreResult<Vec<Adjustment>> {
     let stats = history_stats(conn)?;
     let mut adjustments = Vec::new();
     for cat in stats {
-        if cat.precision.is_none() { continue; }
+        if cat.precision.is_none() {
+            continue;
+        }
         // Bounded nudge: per-event cap + clamped range (defence against runaway).
         // Real adaptation uses reason_event_id chains; stub demonstrates structural neutrality.
         adjustments.push(Adjustment {

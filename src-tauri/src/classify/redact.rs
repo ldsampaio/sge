@@ -112,10 +112,7 @@ mod tests {
     fn assert_scrubbed(f: fn(&str) -> String, text: &str, secrets: &[&str]) {
         let out = f(text);
         for s in secrets {
-            assert!(
-                !out.contains(s),
-                "secret {s:?} survived:\n{out}"
-            );
+            assert!(!out.contains(s), "secret {s:?} survived:\n{out}");
         }
     }
 
@@ -133,7 +130,8 @@ mod tests {
 
     #[test]
     fn boleto_barcode_scrubbed() {
-        let boleto = "Fatura vencida. Linha digitável 23793381286007000123456000000012347650000012345 \
+        let boleto =
+            "Fatura vencida. Linha digitável 23793381286007000123456000000012347650000012345 \
             no valor de R$ 123,45.";
         for f in [redact_input, filter_output] {
             assert_scrubbed(
@@ -150,11 +148,7 @@ mod tests {
         let sig = "Atenciosamente, João — CPF 123.456.789-09, fone (41) 99999-1234, \
             matrícula RA 2023123456.";
         for f in [redact_input, filter_output] {
-            assert_scrubbed(
-                f,
-                sig,
-                &["123.456.789-09", "(41) 99999-1234", "2023123456"],
-            );
+            assert_scrubbed(f, sig, &["123.456.789-09", "(41) 99999-1234", "2023123456"]);
         }
     }
 
@@ -218,7 +212,10 @@ mod tests {
         let out = filter_output(just);
         assert!(!out.contains("Temp1234"), "password value leaked:\n{out}");
         assert!(!out.contains("739201"), "code value leaked:\n{out}");
-        assert!(out.contains("Boletos"), "rule name is the user's own label — kept");
+        assert!(
+            out.contains("Boletos"),
+            "rule name is the user's own label — kept"
+        );
         assert!(looks_clean(&out));
     }
 

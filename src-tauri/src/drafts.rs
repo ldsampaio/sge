@@ -58,8 +58,7 @@ fn sanitize_header(s: &str) -> String {
 /// Hand-rolled so the renderer needs no new crate: only used for
 /// `=?UTF-8?B?...?=` encoded-words of non-ASCII header words.
 fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let mut n: u32 = 0;
@@ -123,10 +122,7 @@ pub fn render_draft_rfc5322(d: &DraftFields, date_rfc2822: &str) -> Vec<u8> {
     }
     let subject = sanitize_header(&d.subject);
     out.push_str(&format!("Subject: {}\r\n", encode_word(&subject)));
-    out.push_str(&format!(
-        "Date: {}\r\n",
-        sanitize_header(date_rfc2822)
-    ));
+    out.push_str(&format!("Date: {}\r\n", sanitize_header(date_rfc2822)));
     out.push_str(&format!(
         "Message-ID: {}\r\n",
         sanitize_header(&d.message_id)
@@ -189,8 +185,7 @@ mod tests {
         d.to = vec!["Lixeira & Cia <lixeira@example.com>".to_string()];
         let raw = render_draft_rfc5322(&d, DATE);
         assert!(
-            raw.windows(10)
-                .any(|w| w == b"=?UTF-8?B?"),
+            raw.windows(10).any(|w| w == b"=?UTF-8?B?"),
             "non-ASCII words must be encoded-word encoded"
         );
         let msg = parse(&raw);
@@ -274,10 +269,7 @@ mod tests {
     #[test]
     fn message_id_rejects_unsafe_atoms() {
         // MN-02: spaces, `>`, and non-ASCII must not reach the wire header.
-        assert_eq!(
-            new_message_id("a b>c@d"),
-            "<abcd@sge.local>".to_string()
-        );
+        assert_eq!(new_message_id("a b>c@d"), "<abcd@sge.local>".to_string());
         let long = "x".repeat(200);
         let id = new_message_id(&long);
         assert!(id.len() < 150, "capped at 128 atoms + domain");

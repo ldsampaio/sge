@@ -81,19 +81,14 @@ pub async fn fetch_body_message(
     let html = extract_html(&msg).map(|h| sanitize_html(&h));
 
     // Step 5 — size check
-    let total = text.as_ref().map(|s| s.len()).unwrap_or(0)
-        + html.as_ref().map(|s| s.len()).unwrap_or(0);
+    let total =
+        text.as_ref().map(|s| s.len()).unwrap_or(0) + html.as_ref().map(|s| s.len()).unwrap_or(0);
 
     let body_complete = total <= BODY_CACHE_CAP_BYTES;
 
     // Step 6 — cache if within cap
     if body_complete {
-        crate::store::queries::insert_body(
-            conn,
-            message_id,
-            text.as_deref(),
-            html.as_deref(),
-        )?;
+        crate::store::queries::insert_body(conn, message_id, text.as_deref(), html.as_deref())?;
     }
 
     // Step 7 — attachments (Phase 3)
@@ -147,7 +142,12 @@ fn read_cached_body(conn: &Connection, message_id: u64) -> Result<BodyContent, S
         .query_row(
             "SELECT body_text, body_html FROM message_bodies WHERE message_id = ?1",
             rusqlite::params![message_id],
-            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
         )
         .map_err(|e| SyncError::Io(format!("cached body read: {e}")))?;
     Ok(BodyContent { text, html })
@@ -156,12 +156,12 @@ fn read_cached_body(conn: &Connection, message_id: u64) -> Result<BodyContent, S
 // ── Tests ────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
+    use super::SyncError;
     use super::*;
     use crate::imap::headers::MessageHeader;
     use crate::imap::{MailboxInfo, MailboxStatus, MailboxSummary, PinBox, SyncSession};
-    use super::SyncError;
-    use crate::store::Store;
     use crate::store::queries;
+    use crate::store::Store;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Minimal mock session for body-fetch tests.
@@ -171,10 +171,7 @@ mod tests {
     }
 
     impl SyncSession for MockSession {
-        fn select_mailbox(
-            &mut self,
-            _name: &str,
-        ) -> PinBox<'_, Result<MailboxSummary, SyncError>> {
+        fn select_mailbox(&mut self, _name: &str) -> PinBox<'_, Result<MailboxSummary, SyncError>> {
             let summary = MailboxSummary {
                 selected_mailbox: "INBOX".to_string(),
                 uid_validity: 100,
@@ -223,7 +220,11 @@ mod tests {
 
         // Plan 10-01 stubs: body-fetch tests never exercise delete/move
         // verbs; arms exist only to satisfy the extended trait.
-        fn store_deleted(&mut self, _uid: u32, _deleted: bool) -> PinBox<'_, Result<(), SyncError>> {
+        fn store_deleted(
+            &mut self,
+            _uid: u32,
+            _deleted: bool,
+        ) -> PinBox<'_, Result<(), SyncError>> {
             Box::pin(async move { Ok(()) })
         }
 
@@ -235,11 +236,19 @@ mod tests {
             Box::pin(async move { Ok(Vec::new()) })
         }
 
-        fn uid_copy_to(&mut self, _uid_set: &str, _dest: &str) -> PinBox<'_, Result<(), SyncError>> {
+        fn uid_copy_to(
+            &mut self,
+            _uid_set: &str,
+            _dest: &str,
+        ) -> PinBox<'_, Result<(), SyncError>> {
             Box::pin(async move { Ok(()) })
         }
 
-        fn uid_move_to(&mut self, _uid_set: &str, _dest: &str) -> PinBox<'_, Result<(), SyncError>> {
+        fn uid_move_to(
+            &mut self,
+            _uid_set: &str,
+            _dest: &str,
+        ) -> PinBox<'_, Result<(), SyncError>> {
             Box::pin(async move { Ok(()) })
         }
 
@@ -307,11 +316,23 @@ mod tests {
         let conn = store.conn();
         let mailbox_id = queries::ensure_mailbox(conn, "INBOX").unwrap();
         queries::upsert_message(
-            conn, mailbox_id, 1, Some("<msg1>"),
-            "Subject 1", "alice@example.com", "", "",
-            "2024-01-01T00:00:00Z", "[]", false, "",
-        ).unwrap();
-        let msg_id = queries::find_message_id(conn, mailbox_id, 1).unwrap().unwrap();
+            conn,
+            mailbox_id,
+            1,
+            Some("<msg1>"),
+            "Subject 1",
+            "alice@example.com",
+            "",
+            "",
+            "2024-01-01T00:00:00Z",
+            "[]",
+            false,
+            "",
+        )
+        .unwrap();
+        let msg_id = queries::find_message_id(conn, mailbox_id, 1)
+            .unwrap()
+            .unwrap();
         queries::insert_body(conn, msg_id, Some("Hello text"), Some("<p>Hello</p>")).unwrap();
 
         let mut session = MockSession {
@@ -320,8 +341,17 @@ mod tests {
         };
 
         let result = async_std::task::block_on(async {
-            fetch_body_message(&mut session, conn, msg_id, 1, 100, std::path::Path::new("/tmp")).await
-        }).unwrap();
+            fetch_body_message(
+                &mut session,
+                conn,
+                msg_id,
+                1,
+                100,
+                std::path::Path::new("/tmp"),
+            )
+            .await
+        })
+        .unwrap();
 
         assert!(
             !session.fetch_body_called.load(Ordering::SeqCst),
@@ -337,11 +367,23 @@ mod tests {
         let conn = store.conn();
         let mailbox_id = queries::ensure_mailbox(conn, "INBOX").unwrap();
         queries::upsert_message(
-            conn, mailbox_id, 1, Some("<msg1>"),
-            "Subject 1", "alice@example.com", "", "",
-            "2024-01-01T00:00:00Z", "[]", false, "",
-        ).unwrap();
-        let msg_id = queries::find_message_id(conn, mailbox_id, 1).unwrap().unwrap();
+            conn,
+            mailbox_id,
+            1,
+            Some("<msg1>"),
+            "Subject 1",
+            "alice@example.com",
+            "",
+            "",
+            "2024-01-01T00:00:00Z",
+            "[]",
+            false,
+            "",
+        )
+        .unwrap();
+        let msg_id = queries::find_message_id(conn, mailbox_id, 1)
+            .unwrap()
+            .unwrap();
 
         let large = "x".repeat(BODY_CACHE_CAP_BYTES + 1);
         let raw = make_msg(&large);
@@ -351,8 +393,17 @@ mod tests {
         };
 
         let _ = async_std::task::block_on(async {
-            fetch_body_message(&mut session, conn, msg_id, 1, 100, std::path::Path::new("/tmp")).await
-        }).unwrap();
+            fetch_body_message(
+                &mut session,
+                conn,
+                msg_id,
+                1,
+                100,
+                std::path::Path::new("/tmp"),
+            )
+            .await
+        })
+        .unwrap();
 
         assert!(
             session.fetch_body_called.load(Ordering::SeqCst),

@@ -151,8 +151,7 @@ pub fn validate_leaf(leaf: &str, delimiter: &str) -> Result<(), FolderNameError>
 /// Minimal base64 encoder (standard alphabet with `=` padding; the
 /// caller adapts it to the modified alphabet).
 fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHA: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0] as u32;
@@ -178,7 +177,10 @@ fn base64_encode(bytes: &[u8]) -> String {
 /// Decode one `&...-` payload (modified base64 → UTF-16BE → String).
 fn decode_shift(chunk: &str) -> String {
     // Modified base64 uses ',' where standard base64 uses '/'.
-    let std_b64: String = chunk.chars().map(|c| if c == ',' { '/' } else { c }).collect();
+    let std_b64: String = chunk
+        .chars()
+        .map(|c| if c == ',' { '/' } else { c })
+        .collect();
     // Payloads omit padding; restore it to a multiple of 4.
     let padded = match std_b64.len() % 4 {
         0 => std_b64,

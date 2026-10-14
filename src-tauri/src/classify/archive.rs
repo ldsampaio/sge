@@ -48,8 +48,8 @@ use chrono::{DateTime, Utc};
 use super::filing::{self, ConfirmResult};
 use super::redact;
 use super::taxonomy::{load_default, top_level};
-use crate::imap::headers::MessageHeader;
 use crate::commands::sync::{prepare_create_wire, refresh_mailbox_tree};
+use crate::imap::headers::MessageHeader;
 use crate::imap::manager::SessionManager;
 use crate::store::queries;
 use crate::store::Store;
@@ -79,7 +79,8 @@ pub fn default_included_folders() -> Vec<String> {
 /// not here — a stored list naming an excluded folder stays inert.
 pub fn resolve_included_folders(conn: &rusqlite::Connection) -> Vec<String> {
     match queries::get_archive_included_json(conn) {
-        Some(json) => serde_json::from_str::<Vec<String>>(&json).unwrap_or_else(|_| default_included_folders()),
+        Some(json) => serde_json::from_str::<Vec<String>>(&json)
+            .unwrap_or_else(|_| default_included_folders()),
         None => default_included_folders(),
     }
 }
@@ -166,7 +167,11 @@ pub fn archive_top_for(
     // Unfiled mail with a label: resolved top DISPLAY name (not the id).
     if let Ok(Some(label)) = queries::get_label(conn, message_id) {
         if let Ok(tax) = load_default() {
-            if let Some(top) = tax.categories.iter().find(|c| c.id == label.primary_id && c.parent.is_none()) {
+            if let Some(top) = tax
+                .categories
+                .iter()
+                .find(|c| c.id == label.primary_id && c.parent.is_none())
+            {
                 return Ok(top.name.clone());
             }
             // Child id: resolve through its parent top.
@@ -296,14 +301,19 @@ pub async fn ensure_archive_tree(
         let guard = store.lock().unwrap();
         let conn = guard.conn();
         let cached = queries::list_mailboxes(conn).map_err(|e| e.to_string())?;
-        let raw = cached.first().map(|r| r.delimiter.clone()).unwrap_or_default();
+        let raw = cached
+            .first()
+            .map(|r| r.delimiter.clone())
+            .unwrap_or_default();
         // Pre-first-sync stores carry an empty delimiter: joining with ""
         // would glue parent+leaf together ("AutoArchive"). The display
         // form uses "/", so normalize to it (same assumption the batch
         // runner's inline wire computation makes).
         let delimiter = if raw.is_empty() { "/".to_string() } else { raw };
-        let marked =
-            queries::get_setting(conn, "auto_root").map_err(|e| e.to_string())?.as_deref() == Some("ours");
+        let marked = queries::get_setting(conn, "auto_root")
+            .map_err(|e| e.to_string())?
+            .as_deref()
+            == Some("ours");
         (cached, delimiter, marked)
     };
     let live = manager.list_mailboxes().await.map_err(|e| e.to_string())?;
@@ -340,14 +350,19 @@ pub async fn ensure_archive_tree(
             Some(idx) => (Some(level[..idx].to_string()), level[idx + 1..].to_string()),
             None => (None, level.clone()),
         };
-        let parent_wire = parent_display.as_deref().map(|p| display_to_wire(p, &delimiter));
+        let parent_wire = parent_display
+            .as_deref()
+            .map(|p| display_to_wire(p, &delimiter));
         let cached_now = {
             let guard = store.lock().unwrap();
             queries::list_mailboxes(guard.conn()).map_err(|e| e.to_string())?
         };
         match prepare_create_wire(&cached_now, parent_wire.as_deref(), &leaf, &delimiter) {
             Ok(wire_now) => {
-                manager.create_mailbox_in(&wire_now).await.map_err(|e| e.to_string())?;
+                manager
+                    .create_mailbox_in(&wire_now)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 known.push(wire_now);
                 created += 1;
             }
@@ -357,7 +372,9 @@ pub async fn ensure_archive_tree(
             Err(e) => return Err(e),
         }
     }
-    let _ = refresh_mailbox_tree(manager, store).await.map_err(|e| e.to_string());
+    let _ = refresh_mailbox_tree(manager, store)
+        .await
+        .map_err(|e| e.to_string());
     {
         let guard = store.lock().unwrap();
         let _ = queries::set_setting(guard.conn(), "auto_root", "ours");
@@ -380,23 +397,35 @@ pub async fn archive_one(
     if mailbox == dest_wire {
         return Err(filing::FilingError::AlreadyThere);
     }
-    filing::move_one_uid(manager, store, mailbox, uid, dest_wire, &archive_detail(dest_display)).await
+    filing::move_one_uid(
+        manager,
+        store,
+        mailbox,
+        uid,
+        dest_wire,
+        &archive_detail(dest_display),
+    )
+    .await
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::batch::{journal_intent, journal_moved, journaled_ids};
+    use super::*;
     use crate::store::queries::*;
     use crate::store::Store;
 
     /// Fixed clock: 2026-10-13T00:00:00Z (deterministic age math).
     fn fixed_now() -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339("2026-10-13T00:00:00Z").unwrap().with_timezone(&Utc)
+        DateTime::parse_from_rfc3339("2026-10-13T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
     }
 
     fn dt_days_ago(days: i64) -> String {
-        (fixed_now() - chrono::Duration::days(days)).format("%Y-%m-%dT%H:%M:%SZ").to_string()
+        (fixed_now() - chrono::Duration::days(days))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string()
     }
 
     /// Seed: INBOX (old 100d + young 10d), Sent old, `A Classificar` old,
@@ -409,18 +438,96 @@ mod tests {
         let review = ensure_mailbox(conn, "A Classificar").unwrap();
         let archive = ensure_mailbox(conn, "Auto/Archive/2026/INBOX").unwrap();
         let filed = ensure_mailbox(conn, "Auto/Financeiro").unwrap();
-        upsert_message(conn, inbox, 1, None, "Boleto velho", "f@x", "[]", "[]",
-            &dt_days_ago(100), "[]", false, "").unwrap();
-        upsert_message(conn, inbox, 2, None, "Oi novo", "g@x", "[]", "[]",
-            &dt_days_ago(10), "[]", false, "").unwrap();
-        upsert_message(conn, sent, 1, None, "Enviado velho", "m@x", "[]", "[]",
-            &dt_days_ago(200), "[]", false, "").unwrap();
-        upsert_message(conn, review, 1, None, "Pendente velho", "r@x", "[]", "[]",
-            &dt_days_ago(200), "[]", false, "").unwrap();
-        upsert_message(conn, archive, 1, None, "Já arquivado", "a@x", "[]", "[]",
-            &dt_days_ago(400), "[]", false, "").unwrap();
-        upsert_message(conn, filed, 5, None, "Fatura velha", "fin@x", "[]", "[]",
-            &dt_days_ago(120), "[]", false, "").unwrap();
+        upsert_message(
+            conn,
+            inbox,
+            1,
+            None,
+            "Boleto velho",
+            "f@x",
+            "[]",
+            "[]",
+            &dt_days_ago(100),
+            "[]",
+            false,
+            "",
+        )
+        .unwrap();
+        upsert_message(
+            conn,
+            inbox,
+            2,
+            None,
+            "Oi novo",
+            "g@x",
+            "[]",
+            "[]",
+            &dt_days_ago(10),
+            "[]",
+            false,
+            "",
+        )
+        .unwrap();
+        upsert_message(
+            conn,
+            sent,
+            1,
+            None,
+            "Enviado velho",
+            "m@x",
+            "[]",
+            "[]",
+            &dt_days_ago(200),
+            "[]",
+            false,
+            "",
+        )
+        .unwrap();
+        upsert_message(
+            conn,
+            review,
+            1,
+            None,
+            "Pendente velho",
+            "r@x",
+            "[]",
+            "[]",
+            &dt_days_ago(200),
+            "[]",
+            false,
+            "",
+        )
+        .unwrap();
+        upsert_message(
+            conn,
+            archive,
+            1,
+            None,
+            "Já arquivado",
+            "a@x",
+            "[]",
+            "[]",
+            &dt_days_ago(400),
+            "[]",
+            false,
+            "",
+        )
+        .unwrap();
+        upsert_message(
+            conn,
+            filed,
+            5,
+            None,
+            "Fatura velha",
+            "fin@x",
+            "[]",
+            "[]",
+            &dt_days_ago(120),
+            "[]",
+            false,
+            "",
+        )
+        .unwrap();
         exclude_folder(conn, "Sent", "test").unwrap();
         store
     }
@@ -442,7 +549,10 @@ mod tests {
         // Backend rejects out-of-range with plain language (UI never the
         // only guard): 6 and 731 fail, boundaries hold.
         let err = set_archive_threshold(conn, 6).unwrap_err();
-        assert!(err.contains("7 e 730"), "plain-language range error, got: {err}");
+        assert!(
+            err.contains("7 e 730"),
+            "plain-language range error, got: {err}"
+        );
         set_archive_threshold(conn, 731).unwrap_err();
         set_archive_threshold(conn, 7).unwrap();
         set_archive_threshold(conn, 730).unwrap();
@@ -465,12 +575,17 @@ mod tests {
         let mut got: Vec<(String, u32)> = cands.into_iter().map(|(_, mb, uid)| (mb, uid)).collect();
         got.sort();
         // Old INBOX + old filed mail; young INBOX stays.
-        assert_eq!(got, vec![("Auto/Financeiro".to_string(), 5), ("INBOX".to_string(), 1)]);
+        assert_eq!(
+            got,
+            vec![("Auto/Financeiro".to_string(), 5), ("INBOX".to_string(), 1)]
+        );
         // Narrower threshold admits the young mail too.
         let cands7 = collect_archive_candidates(conn, 7, &scope, now).unwrap();
         assert_eq!(cands7.len(), 3);
         // Empty scope is a no-op (never a silent whole-account op).
-        assert!(collect_archive_candidates(conn, 7, &[], now).unwrap().is_empty());
+        assert!(collect_archive_candidates(conn, 7, &[], now)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -489,13 +604,29 @@ mod tests {
         ];
         let cands = collect_archive_candidates(conn, 90, &scope, now).unwrap();
         for (_, mb, _) in &cands {
-            assert!(!ALWAYS_EXCLUDED.contains(&mb.as_str()), "sourced excluded {mb}");
+            assert!(
+                !ALWAYS_EXCLUDED.contains(&mb.as_str()),
+                "sourced excluded {mb}"
+            );
             assert!(!is_archive_tree(mb), "sourced archive subtree {mb}");
         }
         // Undatable mail stays put.
         let inbox = mailbox_id(conn, "INBOX").unwrap().unwrap();
-        upsert_message(conn, inbox, 9, None, "Sem data", "z@x", "[]", "[]",
-            "not-a-date", "[]", false, "").unwrap();
+        upsert_message(
+            conn,
+            inbox,
+            9,
+            None,
+            "Sem data",
+            "z@x",
+            "[]",
+            "[]",
+            "not-a-date",
+            "[]",
+            false,
+            "",
+        )
+        .unwrap();
         let cands2 = collect_archive_candidates(conn, 7, &["INBOX".to_string()], now).unwrap();
         assert!(cands2.iter().all(|(_, _, uid)| *uid != 9));
     }
@@ -506,18 +637,40 @@ mod tests {
         let conn = store.conn();
         let now = fixed_now();
         // Filed mail: folder context preserved under the Date year.
-        let filed_mid = find_message_id(conn, mailbox_id(conn, "Auto/Financeiro").unwrap().unwrap(), 5).unwrap().unwrap();
+        let filed_mid = find_message_id(
+            conn,
+            mailbox_id(conn, "Auto/Financeiro").unwrap().unwrap(),
+            5,
+        )
+        .unwrap()
+        .unwrap();
         let (dest, year, top) = archive_dest_for(conn, filed_mid, "Auto/Financeiro", now).unwrap();
         assert_eq!((year, top.as_str()), (2026, "Financeiro"));
         assert_eq!(dest, "Auto/Archive/2026/Financeiro");
         // Unfiled labeled mail: classified TOP name (never the id).
-        let inbox_mid = find_message_id(conn, mailbox_id(conn, "INBOX").unwrap().unwrap(), 1).unwrap().unwrap();
-        upsert_label(conn, inbox_mid, "financeiro.cobrancas", None, 0.9, 0.6, false).unwrap();
+        let inbox_mid = find_message_id(conn, mailbox_id(conn, "INBOX").unwrap().unwrap(), 1)
+            .unwrap()
+            .unwrap();
+        upsert_label(
+            conn,
+            inbox_mid,
+            "financeiro.cobrancas",
+            None,
+            0.9,
+            0.6,
+            false,
+        )
+        .unwrap();
         let (dest2, _, _) = archive_dest_for(conn, inbox_mid, "INBOX", now).unwrap();
         assert_eq!(dest2, "Auto/Archive/2026/Financeiro");
-        assert!(!dest2.contains("financeiro.cobrancas"), "no category-ID references in paths");
+        assert!(
+            !dest2.contains("financeiro.cobrancas"),
+            "no category-ID references in paths"
+        );
         // Unlabeled INBOX mail: source leaf fallback.
-        let inbox_mid2 = find_message_id(conn, mailbox_id(conn, "INBOX").unwrap().unwrap(), 2).unwrap().unwrap();
+        let inbox_mid2 = find_message_id(conn, mailbox_id(conn, "INBOX").unwrap().unwrap(), 2)
+            .unwrap()
+            .unwrap();
         let (dest3, _, _) = archive_dest_for(conn, inbox_mid2, "INBOX", now).unwrap();
         assert_eq!(dest3, "Auto/Archive/2026/INBOX");
     }
@@ -530,7 +683,10 @@ mod tests {
         assert_eq!(clean, "Arquivado em Auto/Archive/2026/Financeiro");
         assert!(redact::looks_clean(&clean));
         let dirty = redact::filter_output("Arquivado senha 482917 terminal 033");
-        assert!(!dirty.contains("482917"), "digit runs must not survive: {dirty}");
+        assert!(
+            !dirty.contains("482917"),
+            "digit runs must not survive: {dirty}"
+        );
     }
 
     #[test]
@@ -550,15 +706,30 @@ mod tests {
         // live below the split marker and don't count.
         const SELF_SRC: &str = include_str!("archive.rs");
         let code = SELF_SRC.split("#[cfg(test)]").next().unwrap_or("");
-        for verb in ["EXPUNGE", "expunge", "STORE \\Deleted", "STORE Deleted", "delete_mailbox", "uid_expunge"] {
+        for verb in [
+            "EXPUNGE",
+            "expunge",
+            "STORE \\Deleted",
+            "STORE Deleted",
+            "delete_mailbox",
+            "uid_expunge",
+        ] {
             assert!(
                 !code.contains(verb),
                 "removal verb `{verb}` on the archive path — MOVE-only invariant violated"
             );
         }
         // Positive control: the allowed verbs ARE present.
-        for allowed in ["move_one_uid", "create_mailbox_in", "journal_intent", "journal_moved"] {
-            assert!(code.contains(allowed), "expected allowed verb `{allowed}` missing");
+        for allowed in [
+            "move_one_uid",
+            "create_mailbox_in",
+            "journal_intent",
+            "journal_moved",
+        ] {
+            assert!(
+                code.contains(allowed),
+                "expected allowed verb `{allowed}` missing"
+            );
         }
     }
 
@@ -598,14 +769,21 @@ mod tests {
         fn select_mailbox(&mut self, name: &str) -> PinBox<'_, Result<MailboxSummary, SyncError>> {
             let name = name.to_string();
             Box::pin(async move {
-                Ok(MailboxSummary { selected_mailbox: name, uid_validity: 7, exists: 1, uid_next: None })
+                Ok(MailboxSummary {
+                    selected_mailbox: name,
+                    uid_validity: 7,
+                    exists: 1,
+                    uid_next: None,
+                })
             })
         }
         fn search_uids(&mut self) -> PinBox<'_, Result<Vec<u32>, SyncError>> {
             Box::pin(async move { Ok(vec![1]) })
         }
-        fn fetch_envelopes<'a>(&'a mut self, _range: &'a str)
-            -> PinBox<'a, Result<Vec<crate::imap::headers::MessageHeader>, SyncError>> {
+        fn fetch_envelopes<'a>(
+            &'a mut self,
+            _range: &'a str,
+        ) -> PinBox<'a, Result<Vec<crate::imap::headers::MessageHeader>, SyncError>> {
             Box::pin(async move { Ok(vec![]) })
         }
         fn fetch_body(&mut self, _uid: u32) -> PinBox<'_, Result<Vec<u8>, SyncError>> {
@@ -619,10 +797,18 @@ mod tests {
             Box::pin(async move { Err(SyncError::Protocol(msg)) })
         }
         fn expunge(&mut self) -> PinBox<'_, Result<Vec<u32>, SyncError>> {
-            Box::pin(async move { Err(SyncError::Protocol("archive fake: expunge called — MOVE-only violated".to_string())) })
+            Box::pin(async move {
+                Err(SyncError::Protocol(
+                    "archive fake: expunge called — MOVE-only violated".to_string(),
+                ))
+            })
         }
         fn uid_expunge(&mut self, _set: &str) -> PinBox<'_, Result<Vec<u32>, SyncError>> {
-            Box::pin(async move { Err(SyncError::Protocol("archive fake: uid_expunge called — MOVE-only violated".to_string())) })
+            Box::pin(async move {
+                Err(SyncError::Protocol(
+                    "archive fake: uid_expunge called — MOVE-only violated".to_string(),
+                ))
+            })
         }
         fn uid_copy_to(&mut self, _set: &str, _dest: &str) -> PinBox<'_, Result<(), SyncError>> {
             Box::pin(async move { Ok(()) })
@@ -636,7 +822,13 @@ mod tests {
             })
         }
         fn capabilities(&mut self) -> PinBox<'_, Result<Vec<String>, SyncError>> {
-            Box::pin(async move { Ok(vec!["IMAP4rev1".to_string(), "MOVE".to_string(), "UIDPLUS".to_string()]) })
+            Box::pin(async move {
+                Ok(vec![
+                    "IMAP4rev1".to_string(),
+                    "MOVE".to_string(),
+                    "UIDPLUS".to_string(),
+                ])
+            })
         }
         fn create_mailbox(&mut self, name: &str) -> PinBox<'_, Result<(), SyncError>> {
             let this = self.0.clone();
@@ -654,32 +846,57 @@ mod tests {
             let this = self.0.clone();
             let name = name.to_string();
             Box::pin(async move {
-                this.removal_calls.lock().unwrap().push(format!("delete_mailbox:{name}"));
-                Err(SyncError::Protocol("archive fake: delete_mailbox called — MOVE-only violated".to_string()))
+                this.removal_calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("delete_mailbox:{name}"));
+                Err(SyncError::Protocol(
+                    "archive fake: delete_mailbox called — MOVE-only violated".to_string(),
+                ))
             })
         }
-        fn append_message(&mut self, _mb: &str, _flags: &str, _bytes: &[u8]) -> PinBox<'_, Result<(), SyncError>> {
+        fn append_message(
+            &mut self,
+            _mb: &str,
+            _flags: &str,
+            _bytes: &[u8],
+        ) -> PinBox<'_, Result<(), SyncError>> {
             Box::pin(async move { Ok(()) })
         }
-        fn uid_search_header(&mut self, _f: &str, _v: &str) -> PinBox<'_, Result<Vec<u32>, SyncError>> {
+        fn uid_search_header(
+            &mut self,
+            _f: &str,
+            _v: &str,
+        ) -> PinBox<'_, Result<Vec<u32>, SyncError>> {
             Box::pin(async move { Ok(vec![]) })
         }
         fn list_mailboxes(&mut self) -> PinBox<'_, Result<Vec<MailboxInfo>, SyncError>> {
             let this = self.0.clone();
             Box::pin(async move {
-                Ok(this.mailboxes.lock().unwrap().iter().map(|n| MailboxInfo {
-                    name: n.clone(),
-                    display_name: n.clone(),
-                    delimiter: "/".to_string(),
-                    attributes: vec![],
-                }).collect())
+                Ok(this
+                    .mailboxes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|n| MailboxInfo {
+                        name: n.clone(),
+                        display_name: n.clone(),
+                        delimiter: "/".to_string(),
+                        attributes: vec![],
+                    })
+                    .collect())
             })
         }
         fn mailbox_status(&mut self, name: &str) -> PinBox<'_, Result<MailboxStatus, SyncError>> {
             let name = name.to_string();
             let _ = name;
             Box::pin(async move {
-                Ok(MailboxStatus { uid_validity: 7, uid_next: Some(2), unseen: 0, messages: 1 })
+                Ok(MailboxStatus {
+                    uid_validity: 7,
+                    uid_next: Some(2),
+                    unseen: 0,
+                    messages: 1,
+                })
             })
         }
         fn logout(&mut self) -> PinBox<'_, Result<(), SyncError>> {
@@ -700,10 +917,12 @@ mod tests {
     }
 
     #[test]
-    fn tracer_old_mail_archives_young_stays() {        async_std::task::block_on(async {
+    fn tracer_old_mail_archives_young_stays() {
+        async_std::task::block_on(async {
             let store = seeded();
             let store = Arc::new(Mutex::new(store));
-            let (manager, fake) = ArchiveFake::with_mailboxes(&["INBOX", "Sent", "A Classificar", "Auto/Financeiro"]);
+            let (manager, fake) =
+                ArchiveFake::with_mailboxes(&["INBOX", "Sent", "A Classificar", "Auto/Financeiro"]);
             let now = fixed_now();
             // 1. Candidates: old INBOX mail only.
             let cands = {
@@ -718,9 +937,19 @@ mod tests {
                 archive_dest_for(guard.conn(), mid, &mailbox, now).unwrap()
             };
             assert_eq!(dest_display, format!("Auto/Archive/{year}/INBOX"));
-            let made = ensure_archive_tree(&manager, &store, &[dest_display.clone()]).await.unwrap();
-            assert!(made >= 3, "Auto + Archive + year levels created, got {made}");
-            assert!(fake.created.lock().unwrap().iter().any(|n| n == "Auto/Archive"));
+            let made = ensure_archive_tree(&manager, &store, &[dest_display.clone()])
+                .await
+                .unwrap();
+            assert!(
+                made >= 3,
+                "Auto + Archive + year levels created, got {made}"
+            );
+            assert!(fake
+                .created
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|n| n == "Auto/Archive"));
             // 3. Journal intent → MOVE → journal moved (verbatim batch order).
             let run = {
                 let guard = store.lock().unwrap();
@@ -728,10 +957,21 @@ mod tests {
             };
             {
                 let guard = store.lock().unwrap();
-                journal_intent(guard.conn(), run, mid, &mailbox, &dest_display, ARCHIVE_LABEL_ID, 0).unwrap();
+                journal_intent(
+                    guard.conn(),
+                    run,
+                    mid,
+                    &mailbox,
+                    &dest_display,
+                    ARCHIVE_LABEL_ID,
+                    0,
+                )
+                .unwrap();
             }
             let wire = display_to_wire(&dest_display, "/");
-            archive_one(&manager, &store, &mailbox, uid, &wire, &dest_display).await.unwrap();
+            archive_one(&manager, &store, &mailbox, uid, &wire, &dest_display)
+                .await
+                .unwrap();
             {
                 let guard = store.lock().unwrap();
                 journal_moved(guard.conn(), run, mid).unwrap();
@@ -744,8 +984,17 @@ mod tests {
             assert_eq!(moved[0].1, wire);
             assert!(fake.removal_calls.lock().unwrap().is_empty());
             let guard = store.lock().unwrap();
-            let young = find_message_id(guard.conn(), mailbox_id(guard.conn(), "INBOX").unwrap().unwrap(), 2).unwrap().unwrap();
-            assert!(journaled_ids(guard.conn(), run).unwrap().iter().all(|id| *id != young));
+            let young = find_message_id(
+                guard.conn(),
+                mailbox_id(guard.conn(), "INBOX").unwrap().unwrap(),
+                2,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(journaled_ids(guard.conn(), run)
+                .unwrap()
+                .iter()
+                .all(|id| *id != young));
         });
     }
 
@@ -758,11 +1007,33 @@ mod tests {
             let conn = store.conn();
             let inbox = ensure_mailbox(conn, "INBOX").unwrap();
             let dest = ensure_mailbox(conn, "Auto/Archive/2026/INBOX").unwrap();
-            upsert_message(conn, dest, 1, None, "Arquivado", "a@x", "[]", "[]",
-                &dt_days_ago(100), "[]", false, "").unwrap();
+            upsert_message(
+                conn,
+                dest,
+                1,
+                None,
+                "Arquivado",
+                "a@x",
+                "[]",
+                "[]",
+                &dt_days_ago(100),
+                "[]",
+                false,
+                "",
+            )
+            .unwrap();
             let mid = find_message_id(conn, dest, 1).unwrap().unwrap();
             let run = create_batch_run(conn).unwrap();
-            journal_intent(conn, run, mid, "INBOX", "Auto/Archive/2026/INBOX", ARCHIVE_LABEL_ID, 0).unwrap();
+            journal_intent(
+                conn,
+                run,
+                mid,
+                "INBOX",
+                "Auto/Archive/2026/INBOX",
+                ARCHIVE_LABEL_ID,
+                0,
+            )
+            .unwrap();
             journal_moved(conn, run, mid).unwrap();
             // Resume contract: a second pass skips the journaled row.
             let remaining: Vec<u64> = vec![mid, 999]
@@ -772,14 +1043,26 @@ mod tests {
             assert_eq!(remaining, vec![999]);
             // The command finishes with {"kind":"archive",...}: the report
             // contract — backend truth the UI parses for labeling.
-            let totals = serde_json::json!({"kind": "archive", "threshold_days": 90, "done": 1, "moved": 1}).to_string();
+            let totals =
+                serde_json::json!({"kind": "archive", "threshold_days": 90, "done": 1, "moved": 1})
+                    .to_string();
             finish_batch_run(conn, run, "done", &totals).unwrap();
-            let stored: String = conn.query_row(
-                "SELECT totals_json FROM batch_runs WHERE id = ?1",
-                rusqlite::params![run], |r| r.get(0)).unwrap();
+            let stored: String = conn
+                .query_row(
+                    "SELECT totals_json FROM batch_runs WHERE id = ?1",
+                    rusqlite::params![run],
+                    |r| r.get(0),
+                )
+                .unwrap();
             let parsed: serde_json::Value = serde_json::from_str(&stored).unwrap();
-            assert_eq!(parsed["kind"], serde_json::Value::String("archive".to_string()));
-            assert_eq!(parsed["threshold_days"], serde_json::Value::Number(90.into()));
+            assert_eq!(
+                parsed["kind"],
+                serde_json::Value::String("archive".to_string())
+            );
+            assert_eq!(
+                parsed["threshold_days"],
+                serde_json::Value::Number(90.into())
+            );
             // Shared undo_batch reverses the archive move (reverse
             // to→from order), marks the run undone. The report survives
             // in the Phase 20 sense: per-category rows (grouped by the
@@ -789,17 +1072,25 @@ mod tests {
             // reused VERBATIM (its "{}" totals overwrite is shared
             // Phase-20 behavior, not archive-specific).
             let store = Arc::new(Mutex::new(store));
-            let (manager, fake) = ArchiveFake::with_mailboxes(&["INBOX", "Auto/Archive/2026/INBOX"]);
-            let restored = super::super::batch::undo_run(&manager, &store, run).await.unwrap();
+            let (manager, fake) =
+                ArchiveFake::with_mailboxes(&["INBOX", "Auto/Archive/2026/INBOX"]);
+            let restored = super::super::batch::undo_run(&manager, &store, run)
+                .await
+                .unwrap();
             assert_eq!(restored, 1);
             let moved = fake.moved.lock().unwrap();
             assert_eq!(moved.len(), 1);
             assert_eq!(moved[0].1, "INBOX");
             assert!(fake.removal_calls.lock().unwrap().is_empty());
             let guard = store.lock().unwrap();
-            let state: String = guard.conn().query_row(
-                "SELECT state FROM batch_runs WHERE id = ?1",
-                rusqlite::params![run], |r| r.get(0)).unwrap();
+            let state: String = guard
+                .conn()
+                .query_row(
+                    "SELECT state FROM batch_runs WHERE id = ?1",
+                    rusqlite::params![run],
+                    |r| r.get(0),
+                )
+                .unwrap();
             assert_eq!(state, "undone");
             // Report survives: per-category still groups the moved row
             // under the "archive" label id; undone count is 1.
@@ -808,9 +1099,14 @@ mod tests {
                 .unwrap().query_map(rusqlite::params![run], |r| Ok((r.get(0)?, r.get(1)?)))
                 .unwrap().collect::<Result<Vec<_>, _>>().unwrap();
             assert_eq!(per_cat, vec![("archive".to_string(), 1)]);
-            let undone: i64 = guard.conn().query_row(
-                "SELECT count(*) FROM batch_items WHERE run_id = ?1 AND undone = 1",
-                rusqlite::params![run], |r| r.get(0)).unwrap();
+            let undone: i64 = guard
+                .conn()
+                .query_row(
+                    "SELECT count(*) FROM batch_items WHERE run_id = ?1 AND undone = 1",
+                    rusqlite::params![run],
+                    |r| r.get(0),
+                )
+                .unwrap();
             assert_eq!(undone, 1);
             let _ = inbox;
         });

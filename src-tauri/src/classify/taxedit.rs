@@ -26,8 +26,13 @@ impl std::fmt::Display for EditError {
         match self {
             EditError::Taxonomy(e) => write!(f, "{e}"),
             EditError::UnknownId(id) => write!(f, "categoria desconhecida: {id}"),
-            EditError::DuplicateName(n) => write!(f, "já existe uma categoria chamada '{n}' neste nível"),
-            EditError::TopLevelCap => write!(f, "limite de 8 categorias no topo — funda duas antes de criar"),
+            EditError::DuplicateName(n) => {
+                write!(f, "já existe uma categoria chamada '{n}' neste nível")
+            }
+            EditError::TopLevelCap => write!(
+                f,
+                "limite de 8 categorias no topo — funda duas antes de criar"
+            ),
             EditError::DepthCap => write!(f, "limite de 3 níveis — crie sob outro pai"),
             EditError::Reserved(n) => write!(f, "nome reservado: '{n}' colide com a raiz Auto"),
             EditError::EmptyName => write!(f, "dê um nome para a categoria"),
@@ -144,7 +149,9 @@ pub fn apply_rename(tax: &mut Taxonomy, id: &str, new_name: &str) -> Result<(), 
 /// Caller remaps labels + moves mail, then persists.
 pub fn apply_merge(tax: &mut Taxonomy, from: &str, into: &str) -> Result<(), EditError> {
     if from == into {
-        return Err(EditError::DuplicateName("use outra categoria como destino".to_string()));
+        return Err(EditError::DuplicateName(
+            "use outra categoria como destino".to_string(),
+        ));
     }
     let f = tax
         .categories
@@ -180,7 +187,11 @@ pub fn apply_delete(tax: &mut Taxonomy, id: &str) -> Result<(), EditError> {
     if !tax.categories.iter().any(|c| c.id == id) {
         return Err(EditError::UnknownId(id.to_string()));
     }
-    if tax.categories.iter().any(|c| c.parent.as_deref() == Some(id)) {
+    if tax
+        .categories
+        .iter()
+        .any(|c| c.parent.as_deref() == Some(id))
+    {
         return Err(EditError::DuplicateName(
             "exclua ou funda as subcategorias primeiro".to_string(),
         ));
@@ -231,8 +242,7 @@ pub fn apply_keywords(
 /// Rejects: unparseable, control chars, overlong names, `/` or `.` in ids
 /// (folder-injection), structural violations (via `validate`).
 pub fn sanitize_import(raw: &str) -> Result<Taxonomy, EditError> {
-    let mut tax: Taxonomy =
-        serde_json::from_str(raw).map_err(|_| EditError::EmptyName)?;
+    let mut tax: Taxonomy = serde_json::from_str(raw).map_err(|_| EditError::EmptyName)?;
     for cat in &mut tax.categories {
         if cat.name.chars().count() > 80 || cat.id.chars().count() > 120 {
             return Err(EditError::DuplicateName(format!(
@@ -249,7 +259,10 @@ pub fn sanitize_import(raw: &str) -> Result<Taxonomy, EditError> {
         // Ids are `top` or `top.child` only: slashes are folder-injection,
         // deeper dots break the hierarchy convention.
         if cat.id.contains('/') || cat.id.matches('.').count() > 1 {
-            return Err(EditError::DuplicateName(format!("id inválido: '{}'", cat.id)));
+            return Err(EditError::DuplicateName(format!(
+                "id inválido: '{}'",
+                cat.id
+            )));
         }
         if cat.id.eq_ignore_ascii_case("auto") || cat.name.trim().eq_ignore_ascii_case("auto") {
             return Err(EditError::Reserved(cat.name.clone()));
@@ -284,10 +297,18 @@ mod tests {
     }
 
     #[test]
-    fn add_top_and_child_with_dedupe() {        let mut tax = test_tax();
+    fn add_top_and_child_with_dedupe() {
+        let mut tax = test_tax();
         let id = apply_add(&mut tax, None, "Esportes", vec!["futebol".into()], "").unwrap();
         assert_eq!(id, "esportes");
-        let id2 = apply_add(&mut tax, Some("esportes"), "Futebol", vec!["gol".into()], "").unwrap();
+        let id2 = apply_add(
+            &mut tax,
+            Some("esportes"),
+            "Futebol",
+            vec!["gol".into()],
+            "",
+        )
+        .unwrap();
         assert_eq!(id2, "esportes.futebol");
         // Duplicate name under another spelling dedupes the id.
         let id3 = apply_add(&mut tax, Some("esportes"), "Futebol!", vec!["x".into()], "").unwrap();
@@ -309,7 +330,14 @@ mod tests {
             Err(EditError::Reserved(_))
         ));
         // Depth: grandchild of a child (3rd level ok, 4th refused).
-        let l3 = apply_add(&mut tax, Some("academico.aulas"), "Sub", vec!["x".into()], "").unwrap();
+        let l3 = apply_add(
+            &mut tax,
+            Some("academico.aulas"),
+            "Sub",
+            vec!["x".into()],
+            "",
+        )
+        .unwrap();
         assert_eq!(l3, "academico.aulas.sub");
         assert_eq!(
             apply_add(&mut tax, Some(&l3), "Sub2", vec!["x".into()], ""),
@@ -321,7 +349,11 @@ mod tests {
     fn rename_keeps_id_and_rejects_dup_sibling() {
         let mut tax = test_tax();
         apply_rename(&mut tax, "financeiro.bolsas", "Bolsas de Estudo").unwrap();
-        let cat = tax.categories.iter().find(|c| c.id == "financeiro.bolsas").unwrap();
+        let cat = tax
+            .categories
+            .iter()
+            .find(|c| c.id == "financeiro.bolsas")
+            .unwrap();
         assert_eq!(cat.name, "Bolsas de Estudo");
         assert!(matches!(
             apply_rename(&mut tax, "financeiro.bolsas", "Boletos e Cobranças"),
@@ -334,7 +366,10 @@ mod tests {
         let mut tax = test_tax();
         apply_merge(&mut tax, "financeiro.bolsas", "financeiro.cobrancas").unwrap();
         assert!(!tax.categories.iter().any(|c| c.id == "financeiro.bolsas"));
-        assert!(tax.categories.iter().any(|c| c.id == "financeiro.cobrancas"));
+        assert!(tax
+            .categories
+            .iter()
+            .any(|c| c.id == "financeiro.cobrancas"));
         // Cross-parent merge refused.
         assert!(apply_merge(&mut tax, "financeiro.cobrancas", "academico.aulas").is_err());
     }
@@ -344,7 +379,10 @@ mod tests {
         let mut tax = test_tax();
         assert!(apply_delete(&mut tax, "financeiro").is_err());
         assert!(apply_delete(&mut tax, "financeiro.reembolsos").is_ok());
-        assert!(!tax.categories.iter().any(|c| c.id == "financeiro.reembolsos"));
+        assert!(!tax
+            .categories
+            .iter()
+            .any(|c| c.id == "financeiro.reembolsos"));
     }
 
     #[test]

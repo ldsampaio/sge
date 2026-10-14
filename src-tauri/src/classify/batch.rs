@@ -68,7 +68,10 @@ pub async fn ensure_full_tree(
         let guard = store.lock().unwrap();
         queries::list_mailboxes(guard.conn()).map_err(|e| e.to_string())?
     };
-    let delimiter = cached.first().map(|r| r.delimiter.clone()).unwrap_or_default();
+    let delimiter = cached
+        .first()
+        .map(|r| r.delimiter.clone())
+        .unwrap_or_default();
     let join = |parts: &[&str]| {
         if delimiter.is_empty() {
             parts.join("/")
@@ -88,9 +91,12 @@ pub async fn ensure_full_tree(
     }
     // Root first.
     if !known.iter().any(|n| n == &root || n == "Auto") {
-        let wire = prepare_create_wire(&cached, None, "Auto", &delimiter)
+        let wire =
+            prepare_create_wire(&cached, None, "Auto", &delimiter).map_err(|e| e.to_string())?;
+        manager
+            .create_mailbox_in(&wire)
+            .await
             .map_err(|e| e.to_string())?;
-        manager.create_mailbox_in(&wire).await.map_err(|e| e.to_string())?;
         known.push(wire);
         created += 1;
     }
@@ -108,7 +114,10 @@ pub async fn ensure_full_tree(
             };
             let wire = prepare_create_wire(&cached_now, Some(&root_wire), &top.name, &delimiter)
                 .map_err(|e| e.to_string())?;
-            manager.create_mailbox_in(&wire).await.map_err(|e| e.to_string())?;
+            manager
+                .create_mailbox_in(&wire)
+                .await
+                .map_err(|e| e.to_string())?;
             known.push(wire.clone());
             created += 1;
         }
@@ -124,9 +133,13 @@ pub async fn ensure_full_tree(
                     let guard = store.lock().unwrap();
                     queries::list_mailboxes(guard.conn()).map_err(|e| e.to_string())?
                 };
-                let wire = prepare_create_wire(&cached_now, Some(&top_wire), &child.name, &delimiter)
+                let wire =
+                    prepare_create_wire(&cached_now, Some(&top_wire), &child.name, &delimiter)
+                        .map_err(|e| e.to_string())?;
+                manager
+                    .create_mailbox_in(&wire)
+                    .await
                     .map_err(|e| e.to_string())?;
-                manager.create_mailbox_in(&wire).await.map_err(|e| e.to_string())?;
                 known.push(wire);
                 created += 1;
             }
@@ -407,8 +420,7 @@ fn preview_archive(conn: &rusqlite::Connection) -> Result<BatchPreview, String> 
     let threshold = queries::get_archive_threshold(conn);
     let included = super::archive::resolve_included_folders(conn);
     let now = chrono::Utc::now();
-    let cands =
-        super::archive::collect_archive_candidates(conn, threshold, &included, now)?;
+    let cands = super::archive::collect_archive_candidates(conn, threshold, &included, now)?;
     let mut items = Vec::new();
     let mut skipped = Vec::new();
     let mut total_candidates = 0usize;
@@ -550,7 +562,12 @@ pub fn resolve_for_move(
         // to a known epoch — treat as stale so the item is re-resolved.
         return Ok(None);
     }
-    Ok(Some(ResolvedMove { message_id, from_folder: folder, uid, epoch: epoch.unwrap() }))
+    Ok(Some(ResolvedMove {
+        message_id,
+        from_folder: folder,
+        uid,
+        epoch: epoch.unwrap(),
+    }))
 }
 
 /// Folder epochs snapshot (run start) for the per-chunk UIDVALIDITY
@@ -589,9 +606,11 @@ pub fn check_retry_entry(
     run_id: i64,
 ) -> Result<Vec<FailedItem>, String> {
     let state: Option<String> = conn
-        .query_row("SELECT state FROM batch_runs WHERE id = ?1", rusqlite::params![run_id], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT state FROM batch_runs WHERE id = ?1",
+            rusqlite::params![run_id],
+            |r| r.get(0),
+        )
         .optional()
         .map_err(|e| e.to_string())?;
     let state = state.ok_or_else(|| "execução desconhecida".to_string())?;
@@ -667,13 +686,24 @@ pub fn journal_intent(
     conn.execute(
         "INSERT INTO batch_items (run_id, message_id, from_folder, to_folder, label_id, chunk)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        rusqlite::params![run_id, message_id, from_folder, to_folder, label_id, chunk as i64],
+        rusqlite::params![
+            run_id,
+            message_id,
+            from_folder,
+            to_folder,
+            label_id,
+            chunk as i64
+        ],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
 }
 
-pub fn journal_moved(conn: &rusqlite::Connection, run_id: i64, message_id: u64) -> Result<(), String> {
+pub fn journal_moved(
+    conn: &rusqlite::Connection,
+    run_id: i64,
+    message_id: u64,
+) -> Result<(), String> {
     conn.execute(
         "UPDATE batch_items SET moved = 1 WHERE run_id = ?1 AND message_id = ?2",
         rusqlite::params![run_id, message_id],
@@ -721,8 +751,7 @@ pub async fn undo_run(
         // Locate current uid: the message now lives in to_folder.
         let current: Option<(String, u32)> = {
             let guard = store.lock().unwrap();
-            queries::message_location(guard.conn(), *mid)
-                .map_err(|e| e.to_string())?
+            queries::message_location(guard.conn(), *mid).map_err(|e| e.to_string())?
         };
         if let Some((mailbox, uid)) = current {
             move_one_uid(
@@ -764,10 +793,36 @@ mod tests {
         let conn = store.conn();
         let inbox = ensure_mailbox(conn, "INBOX").unwrap();
         let sent = ensure_mailbox(conn, "Sent").unwrap();
-        upsert_message(conn, inbox, 1, None, "Boleto", "f@x", "[]", "[]",
-            "2026-10-10T00:00:00Z", "[]", false, "").unwrap();
-        upsert_message(conn, sent, 1, None, "Oi", "g@x", "[]", "[]",
-            "2026-10-10T00:00:00Z", "[]", false, "").unwrap();
+        upsert_message(
+            conn,
+            inbox,
+            1,
+            None,
+            "Boleto",
+            "f@x",
+            "[]",
+            "[]",
+            "2026-10-10T00:00:00Z",
+            "[]",
+            false,
+            "",
+        )
+        .unwrap();
+        upsert_message(
+            conn,
+            sent,
+            1,
+            None,
+            "Oi",
+            "g@x",
+            "[]",
+            "[]",
+            "2026-10-10T00:00:00Z",
+            "[]",
+            false,
+            "",
+        )
+        .unwrap();
         let a = find_message_id(conn, inbox, 1).unwrap().unwrap();
         let b = find_message_id(conn, sent, 1).unwrap().unwrap();
         // Sent is excluded by default in production (seed); emulate here.
@@ -798,7 +853,10 @@ mod tests {
         // Resume view: journaled rows are skipped by the caller.
         let cands = collect_candidates(conn, None).unwrap();
         let done = journaled_ids(conn, run).unwrap();
-        let remaining: Vec<_> = cands.into_iter().filter(|(m, _, _)| !done.contains(m)).collect();
+        let remaining: Vec<_> = cands
+            .into_iter()
+            .filter(|(m, _, _)| !done.contains(m))
+            .collect();
         assert!(remaining.is_empty());
     }
 
@@ -825,10 +883,18 @@ mod tests {
     // ── Phase 30 (BATCH-03): preview + re-resolution ──────────────
 
     fn db_counts(conn: &rusqlite::Connection) -> (i64, i64, i64, i64) {
-        let runs: i64 = conn.query_row("SELECT count(*) FROM batch_runs", [], |r| r.get(0)).unwrap();
-        let items: i64 = conn.query_row("SELECT count(*) FROM batch_items", [], |r| r.get(0)).unwrap();
-        let labels: i64 = conn.query_row("SELECT count(*) FROM labels", [], |r| r.get(0)).unwrap();
-        let events: i64 = conn.query_row("SELECT count(*) FROM override_events", [], |r| r.get(0)).unwrap();
+        let runs: i64 = conn
+            .query_row("SELECT count(*) FROM batch_runs", [], |r| r.get(0))
+            .unwrap();
+        let items: i64 = conn
+            .query_row("SELECT count(*) FROM batch_items", [], |r| r.get(0))
+            .unwrap();
+        let labels: i64 = conn
+            .query_row("SELECT count(*) FROM labels", [], |r| r.get(0))
+            .unwrap();
+        let events: i64 = conn
+            .query_row("SELECT count(*) FROM override_events", [], |r| r.get(0))
+            .unwrap();
         (runs, items, labels, events)
     }
 
@@ -838,10 +904,36 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let conn = store.conn();
         let inbox = ensure_mailbox(conn, "INBOX").unwrap();
-        upsert_message(conn, inbox, 1, None, "Boleto vencido fatura", "f@x", "[]", "[]",
-            "2026-06-01T00:00:00Z", "[]", false, "").unwrap();
-        upsert_message(conn, inbox, 2, None, "xqzkwv jjj", "g@x", "[]", "[]",
-            "2026-10-10T00:00:00Z", "[]", false, "").unwrap();
+        upsert_message(
+            conn,
+            inbox,
+            1,
+            None,
+            "Boleto vencido fatura",
+            "f@x",
+            "[]",
+            "[]",
+            "2026-06-01T00:00:00Z",
+            "[]",
+            false,
+            "",
+        )
+        .unwrap();
+        upsert_message(
+            conn,
+            inbox,
+            2,
+            None,
+            "xqzkwv jjj",
+            "g@x",
+            "[]",
+            "[]",
+            "2026-10-10T00:00:00Z",
+            "[]",
+            false,
+            "",
+        )
+        .unwrap();
         let a = find_message_id(conn, inbox, 1).unwrap().unwrap();
         upsert_label(conn, a, "financeiro", None, 0.9, 0.6, false).unwrap();
         store
@@ -861,19 +953,40 @@ mod tests {
         // Classify leg: labeled mail movable with basis; gibberish mail
         // skipped to the review bucket.
         assert_eq!(classify.kind_tag, "classify");
-        assert!(classify.items.iter().any(|i| i.basis.contains("financeiro")),
-            "labeled mail must preview with its label basis: {:?}", classify.items);
-        assert!(classify.skipped.iter().any(|s| s.skipped_reason.as_deref() == Some("review-bucket")),
-            "unmatched mail must surface as review-bucket: {:?}", classify.skipped);
+        assert!(
+            classify
+                .items
+                .iter()
+                .any(|i| i.basis.contains("financeiro")),
+            "labeled mail must preview with its label basis: {:?}",
+            classify.items
+        );
+        assert!(
+            classify
+                .skipped
+                .iter()
+                .any(|s| s.skipped_reason.as_deref() == Some("review-bucket")),
+            "unmatched mail must surface as review-bucket: {:?}",
+            classify.skipped
+        );
         for row in classify.items.iter().chain(classify.skipped.iter()) {
-            assert!(crate::classify::redact::looks_clean(&row.basis),
-                "basis must be redaction-clean: {}", row.basis);
+            assert!(
+                crate::classify::redact::looks_clean(&row.basis),
+                "basis must be redaction-clean: {}",
+                row.basis
+            );
         }
         // Archive leg rides the SAME function with kind=archive tagging.
         assert_eq!(archive.kind, PreviewKind::Archive);
         assert_eq!(archive.kind_tag, "archive");
-        assert!(archive.items.iter().all(|i| i.basis == super::super::archive::ARCHIVE_LABEL_ID));
-        assert!(archive.items.iter().all(|i| i.dest_display.starts_with("Auto/Archive/")));
+        assert!(archive
+            .items
+            .iter()
+            .all(|i| i.basis == super::super::archive::ARCHIVE_LABEL_ID));
+        assert!(archive
+            .items
+            .iter()
+            .all(|i| i.dest_display.starts_with("Auto/Archive/")));
     }
 
     #[test]
@@ -886,7 +999,16 @@ mod tests {
         let plan = preview_plan(conn, PreviewKind::Classify, None).unwrap();
         let run = create_batch_run(conn).unwrap();
         for (chunk, item) in plan.items.iter().enumerate() {
-            journal_intent(conn, run, item.message_id, &item.from_folder, &item.to_folder, "preview", chunk).unwrap();
+            journal_intent(
+                conn,
+                run,
+                item.message_id,
+                &item.from_folder,
+                &item.to_folder,
+                "preview",
+                chunk,
+            )
+            .unwrap();
         }
         let journaled: Vec<(u64, String)> = conn
             .prepare("SELECT message_id, to_folder FROM batch_items WHERE run_id = ?1 ORDER BY message_id")
@@ -895,9 +1017,16 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        let mut expected: Vec<(u64, String)> = plan.items.iter().map(|i| (i.message_id, i.to_folder.clone())).collect();
+        let mut expected: Vec<(u64, String)> = plan
+            .items
+            .iter()
+            .map(|i| (i.message_id, i.to_folder.clone()))
+            .collect();
         expected.sort();
-        assert_eq!(journaled, expected, "real-run journal must match preview plan");
+        assert_eq!(
+            journaled, expected,
+            "real-run journal must match preview plan"
+        );
     }
 
     #[test]
@@ -915,18 +1044,33 @@ mod tests {
         assert!(!plan.items.is_empty());
         let epochs = snapshot_epochs(conn).unwrap();
         // Snapshot (folder, uid) per item at "preview time".
-        let snap: Vec<(u64, String, u32)> = plan.items.iter().map(|i| {
-            let uid: u32 = conn.query_row(
-                "SELECT uid FROM messages WHERE id = ?1", rusqlite::params![i.message_id], |r| r.get(0)).unwrap();
-            (i.message_id, i.from_folder.clone(), uid)
-        }).collect();
+        let snap: Vec<(u64, String, u32)> = plan
+            .items
+            .iter()
+            .map(|i| {
+                let uid: u32 = conn
+                    .query_row(
+                        "SELECT uid FROM messages WHERE id = ?1",
+                        rusqlite::params![i.message_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                (i.message_id, i.from_folder.clone(), uid)
+            })
+            .collect();
         // Shift 1: move first message's row to Other with a new UID.
         let first = snap[0].0;
-        conn.execute("UPDATE messages SET mailbox_id = ?1, uid = 99 WHERE id = ?2",
-            rusqlite::params![other, first]).unwrap();
+        conn.execute(
+            "UPDATE messages SET mailbox_id = ?1, uid = 99 WHERE id = ?2",
+            rusqlite::params![other, first],
+        )
+        .unwrap();
         // Shift 2: bump INBOX epoch (UIDVALIDITY shift).
-        conn.execute("UPDATE mailboxes SET uid_validity = uid_validity + 1 WHERE id = ?1",
-            rusqlite::params![inbox_id]).unwrap();
+        conn.execute(
+            "UPDATE mailboxes SET uid_validity = uid_validity + 1 WHERE id = ?1",
+            rusqlite::params![inbox_id],
+        )
+        .unwrap();
         // Simulated confirm: resolve → journal → transcript verb.
         let run = create_batch_run(conn).unwrap();
         let mut transcript: Vec<String> = Vec::new();
@@ -939,25 +1083,47 @@ mod tests {
                     // The verb takes ONLY the re-resolved pair — never the
                     // snapshot (folder, uid). Record the verb address.
                     transcript.push(format!("MOVE {}:{} -> filed", res.from_folder, res.uid));
-                    journal_intent(conn, run, *mid, &res.from_folder, "Auto/X", "financeiro", 0).unwrap();
+                    journal_intent(conn, run, *mid, &res.from_folder, "Auto/X", "financeiro", 0)
+                        .unwrap();
                 }
             }
         }
-        assert_eq!(stale_dropped, snap.len(), "every item went stale (location + epoch shifts)");
-        assert!(transcript.is_empty(), "no verb may fire for stale rows: {transcript:?}");
+        assert_eq!(
+            stale_dropped,
+            snap.len(),
+            "every item went stale (location + epoch shifts)"
+        );
+        assert!(
+            transcript.is_empty(),
+            "no verb may fire for stale rows: {transcript:?}"
+        );
         // Fresh control: unshifted store resolves cleanly.
         let store2 = preview_seeded();
         let conn2 = store2.conn();
         let plan2 = preview_plan(conn2, PreviewKind::Classify, None).unwrap();
         let epochs2 = snapshot_epochs(conn2).unwrap();
         for item in &plan2.items {
-            let uid: u32 = conn2.query_row(
-                "SELECT uid FROM messages WHERE id = ?1", rusqlite::params![item.message_id], |r| r.get(0)).unwrap();
-            let res = resolve_for_move(conn2, item.message_id, &item.from_folder, uid,
-                epochs2.get(&item.from_folder).copied().unwrap_or(0)).unwrap();
+            let uid: u32 = conn2
+                .query_row(
+                    "SELECT uid FROM messages WHERE id = ?1",
+                    rusqlite::params![item.message_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let res = resolve_for_move(
+                conn2,
+                item.message_id,
+                &item.from_folder,
+                uid,
+                epochs2.get(&item.from_folder).copied().unwrap_or(0),
+            )
+            .unwrap();
             assert!(res.is_some(), "fresh item must resolve");
             let res = res.unwrap();
-            assert_eq!((res.from_folder.as_str(), res.uid), (item.from_folder.as_str(), uid));
+            assert_eq!(
+                (res.from_folder.as_str(), res.uid),
+                (item.from_folder.as_str(), uid)
+            );
         }
     }
 
@@ -986,8 +1152,21 @@ mod tests {
         let conn = store.conn();
         let inbox = ensure_mailbox(conn, "INBOX").unwrap();
         for uid in 1..=4u32 {
-            upsert_message(conn, inbox, uid, None, &format!("Assunto {uid}"), "f@x", "[]", "[]",
-                "2026-10-10T00:00:00Z", "[]", false, "").unwrap();
+            upsert_message(
+                conn,
+                inbox,
+                uid,
+                None,
+                &format!("Assunto {uid}"),
+                "f@x",
+                "[]",
+                "[]",
+                "2026-10-10T00:00:00Z",
+                "[]",
+                false,
+                "",
+            )
+            .unwrap();
         }
         let mut mids = Vec::new();
         for uid in 1..=4u32 {
@@ -1020,18 +1199,29 @@ mod tests {
         let mut snap: Vec<(u64, String, u32, u32)> = Vec::new();
         for f in &failed {
             let (folder, uid) = queries_message_location(conn, f.message_id).unwrap();
-            let epoch: u32 = conn.query_row(
-                "SELECT uid_validity FROM mailboxes WHERE name = ?1",
-                rusqlite::params![folder], |r| r.get(0)).unwrap_or(0);
+            let epoch: u32 = conn
+                .query_row(
+                    "SELECT uid_validity FROM mailboxes WHERE name = ?1",
+                    rusqlite::params![folder],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
             snap.push((f.message_id, folder, uid, epoch));
         }
         // Mid-retry burst-EXISTS: relocate one message (new mailbox+uid).
         if let Some((mid, new_mb, new_uid)) = shift {
-            let mb_id: u64 = conn.query_row(
-                "SELECT id FROM mailboxes WHERE name = ?1", rusqlite::params!["Other"],
-                |r| r.get(0)).unwrap();
-            conn.execute("UPDATE messages SET mailbox_id = ?1, uid = ?2 WHERE id = ?3",
-                rusqlite::params![mb_id, new_uid, mid]).unwrap();
+            let mb_id: u64 = conn
+                .query_row(
+                    "SELECT id FROM mailboxes WHERE name = ?1",
+                    rusqlite::params!["Other"],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "UPDATE messages SET mailbox_id = ?1, uid = ?2 WHERE id = ?3",
+                rusqlite::params![mb_id, new_uid, mid],
+            )
+            .unwrap();
         }
         let mut transcript = Vec::new();
         let mut skipped = 0usize;
@@ -1040,7 +1230,10 @@ mod tests {
             match resolve_for_move(conn, mid, &folder, uid, epoch).unwrap() {
                 None => skipped += 1,
                 Some(res) => {
-                    transcript.push(format!("MOVE {}:{} -> Auto/Financeiro", res.from_folder, res.uid));
+                    transcript.push(format!(
+                        "MOVE {}:{} -> Auto/Financeiro",
+                        res.from_folder, res.uid
+                    ));
                     journal_moved(conn, run_id, mid).unwrap();
                     moved_now += 1;
                 }
@@ -1049,7 +1242,10 @@ mod tests {
         (transcript, skipped, moved_now)
     }
 
-    fn queries_message_location(conn: &rusqlite::Connection, mid: u64) -> Result<(String, u32), String> {
+    fn queries_message_location(
+        conn: &rusqlite::Connection,
+        mid: u64,
+    ) -> Result<(String, u32), String> {
         queries::message_location(conn, mid)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "missing".to_string())
@@ -1070,13 +1266,17 @@ mod tests {
         assert_eq!(moved_now, failed.len());
         assert_eq!(transcript.len(), failed.len());
         for mid in &moved {
-            assert!(transcript.iter().all(|v| !v.contains(&format!(":{mid} "))),
-                "moved=1 row {mid} must see zero verbs: {transcript:?}");
+            assert!(
+                transcript.iter().all(|v| !v.contains(&format!(":{mid} "))),
+                "moved=1 row {mid} must see zero verbs: {transcript:?}"
+            );
         }
         // Journal now shows all rows moved (exactly-once accumulation on
         // the SAME run_id — no new run row created).
         assert_eq!(failed_count(conn, run), 0);
-        let runs: i64 = conn.query_row("SELECT count(*) FROM batch_runs", [], |r| r.get(0)).unwrap();
+        let runs: i64 = conn
+            .query_row("SELECT count(*) FROM batch_runs", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(runs, 1, "retry must not create a new run row");
     }
 
@@ -1114,8 +1314,11 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
-        assert_eq!(max_seen.load(std::sync::atomic::Ordering::SeqCst), 1,
-            "concurrent retries must never overlap on one run");
+        assert_eq!(
+            max_seen.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "concurrent retries must never overlap on one run"
+        );
         // Held-lane check: an owned lane refuses while held.
         assert!(try_claim_retry(run2));
         assert!(!try_claim_retry(run2), "held lane must refuse while owned");
@@ -1131,13 +1334,21 @@ mod tests {
         let conn = store.conn();
         ensure_mailbox(conn, "Other").unwrap();
         let shifted = failed[0];
-        let (transcript, skipped, moved_now) =
-            simulate_retry(conn, run, Some((shifted, 0, 77)));
-        assert_eq!(skipped, 1, "shifted row must skip, got transcript {transcript:?}");
+        let (transcript, skipped, moved_now) = simulate_retry(conn, run, Some((shifted, 0, 77)));
+        assert_eq!(
+            skipped, 1,
+            "shifted row must skip, got transcript {transcript:?}"
+        );
         assert_eq!(moved_now, failed.len() - 1);
-        assert!(transcript.iter().all(|v| !v.contains(":77 ")),
-            "no verb may address the shifted UID: {transcript:?}");
-        assert_eq!(failed_count(conn, run), 1, "shifted row stays failed for the next retry");
+        assert!(
+            transcript.iter().all(|v| !v.contains(":77 ")),
+            "no verb may address the shifted UID: {transcript:?}"
+        );
+        assert_eq!(
+            failed_count(conn, run),
+            1,
+            "shifted row stays failed for the next retry"
+        );
     }
 
     #[test]
@@ -1145,19 +1356,34 @@ mod tests {
         let (store, run, _, _) = retry_seeded();
         let conn = store.conn();
         // Undone runs never retry (undo already restored originals).
-        conn.execute("UPDATE batch_runs SET state = 'undone' WHERE id = ?1",
-            rusqlite::params![run]).unwrap();
+        conn.execute(
+            "UPDATE batch_runs SET state = 'undone' WHERE id = ?1",
+            rusqlite::params![run],
+        )
+        .unwrap();
         let err = check_retry_entry(conn, run).unwrap_err();
-        assert!(err.contains("desfeita"), "plain-language refusal, got: {err}");
+        assert!(
+            err.contains("desfeita"),
+            "plain-language refusal, got: {err}"
+        );
         // Running runs never retry either.
-        conn.execute("UPDATE batch_runs SET state = 'running' WHERE id = ?1",
-            rusqlite::params![run]).unwrap();
+        conn.execute(
+            "UPDATE batch_runs SET state = 'running' WHERE id = ?1",
+            rusqlite::params![run],
+        )
+        .unwrap();
         assert!(check_retry_entry(conn, run).is_err());
         // Done with zero failures has nothing to offer.
-        conn.execute("UPDATE batch_runs SET state = 'done' WHERE id = ?1",
-            rusqlite::params![run]).unwrap();
-        conn.execute("UPDATE batch_items SET moved = 1 WHERE run_id = ?1",
-            rusqlite::params![run]).unwrap();
+        conn.execute(
+            "UPDATE batch_runs SET state = 'done' WHERE id = ?1",
+            rusqlite::params![run],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE batch_items SET moved = 1 WHERE run_id = ?1",
+            rusqlite::params![run],
+        )
+        .unwrap();
         let err = check_retry_entry(conn, run).unwrap_err();
         assert!(err.contains("não tem falhas"), "got: {err}");
         // Unknown run id refuses plainly.

@@ -88,7 +88,8 @@ mod tests {
 
     #[test]
     fn strips_quotes_and_signatures() {
-        let snippet = "Segue o boleto em anexo.\n> On Mon, João wrote:\n> manda o boleto\n-- \nJoão Silva";
+        let snippet =
+            "Segue o boleto em anexo.\n> On Mon, João wrote:\n> manda o boleto\n-- \nJoão Silva";
         let ev = build_evidence("Boleto", snippet, "utfpr.edu.br", true, true);
         assert!(ev.contains("Segue o boleto em anexo."));
         assert!(!ev.contains("manda o boleto"));

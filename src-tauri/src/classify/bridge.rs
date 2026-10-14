@@ -130,10 +130,7 @@ impl Bridge {
         let res = self
             .client
             .post(format!("{}/v1/systemone", self.base_url))
-            .header(
-                "Authorization",
-                format!("Bearer {}", self.api_key.as_str()),
-            )
+            .header("Authorization", format!("Bearer {}", self.api_key.as_str()))
             // NOTE: no `json` feature on reqwest (loopback-only minimal
             // build) — serialize via serde_json directly.
             .header("Content-Type", "application/json")
@@ -220,7 +217,13 @@ mod tests {
         crit.insert("Financeiro".to_string(), None);
         crit.insert("Acadêmico".to_string(), None);
         let out = rt()
-            .block_on(b.choice("boleto vencido", "top", "Qual a categoria?", &crit, Some(512)))
+            .block_on(b.choice(
+                "boleto vencido",
+                "top",
+                "Qual a categoria?",
+                &crit,
+                Some(512),
+            ))
             .unwrap();
         assert_eq!(out.choice, "Financeiro");
         assert!((out.confidence - 0.81).abs() < 1e-9);

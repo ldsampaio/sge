@@ -4,7 +4,7 @@
 //! All parsing is read-only — `BODY.PEEK` semantics are enforced upstream
 //! by the sync worker's `UID FETCH` attributes (never bare `BODY[]`).
 
-use async_imap::imap_proto::{Address, BodyStructure, types::AttributeValue};
+use async_imap::imap_proto::{types::AttributeValue, Address, BodyStructure};
 use async_imap::types::{Fetch, Flag};
 use futures::TryStreamExt;
 use mail_parser::parsers::MessageStream;
@@ -101,7 +101,11 @@ pub fn format_addresses(addrs: Option<&[Address]>) -> String {
 /// Decode a `Cow<[u8]>` RFC822 header field (e.g. subject, message-id) to a
 /// string, trimming trailing CR that IMAP servers sometimes append.
 fn decode_bytes_opt(b: Option<&[u8]>) -> Option<String> {
-    b.map(|bytes| String::from_utf8_lossy(bytes).trim_end_matches('\r').to_string())
+    b.map(|bytes| {
+        String::from_utf8_lossy(bytes)
+            .trim_end_matches('\r')
+            .to_string()
+    })
 }
 
 /// Decode RFC 2047 encoded-words (`=?charset?Q|B?payload?=`) in a header
@@ -184,7 +188,7 @@ fn try_decode_word(s: &str) -> Option<(String, usize)> {
     let payload_start = q1 + 3;
     let rel = s[payload_start..].find("?=")?;
     let end = payload_start + rel + 2; // consume through `?=`
-    // mail-parser's decoder takes the word starting at `?charset?...?=`.
+                                       // mail-parser's decoder takes the word starting at `?charset?...?=`.
     let inner = &s[1..end];
     let decoded = MessageStream::new(inner.as_bytes()).decode_rfc2047()?;
     Some((decoded, end))
@@ -248,7 +252,13 @@ pub fn parse_fetch_item(fetch: &Fetch, uid: u32) -> MessageHeader {
             format_addresses(e.cc.as_deref()),
         )
     } else {
-        (String::new(), None, String::new(), String::new(), String::new())
+        (
+            String::new(),
+            None,
+            String::new(),
+            String::new(),
+            String::new(),
+        )
     };
 
     let flags = format_flags(fetch.flags().collect());
@@ -476,9 +486,15 @@ mod tests {
         // a future contributor adding a new fetch must update this test.
         let audited_paths = [
             ("1. headers FETCH_ATTRS", "header sweep — no body part"),
-            ("2. imap/mod.rs fetch_body", "uid_fetch(uid, \"BODY.PEEK[]\")"),
+            (
+                "2. imap/mod.rs fetch_body",
+                "uid_fetch(uid, \"BODY.PEEK[]\")",
+            ),
             ("3. sync/worker.rs fetch_envelopes", "routes through path 1"),
-            ("4. commands/sync.rs fetch_message", "session.fetch_body → path 2"),
+            (
+                "4. commands/sync.rs fetch_message",
+                "session.fetch_body → path 2",
+            ),
         ];
         assert_eq!(
             audited_paths.len(),
@@ -520,18 +536,22 @@ pub fn parse_fetch_attributes(attrs: &[AttributeValue]) -> MessageHeader {
                     .date
                     .as_deref()
                     .and_then(|b| decode_bytes_opt(Some(b)))
-                    .and_then(|dt| chrono::DateTime::parse_from_str(&dt, "%d-%b-%Y %H:%M:%S %z").ok())
+                    .and_then(|dt| {
+                        chrono::DateTime::parse_from_str(&dt, "%d-%b-%Y %H:%M:%S %z").ok()
+                    })
                     .map(|dt| dt.to_rfc3339())
                     .unwrap_or_default();
             }
             AttributeValue::Flags(raw_flags) => {
-                header.flags = format_flags(raw_flags.iter().map(|s| Flag::from(s.as_ref())).collect())
+                header.flags =
+                    format_flags(raw_flags.iter().map(|s| Flag::from(s.as_ref())).collect())
             }
             AttributeValue::InternalDate(dt) => {
                 // InternalDate is Cow<str>, parse it
-                header.date_utc = chrono::DateTime::parse_from_str(dt.as_ref(), "%d-%b-%Y %H:%M:%S %z")
-                    .map(|parsed| parsed.to_rfc3339())
-                    .unwrap_or_else(|_| dt.clone().into_owned());
+                header.date_utc =
+                    chrono::DateTime::parse_from_str(dt.as_ref(), "%d-%b-%Y %H:%M:%S %z")
+                        .map(|parsed| parsed.to_rfc3339())
+                        .unwrap_or_else(|_| dt.clone().into_owned());
             }
             AttributeValue::BodyStructure(bs) => header.has_attachments = body_has_attachments(&bs),
             AttributeValue::ModSeq(m) => header.modseq = Some(*m),

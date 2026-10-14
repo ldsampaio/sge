@@ -12,7 +12,10 @@ use futures::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use futures::{AsyncRead, AsyncWrite, TryStreamExt};
 
 use super::errors::{io_to_imap, login_err, session_err, tls_to_imap};
-use super::{BoxedSession, BoxedStream, SyncError, MailboxSummary, AccountConfig, ImapError, SecurityMode, Transcript};
+use super::{
+    AccountConfig, BoxedSession, BoxedStream, ImapError, MailboxSummary, SecurityMode, SyncError,
+    Transcript,
+};
 
 /// Bound shared by every stream handed to async-imap.
 pub trait StreamBound: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send {}

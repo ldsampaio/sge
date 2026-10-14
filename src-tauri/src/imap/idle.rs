@@ -35,8 +35,8 @@ use std::sync::{
 
 use serde::Serialize;
 
-use crate::imap::{AccountConfig, BoxedStream, SyncError};
 use crate::imap::session::connect_sync;
+use crate::imap::{AccountConfig, BoxedStream, SyncError};
 use crate::sync::SyncWake;
 
 /// Re-IDLE heartbeat: async-imap's `wait()` already times out at 29 min
@@ -113,18 +113,19 @@ pub fn status_of(snap: &IdleSnapshot, idle_capable: bool) -> IdleStatus {
             last_wakeup: snap.last_wakeup.clone(),
             reconnect_attempt: 0,
         },
-        IdleState::Connecting | IdleState::Selecting | IdleState::Reconnecting | IdleState::Done => {
-            IdleStatus {
-                status: "Polling".to_string(),
-                detail: if snap.state == IdleState::Reconnecting {
-                    format!("reconectando… (tentativa {})", snap.reconnect_attempt)
-                } else {
-                    "conectando…".to_string()
-                },
-                last_wakeup: snap.last_wakeup.clone(),
-                reconnect_attempt: snap.reconnect_attempt,
-            }
-        }
+        IdleState::Connecting
+        | IdleState::Selecting
+        | IdleState::Reconnecting
+        | IdleState::Done => IdleStatus {
+            status: "Polling".to_string(),
+            detail: if snap.state == IdleState::Reconnecting {
+                format!("reconectando… (tentativa {})", snap.reconnect_attempt)
+            } else {
+                "conectando…".to_string()
+            },
+            last_wakeup: snap.last_wakeup.clone(),
+            reconnect_attempt: snap.reconnect_attempt,
+        },
         IdleState::Stopped => IdleStatus {
             status: "Offline".to_string(),
             detail: "observador parado".to_string(),
@@ -203,7 +204,9 @@ pub async fn drive_cycle<D: IdleDriver>(
         set_state(snap, IdleState::Reconnecting, attempt + 1);
         // Release best-effort even on begin failure (half-open IDLE).
         driver.end_idle().await;
-        return CycleOutcome::Backoff { attempt: attempt + 1 };
+        return CycleOutcome::Backoff {
+            attempt: attempt + 1,
+        };
     }
     set_state(snap, IdleState::Idling, 0);
     let event = driver.wait().await;
@@ -225,7 +228,9 @@ pub async fn drive_cycle<D: IdleDriver>(
         IdleEvent::Timeout => CycleOutcome::ReIdle,
         IdleEvent::Closed(_) => {
             set_state(snap, IdleState::Reconnecting, attempt + 1);
-            CycleOutcome::Backoff { attempt: attempt + 1 }
+            CycleOutcome::Backoff {
+                attempt: attempt + 1,
+            }
         }
     }
 }
@@ -296,8 +301,7 @@ impl IdleWatcher {
                 driver.end_idle().await;
                 return;
             }
-            match drive_cycle(&mut driver, &self.wake, &self.snapshot, &self.stop, attempt).await
-            {
+            match drive_cycle(&mut driver, &self.wake, &self.snapshot, &self.stop, attempt).await {
                 CycleOutcome::Stopped => {
                     driver.end_idle().await;
                     return;
@@ -364,7 +368,10 @@ impl IdleWatcherHandle {
     pub fn snapshot(&self) -> IdleSnapshot {
         // IN-03: poison-safe — a wedged `idle_status` is worse than a
         // slightly stale snapshot.
-        self.snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn stop(&self) {
@@ -396,7 +403,12 @@ impl LiveIdleDriver {
     }
 
     pub fn with_stop(config: AccountConfig, stop: Arc<AtomicBool>) -> Self {
-        Self { config, stop, session: None, handle: None }
+        Self {
+            config,
+            stop,
+            session: None,
+            handle: None,
+        }
     }
 }
 
@@ -465,9 +477,7 @@ impl IdleDriver for LiveIdleDriver {
                     Ok(async_imap::extensions::idle::IdleResponse::NewData(_)) => {
                         IdleEvent::NewMail
                     }
-                    Ok(async_imap::extensions::idle::IdleResponse::Timeout) => {
-                        IdleEvent::Timeout
-                    }
+                    Ok(async_imap::extensions::idle::IdleResponse::Timeout) => IdleEvent::Timeout,
                     Ok(async_imap::extensions::idle::IdleResponse::ManualInterrupt) => {
                         IdleEvent::Closed("manual interrupt".to_string())
                     }
@@ -495,9 +505,7 @@ enum WaitOut {
 }
 
 /// Best-effort DONE + LOGOUT for a detached handle (consumes it).
-async fn release_handle(
-    handle: async_imap::extensions::idle::Handle<BoxedStream>,
-) {
+async fn release_handle(handle: async_imap::extensions::idle::Handle<BoxedStream>) {
     match handle.done().await {
         Ok(mut session) => {
             let _ = session.logout().await;
@@ -560,7 +568,12 @@ mod tests {
 
     impl ScriptDriver {
         pub fn new(steps: Vec<ScriptStep>) -> Self {
-            Self { transcript: vec![], script: steps.into(), fail_begin: false, idling: false }
+            Self {
+                transcript: vec![],
+                script: steps.into(),
+                fail_begin: false,
+                idling: false,
+            }
         }
 
         fn note(&mut self, line: &str) {
@@ -631,15 +644,17 @@ mod tests {
         let s = snap();
         let stop = stop_flag();
         let mut driver = ScriptDriver::new(vec![ScriptStep::Mail]);
-        let outcome =
-            async_std::task::block_on(drive_cycle(&mut driver, &wake, &s, &stop, 0));
+        let outcome = async_std::task::block_on(drive_cycle(&mut driver, &wake, &s, &stop, 0));
         assert_eq!(outcome, CycleOutcome::Woke);
         assert_eq!(wake.request_count(), 1, "one EXISTS → one advisory wakeup");
         let seq = driver.transcript.join("\n");
         let select = seq.find("C2S: SELECT").unwrap();
         let idle = seq.find("C2S: IDLE").unwrap();
         let done = seq.find("C2S: DONE").unwrap();
-        assert!(select < idle && idle < done, "verb order SELECT→IDLE→DONE:\n{seq}");
+        assert!(
+            select < idle && idle < done,
+            "verb order SELECT→IDLE→DONE:\n{seq}"
+        );
         let snap = s.lock().unwrap();
         assert!(snap.last_wakeup.is_some());
         assert_eq!(snap.state, IdleState::Done);
@@ -653,20 +668,25 @@ mod tests {
         let s = snap();
         let stop = stop_flag();
         let mut driver = ScriptDriver::new(vec![ScriptStep::Drop]);
-        let outcome =
-            async_std::task::block_on(drive_cycle(&mut driver, &wake, &s, &stop, 0));
+        let outcome = async_std::task::block_on(drive_cycle(&mut driver, &wake, &s, &stop, 0));
         assert_eq!(outcome, CycleOutcome::Backoff { attempt: 1 });
         assert_eq!(wake.request_count(), 0, "a drop is not mail — no wakeup");
-        assert!(driver.transcript.iter().any(|l| l == "C2S: DONE"), "DONE on drop exit");
+        assert!(
+            driver.transcript.iter().any(|l| l == "C2S: DONE"),
+            "DONE on drop exit"
+        );
         assert_eq!(backoff_secs(1), 12, "5s * 2 + jitter(37 % 5 = 2)");
         assert!(backoff_secs(1) < backoff_secs(3), "backoff grows");
         assert!(backoff_secs(100) <= 605, "backoff capped");
 
         // Reconnect cycle re-IDLEs after backoff.
         let mut driver2 = ScriptDriver::new(vec![ScriptStep::Timeout]);
-        let outcome2 =
-            async_std::task::block_on(drive_cycle(&mut driver2, &wake, &s, &stop, 1));
-        assert_eq!(outcome2, CycleOutcome::ReIdle, "timeout re-IDLEs without wakeup");
+        let outcome2 = async_std::task::block_on(drive_cycle(&mut driver2, &wake, &s, &stop, 1));
+        assert_eq!(
+            outcome2,
+            CycleOutcome::ReIdle,
+            "timeout re-IDLEs without wakeup"
+        );
         assert_eq!(wake.request_count(), 0);
         assert!(driver2.transcript.iter().any(|l| l == "C2S: DONE"));
     }
@@ -686,8 +706,7 @@ mod tests {
             ScriptStep::Mail,
         ]);
         for _ in 0..5 {
-            let outcome =
-                async_std::task::block_on(drive_cycle(&mut driver, &wake, &s, &stop, 0));
+            let outcome = async_std::task::block_on(drive_cycle(&mut driver, &wake, &s, &stop, 0));
             assert_eq!(outcome, CycleOutcome::Woke);
         }
         assert_eq!(wake.request_count(), 5);
@@ -725,12 +744,10 @@ mod tests {
         let s = snap();
         let stop = stop_flag();
         let mut driver = ScriptDriver::new(vec![ScriptStep::Mail]);
-        let outcome =
-            async_std::task::block_on(drive_cycle(&mut driver, &wake, &s, &stop, 0));
+        let outcome = async_std::task::block_on(drive_cycle(&mut driver, &wake, &s, &stop, 0));
         assert_eq!(outcome, CycleOutcome::Woke);
         stop.store(true, Ordering::SeqCst);
-        let outcome2 =
-            async_std::task::block_on(drive_cycle(&mut driver, &wake, &s, &stop, 0));
+        let outcome2 = async_std::task::block_on(drive_cycle(&mut driver, &wake, &s, &stop, 0));
         assert_eq!(outcome2, CycleOutcome::Stopped);
         assert_eq!(s.lock().unwrap().state, IdleState::Stopped);
         assert_eq!(wake.request_count(), 1, "stop adds no duplicate wakeup");
@@ -752,8 +769,9 @@ mod tests {
         };
         let fired = Arc::new(AtomicU64::new(0));
         let fired2 = fired.clone();
-        let on_wake: Arc<dyn Fn() + Send + Sync> =
-            Arc::new(move || { fired2.fetch_add(1, Ordering::SeqCst); });
+        let on_wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            fired2.fetch_add(1, Ordering::SeqCst);
+        });
         let watcher = IdleWatcher::new(cfg, test_wake(), on_wake);
         let stop = watcher.stop.clone();
         // Deep Timeout script: ReIdle cycles never sleep, so the loop spins
@@ -779,8 +797,7 @@ mod tests {
         let stop = stop_flag();
         let mut driver = ScriptDriver::new(vec![]);
         driver.fail_begin = true;
-        let outcome =
-            async_std::task::block_on(drive_cycle(&mut driver, &wake, &s, &stop, 2));
+        let outcome = async_std::task::block_on(drive_cycle(&mut driver, &wake, &s, &stop, 2));
         assert_eq!(outcome, CycleOutcome::Backoff { attempt: 3 });
         assert_eq!(wake.request_count(), 0);
         assert_eq!(s.lock().unwrap().reconnect_attempt, 3);
@@ -835,7 +852,9 @@ mod tests {
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
-        for verb in ["STORE", "EXPUNGE", "APPEND", "COPY", "MOVE", "CREATE", "FETCH", " UID "] {
+        for verb in [
+            "STORE", "EXPUNGE", "APPEND", "COPY", "MOVE", "CREATE", "FETCH", " UID ",
+        ] {
             assert!(!code.contains(verb), "idle.rs must not emit {verb}");
         }
         // DONE + LOGOUT + SELECT + IDLE are the only wire verbs
