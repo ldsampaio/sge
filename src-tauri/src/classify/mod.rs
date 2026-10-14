@@ -12,6 +12,7 @@ pub mod evidence;
 pub mod filing;
 pub mod redact;
 pub mod rules;
+pub mod rules_io;
 pub mod suggest;
 pub mod taxedit;
 pub mod taxonomy;
