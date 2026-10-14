@@ -55,6 +55,20 @@ jobs:
 #   working-directory: src-tauri
 #   run: cargo clippy -- -D warnings
 
+      # Create dummy Laya binary for Tauri build script (CI doesn't have the real binary)
+      - name: Create dummy Laya binary
+        working-directory: src-tauri
+        run: |
+          mkdir -p binaries
+          # Tauri expects platform-specific suffix: sge-laya-<target-triple>
+          # On ubuntu-22.04: x86_64-unknown-linux-gnu
+          cat > binaries/sge-laya-x86_64-unknown-linux-gnu <<'EOF'
+          #!/bin/sh
+          echo "Dummy Laya binary for CI"
+          exit 0
+          EOF
+          chmod +x binaries/sge-laya-x86_64-unknown-linux-gnu
+
       - name: Rust tests
         working-directory: src-tauri
         run: cargo test
