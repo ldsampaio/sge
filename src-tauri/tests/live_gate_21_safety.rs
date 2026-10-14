@@ -76,7 +76,9 @@ impl SyncSession for FakeSession {
     fn search_uids(&mut self) -> sge_lib::imap::PinBox<'_, Result<Vec<u32>, SyncError>> {
         Box::pin(async move {
             let selected = self.selected.as_deref();
-            let mut uids: Vec<u32> = self.messages.iter()
+            let mut uids: Vec<u32> = self
+                .messages
+                .iter()
                 .filter(|(_, (mb, _, _, _))| selected.map_or(true, |sel| sel == mb.as_str()))
                 .map(|(&uid, _)| uid)
                 .collect();
@@ -123,7 +125,11 @@ impl SyncSession for FakeSession {
         })
     }
 
-    fn set_seen(&mut self, uid: u32, _seen: bool) -> sge_lib::imap::PinBox<'_, Result<(), SyncError>> {
+    fn set_seen(
+        &mut self,
+        uid: u32,
+        _seen: bool,
+    ) -> sge_lib::imap::PinBox<'_, Result<(), SyncError>> {
         Box::pin(async move {
             if self.messages.contains_key(&uid) {
                 Ok(())
@@ -164,7 +170,10 @@ impl SyncSession for FakeSession {
         })
     }
 
-    fn uid_expunge(&mut self, uid_set: &str) -> sge_lib::imap::PinBox<'_, Result<Vec<u32>, SyncError>> {
+    fn uid_expunge(
+        &mut self,
+        uid_set: &str,
+    ) -> sge_lib::imap::PinBox<'_, Result<Vec<u32>, SyncError>> {
         let uid_set = uid_set.to_string();
         Box::pin(async move {
             let mut gone = Vec::new();
@@ -268,9 +277,7 @@ impl SyncSession for FakeSession {
         })
     }
 
-    fn list_mailboxes(
-        &mut self,
-    ) -> sge_lib::imap::PinBox<'_, Result<Vec<MailboxInfo>, SyncError>> {
+    fn list_mailboxes(&mut self) -> sge_lib::imap::PinBox<'_, Result<Vec<MailboxInfo>, SyncError>> {
         Box::pin(async move {
             let mut infos: Vec<MailboxInfo> = self
                 .mailboxes
@@ -301,9 +308,7 @@ impl SyncSession for FakeSession {
         })
     }
 
-    fn select_condstore(
-        &mut self,
-    ) -> sge_lib::imap::PinBox<'_, Result<bool, SyncError>> {
+    fn select_condstore(&mut self) -> sge_lib::imap::PinBox<'_, Result<bool, SyncError>> {
         Box::pin(async move { Ok(false) })
     }
 
@@ -325,10 +330,7 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
 }
 
 fn test_app_data(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "sge-live21-safety-{}-{name}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("sge-live21-safety-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -409,11 +411,15 @@ fn live_gate_21_gate_closed_fails_writes_forwards_reads() {
     assert!(block_on(gate.uid_expunge("1")).is_err());
 
     assert!(block_on(gate.search_uids()).unwrap().is_empty());
-    assert!(block_on(gate.capabilities()).unwrap().contains(&"UIDPLUS".to_string()));
+    assert!(block_on(gate.capabilities())
+        .unwrap()
+        .contains(&"UIDPLUS".to_string()));
 
     gate.set_closed(false);
     assert!(!gate.is_closed());
-    assert!(block_on(gate.append_message("INBOX", "\\Seen", b"Message-ID: <a@x>\r\n\r\nb")).is_ok());
+    assert!(
+        block_on(gate.append_message("INBOX", "\\Seen", b"Message-ID: <a@x>\r\n\r\nb")).is_ok()
+    );
     assert_eq!(block_on(gate.search_uids()).unwrap(), vec![1]);
 }
 
@@ -428,8 +434,16 @@ fn live_gate_21_arrival_shape_search_count_and_verbatim() {
     let mut session = FakeSession::with_mailbox("INBOX");
     let mid_a = "<live21-shape-a@sge.local>".to_string();
     let mid_b = "<live21-shape-b@sge.local>".to_string();
-    let bytes_a = format!("Message-ID: {mid_a}\r\nSubject: {0}shape\r\n\r\nbody-a", harness::SUBJECT_PREFIX).into_bytes();
-    let bytes_b = format!("Message-ID: {mid_b}\r\nSubject: {0}shape\r\n\r\nbody-b", harness::SUBJECT_PREFIX).into_bytes();
+    let bytes_a = format!(
+        "Message-ID: {mid_a}\r\nSubject: {0}shape\r\n\r\nbody-a",
+        harness::SUBJECT_PREFIX
+    )
+    .into_bytes();
+    let bytes_b = format!(
+        "Message-ID: {mid_b}\r\nSubject: {0}shape\r\n\r\nbody-b",
+        harness::SUBJECT_PREFIX
+    )
+    .into_bytes();
     block_on(session.append_message("INBOX", "", &bytes_a)).unwrap();
     block_on(session.append_message("INBOX", "", &bytes_b)).unwrap();
 
@@ -483,8 +497,17 @@ fn live_gate_21_offline_flush_shape_enqueue_to_sent() {
         sent_wire: None,
     };
     let summary = block_on(worker.flush_send_queue(&env));
-    assert_eq!(summary.sent, 1, "offline flush must send the one queued row");
-    assert_eq!(summary, FlushSummary { sent: 1, ..FlushSummary::default() });
+    assert_eq!(
+        summary.sent, 1,
+        "offline flush must send the one queued row"
+    );
+    assert_eq!(
+        summary,
+        FlushSummary {
+            sent: 1,
+            ..FlushSummary::default()
+        }
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     // A-02/A-03 shape: clean state after ack.
     {
@@ -493,7 +516,9 @@ fn live_gate_21_offline_flush_shape_enqueue_to_sent() {
         assert_eq!(snap.pending_count, 0);
         assert_eq!(snap.failed, 0);
         assert_eq!(snap.uncertain, 0);
-        let row = queries::get_send_row_by_message_id(guard.conn(), &mid).unwrap().unwrap();
+        let row = queries::get_send_row_by_message_id(guard.conn(), &mid)
+            .unwrap()
+            .unwrap();
         assert_eq!(row.state, "sent");
     }
     std::fs::remove_dir_all(&app_data).ok();
@@ -537,18 +562,28 @@ fn live_gate_21_double_enqueue_same_draft_dedupes_to_one_row() {
     };
     let first = send_queue::enqueue_send(conn, &app_data, mk()).unwrap();
     assert!(!first.deduped);
-    assert_eq!(first.message_id, mid, "draft anchor reuses the draft Message-ID");
+    assert_eq!(
+        first.message_id, mid,
+        "draft anchor reuses the draft Message-ID"
+    );
     let second = send_queue::enqueue_send(conn, &app_data, mk()).unwrap();
-    assert!(second.deduped, "second enqueue of one Message-ID must dedupe");
+    assert!(
+        second.deduped,
+        "second enqueue of one Message-ID must dedupe"
+    );
     assert_eq!(second.queue_id, first.queue_id);
     assert_eq!(second.message_id, first.message_id);
     let n: i64 = conn
-        .query_row("SELECT COUNT(*) FROM send_queue WHERE message_id = ?1", [mid], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT COUNT(*) FROM send_queue WHERE message_id = ?1",
+            [mid],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(n, 1, "one Message-ID → exactly one row");
-    let eml_count = std::fs::read_dir(app_data.join("outbox")).map(|rd| rd.count()).unwrap_or(0);
+    let eml_count = std::fs::read_dir(app_data.join("outbox"))
+        .map(|rd| rd.count())
+        .unwrap_or(0);
     assert_eq!(eml_count, 1, "one Message-ID → exactly one .eml");
     std::fs::remove_dir_all(&app_data).ok();
 }
@@ -560,7 +595,11 @@ fn live_gate_21_server_side_twin_is_detected_not_collapsed() {
     // "collapses" twins, it refuses them.
     let mut session = FakeSession::with_mailbox("INBOX");
     let mid = "<live21-twin@sge.local>".to_string();
-    let bytes = format!("Message-ID: {mid}\r\nSubject: {0}twin\r\n\r\nb", harness::SUBJECT_PREFIX).into_bytes();
+    let bytes = format!(
+        "Message-ID: {mid}\r\nSubject: {0}twin\r\n\r\nb",
+        harness::SUBJECT_PREFIX
+    )
+    .into_bytes();
     block_on(session.append_message("INBOX", "\\Seen", &bytes)).unwrap();
     block_on(session.append_message("INBOX", "\\Seen", &bytes)).unwrap();
     let hits = block_on(session.uid_search_header("Message-ID", &mid)).unwrap();
@@ -611,8 +650,16 @@ fn live_gate_21_sent_unfiled_shape_never_resends() {
     assert_eq!(first.sent, 1);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     let second = block_on(worker.flush_send_queue(&env));
-    assert_eq!(second, FlushSummary::default(), "parked rows must never be due");
-    assert_eq!(calls.load(Ordering::SeqCst), 1, "no second send_raw after park");
+    assert_eq!(
+        second,
+        FlushSummary::default(),
+        "parked rows must never be due"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "no second send_raw after park"
+    );
     // A-07 observability gap, pinned (RESEARCH Pitfall 5): the snapshot
     // hard-codes sent_unfiled 0 — A-07 asserts via flush outcomes +
     // call counts, never via this field.
@@ -673,7 +720,11 @@ fn live_gate_21_oversize_rejected_before_any_transport_call() {
     };
     let summary = block_on(worker.flush_send_queue(&env));
     assert_eq!(summary, FlushSummary::default());
-    assert_eq!(calls.load(Ordering::SeqCst), 0, "no row due → zero transport calls");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "no row due → zero transport calls"
+    );
 }
 
 #[test]
@@ -689,7 +740,9 @@ fn live_gate_21_envelope_log_has_no_bcc_line_but_envelope_keeps_bcc() {
     let eml = std::fs::read(&row.eml_path).unwrap();
     let text = String::from_utf8_lossy(&eml);
     assert!(
-        !text.lines().any(|l| l.to_ascii_lowercase().starts_with("bcc:")),
+        !text
+            .lines()
+            .any(|l| l.to_ascii_lowercase().starts_with("bcc:")),
         "rendered .eml must contain no Bcc: header line"
     );
     assert!(
@@ -709,9 +762,7 @@ fn live_gate_21_envelope_log_has_no_bcc_line_but_envelope_keeps_bcc() {
 // RESEARCH Pitfall 4) and `requeue_failed` refuses non-failed rows (A-06:
 // uncertain never offers resend-as-Retentar).
 
-fn offline_flush_env(
-    transport: Arc<dyn SmtpTransport>,
-) -> sge_lib::sync::worker::SendFlushEnv {
+fn offline_flush_env(transport: Arc<dyn SmtpTransport>) -> sge_lib::sync::worker::SendFlushEnv {
     use sge_lib::send_queue::SendGate;
     sge_lib::sync::worker::SendFlushEnv {
         gate: SendGate::default(),
@@ -741,10 +792,21 @@ fn live_gate_21_retry_armed_flush_marks_uncertain_with_zero_calls() {
     armed.store(true, Ordering::SeqCst);
     let worker = SyncWorker::new(store.clone());
     let summary = block_on(worker.flush_send_queue(&offline_flush_env(Arc::new(fault))));
-    assert_eq!(summary.uncertain, 1, "armed fault must mark the row uncertain");
+    assert_eq!(
+        summary.uncertain, 1,
+        "armed fault must mark the row uncertain"
+    );
     assert_eq!(summary.sent, 0, "faulted attempt must not send");
-    assert_eq!(calls.load(Ordering::SeqCst), 0, "zero inner calls while armed");
-    assert_eq!(forwarded.load(Ordering::SeqCst), 0, "zero forwarded calls while armed");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "zero inner calls while armed"
+    );
+    assert_eq!(
+        forwarded.load(Ordering::SeqCst),
+        0,
+        "zero forwarded calls while armed"
+    );
     // A-04/A-06 shape: uncertain hold visible, never failed.
     {
         let guard = store.lock().unwrap();
@@ -776,7 +838,11 @@ fn live_gate_21_retry_reconcile_hit_confirms_without_resend() {
     };
     // Simulated ambiguous server-accept: the bytes sit in Sent.
     let mut fake = FakeSession::with_mailbox("Sent");
-    let bytes = format!("Message-ID: {mid}\r\nSubject: {0}hit\r\n\r\nb", harness::SUBJECT_PREFIX).into_bytes();
+    let bytes = format!(
+        "Message-ID: {mid}\r\nSubject: {0}hit\r\n\r\nb",
+        harness::SUBJECT_PREFIX
+    )
+    .into_bytes();
     block_on(fake.append_message("Sent", "\\Seen", &bytes)).unwrap();
     let (inner, calls) = harness::CountingTransport::offline();
     let worker = SyncWorker::new(store.clone());
@@ -785,10 +851,16 @@ fn live_gate_21_retry_reconcile_hit_confirms_without_resend() {
     assert_eq!(rec.confirmed_sent, 1, "SEARCH hit must confirm");
     assert_eq!(rec.requeued, 0);
     assert_eq!(rec.still_uncertain, 0);
-    assert_eq!(calls.load(Ordering::SeqCst), before, "reconcile must not call the transport");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        before,
+        "reconcile must not call the transport"
+    );
     {
         let guard = store.lock().unwrap();
-        let row = queries::get_send_row_by_message_id(guard.conn(), &mid).unwrap().unwrap();
+        let row = queries::get_send_row_by_message_id(guard.conn(), &mid)
+            .unwrap()
+            .unwrap();
         assert_eq!(row.state, "sent");
     }
     let _ = inner;
@@ -857,14 +929,25 @@ fn live_gate_21_retry_crash_claim_triaged_to_uncertain_never_queued() {
     let (transport, calls) = harness::CountingTransport::offline();
     let worker = SyncWorker::new(store.clone());
     let summary = block_on(worker.flush_send_queue(&offline_flush_env(Arc::new(transport))));
-    assert_eq!(summary, sge_lib::sync::worker::FlushSummary::default(), "triage emits no send outcome");
+    assert_eq!(
+        summary,
+        sge_lib::sync::worker::FlushSummary::default(),
+        "triage emits no send outcome"
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 0, "triage must send nothing");
     {
         let guard = store.lock().unwrap();
         let row = queries::get_send_row(guard.conn(), &qid).unwrap().unwrap();
-        assert_eq!(row.state, queries::SEND_STATE_UNCERTAIN, "stranded sending triages to uncertain, not queued");
+        assert_eq!(
+            row.state,
+            queries::SEND_STATE_UNCERTAIN,
+            "stranded sending triages to uncertain, not queued"
+        );
         let snap = send_queue::send_status_snapshot(guard.conn()).unwrap();
-        assert!(snap.uncertain >= 1 && snap.failed == 0, "A-05/A-06: uncertain hold, never failed");
+        assert!(
+            snap.uncertain >= 1 && snap.failed == 0,
+            "A-05/A-06: uncertain hold, never failed"
+        );
         // A-06 contract: retry never yanks a row out of `uncertain` (the
         // Retentar backend only requeues genuinely failed rows).
         assert!(
@@ -903,17 +986,52 @@ fn live_gate_21_retry_recorded_failure_schedules_inside_bounds() {
 #[test]
 fn live_gate_21_safety_audit_recipients_self_only_rule() {
     let me = "me@example.com";
-    assert!(harness::audit_recipients_ok(r#"["me@example.com"]"#, "[]", "[]", me));
+    assert!(harness::audit_recipients_ok(
+        r#"["me@example.com"]"#,
+        "[]",
+        "[]",
+        me
+    ));
     // Case + whitespace tolerance mirrors assert_self_only.
-    assert!(harness::audit_recipients_ok(r#"["  ME@EXAMPLE.COM  "]"#, "[]", "[]", me));
+    assert!(harness::audit_recipients_ok(
+        r#"["  ME@EXAMPLE.COM  "]"#,
+        "[]",
+        "[]",
+        me
+    ));
     // Foreign To, extra To, empty To.
-    assert!(!harness::audit_recipients_ok(r#"["other@example.com"]"#, "[]", "[]", me));
-    assert!(!harness::audit_recipients_ok(r#"["me@example.com","other@example.com"]"#, "[]", "[]", me));
+    assert!(!harness::audit_recipients_ok(
+        r#"["other@example.com"]"#,
+        "[]",
+        "[]",
+        me
+    ));
+    assert!(!harness::audit_recipients_ok(
+        r#"["me@example.com","other@example.com"]"#,
+        "[]",
+        "[]",
+        me
+    ));
     assert!(!harness::audit_recipients_ok("[]", "[]", "[]", me));
     // Non-empty Cc / Bcc (whitespace-only still counts as empty, per D-01).
-    assert!(!harness::audit_recipients_ok(r#"["me@example.com"]"#, r#"["x@y.z"]"#, "[]", me));
-    assert!(!harness::audit_recipients_ok(r#"["me@example.com"]"#, "[]", r#"["x@y.z"]"#, me));
-    assert!(harness::audit_recipients_ok(r#"["me@example.com"]"#, r#"["  "]"#, "[]", me));
+    assert!(!harness::audit_recipients_ok(
+        r#"["me@example.com"]"#,
+        r#"["x@y.z"]"#,
+        "[]",
+        me
+    ));
+    assert!(!harness::audit_recipients_ok(
+        r#"["me@example.com"]"#,
+        "[]",
+        r#"["x@y.z"]"#,
+        me
+    ));
+    assert!(harness::audit_recipients_ok(
+        r#"["me@example.com"]"#,
+        r#"["  "]"#,
+        "[]",
+        me
+    ));
     // Malformed JSON never passes.
     assert!(!harness::audit_recipients_ok("not-json", "[]", "[]", me));
 }
@@ -926,14 +1044,29 @@ fn live_gate_21_safety_audit_subject_bcc_mid_rules() {
     assert!(!harness::audit_subject_prefixed("sge-test-lowercase"));
     // Rule 3: Bcc: header line detected; body mentions and folded
     // continuations are not headers.
-    assert!(harness::eml_has_bcc_header(b"From: a@x\r\nBcc: hidden@y\r\nSubject: SGE-TEST-1\r\n\r\nbody"));
-    assert!(harness::eml_has_bcc_header(b"from: a@x\nbcc: hidden@y\n\nbody"));
-    assert!(!harness::eml_has_bcc_header(b"From: a@x\r\nSubject: SGE-TEST-1\r\n\r\nwrite Bcc: in the body freely"));
-    assert!(!harness::eml_has_bcc_header(b"From: a@x\r\nSubject: Re: Bcc discussion\r\n\r\nbody"));
-    assert!(!harness::eml_has_bcc_header(b"From: a@x\r\n Subject: folded bcc: not-a-header\r\n\r\nbody"));
-    assert!(!harness::eml_has_bcc_header(b"From: a@x\r\nSubject: SGE-TEST-1\r\n"));
+    assert!(harness::eml_has_bcc_header(
+        b"From: a@x\r\nBcc: hidden@y\r\nSubject: SGE-TEST-1\r\n\r\nbody"
+    ));
+    assert!(harness::eml_has_bcc_header(
+        b"from: a@x\nbcc: hidden@y\n\nbody"
+    ));
+    assert!(!harness::eml_has_bcc_header(
+        b"From: a@x\r\nSubject: SGE-TEST-1\r\n\r\nwrite Bcc: in the body freely"
+    ));
+    assert!(!harness::eml_has_bcc_header(
+        b"From: a@x\r\nSubject: Re: Bcc discussion\r\n\r\nbody"
+    ));
+    assert!(!harness::eml_has_bcc_header(
+        b"From: a@x\r\n Subject: folded bcc: not-a-header\r\n\r\nbody"
+    ));
+    assert!(!harness::eml_has_bcc_header(
+        b"From: a@x\r\nSubject: SGE-TEST-1\r\n"
+    ));
     // Rule 4: duplicate Message-IDs detected.
-    assert_eq!(harness::audit_first_duplicate_mid(&["<a@x>", "<b@x>"]), None);
+    assert_eq!(
+        harness::audit_first_duplicate_mid(&["<a@x>", "<b@x>"]),
+        None
+    );
     assert_eq!(
         harness::audit_first_duplicate_mid(&["<a@x>", "<b@x>", "<a@x>"]),
         Some("<a@x>".to_string())
@@ -944,13 +1077,28 @@ fn live_gate_21_safety_audit_subject_bcc_mid_rules() {
 fn live_gate_21_safety_scan_detects_planted_credential_substring() {
     // Secrets carry regex metachars — matching is fixed-substring (contains).
     let secrets = ["p@$$w0rd[.*]+foo", "second-secret"];
-    assert!(harness::scan_text_has_secret("log line p@$$w0rd[.*]+foo leaked", &secrets));
-    assert!(harness::scan_text_has_secret("has second-secret inside", &secrets));
-    assert!(!harness::scan_text_has_secret("clean log with RCPT=<me@example.com> only", &secrets));
+    assert!(harness::scan_text_has_secret(
+        "log line p@$$w0rd[.*]+foo leaked",
+        &secrets
+    ));
+    assert!(harness::scan_text_has_secret(
+        "has second-secret inside",
+        &secrets
+    ));
+    assert!(!harness::scan_text_has_secret(
+        "clean log with RCPT=<me@example.com> only",
+        &secrets
+    ));
     // Partial passwords do NOT match (full-value scan, no prefix guessing).
-    assert!(!harness::scan_text_has_secret("log line p@$$w0rd leaked", &secrets));
+    assert!(!harness::scan_text_has_secret(
+        "log line p@$$w0rd leaked",
+        &secrets
+    ));
     // Empty secrets never match (unset env must not fail the scan).
-    assert!(!harness::scan_text_has_secret("anything at all", &["", "   ".trim()]));
+    assert!(!harness::scan_text_has_secret(
+        "anything at all",
+        &["", "   ".trim()]
+    ));
     assert!(!harness::scan_text_has_secret("anything at all", &[]));
 }
 
@@ -961,16 +1109,41 @@ fn live_gate_21_safety_dump_covers_all_temp_tables_for_scan() {
     let app_data = test_app_data("safety-dump");
     let mb = queries::ensure_mailbox(conn, "INBOX").unwrap();
     let mid = sge_lib::drafts::new_message_id("safety-dump");
-    queries::upsert_draft(conn, "draft-dump", mb, &mid, "SGE-TEST-dump", "probe", "me@example.com", "", "").unwrap();
+    queries::upsert_draft(
+        conn,
+        "draft-dump",
+        mb,
+        &mid,
+        "SGE-TEST-dump",
+        "probe",
+        "me@example.com",
+        "",
+        "",
+    )
+    .unwrap();
     let out = send_queue::enqueue_send(conn, &app_data, self_input("dump")).unwrap();
     let (tables, rows, dump) = harness::dump_store_for_scan(conn);
-    assert!(tables.contains(&"send_queue".to_string()), "dump must cover send_queue: {:?}", tables);
-    assert!(tables.contains(&"drafts".to_string()), "dump must cover drafts: {:?}", tables);
+    assert!(
+        tables.contains(&"send_queue".to_string()),
+        "dump must cover send_queue: {:?}",
+        tables
+    );
+    assert!(
+        tables.contains(&"drafts".to_string()),
+        "dump must cover drafts: {:?}",
+        tables
+    );
     assert!(rows > 0, "dump must carry rows");
-    assert!(dump.contains(&out.message_id), "dump must carry queue content");
+    assert!(
+        dump.contains(&out.message_id),
+        "dump must carry queue content"
+    );
     assert!(dump.contains(&mid), "dump must carry drafts content");
     // The dump text is what the password scan runs over.
-    assert!(!harness::scan_text_has_secret(&dump, &["definitely-not-present-secret"]));
+    assert!(!harness::scan_text_has_secret(
+        &dump,
+        &["definitely-not-present-secret"]
+    ));
     assert!(harness::scan_text_has_secret(
         &format!("{}\nplanted-secret-xyz", dump),
         &["planted-secret-xyz"]
@@ -990,21 +1163,47 @@ fn live_gate_21_safety_report_covers_steps_and_checklist() {
     tracked.run_tag = "safety-tag".to_string();
     tracked.probe_detail = "1 INBOX UID + 1 Sent UID per leg".to_string();
     assert!(harness::log_step(&tracked, 3, "arrival", true, "detail-a"));
-    assert!(!harness::log_step(&tracked, 10, "draft-send", false, "detail-b"));
+    assert!(!harness::log_step(
+        &tracked,
+        10,
+        "draft-send",
+        false,
+        "detail-b"
+    ));
     harness::record_calls(&tracked, "arrival", 2, 3);
     harness::record_calls(&tracked, "uncertain-reconcile", 3, 3);
     let report = harness::render_report(&tracked);
-    assert!(report.contains("REPORT live_gate_21 run=safety-tag"), "header:\n{report}");
-    assert!(report.contains("REPORT-STEP 3/12 arrival: PASS"), "steps:\n{report}");
-    assert!(report.contains("REPORT-STEP 10/12 draft-send: FAIL"), "steps:\n{report}");
-    assert!(report.contains("REPORT autosave-branch: 1 INBOX UID"), "branch:\n{report}");
+    assert!(
+        report.contains("REPORT live_gate_21 run=safety-tag"),
+        "header:\n{report}"
+    );
+    assert!(
+        report.contains("REPORT-STEP 3/12 arrival: PASS"),
+        "steps:\n{report}"
+    );
+    assert!(
+        report.contains("REPORT-STEP 10/12 draft-send: FAIL"),
+        "steps:\n{report}"
+    );
+    assert!(
+        report.contains("REPORT autosave-branch: 1 INBOX UID"),
+        "branch:\n{report}"
+    );
     assert!(
         report.contains("REPORT gate=draft-send verdict=SKIP reason=prod-flush-performs-no-delete_draft-local-or-server"),
         "draft verdict:\n{report}"
     );
-    assert!(report.contains("prod-flush-performs-no-delete_draft-local-or-server"), "gap note:\n{report}");
-    assert!(report.contains("REPORT-CALLS leg=arrival delta=1 expected=1 ok=true"), "calls:\n{report}");
-    for id in ["A-01", "A-02", "A-03", "A-04", "A-05", "A-06", "A-07", "A-08", "A-09"] {
+    assert!(
+        report.contains("prod-flush-performs-no-delete_draft-local-or-server"),
+        "gap note:\n{report}"
+    );
+    assert!(
+        report.contains("REPORT-CALLS leg=arrival delta=1 expected=1 ok=true"),
+        "calls:\n{report}"
+    );
+    for id in [
+        "A-01", "A-02", "A-03", "A-04", "A-05", "A-06", "A-07", "A-08", "A-09",
+    ] {
         assert!(report.contains(id), "checklist {id} missing:\n{report}");
     }
     assert!(report.contains("REPORT end:"), "footer:\n{report}");
@@ -1022,8 +1221,17 @@ fn live_gate_21_safety_manual_steps_name_uids_and_webmail() {
     tracked.draft_server_uid = Some(33);
     let steps = harness::manual_cleanup_steps(&tracked);
     assert!(steps.contains("<m@sge.local>"), "mids:\n{steps}");
-    assert!(steps.contains("11") && steps.contains("22") && steps.contains("33"), "uids:\n{steps}");
-    assert!(steps.contains("INBOX") && steps.contains("Sent"), "folders:\n{steps}");
-    assert!(steps.contains("SGE-Test-safety-1-drafts"), "sandbox:\n{steps}");
+    assert!(
+        steps.contains("11") && steps.contains("22") && steps.contains("33"),
+        "uids:\n{steps}"
+    );
+    assert!(
+        steps.contains("INBOX") && steps.contains("Sent"),
+        "folders:\n{steps}"
+    );
+    assert!(
+        steps.contains("SGE-Test-safety-1-drafts"),
+        "sandbox:\n{steps}"
+    );
     assert!(steps.contains("webmail"), "webmail path:\n{steps}");
 }

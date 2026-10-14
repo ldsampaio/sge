@@ -162,7 +162,11 @@ impl SyncSession for FakeSession {
         })
     }
 
-    fn set_seen(&mut self, uid: u32, seen: bool) -> sge_lib::imap::PinBox<'_, Result<(), SyncError>> {
+    fn set_seen(
+        &mut self,
+        uid: u32,
+        seen: bool,
+    ) -> sge_lib::imap::PinBox<'_, Result<(), SyncError>> {
         Box::pin(async move {
             if self.messages.contains_key(&uid) {
                 self.seen_calls.push((uid, seen));
@@ -205,7 +209,10 @@ impl SyncSession for FakeSession {
         })
     }
 
-    fn uid_expunge(&mut self, uid_set: &str) -> sge_lib::imap::PinBox<'_, Result<Vec<u32>, SyncError>> {
+    fn uid_expunge(
+        &mut self,
+        uid_set: &str,
+    ) -> sge_lib::imap::PinBox<'_, Result<Vec<u32>, SyncError>> {
         let uid_set = uid_set.to_string();
         Box::pin(async move {
             let mut gone = Vec::new();
@@ -253,7 +260,13 @@ impl SyncSession for FakeSession {
     }
 
     fn capabilities(&mut self) -> sge_lib::imap::PinBox<'_, Result<Vec<String>, SyncError>> {
-        Box::pin(async move { Ok(vec!["IMAP4rev1".to_string(), "UIDPLUS".to_string(), "MOVE".to_string()]) })
+        Box::pin(async move {
+            Ok(vec![
+                "IMAP4rev1".to_string(),
+                "UIDPLUS".to_string(),
+                "MOVE".to_string(),
+            ])
+        })
     }
 
     fn create_mailbox(&mut self, name: &str) -> sge_lib::imap::PinBox<'_, Result<(), SyncError>> {
@@ -320,7 +333,8 @@ impl SyncSession for FakeSession {
                 .unwrap_or_default();
             let uid = self.next_uid;
             self.next_uid += 1;
-            self.append_calls.push((mailbox.clone(), flags, bytes.clone()));
+            self.append_calls
+                .push((mailbox.clone(), flags, bytes.clone()));
             self.messages.insert(uid, (mailbox, msg_id, bytes, false));
             Ok(())
         })
@@ -346,9 +360,7 @@ impl SyncSession for FakeSession {
         })
     }
 
-    fn list_mailboxes(
-        &mut self,
-    ) -> sge_lib::imap::PinBox<'_, Result<Vec<MailboxInfo>, SyncError>> {
+    fn list_mailboxes(&mut self) -> sge_lib::imap::PinBox<'_, Result<Vec<MailboxInfo>, SyncError>> {
         Box::pin(async move {
             let mut infos: Vec<MailboxInfo> = self
                 .mailboxes
@@ -384,9 +396,7 @@ impl SyncSession for FakeSession {
         Box::pin(async move { Ok(()) })
     }
 
-    fn select_condstore(
-        &mut self,
-    ) -> sge_lib::imap::PinBox<'_, Result<bool, SyncError>> {
+    fn select_condstore(&mut self) -> sge_lib::imap::PinBox<'_, Result<bool, SyncError>> {
         Box::pin(async move { Ok(false) })
     }
 
@@ -434,11 +444,15 @@ pub mod live_gate_26_seen {
         // Online STORE +Seen, FLAGS assert via envelopes only.
         block_on(s.set_seen(uid, true)).unwrap();
         let headers = block_on(s.fetch_envelopes(&uid.to_string())).unwrap();
-        assert!(headers.iter().any(|h| h.uid == uid && h.flags.contains("\\Seen")));
+        assert!(headers
+            .iter()
+            .any(|h| h.uid == uid && h.flags.contains("\\Seen")));
         // Offline replay convergence shape: queue then apply, FLAGS flip.
         block_on(s.set_seen(uid, false)).unwrap();
         let headers = block_on(s.fetch_envelopes(&uid.to_string())).unwrap();
-        assert!(!headers.iter().any(|h| h.uid == uid && h.flags.contains("\\Seen")));
+        assert!(!headers
+            .iter()
+            .any(|h| h.uid == uid && h.flags.contains("\\Seen")));
         assert_eq!(s.seen_calls, vec![(uid, true), (uid, false)]);
     }
 
@@ -456,7 +470,9 @@ pub mod live_gate_26_seen {
         assert!(block_on(gate.create_mailbox("SGE-Test-nope")).is_err());
         // Reads forward untouched.
         assert!(block_on(gate.search_uids()).unwrap().is_empty());
-        assert!(block_on(gate.capabilities()).unwrap().contains(&"IMAP4rev1".to_string()));
+        assert!(block_on(gate.capabilities())
+            .unwrap()
+            .contains(&"IMAP4rev1".to_string()));
         // Reopen: writes flow again.
         gate.set_closed(false);
         assert!(!gate.is_closed());
@@ -549,7 +565,11 @@ pub mod live_gate_26_tree {
         // Browse: SEARCH + envelope FETCH cover every UID.
         let uids = block_on(s.search_uids()).unwrap();
         assert_eq!(uids.len(), 2);
-        let ranges = uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+        let ranges = uids
+            .iter()
+            .map(|u| u.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         let headers = block_on(s.fetch_envelopes(&ranges)).unwrap();
         assert_eq!(headers.len(), 2);
         // Badges: STATUS UNSEEN datum wires through to the comparison the
@@ -581,8 +601,12 @@ pub mod live_gate_26_arrival {
         let bytes = format!(
             "From: me@example.com\r\nTo: me@example.com\r\nSubject: SGE-TEST-arrival-tick\r\nMessage-ID: {msg_id}\r\n\r\nhello"
         );
-        harness::audit_test_mail(&["SGE-TEST-arrival-tick"], &["me@example.com"], "me@example.com")
-            .unwrap();
+        harness::audit_test_mail(
+            &["SGE-TEST-arrival-tick"],
+            &["me@example.com"],
+            "me@example.com",
+        )
+        .unwrap();
         block_on(s.append_message(sandbox, "", bytes.as_bytes())).unwrap();
         // Tick: re-SELECT then SEARCH Message-ID — the arrival is there.
         block_on(s.select_mailbox(sandbox)).unwrap();
@@ -619,7 +643,10 @@ pub mod live_gate_26_arrival {
     fn arrival_replay_before_sweep_order_shape() {
         // The worker logs `imap replay:` at Step 4b before the sweep code
         // runs; file order in the captured log is the evidence.
-        let ok: Vec<&str> = vec!["[SGE sync] imap replay: acked=1 dropped=0 failed=0", "sweep done"];
+        let ok: Vec<&str> = vec![
+            "[SGE sync] imap replay: acked=1 dropped=0 failed=0",
+            "sweep done",
+        ];
         assert!(harness::replay_logged_before_sweep(&ok));
         let missing: Vec<&str> = vec!["sweep done"];
         assert!(!harness::replay_logged_before_sweep(&missing));
@@ -636,9 +663,15 @@ pub mod live_gate_26_safety {
     fn safety_secret_scan_names_artifact_never_secret() {
         // Fixed-substring scan finds the password; the caller maps the
         // index to an artifact name (log/dump), never the secret itself.
-        assert_eq!(harness::scan_text_for_secrets("log hunter2 tail", &["hunter2"]), Some(0));
+        assert_eq!(
+            harness::scan_text_for_secrets("log hunter2 tail", &["hunter2"]),
+            Some(0)
+        );
         assert_eq!(harness::scan_text_for_secrets("clean", &["hunter2"]), None);
-        assert_eq!(harness::scan_text_for_secrets("anything at all", &[""]), None);
+        assert_eq!(
+            harness::scan_text_for_secrets("anything at all", &[""]),
+            None
+        );
         assert_eq!(
             harness::scan_text_for_secrets("u=user p=hunter2", &["user", "hunter2"]),
             Some(0)
@@ -653,8 +686,16 @@ pub mod live_gate_26_safety {
 
     #[test]
     fn safety_audit_rejects_non_self_recipients() {
-        assert!(harness::audit_test_mail(&["SGE-TEST-ok"], &["me@example.com"], "me@example.com").is_ok());
-        assert!(harness::audit_test_mail(&["SGE-TEST-ok"], &["friend@example.com"], "me@example.com").is_err());
+        assert!(
+            harness::audit_test_mail(&["SGE-TEST-ok"], &["me@example.com"], "me@example.com")
+                .is_ok()
+        );
+        assert!(harness::audit_test_mail(
+            &["SGE-TEST-ok"],
+            &["friend@example.com"],
+            "me@example.com"
+        )
+        .is_err());
         // Empty cc/bcc cells are fine; unparseable cells fail closed.
         assert!(harness::audit_test_mail(&["SGE-TEST-ok"], &[], "me@example.com").is_ok());
     }
@@ -703,7 +744,10 @@ pub mod live_gate_26_cleanup {
         block_on(s.uid_expunge(&tracked.to_string())).unwrap();
         let remaining = block_on(s.search_uids()).unwrap();
         assert!(!remaining.contains(&tracked));
-        assert!(remaining.contains(&other), "untracked UID must survive scoped expunge");
+        assert!(
+            remaining.contains(&other),
+            "untracked UID must survive scoped expunge"
+        );
         // Full cleanup shape: expunge the rest, DELETE the sandbox, LIST
         // returns to the pre-run snapshot.
         s.remove_message(other);
@@ -764,13 +808,24 @@ pub mod live_gate_26_filing {
         // Confirm MOVE (uid_move_to models the server verb).
         block_on(s.uid_move_to(&uid.to_string(), &dest)).unwrap();
         block_on(s.select_mailbox(origin)).unwrap();
-        assert!(block_on(s.search_uids()).unwrap().is_empty(), "origin must be empty after MOVE");
+        assert!(
+            block_on(s.search_uids()).unwrap().is_empty(),
+            "origin must be empty after MOVE"
+        );
         block_on(s.select_mailbox(&dest)).unwrap();
-        assert_eq!(block_on(s.search_uids()).unwrap(), vec![uid], "dest must hold the moved UID");
+        assert_eq!(
+            block_on(s.search_uids()).unwrap(),
+            vec![uid],
+            "dest must hold the moved UID"
+        );
         // Undo: MOVE back, restored to origin.
         block_on(s.uid_move_to(&uid.to_string(), origin)).unwrap();
         block_on(s.select_mailbox(origin)).unwrap();
-        assert_eq!(block_on(s.search_uids()).unwrap(), vec![uid], "undo must restore the UID");
+        assert_eq!(
+            block_on(s.search_uids()).unwrap(),
+            vec![uid],
+            "undo must restore the UID"
+        );
         block_on(s.select_mailbox(&dest)).unwrap();
         assert!(block_on(s.search_uids()).unwrap().is_empty());
     }
@@ -783,10 +838,21 @@ pub mod live_gate_26_filing {
         let _ = std::fs::create_dir_all(&dir);
         let db = dir.join("filing.sqlite");
         let store = sge_lib::store::Store::open(&db).unwrap();
-        let mb = sge_lib::store::queries::ensure_mailbox(store.conn(), "SGE-Test-filing-2").unwrap();
+        let mb =
+            sge_lib::store::queries::ensure_mailbox(store.conn(), "SGE-Test-filing-2").unwrap();
         sge_lib::store::queries::upsert_message(
-            store.conn(), mb, 11, Some("<filing-1@example.com>"), "SGE-TEST-filing-confirm",
-            "me@example.com", "[\"me@example.com\"]", "[]", "2026-10-13T12:00:00Z", "[]", false, "",
+            store.conn(),
+            mb,
+            11,
+            Some("<filing-1@example.com>"),
+            "SGE-TEST-filing-confirm",
+            "me@example.com",
+            "[\"me@example.com\"]",
+            "[]",
+            "2026-10-13T12:00:00Z",
+            "[]",
+            false,
+            "",
         )
         .unwrap();
         let mid: u64 = store
@@ -797,9 +863,19 @@ pub mod live_gate_26_filing {
                 |r| r.get(0),
             )
             .unwrap();
-        sge_lib::store::queries::upsert_label(store.conn(), mid, "academico", None, 0.9, 0.5, false)
-            .unwrap();
-        assert!(sge_lib::store::queries::get_label(store.conn(), mid).unwrap().is_some());
+        sge_lib::store::queries::upsert_label(
+            store.conn(),
+            mid,
+            "academico",
+            None,
+            0.9,
+            0.5,
+            false,
+        )
+        .unwrap();
+        assert!(sge_lib::store::queries::get_label(store.conn(), mid)
+            .unwrap()
+            .is_some());
         // Undo of the filing: from the filed category back to the origin.
         sge_lib::store::queries::log_override(store.conn(), mid, "academico", "SGE-Test-filing-2")
             .unwrap();
@@ -891,7 +967,9 @@ pub mod live_gate_26_batch {
             harness::plan_chunks(harness::BATCH_PROBE_SEEDS, harness::BATCH_PROBE_CHUNK),
             vec![(0, 3), (3, 6), (6, 7)]
         );
-        assert!(harness::plan_chunks(harness::BATCH_PROBE_SEEDS, harness::BATCH_PROBE_CHUNK).len() >= 2);
+        assert!(
+            harness::plan_chunks(harness::BATCH_PROBE_SEEDS, harness::BATCH_PROBE_CHUNK).len() >= 2
+        );
         assert_eq!(harness::plan_chunks(0, 3), Vec::<(usize, usize)>::new());
     }
 
@@ -907,9 +985,18 @@ pub mod live_gate_26_batch {
         let mb = sge_lib::store::queries::ensure_mailbox(store.conn(), scope).unwrap();
         for (i, uid) in [21u32, 22, 23].iter().enumerate() {
             sge_lib::store::queries::upsert_message(
-                store.conn(), mb, *uid, Some(&format!("<batch-{i}@example.com>")),
-                &format!("SGE-TEST-batch-probe-{i}"), "me@example.com", "[\"me@example.com\"]",
-                "[]", "2026-10-13T12:00:00Z", "[]", false, "",
+                store.conn(),
+                mb,
+                *uid,
+                Some(&format!("<batch-{i}@example.com>")),
+                &format!("SGE-TEST-batch-probe-{i}"),
+                "me@example.com",
+                "[\"me@example.com\"]",
+                "[]",
+                "2026-10-13T12:00:00Z",
+                "[]",
+                false,
+                "",
             )
             .unwrap();
         }
@@ -922,7 +1009,13 @@ pub mod live_gate_26_batch {
         for (ci, (s, e)) in harness::plan_chunks(cands.len(), 2).iter().enumerate() {
             for (mid, from, _uid) in &cands[*s..*e] {
                 sge_lib::classify::batch::journal_intent(
-                    store.conn(), run, *mid, from, "SGE-Test-batch-1-Auto", "batch-probe", ci,
+                    store.conn(),
+                    run,
+                    *mid,
+                    from,
+                    "SGE-Test-batch-1-Auto",
+                    "batch-probe",
+                    ci,
                 )
                 .unwrap();
                 sge_lib::classify::batch::journal_moved(store.conn(), run, *mid).unwrap();
@@ -935,7 +1028,10 @@ pub mod live_gate_26_batch {
             .filter(|(mid, _, _)| !done.contains(mid))
             .map(|(mid, _, _)| *mid)
             .collect();
-        assert!(remaining.is_empty(), "resume must skip everything journaled");
+        assert!(
+            remaining.is_empty(),
+            "resume must skip everything journaled"
+        );
         let _ = std::fs::remove_file(&db);
     }
 
@@ -950,13 +1046,33 @@ pub mod live_gate_26_batch {
         let scope = "SGE-Test-batch-2";
         let mb = sge_lib::store::queries::ensure_mailbox(store.conn(), scope).unwrap();
         sge_lib::store::queries::upsert_message(
-            store.conn(), mb, 31, Some("<plain@example.com>"), "SGE-TEST-plain",
-            "me@example.com", "[\"me@example.com\"]", "[]", "2026-10-13T12:00:00Z", "[]", false, "",
+            store.conn(),
+            mb,
+            31,
+            Some("<plain@example.com>"),
+            "SGE-TEST-plain",
+            "me@example.com",
+            "[\"me@example.com\"]",
+            "[]",
+            "2026-10-13T12:00:00Z",
+            "[]",
+            false,
+            "",
         )
         .unwrap();
         sge_lib::store::queries::upsert_message(
-            store.conn(), mb, 32, Some("<pinned@example.com>"), "SGE-TEST-pinned",
-            "me@example.com", "[\"me@example.com\"]", "[]", "2026-10-13T12:00:00Z", "[]", false, "",
+            store.conn(),
+            mb,
+            32,
+            Some("<pinned@example.com>"),
+            "SGE-TEST-pinned",
+            "me@example.com",
+            "[\"me@example.com\"]",
+            "[]",
+            "2026-10-13T12:00:00Z",
+            "[]",
+            false,
+            "",
         )
         .unwrap();
         let pinned_mid: u64 = store
@@ -967,16 +1083,32 @@ pub mod live_gate_26_batch {
                 |r| r.get(0),
             )
             .unwrap();
-        sge_lib::store::queries::log_override(store.conn(), pinned_mid, "academico", scope).unwrap();
-        let auto_mb = sge_lib::store::queries::ensure_mailbox(store.conn(), "Auto/Acadêmico").unwrap();
+        sge_lib::store::queries::log_override(store.conn(), pinned_mid, "academico", scope)
+            .unwrap();
+        let auto_mb =
+            sge_lib::store::queries::ensure_mailbox(store.conn(), "Auto/Acadêmico").unwrap();
         sge_lib::store::queries::upsert_message(
-            store.conn(), auto_mb, 1, Some("<filed@example.com>"), "filed",
-            "me@example.com", "[\"me@example.com\"]", "[]", "2026-10-13T12:00:00Z", "[]", false, "",
+            store.conn(),
+            auto_mb,
+            1,
+            Some("<filed@example.com>"),
+            "filed",
+            "me@example.com",
+            "[\"me@example.com\"]",
+            "[]",
+            "2026-10-13T12:00:00Z",
+            "[]",
+            false,
+            "",
         )
         .unwrap();
         let cands =
             sge_lib::classify::batch::collect_candidates(store.conn(), Some(scope)).unwrap();
-        assert_eq!(cands.len(), 1, "only the unpinned in-scope message is a candidate");
+        assert_eq!(
+            cands.len(),
+            1,
+            "only the unpinned in-scope message is a candidate"
+        );
         assert_eq!(cands[0].2, 31);
         // Unscoped collect still excludes the Auto/ tree.
         let all = sge_lib::classify::batch::collect_candidates(store.conn(), None).unwrap();
@@ -1002,7 +1134,10 @@ pub mod live_gate_26_cite {
             line,
             Some("STEP 5/13 one-copy: PASS exactly-one-copy uid=7".to_string())
         );
-        let row = format!("REPORT gate=cite-draft-onecopy verdict=PASS evidence=cite=/tmp/prior22.log line={}", line.unwrap());
+        let row = format!(
+            "REPORT gate=cite-draft-onecopy verdict=PASS evidence=cite=/tmp/prior22.log line={}",
+            line.unwrap()
+        );
         assert!(row.contains("cite=") && row.contains("one-copy: PASS"));
     }
 
@@ -1010,7 +1145,8 @@ pub mod live_gate_26_cite {
     fn cite_evidence_absent_branch_emits_reasoned_skip() {
         // No prior run (normal case: 21/22 live pending creds) → SKIP row
         // with concrete reason + resume pointer, never a bare deferred.
-        let reason = "no prior-run log at $SGE_LIVE22_LOG (locked 21/22 live run still pending creds)";
+        let reason =
+            "no prior-run log at $SGE_LIVE22_LOG (locked 21/22 live run still pending creds)";
         let row = format!(
             "REPORT gate=cite-draft-onecopy verdict=SKIP evidence={}",
             harness::deferral_evidence(reason, "scripts/live-22.sh")
@@ -1048,9 +1184,15 @@ pub mod live_gate_26_cite {
     fn cite_skip_rows_refuse_bare_deferral() {
         // D-47 enforcement shape: the wrapper + REPORT accept a SKIP row
         // only with reason and resume pointer both present and non-empty.
-        assert!(!harness::is_reasoned_deferral("reason= resume=scripts/live-21.sh"));
-        assert!(!harness::is_reasoned_deferral("reason=locked run pending resume="));
-        assert!(!harness::is_reasoned_deferral("resume=scripts/live-21.sh reason="));
+        assert!(!harness::is_reasoned_deferral(
+            "reason= resume=scripts/live-21.sh"
+        ));
+        assert!(!harness::is_reasoned_deferral(
+            "reason=locked run pending resume="
+        ));
+        assert!(!harness::is_reasoned_deferral(
+            "resume=scripts/live-21.sh reason="
+        ));
         assert!(harness::is_reasoned_deferral(&harness::deferral_evidence(
             "smtp would duplicate sends (T-26-10)",
             "scripts/live-21.sh"
@@ -1071,7 +1213,11 @@ pub mod live_gate_26_report {
 
     #[test]
     fn report_rows_carry_gate_verdict_evidence() {
-        let pass = row("confirm-move-undo", "PASS", "confirm→MOVE uid 9 in auto + undo restored 1");
+        let pass = row(
+            "confirm-move-undo",
+            "PASS",
+            "confirm→MOVE uid 9 in auto + undo restored 1",
+        );
         assert!(pass.starts_with("REPORT gate=confirm-move-undo verdict=PASS evidence="));
         let fail = row("rename-delete", "FAIL", "RENAME failed: timeout");
         assert!(fail.contains("verdict=FAIL"));
@@ -1081,7 +1227,9 @@ pub mod live_gate_26_report {
             &harness::deferral_evidence("no prior-run log (21 live pending)", "scripts/live-21.sh"),
         );
         assert!(skip.contains("verdict=SKIP"));
-        assert!(harness::is_reasoned_deferral(skip.split_once("evidence=").unwrap().1));
+        assert!(harness::is_reasoned_deferral(
+            skip.split_once("evidence=").unwrap().1
+        ));
     }
 
     #[test]
@@ -1089,7 +1237,11 @@ pub mod live_gate_26_report {
         // The bundle covers exactly the full deferred set; anything
         // collected short of it surfaces as NOT-RUN (never silent).
         assert_eq!(harness::ALL_GATES.len(), 10);
-        let partial = vec![("seen-roundtrip".to_string(), "PASS".to_string(), "d".to_string())];
+        let partial = vec![(
+            "seen-roundtrip".to_string(),
+            "PASS".to_string(),
+            "d".to_string(),
+        )];
         let missing = harness::missing_gates(&partial, harness::ALL_GATES);
         assert_eq!(missing.len(), 9);
         assert!(missing.contains(&"cite-smtp-send"));
@@ -1120,7 +1272,11 @@ pub mod live_gate_26_report {
             assert_eq!(harness::scan_text_for_secrets(v, &secrets), None);
         }
         // And the scan itself is proven armed: a leaked row IS caught.
-        let leaked = row("seen-roundtrip", "PASS", "uid 3 with hunter2-imap-pass inside");
+        let leaked = row(
+            "seen-roundtrip",
+            "PASS",
+            "uid 3 with hunter2-imap-pass inside",
+        );
         assert_eq!(harness::scan_text_for_secrets(&leaked, &secrets), Some(0));
     }
 }
