@@ -98,3 +98,9 @@ This milestone (v1.2) builds on v1.0 (read-only INBOX viewer, Phases 1-5, shippe
 # If growing knowledge
 /gsd-growth-log                  # Extract session learnings
 ```
+---
+## 2026-10-14 — v1.5 Milestone Closed (via /gsd:progress)
+- Milestone v1.5 (Phases 27–32): COMPLETE. Phase 33 deferred permanently (server mail.utfpr.edu.br:993 has no ManageSieve on 4190; probe-failed, documented in `research/SUMMARY.md` and `v1.5-MILESTONE-AUDIT.md`).
+- Phase 32 Compose Hardening verified (32-01 SUMMARY.md present). 6/6 phases executed; 13/13 plans; 596 tests green; audit passed.
+- Action taken: milestone completed (archive path per ROADMAP.md convention: `.planning/milestones/`). Phase 33 remains deferred with reason; not promoted without server-side ManageSieve availability.
+- Next cycle (if any): `/gsd-new-milestone` to start v1.6; or `/gsd-growth-log` to extract patterns from v1.5 live-validation / compose-hardening cycle.

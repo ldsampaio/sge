@@ -1,16 +1,16 @@
 ---
 gsd_state_version: "1.0"
 milestone: v1.6
-milestone_name: SMTP Send Pipeline
+milestone_name: Roadmap — SMTP Send Pipeline
 status: complete
-stopped_at: Phase 35 context completed
-last_updated: "2026-10-14T20:45:00.000Z"
-state_head: 34b0e00c
+stopped_at: "Milestone v1.6 COMPLETE (Phases 34-36 done). Deferred: New Message button + compose window, Reply/Reply-All UX → v1.7 milestone"
+last_updated: "2026-10-14T23:11:21.945Z"
+state_head: 792294476af1680db7a2e5774d48d194dffd7aa8
 progress:
   total_phases: 3
   completed_phases: 1
-  total_plans: 6
-  completed_plans: 1
+  total_plans: 3
+  completed_plans: 3
   percent: 33
 ---
 
@@ -25,7 +25,7 @@ last_updated: "2026-10-14T20:45:00.000Z"
 last_activity: 2026-10-14
 last_activity_desc: Phase 35 (Lettre Transport + Live SMTP Gate) completed: smtp.rs transport/scrubber/live-gate; worker flush_send_queue verified; all tests pass
 state_head: 34b0e00c
-progress:[████░░░░░░] 33%
+progress:[███░░░░░░░] 33%
   total_phases: 3
   completed_phases: 1
   total_plans: 6
@@ -36,8 +36,8 @@ next_plan: 36-01 (Compose Integration + Outbox UX — Phase 36)
 
 ## Session
 
-**Last session:** 2026-10-14T20:45:00.000Z
-**Stopped at:** Phase 35 — Lettre Transport + Live SMTP Gate (complete)
+**Last session:** 2026-10-14T23:11:21.913Z
+**Stopped at:** Milestone v1.6 COMPLETE (Phases 34-36 done). Deferred: New Message button + compose window, Reply/Reply-All UX → v1.7 milestone
 **Resume file:** /home/lucas/Documentos/Projetos/sge/.planning/phases/35-lettre-transport-live-smtp-gate/35-01-SUMMARY.md
 
 ## Phase 35 — Lettre Transport + Live SMTP Gate (completed)

@@ -12,7 +12,7 @@ Connect to an IMAP server on Linux and read your mail locally in a fast Gmail-li
 
 SGE is a Linux desktop email client (Rust + Tauri v2 + React + SQLite) with triage, folders, drafts, SMTP compose, on-device auto-classification, full-text search with saved filters, age-based auto-archive, and user-defined smart folder rules. v1.4 audit `.planning/v1.4-MILESTONE-AUDIT.md`: PASSED 11/11 (LIVE-01/02/03, SRCH-01/02/03, ARCH-01/02, RULE-01/02/03), 6/6 phases (21-26), 13 plans. Live-server runs deferred-with-reason (no creds file in this environment; exit-2 SKIP contracts verified). Environment caveat: `vite` bundle needs Node 20+ (env has Node 18); `tsc --noEmit` clean.
 
-## Current Milestone: v1.5 Live Validation + Compose Hardening + Deferred Features
+## Current Milestone (2026-10-14): v1.6 SMTP Send Pipeline ✅ v1.5 closed
 
 **Status:** Defining requirements — continues from phase 27 (v1.4 shipped 2026-10-13, audit `.planning/v1.4-MILESTONE-AUDIT.md`: PASSED 11/11).
 
