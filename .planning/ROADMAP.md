@@ -330,7 +330,11 @@ Decimal phases appear between their surrounding integers in numeric order. v1.2 
   4. User can enable per-category auto-confirm on earned precision (opt-in per category, default off) with visible precision display — an override auto-disengages it (override-flips-to-manual tested), journaled MOVEs with digest + one-click undo
   5. Local auto-file and Sieve export coexist without flapping — "managed by Sieve" mutual-exclusion badges ride with this phase
 
-**Plans**: TBD
+**Plans**: 3 plans
+
+- [ ] 31-01-PLAN.md — sieve.rs pure generator + golden fixtures + export_sieve_text + RulesPanel Export-Sieve UI (SIEVE-01)
+- [ ] 31-02-PLAN.md — history_list/history_stats + M22 tables + learn.rs learner + HistoryPanel UI (HIST-01 + LEARN-01)
+- [ ] 31-03-PLAN.md — precision gate + override-flips-to-manual + journaled auto-confirm digest/undo + Sieve-managed coexistence (CONF-01)
 **UI hint**: yes
 
 ### Phase 32: Compose Hardening
