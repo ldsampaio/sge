@@ -1424,18 +1424,11 @@ pub async fn batch_classify(
         let done = batch::journaled_ids(guard.conn(), run_id)?;
         candidates.retain(|(mid, _, _)| !done.contains(mid));
     }
-    // Folder epochs at run start (per-chunk UIDVALIDITY re-check).
-    let epochs: std::collections::HashMap<String, u32> = {
+    // Folder epochs at run start (per-chunk UIDVALIDITY re-check —
+    // shared helper, Phase 30 stale-preview re-resolution).
+    let epochs = {
         let guard = store.lock().unwrap();
-        let rows: Vec<(String, u32)> = guard
-            .conn()
-            .prepare("SELECT name, uid_validity FROM mailboxes")
-            .map_err(|e| e.to_string())?
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<_, _>>()
-            .map_err(|e| e.to_string())?;
-        rows.into_iter().collect()
+        batch::snapshot_epochs(guard.conn())?
     };
     let total = candidates.len();
     let app_h = app.clone();
@@ -1443,6 +1436,7 @@ pub async fn batch_classify(
         let mut done = 0usize;
         let mut moved = 0usize;
         let mut review = 0usize;
+        let mut stale_dropped = 0usize;
         let mut chunk_no = 0usize;
         for chunk in candidates.chunks(batch::BATCH_CHUNK) {
             if cancel.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1463,11 +1457,12 @@ pub async fn batch_classify(
                         .unwrap_or(0)
                 };
                 if epochs.get(mb).copied().unwrap_or(0) != epoch_now {
+                    stale_dropped += 1;
                     continue; // UIDVALIDITY shifted mid-run: skip (abort-to-resync for this folder)
                 }
                 live_chunk.push((*mid, mb.clone(), *uid));
             }
-            for (mid, _mb, _uid) in live_chunk {
+            for (mid, snap_mb, snap_uid) in live_chunk {
                 if cancel.load(std::sync::atomic::Ordering::SeqCst) {
                     break;
                 }
@@ -1507,70 +1502,66 @@ pub async fn batch_classify(
                     done += 1;
                     continue;
                 }
-                // Destination + journal BEFORE the verb.
-                let dest_display = match &ready.child_id {
-                    Some(_) => {
-                        let top_name = tax.categories.iter()
-                            .find(|c| c.id == ready.primary_id).map(|c| c.name.clone())
-                            .unwrap_or_else(|| ready.primary_id.clone());
-                        let child_name = tax.categories.iter()
-                            .find(|c| Some(c.id.clone()) == ready.child_id).map(|c| c.name.clone());
-                        match child_name {
-                            Some(cn) => format!("Auto/{top_name}/{cn}"),
-                            None => format!("Auto/{top_name}"),
-                        }
-                    }
-                    None => {
-                        let top_name = tax.categories.iter()
-                            .find(|c| c.id == ready.primary_id).map(|c| c.name.clone())
-                            .unwrap_or_else(|| ready.primary_id.clone());
-                        format!("Auto/{top_name}")
+                // Destination (shared helper — preview plans the identical
+                // shape, T-30-04) + per-item re-resolution in the journal
+                // lock section: the MOVE verb takes ONLY the re-resolved
+                // pair, never the run-start snapshot (T-30-01).
+                let dest_display = batch::dest_display_for(
+                    &tax,
+                    &ready.primary_id,
+                    ready.child_id.as_deref(),
+                );
+                let snap_epoch = epochs.get(&snap_mb).copied().unwrap_or(0);
+                let resolved = {
+                    let guard = store.lock().unwrap();
+                    match batch::resolve_for_move(
+                        guard.conn(),
+                        mid,
+                        &snap_mb,
+                        snap_uid,
+                        snap_epoch,
+                    ) {
+                        Ok(r) => r,
+                        Err(_) => None,
                     }
                 };
-                // Resolve wire: reuse ensure path per message? Tree is
-                // pre-created — wire = display with delimiter. Resolve
-                // delimiter + existing wire from cache.
-                let (from_folder, dest_wire) = {
+                let Some(res) = resolved else {
+                    stale_dropped += 1;
+                    done += 1;
+                    continue;
+                };
+                // Resolve wire from the re-resolved folder (delimiter from
+                // cache; leaves encoded like prepare_create_wire does).
+                let dest_wire = {
                     let guard = store.lock().unwrap();
                     let conn = guard.conn();
-                    let loc = crate::store::queries::message_location(conn, mid).ok().flatten();
                     let cached = crate::store::queries::list_mailboxes(conn).ok().unwrap_or_default();
-                    match loc {
-                        Some((mb, _)) => {
-                            let delim = cached.first().map(|r| r.delimiter.clone()).unwrap_or_default();
-                            let wire = if delim.is_empty() {
-                                dest_display.replace('/', "/")
-                            } else {
-                                // Encode leaves (non-ASCII) like prepare_create_wire does.
-                                let parts: Vec<&str> = dest_display.split('/').collect();
-                                let mut w = String::new();
-                                for (i, p) in parts.iter().enumerate() {
-                                    if i > 0 {
-                                        w.push_str(&delim);
-                                    }
-                                    // Only encode non-ASCII leaves; ASCII passes through.
-                                    w.push_str(&crate::imap::mutf7::encode_modified_utf7(p));
-                                }
-                                w
-                            };
-                            (mb, wire)
+                    let delim = cached.first().map(|r| r.delimiter.clone()).unwrap_or_default();
+                    if delim.is_empty() {
+                        dest_display.replace('/', "/")
+                    } else {
+                        let parts: Vec<&str> = dest_display.split('/').collect();
+                        let mut w = String::new();
+                        for (i, p) in parts.iter().enumerate() {
+                            if i > 0 {
+                                w.push_str(&delim);
+                            }
+                            w.push_str(&crate::imap::mutf7::encode_modified_utf7(p));
                         }
-                        None => continue,
+                        w
                     }
                 };
                 {
                     let guard = store.lock().unwrap();
                     let _ = batch::journal_intent(
-                        guard.conn(), run_id, mid, &from_folder, &dest_wire,
+                        guard.conn(), run_id, mid, &res.from_folder, &dest_wire,
                         &ready.primary_id, chunk_no,
                     );
                 }
-                // Current uid may have shifted; re-read location for the verb.
-                let verb_loc = {
-                    let guard = store.lock().unwrap();
-                    crate::store::queries::message_location(guard.conn(), mid).ok().flatten()
-                };
-                if let Some((mb_now, uid_now)) = verb_loc {
+                // Verb addresses the re-resolved (folder, UID) pair read
+                // in the same lock section as the journal write above.
+                let (mb_now, uid_now) = (res.from_folder.clone(), res.uid);
+                {
                     if mb_now == dest_wire {
                         let guard = store.lock().unwrap();
                         let _ = batch::journal_moved(guard.conn(), run_id, mid);
@@ -1621,7 +1612,7 @@ pub async fn batch_classify(
             );
         }
         let interrupted = cancel.load(std::sync::atomic::Ordering::SeqCst);
-        let totals = serde_json::json!({ "done": done, "moved": moved, "review": review }).to_string();
+        let totals = serde_json::json!({ "done": done, "moved": moved, "review": review, "stale_dropped": stale_dropped }).to_string();
         {
             let guard = store.lock().unwrap();
             let _ = crate::store::queries::finish_batch_run(
@@ -1689,8 +1680,40 @@ pub async fn batch_report(
             |r| r.get(0),
         )
         .map_err(|e| e.to_string())?;
-    let _ = totals;
-    Ok(BatchReport { run_id, state: state_s, per_category, remainder: remainder as usize, undone: undone as usize, totals_json: totals })
+    // Phase 30: additive totals parsed from backend truth (labeling +
+    // gating only — old rows without the keys default to 0).
+    let parsed: serde_json::Value = serde_json::from_str(&totals).unwrap_or_default();
+    let num = |k: &str| parsed.get(k).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let failed = batch::failed_count(conn, run_id);
+    Ok(BatchReport { run_id, state: state_s, per_category, remainder: remainder as usize, undone: undone as usize, totals_json: totals, stale_dropped: num("stale_dropped"), retry_skipped: num("retry_skipped"), failed })
+}
+
+// ── Phase 30: dry-run preview commands (BATCH-03) ────────────────
+//
+// Two thin wrappers over the SAME `batch::preview_plan` function
+// (never a second implementation). Both are pure-read: zero DB writes,
+// zero IMAP verbs, zero SyncGate interaction. Inputs take NO run_id and
+// NO preview rows — confirm always re-collects fresh via
+// `batch_classify` / `archive_run`.
+
+/// Dry-run a batch classify: per-item plan with basis + skipped rows.
+#[tauri::command]
+pub async fn preview_batch(
+    state: State<'_, AppState>,
+    scope: Option<String>,
+) -> Result<batch::BatchPreview, String> {
+    let guard = state.store.lock().unwrap();
+    batch::preview_plan(guard.conn(), batch::PreviewKind::Classify, scope.as_deref())
+}
+
+/// Dry-run an archive run through the shared preview path
+/// (`kind_tag: "archive"` — same shape, same function).
+#[tauri::command]
+pub async fn preview_archive(
+    state: State<'_, AppState>,
+) -> Result<batch::BatchPreview, String> {
+    let guard = state.store.lock().unwrap();
+    batch::preview_plan(guard.conn(), batch::PreviewKind::Archive, None)
 }
 
 /// Undo-batch: restore originals in reverse journal order.
@@ -1878,24 +1901,18 @@ pub async fn archive_run(
         dests.dedup();
         archive::ensure_archive_tree(&manager, &store, &dests).await?;
     }
-    // Folder epochs at run start (per-chunk UIDVALIDITY re-check).
-    let epochs: std::collections::HashMap<String, u32> = {
+    // Folder epochs at run start (per-chunk UIDVALIDITY re-check —
+    // shared helper, Phase 30 stale-preview re-resolution).
+    let epochs = {
         let guard = store.lock().unwrap();
-        let rows: Vec<(String, u32)> = guard
-            .conn()
-            .prepare("SELECT name, uid_validity FROM mailboxes")
-            .map_err(|e| e.to_string())?
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<_, _>>()
-            .map_err(|e| e.to_string())?;
-        rows.into_iter().collect()
+        batch::snapshot_epochs(guard.conn())?
     };
     let total = jobs.len();
     let app_h = app.clone();
     tauri::async_runtime::spawn(async move {
         let mut done = 0usize;
         let mut moved = 0usize;
+        let mut stale_dropped = 0usize;
         let mut chunk_no = 0usize;
         for chunk in jobs.chunks(batch::BATCH_CHUNK) {
             if cancel.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1917,44 +1934,53 @@ pub async fn archive_run(
                         .unwrap_or(0)
                 };
                 if epochs.get(mb).copied().unwrap_or(0) != epoch_now {
+                    stale_dropped += 1;
                     continue;
                 }
                 live_chunk.push((*mid, mb.clone(), *uid, dest.clone()));
             }
-            for (mid, _mb, _uid, dest_display) in live_chunk {
+            for (mid, snap_mb, snap_uid, dest_display) in live_chunk {
                 if cancel.load(std::sync::atomic::Ordering::SeqCst) {
                     break;
                 }
-                // Resolve wire + current location (short lock, no await).
-                let (from_folder, dest_wire) = {
+                // Per-item re-resolution in the journal lock section
+                // (T-30-01): the verb takes ONLY the re-resolved pair.
+                let snap_epoch = epochs.get(&snap_mb).copied().unwrap_or(0);
+                let resolved = {
+                    let guard = store.lock().unwrap();
+                    match batch::resolve_for_move(
+                        guard.conn(),
+                        mid,
+                        &snap_mb,
+                        snap_uid,
+                        snap_epoch,
+                    ) {
+                        Ok(r) => r,
+                        Err(_) => None,
+                    }
+                };
+                let Some(res) = resolved else {
+                    stale_dropped += 1;
+                    done += 1;
+                    continue;
+                };
+                // Resolve wire from the re-resolved folder.
+                let dest_wire = {
                     let guard = store.lock().unwrap();
                     let conn = guard.conn();
-                    let loc = crate::store::queries::message_location(conn, mid).ok().flatten();
                     let cached = crate::store::queries::list_mailboxes(conn).ok().unwrap_or_default();
-                    match loc {
-                        Some((mb, _)) => {
-                            let delim = cached.first().map(|r| r.delimiter.clone()).unwrap_or_default();
-                            (mb, archive::display_to_wire(&dest_display, &delim))
-                        }
-                        None => {
-                            done += 1;
-                            continue;
-                        }
-                    }
+                    let delim = cached.first().map(|r| r.delimiter.clone()).unwrap_or_default();
+                    archive::display_to_wire(&dest_display, &delim)
                 };
                 {
                     let guard = store.lock().unwrap();
                     let _ = batch::journal_intent(
-                        guard.conn(), run_id, mid, &from_folder, &dest_wire,
+                        guard.conn(), run_id, mid, &res.from_folder, &dest_wire,
                         archive::ARCHIVE_LABEL_ID, chunk_no,
                     );
                 }
-                // Current uid may have shifted; re-read location for the verb.
-                let verb_loc = {
-                    let guard = store.lock().unwrap();
-                    crate::store::queries::message_location(guard.conn(), mid).ok().flatten()
-                };
-                if let Some((mb_now, uid_now)) = verb_loc {
+                let (mb_now, uid_now) = (res.from_folder.clone(), res.uid);
+                {
                     if mb_now == dest_wire {
                         let guard = store.lock().unwrap();
                         let _ = batch::journal_moved(guard.conn(), run_id, mid);
@@ -1991,6 +2017,7 @@ pub async fn archive_run(
             "threshold_days": threshold,
             "done": done,
             "moved": moved,
+            "stale_dropped": stale_dropped,
         })
         .to_string();
         {

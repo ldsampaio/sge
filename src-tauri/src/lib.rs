@@ -542,6 +542,8 @@ pub fn run() {
             commands::classify::import_taxonomy,
             commands::classify::export_taxonomy,
             commands::classify::batch_classify,
+            commands::classify::preview_batch,
+            commands::classify::preview_archive,
             commands::classify::cancel_batch,
             commands::classify::batch_report,
             commands::classify::undo_batch,

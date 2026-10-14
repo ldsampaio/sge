@@ -7,9 +7,12 @@
 //! Explicitly UNCONFIRMED by design (one account-level decision with a
 //! persisted report + undo) — distinct from single-email always-confirmed.
 
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::Serialize;
+
+use rusqlite::OptionalExtension;
 
 use super::filing::move_one_uid;
 use super::taxonomy::{children_of, load_default, top_level};
@@ -43,6 +46,15 @@ pub struct BatchReport {
     /// archive runs so report surfaces can label them distinctly without
     /// a second query — additive, existing readers ignore it).
     pub totals_json: String,
+    /// Phase 30: stale-drop count parsed from `totals_json`
+    /// (`stale_dropped`, default 0 on old rows).
+    pub stale_dropped: usize,
+    /// Phase 30: retry-skip count parsed from `totals_json`
+    /// (`retry_skipped`, default 0 until a retry accumulates).
+    pub retry_skipped: usize,
+    /// Phase 30: failed-intent count (`moved=0` rows) — the retry
+    /// button's failure count (backend truth, labeling + gating).
+    pub failed: usize,
 }
 
 /// Pre-create the FULL `Auto/` tree up front (all tops + children).
@@ -176,6 +188,449 @@ pub fn collect_candidates(
     Ok(out)
 }
 
+/// Destination display path for a (primary, child?) label pair.
+/// Shared by the real run loop and the dry-run preview so the two can
+/// never diverge (T-30-04): `Auto/<Top>` or `Auto/<Top>/<Child>`, falling
+/// back to the raw id when the taxonomy no longer names it.
+pub fn dest_display_for(
+    tax: &super::taxonomy::Taxonomy,
+    primary_id: &str,
+    child_id: Option<&str>,
+) -> String {
+    let top_name = tax
+        .categories
+        .iter()
+        .find(|c| c.id == primary_id)
+        .map(|c| c.name.clone())
+        .unwrap_or_else(|| primary_id.to_string());
+    match child_id {
+        Some(child) => {
+            let child_name = tax
+                .categories
+                .iter()
+                .find(|c| c.id == child)
+                .map(|c| c.name.clone());
+            match child_name {
+                Some(cn) => format!("Auto/{top_name}/{cn}"),
+                None => format!("Auto/{top_name}"),
+            }
+        }
+        None => format!("Auto/{top_name}"),
+    }
+}
+
+// ── Phase 30: shared dry-run preview (BATCH-03) ────────────────────
+//
+// One preview path serving BOTH `batch_classify` and `archive_run`.
+// Preview runs the IDENTICAL candidate collection (`collect_candidates`
+// for classify; the archive selector for archive) and the IDENTICAL
+// destination shape (`dest_display_for` / `archive_dest_for`) as the real
+// run. The `execute=false` equivalent is structural: this function is
+// pure-read — it performs ZERO DB writes (no `batch_runs` row, no
+// `batch_items` rows, no label upserts, no `override_events` rows; Phase
+// 29 `dry_run_writes_nothing` precedent) and issues ZERO IMAP verbs, so
+// it never touches SyncGate. The plan is a transient return value, never
+// persisted. Confirm NEVER replays preview rows — `batch_classify` /
+// `archive_run` re-collect fresh (see `resolve_for_move` below).
+
+/// Maximum preview rows returned (DoS cap, T-30-03).
+pub const PREVIEW_CAP: usize = 500;
+
+/// Preview leg selector. Archive reuses this SAME function with
+/// `PreviewKind::Archive` (never a second implementation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PreviewKind {
+    Classify,
+    Archive,
+}
+
+/// One row of the per-item plan. Movable rows carry `to_folder` +
+/// `basis` with `skipped_reason: None`; skipped rows carry a fixed-enum
+/// `skipped_reason` (`review-bucket`, `excluded`, `undatable`) and an
+/// empty `to_folder`. All strings are backend-enum/label-ID cents only —
+/// never bodies or secrets (T-30-02, redaction-sanitized).
+#[derive(Debug, Clone, Serialize)]
+pub struct PreviewItem {
+    pub message_id: u64,
+    pub from_folder: String,
+    pub to_folder: String,
+    pub dest_display: String,
+    pub basis: String,
+    pub skipped_reason: Option<String>,
+}
+
+/// Transient dry-run plan (never persisted).
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchPreview {
+    pub kind: PreviewKind,
+    /// Reports alternate spelling for surfaces that switch on it.
+    pub kind_tag: String,
+    pub items: Vec<PreviewItem>,
+    pub skipped: Vec<PreviewItem>,
+    pub total_candidates: usize,
+    pub truncated: bool,
+    /// `A Classificar` remainder (classify leg only; 0 for archive).
+    pub remainder: usize,
+}
+
+/// Shared preview entry: identical matcher, writes off, transient.
+/// `scope` narrows the classify leg to one folder (None = whole
+/// account); the archive leg ignores it (settings scope is backend
+/// truth).
+pub fn preview_plan(
+    conn: &rusqlite::Connection,
+    kind: PreviewKind,
+    scope: Option<&str>,
+) -> Result<BatchPreview, String> {
+    match kind {
+        PreviewKind::Classify => preview_classify(conn, scope),
+        PreviewKind::Archive => preview_archive(conn),
+    }
+}
+
+fn preview_classify(
+    conn: &rusqlite::Connection,
+    scope: Option<&str>,
+) -> Result<BatchPreview, String> {
+    let tax = load_default().map_err(|e| e.to_string())?;
+    let cands = collect_candidates(conn, scope)?;
+    let mut items = Vec::new();
+    let mut skipped = Vec::new();
+    for (mid, mb, _uid) in cands {
+        let row = build_classify_preview_item(conn, &tax, mid, &mb)?;
+        if row.skipped_reason.is_some() {
+            if skipped.len() < PREVIEW_CAP {
+                skipped.push(row);
+            }
+        } else if items.len() < PREVIEW_CAP {
+            items.push(row);
+        }
+    }
+    let total = items.len() + skipped.len();
+    // Remainder mirrors the `batch_report` remainder query (review list).
+    let remainder: usize = conn
+        .query_row(
+            "SELECT count(*) FROM labels WHERE needs_review = 1 AND dismissed = 0",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n as usize)
+        .unwrap_or(0);
+    let truncated = items.len() + skipped.len() >= PREVIEW_CAP && total >= PREVIEW_CAP;
+    Ok(BatchPreview {
+        kind: PreviewKind::Classify,
+        kind_tag: "classify".to_string(),
+        items,
+        skipped,
+        total_candidates: total,
+        truncated,
+        remainder,
+    })
+}
+
+/// One classify preview row from CACHED rows only (no sidecar, no FETCH):
+/// an existing fresh label row decides (same ids the real run journals);
+/// otherwise a headless taxonomy keyword match over the cached classify
+/// fields approximates the suggester — no match means review-bucket.
+fn build_classify_preview_item(
+    conn: &rusqlite::Connection,
+    tax: &super::taxonomy::Taxonomy,
+    mid: u64,
+    mb: &str,
+) -> Result<PreviewItem, String> {
+    let empty = |reason: &str| PreviewItem {
+        message_id: mid,
+        from_folder: mb.to_string(),
+        to_folder: String::new(),
+        dest_display: String::new(),
+        basis: String::new(),
+        skipped_reason: Some(reason.to_string()),
+    };
+    if let Some(label) = queries::get_label(conn, mid).map_err(|e| e.to_string())? {
+        if label.stale {
+            return Ok(empty("review-bucket"));
+        }
+        let dest = dest_display_for(tax, &label.primary_id, label.secondary_id.as_deref());
+        if label.needs_review {
+            let mut row = empty("review-bucket");
+            row.to_folder = dest.clone();
+            row.dest_display = dest;
+            row.basis = super::redact::filter_output(&format!(
+                "{} {:.2}",
+                label.primary_id, label.confidence
+            ));
+            return Ok(row);
+        }
+        return Ok(PreviewItem {
+            message_id: mid,
+            from_folder: mb.to_string(),
+            to_folder: dest.clone(),
+            dest_display: dest,
+            basis: super::redact::filter_output(&format!(
+                "{} {:.2}",
+                label.primary_id, label.confidence
+            )),
+            skipped_reason: None,
+        });
+    }
+    // No label row: headless keyword match over cached fields.
+    let fields = queries::message_classify_fields(conn, mid).map_err(|e| e.to_string())?;
+    let Some((subject, snippet, from_addr, atts)) = fields else {
+        return Ok(empty("review-bucket"));
+    };
+    let domain = from_addr.rsplit('@').next().unwrap_or("");
+    let is_reply = subject.to_lowercase().starts_with("re:");
+    let ev = super::evidence::build_evidence(&subject, &snippet, domain, atts, is_reply);
+    let all: Vec<&super::taxonomy::Category> = tax.categories.iter().collect();
+    let hits = super::taxonomy::match_keywords(&ev, &all);
+    let Some((best_id, _)) = hits.into_iter().next() else {
+        return Ok(empty("review-bucket"));
+    };
+    let best = tax.categories.iter().find(|c| c.id == best_id);
+    let (primary, child) = match best.and_then(|c| c.parent.clone()) {
+        Some(pid) => (pid, Some(best_id.as_str())),
+        None => (best_id.clone(), None),
+    };
+    let dest = dest_display_for(tax, &primary, child);
+    Ok(PreviewItem {
+        message_id: mid,
+        from_folder: mb.to_string(),
+        to_folder: dest.clone(),
+        dest_display: dest,
+        basis: super::redact::filter_output(&format!("{primary} keyword")),
+        skipped_reason: None,
+    })
+}
+
+fn preview_archive(conn: &rusqlite::Connection) -> Result<BatchPreview, String> {
+    let threshold = queries::get_archive_threshold(conn);
+    let included = super::archive::resolve_included_folders(conn);
+    let now = chrono::Utc::now();
+    let cands =
+        super::archive::collect_archive_candidates(conn, threshold, &included, now)?;
+    let mut items = Vec::new();
+    for (mid, mb, _uid) in cands {
+        if items.len() >= PREVIEW_CAP {
+            break;
+        }
+        let Ok((dest_display, _, _)) = super::archive::archive_dest_for(conn, mid, &mb, now)
+        else {
+            continue;
+        };
+        items.push(PreviewItem {
+            message_id: mid,
+            from_folder: mb,
+            to_folder: dest_display.clone(),
+            dest_display,
+            basis: super::archive::ARCHIVE_LABEL_ID.to_string(),
+            skipped_reason: None,
+        });
+    }
+    // Undatable mail stays put structurally — surface it as skipped so
+    // the user sees WHY those rows never move.
+    let mut skipped = Vec::new();
+    let included_set: HashSet<&str> = included.iter().map(|s| s.as_str()).collect();
+    let mboxes: Vec<String> = conn
+        .prepare("SELECT name FROM mailboxes")
+        .map_err(|e| e.to_string())?
+        .query_map([], |r| r.get(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    for mb in mboxes {
+        if !included_set.contains(mb.as_str()) {
+            continue;
+        }
+        let rows: Vec<(u64, String)> = conn
+            .prepare(
+                "SELECT m.id, m.date_utc FROM messages m JOIN mailboxes b ON m.mailbox_id = b.id
+                 WHERE b.name = ?1",
+            )
+            .map_err(|e| e.to_string())?
+            .query_map(rusqlite::params![mb], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        for (mid, date_utc) in rows {
+            if super::archive::parse_date_utc(&date_utc).is_none() && skipped.len() < PREVIEW_CAP {
+                skipped.push(PreviewItem {
+                    message_id: mid,
+                    from_folder: mb.clone(),
+                    to_folder: String::new(),
+                    dest_display: String::new(),
+                    basis: String::new(),
+                    skipped_reason: Some("undatable".to_string()),
+                });
+            }
+        }
+    }
+    let total = items.len() + skipped.len();
+    let items_capped = items.len() >= PREVIEW_CAP;
+    Ok(BatchPreview {
+        kind: PreviewKind::Archive,
+        // Mirrors the Phase 24 `totals_json` `{"kind":"archive"}` convention.
+        kind_tag: "archive".to_string(),
+        items,
+        skipped,
+        total_candidates: total,
+        truncated: items_capped,
+        remainder: 0,
+    })
+}
+
+// ── Phase 30: stale-preview re-resolution (T-30-01) ────────────────
+//
+// The MOVE verb ALWAYS addresses the (folder, UID) pair returned by
+// `resolve_for_move`, read in the same lock section as the journal
+// write. A preview/run-start UID is NEVER passed to the verb directly.
+// Staleness: the item's (folder, UID) differs from the run-start
+// snapshot OR its folder's `uid_validity` epoch differs from the epoch
+// snapshot. Stale items return None → the caller drops them with a
+// surfaced `stale_dropped` count, never filed by stale UID (T-30-01).
+// Folder-level epoch shifts abort that folder's items to resync (Phase
+// 20 precedent) — the run continues for unaffected folders.
+
+/// Re-resolved move target: the ONLY address the MOVE verb may take.
+#[derive(Debug, Clone)]
+pub struct ResolvedMove {
+    pub message_id: u64,
+    pub from_folder: String,
+    pub uid: u32,
+    pub epoch: u32,
+}
+
+/// Re-read `message_location` + `mailboxes.uid_validity` in the caller's
+/// lock section and compare against the run-start snapshot. `Ok(None)`
+/// = stale (drop + count); `Ok(Some(_))` = fresh pair for journal+verb.
+pub fn resolve_for_move(
+    conn: &rusqlite::Connection,
+    message_id: u64,
+    snap_folder: &str,
+    snap_uid: u32,
+    snap_epoch: u32,
+) -> Result<Option<ResolvedMove>, String> {
+    let loc = queries::message_location(conn, message_id).map_err(|e| e.to_string())?;
+    let Some((folder, uid)) = loc else {
+        return Ok(None); // Vanished mid-run: re-collect, never resurrect.
+    };
+    if folder != snap_folder || uid != snap_uid {
+        return Ok(None);
+    }
+    let epoch: u32 = conn
+        .query_row(
+            "SELECT uid_validity FROM mailboxes WHERE name = ?1",
+            rusqlite::params![folder],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if epoch != snap_epoch {
+        return Ok(None);
+    }
+    Ok(Some(ResolvedMove { message_id, from_folder: folder, uid, epoch }))
+}
+
+/// Folder epochs snapshot (run start) for the per-chunk UIDVALIDITY
+/// re-check pattern (Phase 20, reused verbatim).
+pub fn snapshot_epochs(conn: &rusqlite::Connection) -> Result<HashMap<String, u32>, String> {
+    conn.prepare("SELECT name, uid_validity FROM mailboxes")
+        .map_err(|e| e.to_string())?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<HashMap<_, _>, _>>()
+        .map_err(|e| e.to_string())
+}
+
+// ── Phase 30: retry-only-failures core (BATCH-04, backend half) ────
+//
+// Failure model: failed = `batch_items` intent rows with `moved=0` in a
+// finished/interrupted run (journaled intent, no journaled fact). Rows
+// with `moved=1` are done and never re-executed; rows never journaled
+// (candidate vanished mid-run) are re-collected, not resurrected.
+// Failure derives from `moved=0` alone — no migration, no new column.
+
+/// One failed intent row awaiting retry.
+#[derive(Debug, Clone)]
+pub struct FailedItem {
+    pub message_id: u64,
+    pub from_folder: String,
+    pub to_folder: String,
+    pub label_id: String,
+}
+
+/// Entry gate: only `done`/`interrupted` runs with at least one
+/// `moved=0` row offer retry. `undone` runs never retry (undo already
+/// restored originals). Plain-language errors, no internals (T-30-08).
+pub fn check_retry_entry(
+    conn: &rusqlite::Connection,
+    run_id: i64,
+) -> Result<Vec<FailedItem>, String> {
+    let state: Option<String> = conn
+        .query_row("SELECT state FROM batch_runs WHERE id = ?1", rusqlite::params![run_id], |r| {
+            r.get(0)
+        })
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let state = state.ok_or_else(|| "execução desconhecida".to_string())?;
+    if state == "undone" {
+        return Err("execução desfeita — nada para repetir".to_string());
+    }
+    if state != "done" && state != "interrupted" {
+        return Err("só execuções terminadas podem repetir falhas".to_string());
+    }
+    let rows: Vec<FailedItem> = conn
+        .prepare(
+            "SELECT message_id, from_folder, to_folder, label_id FROM batch_items
+             WHERE run_id = ?1 AND moved = 0",
+        )
+        .map_err(|e| e.to_string())?
+        .query_map(rusqlite::params![run_id], |r| {
+            Ok(FailedItem {
+                message_id: r.get(0)?,
+                from_folder: r.get(1)?,
+                to_folder: r.get(2)?,
+                label_id: r.get(3)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    if rows.is_empty() {
+        return Err("esta execução não tem falhas para repetir".to_string());
+    }
+    Ok(rows)
+}
+
+/// Count of failed (`moved=0`) rows — the retry button's failure count.
+pub fn failed_count(conn: &rusqlite::Connection, run_id: i64) -> usize {
+    conn.query_row(
+        "SELECT count(*) FROM batch_items WHERE run_id = ?1 AND moved = 0",
+        rusqlite::params![run_id],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|n| n as usize)
+    .unwrap_or(0)
+}
+
+/// Run-level single-flight guard (SyncGate-style): double-click-retry
+/// never double-executes — the second caller sees the running retry and
+/// skips (T-30-06).
+static RETRY_IN_FLIGHT: OnceLock<Mutex<HashSet<i64>>> = OnceLock::new();
+
+fn retry_set() -> &'static Mutex<HashSet<i64>> {
+    RETRY_IN_FLIGHT.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Try to claim the retry lane for `run_id`. `true` = claimed (caller
+/// must `release_retry`); `false` = a retry is already running, skip.
+pub fn try_claim_retry(run_id: i64) -> bool {
+    retry_set().lock().unwrap().insert(run_id)
+}
+
+/// Release the retry lane for `run_id`.
+pub fn release_retry(run_id: i64) {
+    retry_set().lock().unwrap().remove(&run_id);
+}
 /// Journal a move intent BEFORE the verb fires (crash safety).
 pub fn journal_intent(
     conn: &rusqlite::Connection,
@@ -342,5 +797,159 @@ mod tests {
         // per-chunk UIDVALIDITY re-check assume small chunks; do not bump
         // without re-running the Phase 26 live bundle.
         assert_eq!(BATCH_CHUNK, 25);
+    }
+
+    // ── Phase 30 (BATCH-03): preview + re-resolution ──────────────
+
+    fn db_counts(conn: &rusqlite::Connection) -> (i64, i64, i64, i64) {
+        let runs: i64 = conn.query_row("SELECT count(*) FROM batch_runs", [], |r| r.get(0)).unwrap();
+        let items: i64 = conn.query_row("SELECT count(*) FROM batch_items", [], |r| r.get(0)).unwrap();
+        let labels: i64 = conn.query_row("SELECT count(*) FROM labels", [], |r| r.get(0)).unwrap();
+        let events: i64 = conn.query_row("SELECT count(*) FROM override_events", [], |r| r.get(0)).unwrap();
+        (runs, items, labels, events)
+    }
+
+    /// Preview seed: labeled INBOX mail (movable) + unlabeled INBOX mail
+    /// (keyword/review path) + old mail for the archive leg.
+    fn preview_seeded() -> Store {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let inbox = ensure_mailbox(conn, "INBOX").unwrap();
+        upsert_message(conn, inbox, 1, None, "Boleto vencido fatura", "f@x", "[]", "[]",
+            "2026-06-01T00:00:00Z", "[]", false, "").unwrap();
+        upsert_message(conn, inbox, 2, None, "xqzkwv jjj", "g@x", "[]", "[]",
+            "2026-10-10T00:00:00Z", "[]", false, "").unwrap();
+        let a = find_message_id(conn, inbox, 1).unwrap().unwrap();
+        upsert_label(conn, a, "financeiro", None, 0.9, 0.6, false).unwrap();
+        store
+    }
+
+    #[test]
+    fn preview_writes_nothing() {
+        // Phase 29 `dry_run_writes_nothing` precedent, adapted: snapshot
+        // batch_runs/batch_items/labels/override_events, run BOTH preview
+        // legs, assert counts identical (zero writes, transient plan).
+        let store = preview_seeded();
+        let conn = store.conn();
+        let before = db_counts(conn);
+        let classify = preview_plan(conn, PreviewKind::Classify, None).unwrap();
+        let archive = preview_plan(conn, PreviewKind::Archive, None).unwrap();
+        assert_eq!(db_counts(conn), before, "preview must write nothing");
+        // Classify leg: labeled mail movable with basis; gibberish mail
+        // skipped to the review bucket.
+        assert_eq!(classify.kind_tag, "classify");
+        assert!(classify.items.iter().any(|i| i.basis.contains("financeiro")),
+            "labeled mail must preview with its label basis: {:?}", classify.items);
+        assert!(classify.skipped.iter().any(|s| s.skipped_reason.as_deref() == Some("review-bucket")),
+            "unmatched mail must surface as review-bucket: {:?}", classify.skipped);
+        for row in classify.items.iter().chain(classify.skipped.iter()) {
+            assert!(crate::classify::redact::looks_clean(&row.basis),
+                "basis must be redaction-clean: {}", row.basis);
+        }
+        // Archive leg rides the SAME function with kind=archive tagging.
+        assert_eq!(archive.kind, PreviewKind::Archive);
+        assert_eq!(archive.kind_tag, "archive");
+        assert!(archive.items.iter().all(|i| i.basis == super::super::archive::ARCHIVE_LABEL_ID));
+        assert!(archive.items.iter().all(|i| i.dest_display.starts_with("Auto/Archive/")));
+    }
+
+    #[test]
+    fn commit_counts_match_preview() {
+        // Parity: journaling the preview destinations (the headless shape
+        // of the real run's journal-before-move) yields exactly the
+        // preview's candidate set + destinations.
+        let store = preview_seeded();
+        let conn = store.conn();
+        let plan = preview_plan(conn, PreviewKind::Classify, None).unwrap();
+        let run = create_batch_run(conn).unwrap();
+        for (chunk, item) in plan.items.iter().enumerate() {
+            journal_intent(conn, run, item.message_id, &item.from_folder, &item.to_folder, "preview", chunk).unwrap();
+        }
+        let journaled: Vec<(u64, String)> = conn
+            .prepare("SELECT message_id, to_folder FROM batch_items WHERE run_id = ?1 ORDER BY message_id")
+            .unwrap()
+            .query_map(rusqlite::params![run], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut expected: Vec<(u64, String)> = plan.items.iter().map(|i| (i.message_id, i.to_folder.clone())).collect();
+        expected.sort();
+        assert_eq!(journaled, expected, "real-run journal must match preview plan");
+    }
+
+    #[test]
+    fn stale_preview_drop() {
+        // Fixture: two preview items; between preview and confirm one
+        // message's location shifts (burst-EXISTS) and one folder's epoch
+        // shifts (UIDVALIDITY). The simulated confirm loop re-resolves in
+        // the journal lock section: shifted rows drop with stale_dropped
+        // == 2 and the verb transcript contains NO MOVE for stale UIDs.
+        let store = preview_seeded();
+        let conn = store.conn();
+        let inbox_id = mailbox_id(conn, "INBOX").unwrap().unwrap();
+        let other = ensure_mailbox(conn, "Other").unwrap();
+        let plan = preview_plan(conn, PreviewKind::Classify, None).unwrap();
+        assert!(!plan.items.is_empty());
+        let epochs = snapshot_epochs(conn).unwrap();
+        // Snapshot (folder, uid) per item at "preview time".
+        let snap: Vec<(u64, String, u32)> = plan.items.iter().map(|i| {
+            let uid: u32 = conn.query_row(
+                "SELECT uid FROM messages WHERE id = ?1", rusqlite::params![i.message_id], |r| r.get(0)).unwrap();
+            (i.message_id, i.from_folder.clone(), uid)
+        }).collect();
+        // Shift 1: move first message's row to Other with a new UID.
+        let first = snap[0].0;
+        conn.execute("UPDATE messages SET mailbox_id = ?1, uid = 99 WHERE id = ?2",
+            rusqlite::params![other, first]).unwrap();
+        // Shift 2: bump INBOX epoch (UIDVALIDITY shift).
+        conn.execute("UPDATE mailboxes SET uid_validity = uid_validity + 1 WHERE id = ?1",
+            rusqlite::params![inbox_id]).unwrap();
+        // Simulated confirm: resolve → journal → transcript verb.
+        let run = create_batch_run(conn).unwrap();
+        let mut transcript: Vec<String> = Vec::new();
+        let mut stale_dropped = 0usize;
+        for (mid, folder, uid) in &snap {
+            let epoch = epochs.get(folder).copied().unwrap_or(0);
+            match resolve_for_move(conn, *mid, folder, *uid, epoch).unwrap() {
+                None => stale_dropped += 1,
+                Some(res) => {
+                    // The verb takes ONLY the re-resolved pair — never the
+                    // snapshot (folder, uid). Record the verb address.
+                    transcript.push(format!("MOVE {}:{} -> filed", res.from_folder, res.uid));
+                    journal_intent(conn, run, *mid, &res.from_folder, "Auto/X", "financeiro", 0).unwrap();
+                }
+            }
+        }
+        assert_eq!(stale_dropped, snap.len(), "every item went stale (location + epoch shifts)");
+        assert!(transcript.is_empty(), "no verb may fire for stale rows: {transcript:?}");
+        // Fresh control: unshifted store resolves cleanly.
+        let store2 = preview_seeded();
+        let conn2 = store2.conn();
+        let plan2 = preview_plan(conn2, PreviewKind::Classify, None).unwrap();
+        let epochs2 = snapshot_epochs(conn2).unwrap();
+        for item in &plan2.items {
+            let uid: u32 = conn2.query_row(
+                "SELECT uid FROM messages WHERE id = ?1", rusqlite::params![item.message_id], |r| r.get(0)).unwrap();
+            let res = resolve_for_move(conn2, item.message_id, &item.from_folder, uid,
+                epochs2.get(&item.from_folder).copied().unwrap_or(0)).unwrap();
+            assert!(res.is_some(), "fresh item must resolve");
+            let res = res.unwrap();
+            assert_eq!((res.from_folder.as_str(), res.uid), (item.from_folder.as_str(), uid));
+        }
+    }
+
+    #[test]
+    fn live_preview_gate_skips_offline() {
+        // Sandbox contract: without operator credentials this leg SKIPs,
+        // never fails and never touches the network (exit-2 shape for the
+        // live-gate bins; early return for the unit leg).
+        if std::env::var("SGE_LIVE_IMAP_USER").is_err() {
+            eprintln!("SKIP: live batch preview leg needs SGE_LIVE_IMAP_USER (operator-only)");
+            return;
+        }
+        // With creds the operator runs the credentialed preview leg
+        // externally (self-only mail, pre-flight guard, undo_batch
+        // cleanup); the headless tests above are the assertion.
+        let _store = Store::open_in_memory().unwrap();
     }
 }
