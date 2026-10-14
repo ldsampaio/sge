@@ -4,12 +4,12 @@ milestone: v1.5
 milestone_name: Live Validation + Compose Hardening + Deferred Features
 current_phase: 32
 current_phase_name: Compose Hardening
-status: complete
-stopped_at: Phase 32 complete; v1.5 milestone ready for audit (Phase 33 deferred permanently)
-last_updated: "2026-10-14T11:00:00.000Z"
+status: shipped
+stopped_at: v1.5 milestone shipped — PR #2 created; all 6 phases (27-32) complete; Phase 33 deferred permanently
+last_updated: "2026-10-14T12:00:00.000Z"
 last_activity: 2026-10-14
-last_activity_desc: Phase 32 executed; Phase 33 deferred permanently — server has no ManageSieve; client-side org via Phases 25/31/30
-state_head: 617cb53efcb931a99129d0fa5909219cd1400019
+last_activity_desc: v1.5 milestone shipped — PR #2 (feat/v1.5-milestone-complete); 13 plans, 596 tests green; Phase 33 deferred permanently
+state_head: 33a4fa5c
 progress:
   total_phases: 6
   completed_phases: 6
