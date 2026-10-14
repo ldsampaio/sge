@@ -2,20 +2,20 @@
 gsd_state_version: "1.0"
 milestone: v1.5
 milestone_name: Live Validation + Compose Hardening + Deferred Features
-current_phase: 30
-current_phase_name: Batch Trust Pair
+current_phase: 31
+current_phase_name: Sieve Export + History + Learning v1 + Auto-Confirm
 status: planning
-stopped_at: Phase 29 complete, ready to plan Phase 30
-last_updated: "2026-10-14T05:37:11.632Z"
+stopped_at: Phase 30 complete, ready to plan Phase 31
+last_updated: "2026-10-14T05:50:57.025Z"
 last_activity: 2026-10-14
-last_activity_desc: Phase 29 complete (3/3 plans, verified 11/11, review 11/11 fixed), transitioned to Phase 30
-state_head: d27cf6ff6ab34f52109936ba2a9069c1b69845c7
+last_activity_desc: Phase 30 complete, transitioned to Phase 31
+state_head: 617cb53efcb931a99129d0fa5909219cd1400019
 progress:
   total_phases: 7
-  completed_phases: 3
-  total_plans: 7
-  completed_plans: 7
-  percent: 43
+  completed_phases: 4
+  total_plans: 9
+  completed_plans: 9
+  percent: 57
 ---
 
 ---
@@ -26,7 +26,7 @@ progress:
 See: .planning/PROJECT.md (updated 2026-10-13 — Milestone v1.5 defined)
 
 **Core value:** Connect to an IMAP server on Linux and read your mail locally in a fast Gmail-like UI.
-**Current focus:** v1.5 roadmap (Phases 27–29 complete) — next: discuss/plan Phase 30
+**Current focus:** v1.5 roadmap (Phases 27–30 complete) — next: discuss/plan Phase 31
 
 ## Milestone Status
 
@@ -39,10 +39,10 @@ See: .planning/PROJECT.md (updated 2026-10-13 — Milestone v1.5 defined)
 
 ## Current Position
 
-Phase: 30 (Batch Trust Pair — next to discuss/plan)
+Phase: 31 (Sieve Export + History + Learning v1 + Auto-Confirm — next to discuss/plan)
 Plan: Not started
-Status: Phase 29 complete (3/3 plans, verified 11/11, review 11/11 fixed), ready to plan Phase 30
-Last activity: 2026-10-14 — Phase 29 executed (rules_io + IdleWatcher + RulesPanel UI; 425 lib tests green)
+Status: Phase 30 complete (2/2 plans, verified 7/7), code review running, ready to plan Phase 31
+Last activity: 2026-10-14 — Phase 30 executed (preview_batch/archive + retry_failed + BatchPreviewTable UI; 434 lib tests green)
 
 ## Performance Metrics
 
@@ -61,7 +61,7 @@ Last activity: 2026-10-14 — Phase 29 executed (rules_io + IdleWatcher + RulesP
 | 27. Live-Validation Gate + Capability Probes | 2/2 | ✅ Complete (verified 9/9) |
 | 28. Override-Event Log + CONDSTORE Fast Path | 2/2 | ✅ Complete (verified) |
 | 29. Rule Import/Export + IDLE Watcher | 3/3 | ✅ Complete (verified 11/11, review 11/11 fixed, 425 lib green) |
-| 30. Batch Trust Pair | 0/? | Not started |
+| 30. Batch Trust Pair | 2/2 | ✅ Complete (verified 7/7; review pending) |
 | 31. Sieve Export + History + Learning v1 + Auto-Confirm | 0/? | Not started |
 | 32. Compose Hardening | 0/? | Not started (parallelizable after Phase 27) |
 | 33. ManageSieve Upload (conditional) | 0/? | Not started (only if Phase 27 probe succeeds) |
@@ -84,7 +84,7 @@ Decisions are logged in PROJECT.md Key Decisions table. v1.5 structural decision
 
 ### Pending Todos
 
-- v1.5 Phases 27-29 complete — next agent action: `/gsd-discuss-phase 30` (batch trust pair: dry-run preview + retry-only-failures)
+- v1.5 Phases 27-30 complete — next agent action: `/gsd-discuss-phase 31` (sieve export + history + learning v1 + auto-confirm)
 - Validate live when convenient: `/gsd-verify-work 6/7/8` (v1.1) + `/gsd-verify-work 12/13` (v1.2) — folded into Phase 27 scope, now in UAT-27.md deferred ledger
 
 ### Blockers/Concerns
@@ -112,7 +112,7 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-**Stopped at:** Phase 29 complete (3/3 plans, verified 11/11, review 11/11 fixed) — next: `/gsd-discuss-phase 30` then `/gsd-plan-phase 30` (2026-10-14)
+**Stopped at:** Phase 30 complete (2/2 plans, verified 7/7) — review running, next: `/gsd-discuss-phase 31` then `/gsd-plan-phase 31` (2026-10-14)
 
 **Operator repairs 2026-10-13 (autonomous run pre-flight):**
 

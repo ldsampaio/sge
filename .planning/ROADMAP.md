@@ -48,7 +48,7 @@ Decimal phases appear between their surrounding integers in numeric order. v1.2 
 - [x] **Phase 27: Live-Validation Gate + Capability Probes** - Real-creds live-21/22/26 runs, draft-send gap closure, Node 20+ bundle, human UAT, protocol probes (completed 2026-10-13)
 - [x] **Phase 28: Override-Event Log + CONDSTORE Fast Path** - Headless sync core: telemetry log + MODSEQ-delta resync (completed 2026-10-13)
 - [x] **Phase 29: Rule Import/Export + IDLE Watcher** - Versioned rule JSON portability + INBOX push over a manager-owned watcher (completed 2026-10-14)
-- [ ] **Phase 30: Batch Trust Pair** - Dry-run preview + retry-only-failures over a per-item run record
+- [x] **Phase 30: Batch Trust Pair** - Dry-run preview + retry-only-failures over a per-item run record (completed 2026-10-14)
 - [ ] **Phase 31: Sieve Export + History + Learning v1 + Auto-Confirm** - Feedback loop ships with its governor as one unit
 - [ ] **Phase 32: Compose Hardening** - Send/drafts/reply/reply-all verified end-to-end over v1.2 pipelines (parallelizable after Phase 27)
 - [ ] **Phase 33 (conditional): ManageSieve Upload** - Server-side rule upload only if the port-4190 probe succeeds; otherwise export-only stands
@@ -311,8 +311,9 @@ Decimal phases appear between their surrounding integers in numeric order. v1.2 
 
 **Plans**: 2 plans
 
-- [ ] 30-01-PLAN.md — shared dry-run preview core (preview_batch/preview_archive, writes off) + stale-preview re-resolution in confirm path (BATCH-03 backend)
-- [ ] 30-02-PLAN.md — retry-only-failures on same run_id with stress tests + BatchPanel/ArchivePanel preview + retry UI (BATCH-04 + surfaces)
+- [x] 30-01-PLAN.md — shared dry-run preview core (preview_batch/preview_archive, writes off) + stale-preview re-resolution in confirm path (BATCH-03 backend)
+- [x] 30-02-PLAN.md — retry-only-failures on same run_id with stress tests + BatchPanel/ArchivePanel preview + retry UI (BATCH-04 + surfaces)
+
 **UI hint**: yes
 
 ### Phase 31: Sieve Export + History + Learning v1 + Auto-Confirm
@@ -397,7 +398,7 @@ Decimal phases appear between their surrounding integers in numeric order. v1.2 
 | 27. Live-Validation Gate + Capability Probes | v1.5 | 2/2 | Complete (verified 9/9) | 2026-10-13 |
 | 28. Override-Event Log + CONDSTORE Fast Path | v1.5 | 2/2 | Complete (verified) | 2026-10-13 |
 | 29. Rule Import/Export + IDLE Watcher | v1.5 | 3/3 | Complete (425 lib green, verified 11/11, review 11/11 fixed) | 2026-10-14 |
-| 30. Batch Trust Pair | v1.5 | 0/? | Not started | - |
+| 30. Batch Trust Pair | v1.5 | 2/2 | Complete (434 lib green, verified 7/7) | 2026-10-14 |
 | 31. Sieve Export + History + Learning v1 + Auto-Confirm | v1.5 | 0/? | Not started | - |
 | 32. Compose Hardening | v1.5 | 0/? | Not started (parallelizable after Phase 27) | - |
 | 33. ManageSieve Upload (conditional) | v1.5 | 0/? | Not started (only if Phase 27 port-4190 probe succeeds) | - |

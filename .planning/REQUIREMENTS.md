@@ -29,8 +29,8 @@
 
 ### Batch Trust (one run record)
 
-- [ ] **BATCH-03**: User can dry-run a batch/archive operation and review the per-item plan with writes off
-- [ ] **BATCH-04**: User can retry only the failed items of a batch run with writes re-on for failures
+- [x] **BATCH-03**: User can dry-run a batch/archive operation and review the per-item plan with writes off
+- [x] **BATCH-04**: User can retry only the failed items of a batch run with writes re-on for failures
 
 ### Sieve Export (upload probe-gated)
 
@@ -76,8 +76,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 | SYNC-01 | Phase 28 | Pending |
 | IMP-01 | Phase 29 | Complete |
 | IDLE-01 | Phase 29 | Complete |
-| BATCH-03 | Phase 30 | Pending |
-| BATCH-04 | Phase 30 | Pending |
+| BATCH-03 | Phase 30 | Complete |
+| BATCH-04 | Phase 30 | Complete |
 | SIEVE-01 | Phase 31 | Pending |
 | HIST-01 | Phase 31 | Pending |
 | LEARN-01 | Phase 31 | Pending |
