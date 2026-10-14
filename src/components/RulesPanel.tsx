@@ -85,6 +85,33 @@ export function RulesPanel({ onClose }: RulesPanelProps) {
   const [lastRun, setLastRun] = React.useState<number | null>(null);
   const [thinResult, setThinResult] = React.useState<string | null>(null);
   /** Phase 29: import validation preview (null = no import in flight). */
+  const [sieveText, setSieveText] = React.useState<string | null>(null);
+  const [sieveWarnings, setSieveWarnings] = React.useState<number | null>(null);
+  const [exportBusy, setExportBusy] = React.useState(false);
+  /** Phase 31 Export-Sieve (SIEVE-01): preview + copy + Blob download. */
+  const exportSieve = async () => {
+    setExportBusy(true);
+    try {
+      const res = (await invoke("export_sieve_text")) as { text: string; warnings_count: number };
+      setSieveText(res.text);
+      setSieveWarnings(res.warnings_count);
+    } catch (e) {
+      setMessage(`Falha export Sieve: ${e}`);
+    } finally {
+      setExportBusy(false);
+    }
+  };
+  const copySieve = () => {
+    if (!sieveText) return;
+    navigator.clipboard.writeText(sieveText).catch(() => {});
+  };
+  const downloadSieve = () => {
+    if (!sieveText) return;
+    const blob = new Blob([sieveText], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "rules.sieve"; a.click(); URL.revokeObjectURL(url);
+  };
   const [preview, setPreview] = React.useState<ImportPreview | null>(null);
   const [portBusy, setPortBusy] = React.useState(false);
   const fileRef = React.useRef<HTMLInputElement | null>(null);
@@ -491,6 +518,28 @@ export function RulesPanel({ onClose }: RulesPanelProps) {
               if (f) void onFilePicked(f);
             }}
           />
+        </div>
+        {/* Phase 31 Export-Sieve (SIEVE-01) section */}
+        <div style={{ marginTop: 8, borderTop: "1px dashed #334", paddingTop: 6 }}>
+          <b>Exportar Sieve (.sieve)</b> &nbsp;
+          <button type="button" className="btn btn-small" disabled={exportBusy} onClick={() => void exportSieve()}>Preview/.sieve</button>
+          {sieveText !== null && (
+            <>
+              <button type="button" className="btn btn-small" onClick={copySieve}>Copiar</button>
+              <button type="button" className="btn btn-small" onClick={downloadSieve}>Baixar .sieve</button>
+              <span style={{ marginLeft: 6, fontSize: "0.85rem", color: "#c7d2fe" }}>
+                avisos={sieveWarnings ?? "-"}
+              </span>
+            </>
+          )}
+          {sieveText && (
+            <pre style={{ fontSize: "0.78rem", background: "#0b1220", maxHeight: 160, overflow: "auto", marginTop: 4, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+              {sieveText}
+            </pre>
+          )}
+          <p style={{ fontSize: "0.75rem", color: "#8896ab", margin: 2 }}>
+            Preview filtrado; download via Blob (sem escrita no backend). Sem novos deps.
+          </p>
         </div>
         {thinResult && (
           <p style={{ color: "#94a3b8", fontSize: "0.85rem" }}>{thinResult}</p>
