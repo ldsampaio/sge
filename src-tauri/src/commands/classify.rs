@@ -2117,6 +2117,8 @@ pub async fn create_rule(
         },
         scope_json: serde_json::to_string(&scope.folders).map_err(|e| e.to_string())?,
         enabled: true,
+        rule_version: 1,
+        rule_etag: None,
     };
     crate::store::queries::insert_rule(conn, &row).map_err(|e| e.to_string())?;
     rule_view(&row)
@@ -2165,6 +2167,8 @@ pub async fn update_rule(
         },
         scope_json: serde_json::to_string(&scope.folders).map_err(|e| e.to_string())?,
         enabled,
+        rule_version: existing.rule_version,
+        rule_etag: existing.rule_etag.clone(),
     };
     crate::store::queries::update_rule(conn, &row).map_err(|e| e.to_string())?;
     rule_view(&row)
@@ -2202,6 +2206,31 @@ pub async fn set_rule_priority(
     let guard = state.store.lock().unwrap();
     crate::store::queries::set_rule_priority(guard.conn(), &id, priority)
         .map_err(|e| e.to_string())
+}
+
+// ── Phase 29: rule portability commands (IMP-01) ─────────────────────
+//
+// `export_rules` serializes every `folder_rules` row as versioned JSON
+// (rule metadata only — no message content, no credentials).
+// `import_rules` validates server-side and either previews (`commit =
+// false` — the RulesPanel validation modal) or upserts (`commit = true`).
+// The frontend NEVER validates: the preview renders the backend's
+// `ImportResult` verbatim (T-29-09).
+
+/// Export all rules as versioned JSON (IMP-01).
+#[tauri::command]
+pub async fn export_rules(state: State<'_, AppState>) -> Result<String, String> {
+    crate::classify::rules_io::export_rules(&state.store)
+}
+
+/// Validate (dry run) or commit (upsert) a rules JSON envelope (IMP-01).
+#[tauri::command]
+pub async fn import_rules(
+    state: State<'_, AppState>,
+    json: String,
+    commit: bool,
+) -> Result<crate::classify::rules_io::ImportResult, String> {
+    crate::classify::rules_io::import_rules(&state.store, &json, commit)
 }
 
 // ── Phase 25: at-sync hook + apply_rules through confirm_suggestion ──
@@ -2633,6 +2662,8 @@ mod rule_apply_tests {
                 destination: "Arquivo".to_string(),
                 scope_json: "[]".to_string(),
                 enabled,
+                rule_version: 1,
+                rule_etag: None,
             },
         )
         .unwrap();
@@ -2711,6 +2742,8 @@ mod rule_apply_tests {
                 destination: "Arquivo".to_string(),
                 scope_json: r#"["Sent"]"#.to_string(),
                 enabled: true,
+                rule_version: 1,
+                rule_etag: None,
             },
         )
         .unwrap();
@@ -2825,6 +2858,8 @@ mod rule_conflict_tests {
                 destination: destination.to_string(),
                 scope_json: "[]".to_string(),
                 enabled: true,
+                rule_version: 1,
+                rule_etag: None,
             },
         )
         .unwrap();
@@ -3026,6 +3061,8 @@ mod rule_evolv_tests {
                 destination: dest.to_string(),
                 scope_json: "[]".to_string(),
                 enabled: true,
+                rule_version: 1,
+                rule_etag: None,
             },
         )
         .unwrap();
@@ -3448,6 +3485,8 @@ mod rule_bulk_tests {
                 destination: "Arquivo".to_string(),
                 scope_json: "[]".to_string(),
                 enabled: true,
+                rule_version: 1,
+                rule_etag: None,
             },
         )
         .unwrap();

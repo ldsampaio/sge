@@ -16,7 +16,7 @@ pub mod queries;
 pub const BODY_CACHE_CAP_BYTES: usize = 262144;
 
 /// Schema version managed by rusqlite_migration.
-pub const SCHEMA_VERSION: u32 = 12;
+pub const SCHEMA_VERSION: u32 = 13;
 
 // v1 = full schema.sql (canonical DDL from ARCHITECTURE.md)
 // M2 = flag_outbox durable queue (Phase 6, Plan 06-01). The schema.sql v1
@@ -100,6 +100,7 @@ impl Store {
             M::up(M18_FILTERS_SQL),
             M::up(M19_RULES_SQL),
             M::up(M20_OVERRIDE_EVENTS_SQL),
+            M::up(M21_RULE_VERSION_SQL),
         ]);
         migrations.to_latest(conn)?;
         Ok(())
@@ -700,6 +701,20 @@ const M20_OVERRIDE_EVENTS_SQL: &str = concat!(
     "CREATE INDEX idx_override_events_msg_ts ON override_events(message_id, ts);",
 );
 
+/// M21 forward migration: rule portability columns (Phase 29, IMP-01).
+///
+/// `rule_version` bumps on every import-driven update of an existing
+/// `folder_rules` row (conflict resolution: same id → update, version++),
+/// so a re-import of an exported file is observable and a future Sieve
+/// export (Phase 31) can detect drift. `rule_etag` is reserved for
+/// optimistic locking (unused in M1 — always NULL on write paths that do
+/// not opt in). Both columns default so pre-M21 rows upgrade in place
+/// with `rule_version = 1` (see `m21_adds_rule_version_preserving_rows`).
+const M21_RULE_VERSION_SQL: &str = concat!(
+    "ALTER TABLE folder_rules ADD COLUMN rule_version INTEGER NOT NULL DEFAULT 1;",
+    "ALTER TABLE folder_rules ADD COLUMN rule_etag TEXT;",
+);
+
 /// Returns the app-data attachment directory for a given mailbox UID.
 ///
 /// Files live under `<app_data>/attachments/<uid_validity>/<uid>/` —
@@ -788,8 +803,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_12_with_m20_override_events() {
-        assert_eq!(SCHEMA_VERSION, 12);
+    fn schema_version_is_13_with_m21_rule_version() {
+        assert_eq!(SCHEMA_VERSION, 13);
         let store = Store::open_in_memory().expect("migration should succeed");
         let conn = store.conn();
         let count: i64 = conn
@@ -1807,5 +1822,72 @@ mod m18_tests {
             )
             .unwrap();
         assert_eq!(back, "Arquivo");
+    }
+
+    #[test]
+    fn m21_adds_rule_version_preserving_rows() {
+        // Simulate a v20 database (through M20, as shipped after Phase 28).
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        Migrations::new(vec![
+            M::up(include_str!("schema.sql")),
+            M::up(M2_FLAG_OUTBOX_SQL),
+            M::up(M3_UNSEEN_COUNT_SQL),
+            M::up(M4_BACKFILL_SQL),
+            M::up(M5_STATUS_TS_SQL),
+            M::up(M6_DELIMITER_SQL),
+            M::up(M7_IMAP_OUTBOX_SQL),
+            M::up(M8_ROLES_SQL),
+            M::up(M9_DRAFTS_SQL),
+            M::up(M10_SEND_QUEUE_SQL),
+            M::up(M11_SENT_UNFILED_SQL),
+            M::up(M12_CLASSIFY_SQL),
+            M::up(M13_EXCLUSIONS_SQL),
+            M::up(M14_REVIEW_SETTINGS_SQL),
+            M::up(M15_DISMISSED_SQL),
+            M::up(M16_BATCH_ITEMS_SQL),
+            M::up(M17_FTS_BODY_SQL),
+            M::up(M18_FILTERS_SQL),
+            M::up(M19_RULES_SQL),
+            M::up(M20_OVERRIDE_EVENTS_SQL),
+        ])
+        .to_latest(&mut conn)
+        .unwrap();
+        // Seed a pre-M21 rule row (no rule_version / rule_etag columns yet).
+        conn.execute(
+            "INSERT INTO folder_rules (id, name, priority, conditions_json, dest_kind, destination, scope_json, enabled) \
+             VALUES ('r-legacy', 'Legada', 50, '{\"sender_domain\":\"x.com\"}', 'folder', 'Arquivo', '[]', 1)",
+            [],
+        )
+        .unwrap();
+
+        // Forward-upgrade with the production set — only M21 applies.
+        Store::apply_migrations(&mut conn).unwrap();
+
+        // Legacy row survives with rule_version = 1 and NULL etag.
+        let (version, etag): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT rule_version, rule_etag FROM folder_rules WHERE id = 'r-legacy'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(version, 1, "pre-M21 rows upgrade with rule_version = 1");
+        assert_eq!(etag, None, "pre-M21 rows upgrade with NULL rule_etag");
+        // New writes accept explicit versions.
+        conn.execute(
+            "INSERT INTO folder_rules (id, name, priority, conditions_json, dest_kind, destination, rule_version) \
+             VALUES ('r-new', 'Nova', 10, '{}', 'folder', 'Arquivo', 3)",
+            [],
+        )
+        .unwrap();
+        let back: i64 = conn
+            .query_row(
+                "SELECT rule_version FROM folder_rules WHERE id = 'r-new'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(back, 3);
     }
 }

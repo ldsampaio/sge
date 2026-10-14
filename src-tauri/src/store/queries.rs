@@ -2601,6 +2601,11 @@ pub struct RuleRow {
     pub destination: String,
     pub scope_json: String,
     pub enabled: bool,
+    /// Import generation counter (M21): bumped on every import-driven
+    /// update of an existing row. UI edits keep the value untouched.
+    pub rule_version: i64,
+    /// Reserved for optimistic locking (M21, always None in M1).
+    pub rule_etag: Option<String>,
 }
 
 fn rule_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RuleRow> {
@@ -2613,18 +2618,21 @@ fn rule_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RuleRow> {
         destination: r.get(5)?,
         scope_json: r.get(6)?,
         enabled: r.get::<_, i64>(7)? != 0,
+        rule_version: r.get(8)?,
+        rule_etag: r.get(9)?,
     })
 }
 
-const RULE_COLS: &str = "id, name, priority, conditions_json, dest_kind, destination, scope_json, enabled";
+const RULE_COLS: &str = "id, name, priority, conditions_json, dest_kind, destination, scope_json, enabled, rule_version, rule_etag";
 
 pub fn insert_rule(conn: &Connection, row: &RuleRow) -> StoreResult<()> {
     conn.execute(
-        "INSERT INTO folder_rules (id, name, priority, conditions_json, dest_kind, destination, scope_json, enabled) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO folder_rules (id, name, priority, conditions_json, dest_kind, destination, scope_json, enabled, rule_version, rule_etag) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         rusqlite::params![
             row.id, row.name, row.priority, row.conditions_json,
             row.dest_kind, row.destination, row.scope_json, row.enabled as i64,
+            row.rule_version, row.rule_etag,
         ],
     )?;
     Ok(())
@@ -2655,10 +2663,12 @@ pub fn update_rule(conn: &Connection, row: &RuleRow) -> StoreResult<()> {
     conn.execute(
         "UPDATE folder_rules SET name = ?2, priority = ?3, conditions_json = ?4, \
          dest_kind = ?5, destination = ?6, scope_json = ?7, enabled = ?8, \
+         rule_version = ?9, rule_etag = ?10, \
          updated_at = datetime('now') WHERE id = ?1",
         rusqlite::params![
             row.id, row.name, row.priority, row.conditions_json,
             row.dest_kind, row.destination, row.scope_json, row.enabled as i64,
+            row.rule_version, row.rule_etag,
         ],
     )?;
     Ok(())
@@ -2669,6 +2679,71 @@ pub fn update_rule(conn: &Connection, row: &RuleRow) -> StoreResult<()> {
 pub fn delete_rule(conn: &Connection, id: &str) -> StoreResult<usize> {
     let n = conn.execute("DELETE FROM folder_rules WHERE id = ?1", rusqlite::params![id])?;
     Ok(n)
+}
+
+/// All rules in export order (same deterministic order as evaluation:
+/// priority ASC, oldest first). Feeds `export_rules` (IMP-01).
+pub fn export_all_rules(conn: &Connection) -> StoreResult<Vec<RuleRow>> {
+    list_rules(conn)
+}
+
+/// Every `(id, name)` pair for import duplicate-name detection (IMP-01).
+/// Parameterized read; names compared case-sensitively by the caller after
+/// trim (matching `validate_rule`'s case-insensitive uniqueness via
+/// `lower()` at the call site when needed).
+pub fn get_all_rule_names(conn: &Connection) -> StoreResult<Vec<(String, String)>> {
+    conn.prepare("SELECT id, name FROM folder_rules")?
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(super::StoreError::Sql)
+}
+
+/// Import upsert (IMP-01): insert when `id` is new, else overwrite the row
+/// and bump `rule_version` (old + 1). Returns `true` when an existing row
+/// was updated. All values ride bound parameters — never interpolated.
+pub fn upsert_rule_import(conn: &Connection, row: &RuleRow) -> StoreResult<bool> {
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT rule_version FROM folder_rules WHERE id = ?1",
+            rusqlite::params![row.id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(super::StoreError::Sql)?;
+    match existing {
+        None => {
+            let mut fresh = RuleRow {
+                id: row.id.clone(),
+                name: row.name.clone(),
+                priority: row.priority,
+                conditions_json: row.conditions_json.clone(),
+                dest_kind: row.dest_kind.clone(),
+                destination: row.destination.clone(),
+                scope_json: row.scope_json.clone(),
+                enabled: row.enabled,
+                rule_version: 1,
+                rule_etag: None,
+            };
+            insert_rule(conn, &fresh)?;
+            Ok(false)
+        }
+        Some(old) => {
+            let mut updated = RuleRow {
+                id: row.id.clone(),
+                name: row.name.clone(),
+                priority: row.priority,
+                conditions_json: row.conditions_json.clone(),
+                dest_kind: row.dest_kind.clone(),
+                destination: row.destination.clone(),
+                scope_json: row.scope_json.clone(),
+                enabled: row.enabled,
+                rule_version: old + 1,
+                rule_etag: None,
+            };
+            update_rule(conn, &updated)?;
+            Ok(true)
+        }
+    }
 }
 
 pub fn set_rule_enabled(conn: &Connection, id: &str, enabled: bool) -> StoreResult<()> {
