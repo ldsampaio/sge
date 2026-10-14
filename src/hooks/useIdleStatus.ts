@@ -93,7 +93,8 @@ export function useIdleStatus() {
       .then(() => {
         if (alive) void fetch();
       });
-    void fetch();
+    // IN-02: single fetch — the standalone `void fetch()` here used to fire
+    // a second identical backend round-trip on every mount.
     const timer = window.setInterval(() => {
       if (!alive) return;
       // Backoff awareness: poll faster while reconnecting.
