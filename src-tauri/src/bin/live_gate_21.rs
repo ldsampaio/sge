@@ -36,13 +36,13 @@ use std::sync::{
 };
 
 use sge_lib::creds::{CredentialStore, KeyringStore, SavedCredentials, ServerConfig};
+use sge_lib::drafts::new_message_id;
 use sge_lib::imap::headers::MessageHeader;
 use sge_lib::imap::manager::SessionManager;
 use sge_lib::imap::{
     normalize_host, AccountConfig, MailboxInfo, MailboxStatus, MailboxSummary, PinBox,
     SecurityMode, SyncError, SyncSession,
 };
-use sge_lib::drafts::new_message_id;
 use sge_lib::send_queue::{self, EnqueueInput, SendGate};
 use sge_lib::smtp::{SmtpAccount, SmtpOutcome, SmtpTransport, SmtpTransporter};
 use sge_lib::store::{queries, Store};
@@ -406,7 +406,9 @@ impl SyncSession for GateSession<'_> {
             if blocked {
                 return Err(gate_err("condstore_fetch_changedsince"));
             }
-            self.inner.condstore_fetch_changedsince(&range, modseq).await
+            self.inner
+                .condstore_fetch_changedsince(&range, modseq)
+                .await
         })
     }
 }
@@ -425,12 +427,24 @@ pub struct CountingTransport {
 impl CountingTransport {
     pub fn live(inner: Arc<dyn SmtpTransport>) -> (Self, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
-        (Self { inner: Some(inner), calls: calls.clone() }, calls)
+        (
+            Self {
+                inner: Some(inner),
+                calls: calls.clone(),
+            },
+            calls,
+        )
     }
 
     pub fn offline() -> (Self, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
-        (Self { inner: None, calls: calls.clone() }, calls)
+        (
+            Self {
+                inner: None,
+                calls: calls.clone(),
+            },
+            calls,
+        )
     }
 
     pub fn calls(&self) -> usize {
@@ -479,7 +493,8 @@ impl SmtpTransport for SharedCountingTransport {
         bytes: &[u8],
     ) -> SmtpOutcome {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        self.inner.send_raw(account, envelope_from, envelope_to, bytes)
+        self.inner
+            .send_raw(account, envelope_from, envelope_to, bytes)
     }
 }
 
@@ -528,7 +543,8 @@ impl SmtpTransport for TimeoutTransport {
             };
         }
         self.inner_calls.fetch_add(1, Ordering::SeqCst);
-        self.inner.send_raw(account, envelope_from, envelope_to, bytes)
+        self.inner
+            .send_raw(account, envelope_from, envelope_to, bytes)
     }
 }
 
@@ -609,8 +625,12 @@ pub fn expected_calls_delta(leg: &str) -> Option<usize> {
     match leg {
         "arrival" | "no-duplicate" | "sent-unfiled" | "offline-flush" | "draft-send"
         | "crash-final-flush" => Some(1),
-        "sent-unfiled-reflush" | "uncertain-armed-flush" | "uncertain-reconcile"
-        | "crash-triage-flush" | "crash-reconcile" | "crash-backoff-poll" => Some(0),
+        "sent-unfiled-reflush"
+        | "uncertain-armed-flush"
+        | "uncertain-reconcile"
+        | "crash-triage-flush"
+        | "crash-reconcile"
+        | "crash-backoff-poll" => Some(0),
         _ => None,
     }
 }
@@ -621,9 +641,7 @@ pub fn expected_calls_delta(leg: &str) -> Option<usize> {
 // artifact matched, never the secret itself.
 
 pub fn scan_text_has_secret(text: &str, secrets: &[&str]) -> bool {
-    secrets
-        .iter()
-        .any(|s| !s.is_empty() && text.contains(s))
+    secrets.iter().any(|s| !s.is_empty() && text.contains(s))
 }
 
 /// Full SQLite dump for the secret scan (D-13, T-21-04): renders EVERY
@@ -714,9 +732,15 @@ pub fn deferred_backoff_ok(
         }
     }
     if bad.is_empty() {
-        (true, format!("{} deferred row(s) inside backoff_bounds", rows.len()))
+        (
+            true,
+            format!("{} deferred row(s) inside backoff_bounds", rows.len()),
+        )
     } else {
-        (false, format!("deferred rows outside backoff_bounds: {:?}", bad))
+        (
+            false,
+            format!("deferred rows outside backoff_bounds: {:?}", bad),
+        )
     }
 }
 
@@ -752,22 +776,18 @@ pub fn record_calls(tracked: &TrackedMail, leg: &str, before: usize, after: usiz
 }
 
 pub fn logged_outcome(tracked: &TrackedMail, n: usize, name: &str) -> Option<bool> {
-    tracked
-        .step_log
-        .lock()
-        .ok()
-        .and_then(|log| log.iter().find(|s| s.n == n && s.name == name).map(|s| s.ok))
+    tracked.step_log.lock().ok().and_then(|log| {
+        log.iter()
+            .find(|s| s.n == n && s.name == name)
+            .map(|s| s.ok)
+    })
 }
 
 // ── Live IMAP helpers for the failure-mode legs ──────────────────────────
 
 /// Bounded poll for server-side delivery (D-05): 3×10s, then Err — never an
 /// open-ended wait. Epoch-guarded (aborts loud on UIDVALIDITY change).
-async fn poll_inbox_for_mid(
-    mgr: &SessionManager,
-    mid: &str,
-    validity: u32,
-) -> Result<u32, String> {
+async fn poll_inbox_for_mid(mgr: &SessionManager, mid: &str, validity: u32) -> Result<u32, String> {
     let mut detail = String::new();
     for round in 0..ARRIVAL_POLL_ROUNDS {
         if round > 0 {
@@ -884,7 +904,9 @@ fn keyring_or_env(username: &str, env_key: &str) -> Result<zeroize::Zeroizing<St
             Ok(zeroize::Zeroizing::new(p))
         }
         None => {
-            eprintln!("[live-gate] auth {env_key}: keyring miss — env value (run --seed-only once)");
+            eprintln!(
+                "[live-gate] auth {env_key}: keyring miss — env value (run --seed-only once)"
+            );
             Ok(zeroize::Zeroizing::new(required_env(env_key)?))
         }
     }
@@ -1035,7 +1057,13 @@ async fn check_list_stable(
     match list_snapshot(mgr).await {
         Ok(after) => {
             let delta = unexpected_list_delta(before, &after, guard_marker);
-            log_step(tracked, n, name, delta.is_empty(), &format!("LIST deltas: {:?}", delta))
+            log_step(
+                tracked,
+                n,
+                name,
+                delta.is_empty(),
+                &format!("LIST deltas: {:?}", delta),
+            )
         }
         Err(e) => log_step(tracked, n, name, false, &format!("re-LIST failed: {}", e)),
     }
@@ -1123,10 +1151,8 @@ pub fn render_report(tracked: &TrackedMail) -> String {
     };
     // A checklist row is PASS only when every evidence STEP passed; None
     // (leg never ran — early abort) counts as not-pass, never as pass.
-    let all_ok = |legs: &[(usize, &str)]| {
-        legs.iter()
-            .all(|(n, name)| outcome(*n, name) == Some(true))
-    };
+    let all_ok =
+        |legs: &[(usize, &str)]| legs.iter().all(|(n, name)| outcome(*n, name) == Some(true));
     let pass = steps.iter().filter(|s| s.ok).count();
     let mut out = String::new();
     out.push_str(&format!(
@@ -1145,7 +1171,10 @@ pub fn render_report(tracked: &TrackedMail) -> String {
             s.detail
         ));
     }
-    out.push_str(&format!("REPORT autosave-branch: {}\n", tracked.probe_detail));
+    out.push_str(&format!(
+        "REPORT autosave-branch: {}\n",
+        tracked.probe_detail
+    ));
     for (mid, sent_uids, is_unfiled) in &tracked.probe_counts {
         out.push_str(&format!(
             "REPORT-PROBE mid={} sent_uids={}{}\n",
@@ -1180,7 +1209,8 @@ pub fn render_report(tracked: &TrackedMail) -> String {
             "REPORT-CALLS leg={} delta={} expected={} ok={}\n",
             leg,
             delta,
-            exp.map(|e| e.to_string()).unwrap_or_else(|| "?".to_string()),
+            exp.map(|e| e.to_string())
+                .unwrap_or_else(|| "?".to_string()),
             ok
         ));
     }
@@ -1206,7 +1236,11 @@ pub fn render_report(tracked: &TrackedMail) -> String {
             id,
             label,
             if *id == "A-07" {
-                if all_ok(legs) && calls_ok { "PASS" } else { "FAIL" }
+                if all_ok(legs) && calls_ok {
+                    "PASS"
+                } else {
+                    "FAIL"
+                }
             } else if all_ok(legs) {
                 "PASS"
             } else {
@@ -1308,21 +1342,46 @@ async fn run() -> i32 {
     let before = match list_snapshot(&manager).await {
         Ok(names) => names,
         Err(e) => {
-            log_step(&tracked, 1, "preflight", false, &format!("LIST failed: {e}"));
-            return cleanup(&manager, &db_path, &app_data, &before_list_or_empty(), &tracked).await;
+            log_step(
+                &tracked,
+                1,
+                "preflight",
+                false,
+                &format!("LIST failed: {e}"),
+            );
+            return cleanup(
+                &manager,
+                &db_path,
+                &app_data,
+                &before_list_or_empty(),
+                &tracked,
+            )
+            .await;
         }
     };
     let sent_wire = match manager.list_mailboxes().await {
         Ok(infos) => resolve_sent_wire(&infos),
         Err(e) => {
-            log_step(&tracked, 1, "preflight", false, &format!("LIST for Sent resolve failed: {e}"));
+            log_step(
+                &tracked,
+                1,
+                "preflight",
+                false,
+                &format!("LIST for Sent resolve failed: {e}"),
+            );
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
     };
     let sent_wire = match sent_wire {
         Some(w) => w,
         None => {
-            log_step(&tracked, 1, "preflight", false, "no Sent folder resolved (need Sent for D-06)");
+            log_step(
+                &tracked,
+                1,
+                "preflight",
+                false,
+                "no Sent folder resolved (need Sent for D-06)",
+            );
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
     };
@@ -1330,18 +1389,31 @@ async fn run() -> i32 {
     let inbox_validity = match current_validity(&manager, "INBOX").await {
         Ok(v) => v,
         Err(e) => {
-            log_step(&tracked, 1, "preflight", false, &format!("INBOX UIDVALIDITY read failed: {e}"));
+            log_step(
+                &tracked,
+                1,
+                "preflight",
+                false,
+                &format!("INBOX UIDVALIDITY read failed: {e}"),
+            );
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
     };
     let sent_validity = match current_validity(&manager, &sent_wire).await {
         Ok(v) => v,
         Err(e) => {
-            log_step(&tracked, 1, "preflight", false, &format!("Sent UIDVALIDITY read failed: {e}"));
+            log_step(
+                &tracked,
+                1,
+                "preflight",
+                false,
+                &format!("Sent UIDVALIDITY read failed: {e}"),
+            );
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
     };
-    if !log_step(&tracked,
+    if !log_step(
+        &tracked,
         1,
         "preflight",
         true,
@@ -1361,7 +1433,13 @@ async fn run() -> i32 {
     let to_self = vec![cfg.self_addr.clone()];
     match assert_self_only(&cfg.self_addr, &to_self, &[], &[], &cfg.self_addr) {
         Ok(()) => {
-            if !log_step(&tracked, 2, "recipient-guard", true, &format!("self-only envelope to=<{}>", cfg.self_addr)) {
+            if !log_step(
+                &tracked,
+                2,
+                "recipient-guard",
+                true,
+                &format!("self-only envelope to=<{}>", cfg.self_addr),
+            ) {
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         }
@@ -1399,13 +1477,25 @@ async fn run() -> i32 {
         ) {
             Ok(out) => {
                 if out.deduped {
-                    log_step(&tracked, 3, "arrival", false, "fresh run_tag unexpectedly deduped");
+                    log_step(
+                        &tracked,
+                        3,
+                        "arrival",
+                        false,
+                        "fresh run_tag unexpectedly deduped",
+                    );
                     return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
                 }
                 out.message_id
             }
             Err(e) => {
-                log_step(&tracked, 3, "arrival", false, &format!("enqueue_send failed: {}", e));
+                log_step(
+                    &tracked,
+                    3,
+                    "arrival",
+                    false,
+                    &format!("enqueue_send failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         }
@@ -1417,7 +1507,8 @@ async fn run() -> i32 {
         match send_queue::send_status_snapshot(guard.conn()) {
             Ok(snap) => {
                 if !(snap.pending_count >= 1 && snap.queued >= 1) {
-                    log_step(&tracked,
+                    log_step(
+                        &tracked,
                         3,
                         "arrival",
                         false,
@@ -1430,7 +1521,13 @@ async fn run() -> i32 {
                 }
             }
             Err(e) => {
-                log_step(&tracked, 3, "arrival", false, &format!("send_status snapshot failed: {}", e));
+                log_step(
+                    &tracked,
+                    3,
+                    "arrival",
+                    false,
+                    &format!("send_status snapshot failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         }
@@ -1452,7 +1549,10 @@ async fn run() -> i32 {
         manager: Some(manager.clone()),
         sent_wire: Some(sent_wire.clone()),
     };
-    eprintln!("[live-gate] {} (arrival leg)", envelope_log_line(&cfg.self_addr, &[cfg.self_addr.clone()]));
+    eprintln!(
+        "[live-gate] {} (arrival leg)",
+        envelope_log_line(&cfg.self_addr, &[cfg.self_addr.clone()])
+    );
     let summary = worker.flush_send_queue(&flush_env).await;
     eprintln!(
         "[live-gate] arrival flush done: sent={} deferred={} failed={} uncertain={} unfiled={} transport_calls={}",
@@ -1464,7 +1564,8 @@ async fn run() -> i32 {
         send_calls.load(Ordering::SeqCst)
     );
     if summary.sent != 1 {
-        log_step(&tracked,
+        log_step(
+            &tracked,
             3,
             "arrival",
             false,
@@ -1492,11 +1593,18 @@ async fn run() -> i32 {
         match lease.selected_validity() {
             Some(v) if v == inbox_validity => {}
             other => {
-                arrival_detail = format!("INBOX epoch change mid-run (want {:?}, got {:?}) — aborting loud", inbox_validity, other);
+                arrival_detail = format!(
+                    "INBOX epoch change mid-run (want {:?}, got {:?}) — aborting loud",
+                    inbox_validity, other
+                );
                 break;
             }
         }
-        match lease.session().uid_search_header("Message-ID", &arrival_mid).await {
+        match lease
+            .session()
+            .uid_search_header("Message-ID", &arrival_mid)
+            .await
+        {
             Ok(hits) => {
                 if hits.len() == 1 {
                     arrival_uid = Some(hits[0]);
@@ -1522,7 +1630,10 @@ async fn run() -> i32 {
         Ok(mut lease) => match lease.session().fetch_body(arrival_uid).await {
             Ok(bytes) => match mail_parser::MessageParser::new().parse(&bytes) {
                 Some(m) => {
-                    let subj_ok = m.subject().map(|s| s.starts_with(SUBJECT_PREFIX)).unwrap_or(false);
+                    let subj_ok = m
+                        .subject()
+                        .map(|s| s.starts_with(SUBJECT_PREFIX))
+                        .unwrap_or(false);
                     let bare = arrival_mid.trim_matches(&['<', '>'][..]);
                     let mid_ok = m.message_id().map(|id| id == bare).unwrap_or(false);
                     subj_ok && mid_ok
@@ -1534,7 +1645,13 @@ async fn run() -> i32 {
         Err(_) => false,
     };
     if !header_ok {
-        log_step(&tracked, 3, "arrival", false, "PEEK header confirm failed (subject prefix / Message-ID)");
+        log_step(
+            &tracked,
+            3,
+            "arrival",
+            false,
+            "PEEK header confirm failed (subject prefix / Message-ID)",
+        );
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
     // A-02/A-03: clean state after ack (badge hidden, no failed surface).
@@ -1546,12 +1663,24 @@ async fn run() -> i32 {
         }
     };
     if !post_ok {
-        log_step(&tracked, 3, "arrival", false, "A-02/A-03 post-condition failed (pending/failed/uncertain not all 0)");
+        log_step(
+            &tracked,
+            3,
+            "arrival",
+            false,
+            "A-02/A-03 post-condition failed (pending/failed/uncertain not all 0)",
+        );
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
     tracked.message_ids.push(arrival_mid.clone());
     tracked.inbox_uids.push((arrival_mid.clone(), arrival_uid));
-    if !log_step(&tracked, 3, "arrival", true, &format!("1 INBOX UID + headers confirm (mid {})", arrival_mid)) {
+    if !log_step(
+        &tracked,
+        3,
+        "arrival",
+        true,
+        &format!("1 INBOX UID + headers confirm (mid {})", arrival_mid),
+    ) {
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
     if !check_list_stable(&manager, &before, &list_guard, &tracked, 3, "arrival-list").await {
@@ -1564,21 +1693,46 @@ async fn run() -> i32 {
         let mut lease = match manager.lease_for(&sent_wire).await {
             Ok(l) => l,
             Err(e) => {
-                log_step(&tracked, 4, "sent-copy", false, &format!("Sent lease failed: {}", e));
+                log_step(
+                    &tracked,
+                    4,
+                    "sent-copy",
+                    false,
+                    &format!("Sent lease failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         };
         match lease.selected_validity() {
             Some(v) if v == sent_validity => {}
             other => {
-                log_step(&tracked, 4, "sent-copy", false, &format!("Sent epoch change mid-run (want {:?}, got {:?})", sent_validity, other));
+                log_step(
+                    &tracked,
+                    4,
+                    "sent-copy",
+                    false,
+                    &format!(
+                        "Sent epoch change mid-run (want {:?}, got {:?})",
+                        sent_validity, other
+                    ),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         }
-        let hits = match lease.session().uid_search_header("Message-ID", &arrival_mid).await {
+        let hits = match lease
+            .session()
+            .uid_search_header("Message-ID", &arrival_mid)
+            .await
+        {
             Ok(h) => h,
             Err(e) => {
-                log_step(&tracked, 4, "sent-copy", false, &format!("Sent SEARCH failed: {}", e));
+                log_step(
+                    &tracked,
+                    4,
+                    "sent-copy",
+                    false,
+                    &format!("Sent SEARCH failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         };
@@ -1591,17 +1745,31 @@ async fn run() -> i32 {
         };
         // \Seen via the envelope/flags read path (never a non-PEEK fetch).
         let seen_ok = match lease.session().fetch_envelopes(&uid.to_string()).await {
-            Ok(envs) => envs.iter().any(|h| h.uid == uid && flags_contain_seen(&h.flags)),
+            Ok(envs) => envs
+                .iter()
+                .any(|h| h.uid == uid && flags_contain_seen(&h.flags)),
             Err(_) => false,
         };
         if !seen_ok {
-            log_step(&tracked, 4, "sent-copy", false, "\\Seen not set on the Sent copy");
+            log_step(
+                &tracked,
+                4,
+                "sent-copy",
+                false,
+                "\\Seen not set on the Sent copy",
+            );
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
         let server_bytes = match lease.session().fetch_body(uid).await {
             Ok(b) => b,
             Err(e) => {
-                log_step(&tracked, 4, "sent-copy", false, &format!("Sent PEEK fetch failed: {}", e));
+                log_step(
+                    &tracked,
+                    4,
+                    "sent-copy",
+                    false,
+                    &format!("Sent PEEK fetch failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         };
@@ -1613,16 +1781,37 @@ async fn run() -> i32 {
             }
         };
         if queued_bytes.is_empty() || !verbatim_equal(&server_bytes, &queued_bytes) {
-            log_step(&tracked, 4, "sent-copy", false, "Sent copy bytes differ from the queued .eml (not verbatim)");
+            log_step(
+                &tracked,
+                4,
+                "sent-copy",
+                false,
+                "Sent copy bytes differ from the queued .eml (not verbatim)",
+            );
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
         uid
     };
     tracked.sent_uids.push((arrival_mid.clone(), sent_uid));
-    if !log_step(&tracked, 4, "sent-copy", true, &format!("1 Sent UID + \\Seen + verbatim bytes (uid {})", sent_uid)) {
+    if !log_step(
+        &tracked,
+        4,
+        "sent-copy",
+        true,
+        &format!("1 Sent UID + \\Seen + verbatim bytes (uid {})", sent_uid),
+    ) {
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
-    if !check_list_stable(&manager, &before, &list_guard, &tracked, 4, "sent-copy-list").await {
+    if !check_list_stable(
+        &manager,
+        &before,
+        &list_guard,
+        &tracked,
+        4,
+        "sent-copy-list",
+    )
+    .await
+    {
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
 
@@ -1634,7 +1823,13 @@ async fn run() -> i32 {
         let mb = match queries::ensure_mailbox(guard.conn(), "INBOX") {
             Ok(id) => id,
             Err(e) => {
-                log_step(&tracked, 5, "no-duplicate", false, &format!("temp mailbox seed failed: {}", e));
+                log_step(
+                    &tracked,
+                    5,
+                    "no-duplicate",
+                    false,
+                    &format!("temp mailbox seed failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         };
@@ -1651,7 +1846,13 @@ async fn run() -> i32 {
             "",
             "",
         ) {
-            log_step(&tracked, 5, "no-duplicate", false, &format!("temp draft seed failed: {}", e));
+            log_step(
+                &tracked,
+                5,
+                "no-duplicate",
+                false,
+                &format!("temp draft seed failed: {}", e),
+            );
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
         let mk_input = |did: Option<String>| EnqueueInput {
@@ -1663,27 +1864,54 @@ async fn run() -> i32 {
             body: "live gate no-duplicate probe".to_string(),
             draft_id: did,
         };
-        let first = match send_queue::enqueue_send(guard.conn(), &app_data, mk_input(Some(draft_id.clone()))) {
+        let first = match send_queue::enqueue_send(
+            guard.conn(),
+            &app_data,
+            mk_input(Some(draft_id.clone())),
+        ) {
             Ok(o) => o,
             Err(e) => {
-                log_step(&tracked, 5, "no-duplicate", false, &format!("first enqueue failed: {}", e));
+                log_step(
+                    &tracked,
+                    5,
+                    "no-duplicate",
+                    false,
+                    &format!("first enqueue failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         };
         // Recipient guard re-checked on the resolved second envelope too.
-        if let Err(e) = assert_self_only(&cfg.self_addr, &[cfg.self_addr.clone()], &[], &[], &cfg.self_addr) {
+        if let Err(e) = assert_self_only(
+            &cfg.self_addr,
+            &[cfg.self_addr.clone()],
+            &[],
+            &[],
+            &cfg.self_addr,
+        ) {
             log_step(&tracked, 5, "no-duplicate", false, &e);
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
-        let second = match send_queue::enqueue_send(guard.conn(), &app_data, mk_input(Some(draft_id))) {
-            Ok(o) => o,
-            Err(e) => {
-                log_step(&tracked, 5, "no-duplicate", false, &format!("second enqueue failed: {}", e));
-                return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
-            }
-        };
-        if !(second.deduped && second.queue_id == first.queue_id && second.message_id == first.message_id) {
-            log_step(&tracked,
+        let second =
+            match send_queue::enqueue_send(guard.conn(), &app_data, mk_input(Some(draft_id))) {
+                Ok(o) => o,
+                Err(e) => {
+                    log_step(
+                        &tracked,
+                        5,
+                        "no-duplicate",
+                        false,
+                        &format!("second enqueue failed: {}", e),
+                    );
+                    return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
+                }
+            };
+        if !(second.deduped
+            && second.queue_id == first.queue_id
+            && second.message_id == first.message_id)
+        {
+            log_step(
+                &tracked,
                 5,
                 "no-duplicate",
                 false,
@@ -1704,13 +1932,22 @@ async fn run() -> i32 {
             )
             .unwrap_or(-1);
         if row_count != 1 {
-            log_step(&tracked, 5, "no-duplicate", false, &format!("{} rows for one Message-ID (want 1)", row_count));
+            log_step(
+                &tracked,
+                5,
+                "no-duplicate",
+                false,
+                &format!("{} rows for one Message-ID (want 1)", row_count),
+            );
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
         mid
     };
     let calls_before_nondup = send_calls.load(Ordering::SeqCst);
-    eprintln!("[live-gate] {} (no-duplicate leg)", envelope_log_line(&cfg.self_addr, &[cfg.self_addr.clone()]));
+    eprintln!(
+        "[live-gate] {} (no-duplicate leg)",
+        envelope_log_line(&cfg.self_addr, &[cfg.self_addr.clone()])
+    );
     let nondup_summary = worker.flush_send_queue(&flush_env).await;
     eprintln!(
         "[live-gate] no-duplicate flush done: sent={} deferred={} failed={} uncertain={} unfiled={} transport_calls={}",
@@ -1722,17 +1959,25 @@ async fn run() -> i32 {
         send_calls.load(Ordering::SeqCst)
     );
     if nondup_summary.sent != 1 {
-        log_step(&tracked,
+        log_step(
+            &tracked,
             5,
             "no-duplicate",
             false,
-            &format!("flush sent={} (want 1 for the deduped row)", nondup_summary.sent),
+            &format!(
+                "flush sent={} (want 1 for the deduped row)",
+                nondup_summary.sent
+            ),
         );
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
     // Single delivery: exactly 1 INBOX UID for the double-enqueued ID.
     let nondup_uid = match manager.lease_for("INBOX").await {
-        Ok(mut lease) => match lease.session().uid_search_header("Message-ID", &nondup_mid).await {
+        Ok(mut lease) => match lease
+            .session()
+            .uid_search_header("Message-ID", &nondup_mid)
+            .await
+        {
             Ok(hits) => match assert_exactly_one(&hits, "no-duplicate arrival") {
                 Ok(u) => u,
                 Err(e) => {
@@ -1741,18 +1986,34 @@ async fn run() -> i32 {
                 }
             },
             Err(e) => {
-                log_step(&tracked, 5, "no-duplicate", false, &format!("INBOX SEARCH failed: {}", e));
+                log_step(
+                    &tracked,
+                    5,
+                    "no-duplicate",
+                    false,
+                    &format!("INBOX SEARCH failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         },
         Err(e) => {
-            log_step(&tracked, 5, "no-duplicate", false, &format!("INBOX lease failed: {}", e));
+            log_step(
+                &tracked,
+                5,
+                "no-duplicate",
+                false,
+                &format!("INBOX lease failed: {}", e),
+            );
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
     };
     // ...and exactly 1 filed Sent copy.
     let nondup_sent_uid = match manager.lease_for(&sent_wire).await {
-        Ok(mut lease) => match lease.session().uid_search_header("Message-ID", &nondup_mid).await {
+        Ok(mut lease) => match lease
+            .session()
+            .uid_search_header("Message-ID", &nondup_mid)
+            .await
+        {
             Ok(hits) => match assert_exactly_one(&hits, "no-duplicate sent-copy") {
                 Ok(u) => u,
                 Err(e) => {
@@ -1761,19 +2022,34 @@ async fn run() -> i32 {
                 }
             },
             Err(e) => {
-                log_step(&tracked, 5, "no-duplicate", false, &format!("Sent SEARCH failed: {}", e));
+                log_step(
+                    &tracked,
+                    5,
+                    "no-duplicate",
+                    false,
+                    &format!("Sent SEARCH failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         },
         Err(e) => {
-            log_step(&tracked, 5, "no-duplicate", false, &format!("Sent lease failed: {}", e));
+            log_step(
+                &tracked,
+                5,
+                "no-duplicate",
+                false,
+                &format!("Sent lease failed: {}", e),
+            );
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
     };
     tracked.message_ids.push(nondup_mid.clone());
     tracked.inbox_uids.push((nondup_mid.clone(), nondup_uid));
-    tracked.sent_uids.push((nondup_mid.clone(), nondup_sent_uid));
-    if !log_step(&tracked,
+    tracked
+        .sent_uids
+        .push((nondup_mid.clone(), nondup_sent_uid));
+    if !log_step(
+        &tracked,
         5,
         "no-duplicate",
         true,
@@ -1785,7 +2061,16 @@ async fn run() -> i32 {
     ) {
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
-    if !check_list_stable(&manager, &before, &list_guard, &tracked, 5, "no-duplicate-list").await {
+    if !check_list_stable(
+        &manager,
+        &before,
+        &list_guard,
+        &tracked,
+        5,
+        "no-duplicate-list",
+    )
+    .await
+    {
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
 
@@ -1812,7 +2097,13 @@ async fn run() -> i32 {
         ) {
             Ok(out) => out.message_id,
             Err(e) => {
-                log_step(&tracked, 6, "sent-unfiled", false, &format!("enqueue_send failed: {}", e));
+                log_step(
+                    &tracked,
+                    6,
+                    "sent-unfiled",
+                    false,
+                    &format!("enqueue_send failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         }
@@ -1847,20 +2138,28 @@ async fn run() -> i32 {
         calls_after_unfiled
     );
     if unfiled_summary.sent_unfiled != 1 {
-        log_step(&tracked,
+        log_step(
+            &tracked,
             6,
             "sent-unfiled",
             false,
-            &format!("flush sent_unfiled={} (want 1 via bogus Sent wire)", unfiled_summary.sent_unfiled),
+            &format!(
+                "flush sent_unfiled={} (want 1 via bogus Sent wire)",
+                unfiled_summary.sent_unfiled
+            ),
         );
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
     if calls_after_unfiled != calls_before_unfiled + 1 {
-        log_step(&tracked,
+        log_step(
+            &tracked,
             6,
             "sent-unfiled",
             false,
-            &format!("transport calls {} -> {} (want exactly +1 SMTP send)", calls_before_unfiled, calls_after_unfiled),
+            &format!(
+                "transport calls {} -> {} (want exactly +1 SMTP send)",
+                calls_before_unfiled, calls_after_unfiled
+            ),
         );
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
@@ -1873,7 +2172,13 @@ async fn run() -> i32 {
         }
     };
     if !parked_sent {
-        log_step(&tracked, 6, "sent-unfiled", false, "row not parked sent after SentUnfiled");
+        log_step(
+            &tracked,
+            6,
+            "sent-unfiled",
+            false,
+            "row not parked sent after SentUnfiled",
+        );
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
     // Never-resend: a second flush adds zero transport calls (parked sent
@@ -1881,7 +2186,8 @@ async fn run() -> i32 {
     let reflush_summary = worker.flush_send_queue(&unfiled_env).await;
     let calls_after_reflush = send_calls.load(Ordering::SeqCst);
     if reflush_summary != FlushSummary::default() {
-        log_step(&tracked,
+        log_step(
+            &tracked,
             6,
             "sent-unfiled",
             false,
@@ -1893,11 +2199,15 @@ async fn run() -> i32 {
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
     if calls_after_reflush != calls_after_unfiled {
-        log_step(&tracked,
+        log_step(
+            &tracked,
             6,
             "sent-unfiled",
             false,
-            &format!("re-flush re-sent (calls {} -> {}) — SentUnfiled must never re-SMTP-send", calls_after_unfiled, calls_after_reflush),
+            &format!(
+                "re-flush re-sent (calls {} -> {}) — SentUnfiled must never re-SMTP-send",
+                calls_after_unfiled, calls_after_reflush
+            ),
         );
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
@@ -1905,7 +2215,11 @@ async fn run() -> i32 {
     // cleanup. Sent side: 0 (no autosave) or 1 (server autosaved) — the
     // autosave probe (step 7) reports which.
     let unfiled_inbox_uid = match manager.lease_for("INBOX").await {
-        Ok(mut lease) => match lease.session().uid_search_header("Message-ID", &unfiled_mid).await {
+        Ok(mut lease) => match lease
+            .session()
+            .uid_search_header("Message-ID", &unfiled_mid)
+            .await
+        {
             Ok(hits) => match assert_exactly_one(&hits, "sent-unfiled arrival") {
                 Ok(u) => u,
                 Err(e) => {
@@ -1914,17 +2228,31 @@ async fn run() -> i32 {
                 }
             },
             Err(e) => {
-                log_step(&tracked, 6, "sent-unfiled", false, &format!("INBOX SEARCH failed: {}", e));
+                log_step(
+                    &tracked,
+                    6,
+                    "sent-unfiled",
+                    false,
+                    &format!("INBOX SEARCH failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         },
         Err(e) => {
-            log_step(&tracked, 6, "sent-unfiled", false, &format!("INBOX lease failed: {}", e));
+            log_step(
+                &tracked,
+                6,
+                "sent-unfiled",
+                false,
+                &format!("INBOX lease failed: {}", e),
+            );
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
     };
     tracked.message_ids.push(unfiled_mid.clone());
-    tracked.inbox_uids.push((unfiled_mid.clone(), unfiled_inbox_uid));
+    tracked
+        .inbox_uids
+        .push((unfiled_mid.clone(), unfiled_inbox_uid));
     tracked.unfiled.push(unfiled_mid.clone());
     // A-07 observability gap (RESEARCH Pitfall 5, plan-recorded):
     // send_status_snapshot().sent_unfiled hard-codes 0 — A-07 is asserted
@@ -1940,7 +2268,16 @@ async fn run() -> i32 {
     ) {
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
-    if !check_list_stable(&manager, &before, &list_guard, &tracked, 6, "sent-unfiled-list").await {
+    if !check_list_stable(
+        &manager,
+        &before,
+        &list_guard,
+        &tracked,
+        6,
+        "sent-unfiled-list",
+    )
+    .await
+    {
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
 
@@ -1958,7 +2295,13 @@ async fn run() -> i32 {
             let mut lease = match manager.lease_for("INBOX").await {
                 Ok(l) => l,
                 Err(e) => {
-                    log_step(&tracked, 7, "offline-flush", false, &format!("INBOX lease failed: {}", e));
+                    log_step(
+                        &tracked,
+                        7,
+                        "offline-flush",
+                        false,
+                        &format!("INBOX lease failed: {}", e),
+                    );
                     return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
                 }
             };
@@ -1966,18 +2309,36 @@ async fn run() -> i32 {
             match gated.store_deleted(u32::MAX, true).await {
                 Err(e) if e.to_string().contains("offline gate closed") => {}
                 Err(e) => {
-                    log_step(&tracked, 7, "offline-flush", false, &format!("gate-closed write failed unexpectedly: {}", e));
+                    log_step(
+                        &tracked,
+                        7,
+                        "offline-flush",
+                        false,
+                        &format!("gate-closed write failed unexpectedly: {}", e),
+                    );
                     return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
                 }
                 Ok(()) => {
-                    log_step(&tracked, 7, "offline-flush", false, "gate-closed write SUCCEEDED — gate is not failing closed");
+                    log_step(
+                        &tracked,
+                        7,
+                        "offline-flush",
+                        false,
+                        "gate-closed write SUCCEEDED — gate is not failing closed",
+                    );
                     return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
                 }
             }
         }
         // Enqueue locally while "offline" (the durable queue needs no
         // network — D-09). Recipient guard first, like every leg.
-        if let Err(e) = assert_self_only(&cfg.self_addr, &[cfg.self_addr.clone()], &[], &[], &cfg.self_addr) {
+        if let Err(e) = assert_self_only(
+            &cfg.self_addr,
+            &[cfg.self_addr.clone()],
+            &[],
+            &[],
+            &cfg.self_addr,
+        ) {
             log_step(&tracked, 7, "offline-flush", false, &e);
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
@@ -1998,7 +2359,13 @@ async fn run() -> i32 {
             ) {
                 Ok(out) => out.message_id,
                 Err(e) => {
-                    log_step(&tracked, 7, "offline-flush", false, &format!("offline enqueue_send failed: {}", e));
+                    log_step(
+                        &tracked,
+                        7,
+                        "offline-flush",
+                        false,
+                        &format!("offline enqueue_send failed: {}", e),
+                    );
                     return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
                 }
             }
@@ -2024,7 +2391,13 @@ async fn run() -> i32 {
                     }
                 }
                 Err(e) => {
-                    log_step(&tracked, 7, "offline-flush", false, &format!("send_status snapshot failed: {}", e));
+                    log_step(
+                        &tracked,
+                        7,
+                        "offline-flush",
+                        false,
+                        &format!("send_status snapshot failed: {}", e),
+                    );
                     return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
                 }
             }
@@ -2035,7 +2408,13 @@ async fn run() -> i32 {
             let mut lease = match manager.lease_for("INBOX").await {
                 Ok(l) => l,
                 Err(e) => {
-                    log_step(&tracked, 7, "offline-flush", false, &format!("INBOX lease failed: {}", e));
+                    log_step(
+                        &tracked,
+                        7,
+                        "offline-flush",
+                        false,
+                        &format!("INBOX lease failed: {}", e),
+                    );
                     return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
                 }
             };
@@ -2046,7 +2425,13 @@ async fn run() -> i32 {
                     return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
                 }
                 Err(e) => {
-                    log_step(&tracked, 7, "offline-flush", false, &format!("pre-send INBOX SEARCH failed: {}", e));
+                    log_step(
+                        &tracked,
+                        7,
+                        "offline-flush",
+                        false,
+                        &format!("pre-send INBOX SEARCH failed: {}", e),
+                    );
                     return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
                 }
             }
@@ -2054,10 +2439,18 @@ async fn run() -> i32 {
         mid
     };
     let calls_before_offline = send_calls.load(Ordering::SeqCst);
-    eprintln!("[live-gate] {} (offline-flush leg, gate reopened)", envelope_log_line(&cfg.self_addr, &[cfg.self_addr.clone()]));
+    eprintln!(
+        "[live-gate] {} (offline-flush leg, gate reopened)",
+        envelope_log_line(&cfg.self_addr, &[cfg.self_addr.clone()])
+    );
     let offline_summary = worker.flush_send_queue(&flush_env).await;
     let calls_after_offline = send_calls.load(Ordering::SeqCst);
-    record_calls(&tracked, "offline-flush", calls_before_offline, calls_after_offline);
+    record_calls(
+        &tracked,
+        "offline-flush",
+        calls_before_offline,
+        calls_after_offline,
+    );
     eprintln!(
         "[live-gate] offline flush done: sent={} deferred={} failed={} uncertain={} unfiled={} transport_calls={}",
         offline_summary.sent,
@@ -2075,7 +2468,10 @@ async fn run() -> i32 {
             false,
             &format!(
                 "flush summary sent={} (want 1) deferred={} failed={} uncertain={}",
-                offline_summary.sent, offline_summary.deferred, offline_summary.failed, offline_summary.uncertain
+                offline_summary.sent,
+                offline_summary.deferred,
+                offline_summary.failed,
+                offline_summary.uncertain
             ),
         );
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
@@ -2086,7 +2482,10 @@ async fn run() -> i32 {
             7,
             "offline-flush",
             false,
-            &format!("transport calls {} -> {} (want exactly +1 SMTP send)", calls_before_offline, calls_after_offline),
+            &format!(
+                "transport calls {} -> {} (want exactly +1 SMTP send)",
+                calls_before_offline, calls_after_offline
+            ),
         );
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
@@ -2097,9 +2496,10 @@ async fn run() -> i32 {
         let (ok, detail) = {
             let guard = store.lock().unwrap();
             let mut rows: Vec<(String, i64, Option<String>)> = Vec::new();
-            if let Ok(mut stmt) = guard.conn().prepare(
-                "SELECT id, attempts, next_retry_at FROM send_queue WHERE attempts > 0",
-            ) {
+            if let Ok(mut stmt) = guard
+                .conn()
+                .prepare("SELECT id, attempts, next_retry_at FROM send_queue WHERE attempts > 0")
+            {
                 if let Ok(mapped) = stmt.query_map([], |r| {
                     Ok((
                         r.get::<_, String>(0)?,
@@ -2113,7 +2513,13 @@ async fn run() -> i32 {
             deferred_backoff_ok(&rows, chrono::Utc::now().timestamp())
         };
         if !ok {
-            log_step(&tracked, 7, "offline-flush", false, &format!("backoff schedule violated: {}", detail));
+            log_step(
+                &tracked,
+                7,
+                "offline-flush",
+                false,
+                &format!("backoff schedule violated: {}", detail),
+            );
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
         eprintln!("[live-gate] offline backoff check: {}", detail);
@@ -2127,7 +2533,13 @@ async fn run() -> i32 {
         }
     };
     if !peek_confirms_mid(&manager, "INBOX", offline_uid, &offline_mid).await {
-        log_step(&tracked, 7, "offline-flush", false, "PEEK header confirm failed (subject prefix / Message-ID)");
+        log_step(
+            &tracked,
+            7,
+            "offline-flush",
+            false,
+            "PEEK header confirm failed (subject prefix / Message-ID)",
+        );
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
     {
@@ -2135,12 +2547,24 @@ async fn run() -> i32 {
         match send_queue::send_status_snapshot(guard.conn()) {
             Ok(snap) => {
                 if !(snap.pending_count == 0 && snap.failed == 0 && snap.uncertain == 0) {
-                    log_step(&tracked, 7, "offline-flush", false, "A-02/A-03 post-condition failed (pending/failed/uncertain not all 0)");
+                    log_step(
+                        &tracked,
+                        7,
+                        "offline-flush",
+                        false,
+                        "A-02/A-03 post-condition failed (pending/failed/uncertain not all 0)",
+                    );
                     return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
                 }
             }
             Err(e) => {
-                log_step(&tracked, 7, "offline-flush", false, &format!("send_status snapshot failed: {}", e));
+                log_step(
+                    &tracked,
+                    7,
+                    "offline-flush",
+                    false,
+                    &format!("send_status snapshot failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         }
@@ -2161,7 +2585,9 @@ async fn run() -> i32 {
     };
     tracked.message_ids.push(offline_mid.clone());
     tracked.inbox_uids.push((offline_mid.clone(), offline_uid));
-    tracked.sent_uids.push((offline_mid.clone(), offline_sent_uid));
+    tracked
+        .sent_uids
+        .push((offline_mid.clone(), offline_sent_uid));
     if !log_step(
         &tracked,
         7,
@@ -2171,7 +2597,16 @@ async fn run() -> i32 {
     ) {
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
-    if !check_list_stable(&manager, &before, &list_guard, &tracked, 7, "offline-flush-list").await {
+    if !check_list_stable(
+        &manager,
+        &before,
+        &list_guard,
+        &tracked,
+        7,
+        "offline-flush-list",
+    )
+    .await
+    {
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
 
@@ -2180,7 +2615,13 @@ async fn run() -> i32 {
     // issued) → simulated ambiguous server-accept → reconcile-not-resend
     // (SEARCH hit confirms with ZERO new transport calls).
     let uncertain_mid = {
-        if let Err(e) = assert_self_only(&cfg.self_addr, &[cfg.self_addr.clone()], &[], &[], &cfg.self_addr) {
+        if let Err(e) = assert_self_only(
+            &cfg.self_addr,
+            &[cfg.self_addr.clone()],
+            &[],
+            &[],
+            &cfg.self_addr,
+        ) {
             log_step(&tracked, 8, "uncertain-reconcile", false, &e);
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
@@ -2200,7 +2641,13 @@ async fn run() -> i32 {
         ) {
             Ok(out) => out.message_id,
             Err(e) => {
-                log_step(&tracked, 8, "uncertain-reconcile", false, &format!("enqueue_send failed: {}", e));
+                log_step(
+                    &tracked,
+                    8,
+                    "uncertain-reconcile",
+                    false,
+                    &format!("enqueue_send failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         }
@@ -2221,11 +2668,19 @@ async fn run() -> i32 {
     };
     let calls_before_fault = send_calls.load(Ordering::SeqCst);
     let inner_before_fault = fault_inner_calls.load(Ordering::SeqCst);
-    eprintln!("[live-gate] {} (uncertain leg, DATA-timeout fault ARMED)", envelope_log_line(&cfg.self_addr, &[cfg.self_addr.clone()]));
+    eprintln!(
+        "[live-gate] {} (uncertain leg, DATA-timeout fault ARMED)",
+        envelope_log_line(&cfg.self_addr, &[cfg.self_addr.clone()])
+    );
     let fault_summary = worker.flush_send_queue(&fault_env).await;
     let calls_after_fault = send_calls.load(Ordering::SeqCst);
     let inner_after_fault = fault_inner_calls.load(Ordering::SeqCst);
-    record_calls(&tracked, "uncertain-armed-flush", calls_before_fault, calls_after_fault);
+    record_calls(
+        &tracked,
+        "uncertain-armed-flush",
+        calls_before_fault,
+        calls_after_fault,
+    );
     eprintln!(
         "[live-gate] uncertain flush done: sent={} deferred={} failed={} uncertain={} unfiled={} transport_calls={}",
         fault_summary.sent,
@@ -2280,7 +2735,13 @@ async fn run() -> i32 {
                 }
             }
             Err(e) => {
-                log_step(&tracked, 8, "uncertain-reconcile", false, &format!("send_status snapshot failed: {}", e));
+                log_step(
+                    &tracked,
+                    8,
+                    "uncertain-reconcile",
+                    false,
+                    &format!("send_status snapshot failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         }
@@ -2290,18 +2751,43 @@ async fn run() -> i32 {
         let mut lease = match manager.lease_for("INBOX").await {
             Ok(l) => l,
             Err(e) => {
-                log_step(&tracked, 8, "uncertain-reconcile", false, &format!("INBOX lease failed: {}", e));
+                log_step(
+                    &tracked,
+                    8,
+                    "uncertain-reconcile",
+                    false,
+                    &format!("INBOX lease failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         };
-        match lease.session().uid_search_header("Message-ID", &uncertain_mid).await {
+        match lease
+            .session()
+            .uid_search_header("Message-ID", &uncertain_mid)
+            .await
+        {
             Ok(hits) if hits.is_empty() => {}
             Ok(hits) => {
-                log_step(&tracked, 8, "uncertain-reconcile", false, &format!("fault leaked bytes: {} INBOX hit(s) for an unsent MID", hits.len()));
+                log_step(
+                    &tracked,
+                    8,
+                    "uncertain-reconcile",
+                    false,
+                    &format!(
+                        "fault leaked bytes: {} INBOX hit(s) for an unsent MID",
+                        hits.len()
+                    ),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
             Err(e) => {
-                log_step(&tracked, 8, "uncertain-reconcile", false, &format!("INBOX SEARCH failed: {}", e));
+                log_step(
+                    &tracked,
+                    8,
+                    "uncertain-reconcile",
+                    false,
+                    &format!("INBOX SEARCH failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         }
@@ -2319,23 +2805,51 @@ async fn run() -> i32 {
         }
     };
     if uncertain_eml.is_empty() {
-        log_step(&tracked, 8, "uncertain-reconcile", false, "queued .eml unreadable for the simulated accept");
+        log_step(
+            &tracked,
+            8,
+            "uncertain-reconcile",
+            false,
+            "queued .eml unreadable for the simulated accept",
+        );
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
     if let Err(e) = assert_harness_append_target(&sent_wire, &[sent_wire.clone()]) {
-        log_step(&tracked, 8, "uncertain-reconcile", false, &format!("append-target guard refused the Sent wire: {}", e));
+        log_step(
+            &tracked,
+            8,
+            "uncertain-reconcile",
+            false,
+            &format!("append-target guard refused the Sent wire: {}", e),
+        );
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
     {
         let mut lease = match manager.lease_for(&sent_wire).await {
             Ok(l) => l,
             Err(e) => {
-                log_step(&tracked, 8, "uncertain-reconcile", false, &format!("Sent lease failed: {}", e));
+                log_step(
+                    &tracked,
+                    8,
+                    "uncertain-reconcile",
+                    false,
+                    &format!("Sent lease failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         };
-        if let Err(e) = lease.session().append_message(&sent_wire, "\\Seen", &uncertain_eml).await {
-            log_step(&tracked, 8, "uncertain-reconcile", false, &format!("simulated-accept APPEND failed: {}", e));
+        if let Err(e) = lease
+            .session()
+            .append_message(&sent_wire, "\\Seen", &uncertain_eml)
+            .await
+        {
+            log_step(
+                &tracked,
+                8,
+                "uncertain-reconcile",
+                false,
+                &format!("simulated-accept APPEND failed: {}", e),
+            );
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
     }
@@ -2348,7 +2862,13 @@ async fn run() -> i32 {
         let mut lease = match manager.lease_for("INBOX").await {
             Ok(l) => l,
             Err(e) => {
-                log_step(&tracked, 8, "uncertain-reconcile", false, &format!("INBOX lease failed: {}", e));
+                log_step(
+                    &tracked,
+                    8,
+                    "uncertain-reconcile",
+                    false,
+                    &format!("INBOX lease failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         };
@@ -2358,7 +2878,13 @@ async fn run() -> i32 {
         {
             Ok(r) => r,
             Err(e) => {
-                log_step(&tracked, 8, "uncertain-reconcile", false, &format!("reconcile failed: {}", e));
+                log_step(
+                    &tracked,
+                    8,
+                    "uncertain-reconcile",
+                    false,
+                    &format!("reconcile failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         }
@@ -2411,7 +2937,9 @@ async fn run() -> i32 {
         }
     };
     tracked.message_ids.push(uncertain_mid.clone());
-    tracked.sent_uids.push((uncertain_mid.clone(), uncertain_sent_uid));
+    tracked
+        .sent_uids
+        .push((uncertain_mid.clone(), uncertain_sent_uid));
     if !log_step(
         &tracked,
         8,
@@ -2421,7 +2949,16 @@ async fn run() -> i32 {
     ) {
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
-    if !check_list_stable(&manager, &before, &list_guard, &tracked, 8, "uncertain-reconcile-list").await {
+    if !check_list_stable(
+        &manager,
+        &before,
+        &list_guard,
+        &tracked,
+        8,
+        "uncertain-reconcile-list",
+    )
+    .await
+    {
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
 
@@ -2431,7 +2968,13 @@ async fn run() -> i32 {
     // backoff-waited single send: exactly 1 INBOX UID + 1 Sent UID,
     // failed == 0 (pending, never failed).
     let (crash_mid, crash_qid) = {
-        if let Err(e) = assert_self_only(&cfg.self_addr, &[cfg.self_addr.clone()], &[], &[], &cfg.self_addr) {
+        if let Err(e) = assert_self_only(
+            &cfg.self_addr,
+            &[cfg.self_addr.clone()],
+            &[],
+            &[],
+            &cfg.self_addr,
+        ) {
             log_step(&tracked, 9, "crash-recover", false, &e);
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
@@ -2451,7 +2994,13 @@ async fn run() -> i32 {
         ) {
             Ok(out) => (out.message_id, out.queue_id),
             Err(e) => {
-                log_step(&tracked, 9, "crash-recover", false, &format!("enqueue_send failed: {}", e));
+                log_step(
+                    &tracked,
+                    9,
+                    "crash-recover",
+                    false,
+                    &format!("enqueue_send failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         }
@@ -2461,8 +3010,16 @@ async fn run() -> i32 {
     // the kill lands between claim and verdict.
     {
         let guard = store.lock().unwrap();
-        if let Err(e) = queries::set_send_state(guard.conn(), &crash_qid, queries::SEND_STATE_SENDING) {
-            log_step(&tracked, 9, "crash-recover", false, &format!("claim to sending failed: {}", e));
+        if let Err(e) =
+            queries::set_send_state(guard.conn(), &crash_qid, queries::SEND_STATE_SENDING)
+        {
+            log_step(
+                &tracked,
+                9,
+                "crash-recover",
+                false,
+                &format!("claim to sending failed: {}", e),
+            );
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
     }
@@ -2473,22 +3030,46 @@ async fn run() -> i32 {
         match send_queue::crash_recover(guard.conn()) {
             Ok(1) => {}
             Ok(n) => {
-                log_step(&tracked, 9, "crash-recover", false, &format!("crash_recover flipped {} rows (want 1)", n));
+                log_step(
+                    &tracked,
+                    9,
+                    "crash-recover",
+                    false,
+                    &format!("crash_recover flipped {} rows (want 1)", n),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
             Err(e) => {
-                log_step(&tracked, 9, "crash-recover", false, &format!("crash_recover failed: {}", e));
+                log_step(
+                    &tracked,
+                    9,
+                    "crash-recover",
+                    false,
+                    &format!("crash_recover failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         }
         match queries::get_send_row(guard.conn(), &crash_qid) {
             Ok(Some(row)) if row.state == queries::SEND_STATE_QUEUED => {}
             Ok(Some(row)) => {
-                log_step(&tracked, 9, "crash-recover", false, &format!("post-crash_recover state={} (want queued)", row.state));
+                log_step(
+                    &tracked,
+                    9,
+                    "crash-recover",
+                    false,
+                    &format!("post-crash_recover state={} (want queued)", row.state),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
             _ => {
-                log_step(&tracked, 9, "crash-recover", false, "crash row vanished after crash_recover");
+                log_step(
+                    &tracked,
+                    9,
+                    "crash-recover",
+                    false,
+                    "crash row vanished after crash_recover",
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         }
@@ -2500,16 +3081,32 @@ async fn run() -> i32 {
     // stranded set the triage must observe).
     {
         let guard = store.lock().unwrap();
-        if let Err(e) = queries::set_send_state(guard.conn(), &crash_qid, queries::SEND_STATE_SENDING) {
-            log_step(&tracked, 9, "crash-recover", false, &format!("re-claim to sending failed: {}", e));
+        if let Err(e) =
+            queries::set_send_state(guard.conn(), &crash_qid, queries::SEND_STATE_SENDING)
+        {
+            log_step(
+                &tracked,
+                9,
+                "crash-recover",
+                false,
+                &format!("re-claim to sending failed: {}", e),
+            );
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
     }
     let calls_before_crash = send_calls.load(Ordering::SeqCst);
-    eprintln!("[live-gate] {} (crash-recover leg, restart into flush pass)", envelope_log_line(&cfg.self_addr, &[cfg.self_addr.clone()]));
+    eprintln!(
+        "[live-gate] {} (crash-recover leg, restart into flush pass)",
+        envelope_log_line(&cfg.self_addr, &[cfg.self_addr.clone()])
+    );
     let crash_summary = worker.flush_send_queue(&flush_env).await;
     let calls_after_crash = send_calls.load(Ordering::SeqCst);
-    record_calls(&tracked, "crash-triage-flush", calls_before_crash, calls_after_crash);
+    record_calls(
+        &tracked,
+        "crash-triage-flush",
+        calls_before_crash,
+        calls_after_crash,
+    );
     eprintln!(
         "[live-gate] crash triage flush done: sent={} deferred={} failed={} uncertain={} unfiled={} transport_calls={}",
         crash_summary.sent,
@@ -2525,7 +3122,10 @@ async fn run() -> i32 {
             9,
             "crash-recover",
             false,
-            &format!("recovery pass sent={} calls {} -> {} — triage must send nothing (no blind resend)", crash_summary.sent, calls_before_crash, calls_after_crash),
+            &format!(
+                "recovery pass sent={} calls {} -> {} — triage must send nothing (no blind resend)",
+                crash_summary.sent, calls_before_crash, calls_after_crash
+            ),
         );
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
@@ -2547,18 +3147,36 @@ async fn run() -> i32 {
                 }
             }
             Err(e) => {
-                log_step(&tracked, 9, "crash-recover", false, &format!("send_status snapshot failed: {}", e));
+                log_step(
+                    &tracked,
+                    9,
+                    "crash-recover",
+                    false,
+                    &format!("send_status snapshot failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         }
         match queries::get_send_row(guard.conn(), &crash_qid) {
             Ok(Some(row)) if row.state == queries::SEND_STATE_UNCERTAIN => {}
             Ok(Some(row)) => {
-                log_step(&tracked, 9, "crash-recover", false, &format!("crash row state={} (want uncertain — Pitfall 4)", row.state));
+                log_step(
+                    &tracked,
+                    9,
+                    "crash-recover",
+                    false,
+                    &format!("crash row state={} (want uncertain — Pitfall 4)", row.state),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
             _ => {
-                log_step(&tracked, 9, "crash-recover", false, "crash row vanished after the triage pass");
+                log_step(
+                    &tracked,
+                    9,
+                    "crash-recover",
+                    false,
+                    "crash row vanished after the triage pass",
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         }
@@ -2571,7 +3189,13 @@ async fn run() -> i32 {
         let mut lease = match manager.lease_for("INBOX").await {
             Ok(l) => l,
             Err(e) => {
-                log_step(&tracked, 9, "crash-recover", false, &format!("INBOX lease failed: {}", e));
+                log_step(
+                    &tracked,
+                    9,
+                    "crash-recover",
+                    false,
+                    &format!("INBOX lease failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         };
@@ -2581,13 +3205,24 @@ async fn run() -> i32 {
         {
             Ok(r) => r,
             Err(e) => {
-                log_step(&tracked, 9, "crash-recover", false, &format!("reconcile failed: {}", e));
+                log_step(
+                    &tracked,
+                    9,
+                    "crash-recover",
+                    false,
+                    &format!("reconcile failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         }
     };
     let crash_rec_after = send_calls.load(Ordering::SeqCst);
-    record_calls(&tracked, "crash-reconcile", crash_rec_before, crash_rec_after);
+    record_calls(
+        &tracked,
+        "crash-reconcile",
+        crash_rec_before,
+        crash_rec_after,
+    );
     if crash_reconcile.requeued != 1 || crash_reconcile.confirmed_sent != 0 {
         log_step(
             &tracked,
@@ -2607,7 +3242,10 @@ async fn run() -> i32 {
             9,
             "crash-recover",
             false,
-            &format!("reconcile re-sent (calls {} -> {}) — miss path must requeue, never resend", crash_rec_before, crash_rec_after),
+            &format!(
+                "reconcile re-sent (calls {} -> {}) — miss path must requeue, never resend",
+                crash_rec_before, crash_rec_after
+            ),
         );
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
@@ -2630,7 +3268,13 @@ async fn run() -> i32 {
                 }
             }
             _ => {
-                log_step(&tracked, 9, "crash-recover", false, "crash row vanished after reconcile");
+                log_step(
+                    &tracked,
+                    9,
+                    "crash-recover",
+                    false,
+                    "crash row vanished after reconcile",
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         }
@@ -2667,13 +3311,25 @@ async fn run() -> i32 {
                 9,
                 "crash-recover",
                 false,
-                &format!("backoff poll {} sent without due row (sent={} calls {} -> {})", round + 1, s.sent, b, a),
+                &format!(
+                    "backoff poll {} sent without due row (sent={} calls {} -> {})",
+                    round + 1,
+                    s.sent,
+                    b,
+                    a
+                ),
             );
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
     }
     if !crash_sent {
-        log_step(&tracked, 9, "crash-recover", false, "requeued row never became due within 10 × 15s polls");
+        log_step(
+            &tracked,
+            9,
+            "crash-recover",
+            false,
+            "requeued row never became due within 10 × 15s polls",
+        );
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
     // Exactly-once: 1 INBOX UID + 1 Sent UID, failed == 0, leg calls +1.
@@ -2685,7 +3341,13 @@ async fn run() -> i32 {
         }
     };
     if !peek_confirms_mid(&manager, "INBOX", crash_uid, &crash_mid).await {
-        log_step(&tracked, 9, "crash-recover", false, "PEEK header confirm failed (subject prefix / Message-ID)");
+        log_step(
+            &tracked,
+            9,
+            "crash-recover",
+            false,
+            "PEEK header confirm failed (subject prefix / Message-ID)",
+        );
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
     let crash_sent_uid = match search_sent_for_mid(&manager, &sent_wire, &crash_mid).await {
@@ -2706,12 +3368,27 @@ async fn run() -> i32 {
         match send_queue::send_status_snapshot(guard.conn()) {
             Ok(snap) => {
                 if snap.failed != 0 {
-                    log_step(&tracked, 9, "crash-recover", false, &format!("failed={} (want 0 — crash-recovered item shows pending, never failed)", snap.failed));
+                    log_step(
+                        &tracked,
+                        9,
+                        "crash-recover",
+                        false,
+                        &format!(
+                            "failed={} (want 0 — crash-recovered item shows pending, never failed)",
+                            snap.failed
+                        ),
+                    );
                     return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
                 }
             }
             Err(e) => {
-                log_step(&tracked, 9, "crash-recover", false, &format!("send_status snapshot failed: {}", e));
+                log_step(
+                    &tracked,
+                    9,
+                    "crash-recover",
+                    false,
+                    &format!("send_status snapshot failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         }
@@ -2728,7 +3405,16 @@ async fn run() -> i32 {
     ) {
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
-    if !check_list_stable(&manager, &before, &list_guard, &tracked, 9, "crash-recover-list").await {
+    if !check_list_stable(
+        &manager,
+        &before,
+        &list_guard,
+        &tracked,
+        9,
+        "crash-recover-list",
+    )
+    .await
+    {
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
 
@@ -2743,7 +3429,13 @@ async fn run() -> i32 {
     // assisted discard on this path.
     let draft_folder = format!("{}{}-drafts", SANDBOX_PREFIX, tag);
     if let Err(e) = assert_sandbox_prefix(&draft_folder) {
-        log_step(&tracked, 10, "draft-send", false, &format!("sandbox guard refused the draft folder: {}", e));
+        log_step(
+            &tracked,
+            10,
+            "draft-send",
+            false,
+            &format!("sandbox guard refused the draft folder: {}", e),
+        );
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
     // Sandbox APPEND preferred (D-16 researcher flag): attempt account-root
@@ -2752,7 +3444,13 @@ async fn run() -> i32 {
         let mut lease = match manager.lease_for("INBOX").await {
             Ok(l) => l,
             Err(e) => {
-                log_step(&tracked, 10, "draft-send", false, &format!("INBOX lease failed: {}", e));
+                log_step(
+                    &tracked,
+                    10,
+                    "draft-send",
+                    false,
+                    &format!("INBOX lease failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         };
@@ -2767,7 +3465,13 @@ async fn run() -> i32 {
         let infos = match manager.list_mailboxes().await {
             Ok(i) => i,
             Err(e) => {
-                log_step(&tracked, 10, "draft-send", false, &format!("LIST for Drafts fallback failed: {}", e));
+                log_step(
+                    &tracked,
+                    10,
+                    "draft-send",
+                    false,
+                    &format!("LIST for Drafts fallback failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         };
@@ -2775,7 +3479,11 @@ async fn run() -> i32 {
             .iter()
             .find(|i| i.name == "Drafts")
             .or_else(|| infos.iter().find(|i| i.name.eq_ignore_ascii_case("drafts")))
-            .or_else(|| infos.iter().find(|i| i.name.eq_ignore_ascii_case("rascunhos")))
+            .or_else(|| {
+                infos
+                    .iter()
+                    .find(|i| i.name.eq_ignore_ascii_case("rascunhos"))
+            })
             .map(|i| i.name.clone());
         match wire {
             Some(w) => {
@@ -2783,7 +3491,13 @@ async fn run() -> i32 {
                 w
             }
             None => {
-                log_step(&tracked, 10, "draft-send", false, "no Drafts folder resolved for the fallback — refusing blind APPEND elsewhere");
+                log_step(
+                    &tracked,
+                    10,
+                    "draft-send",
+                    false,
+                    "no Drafts folder resolved for the fallback — refusing blind APPEND elsewhere",
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         }
@@ -2803,7 +3517,13 @@ async fn run() -> i32 {
         let mb = match queries::ensure_mailbox(guard.conn(), "INBOX") {
             Ok(id) => id,
             Err(e) => {
-                log_step(&tracked, 10, "draft-send", false, &format!("temp mailbox seed failed: {}", e));
+                log_step(
+                    &tracked,
+                    10,
+                    "draft-send",
+                    false,
+                    &format!("temp mailbox seed failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         };
@@ -2818,7 +3538,13 @@ async fn run() -> i32 {
             "",
             "",
         ) {
-            log_step(&tracked, 10, "draft-send", false, &format!("temp draft seed failed: {}", e));
+            log_step(
+                &tracked,
+                10,
+                "draft-send",
+                false,
+                &format!("temp draft seed failed: {}", e),
+            );
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
     }
@@ -2826,7 +3552,13 @@ async fn run() -> i32 {
     tracked.draft_mid = Some(draft_mid.clone());
     // Enqueue with draft_id set (production path reuses the drafts row
     // Message-ID per the send_queue.rs draft_id arm).
-    if let Err(e) = assert_self_only(&cfg.self_addr, &[cfg.self_addr.clone()], &[], &[], &cfg.self_addr) {
+    if let Err(e) = assert_self_only(
+        &cfg.self_addr,
+        &[cfg.self_addr.clone()],
+        &[],
+        &[],
+        &cfg.self_addr,
+    ) {
         log_step(&tracked, 10, "draft-send", false, &e);
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
@@ -2858,7 +3590,13 @@ async fn run() -> i32 {
                 }
             }
             Err(e) => {
-                log_step(&tracked, 10, "draft-send", false, &format!("draft-anchored enqueue_send failed: {}", e));
+                log_step(
+                    &tracked,
+                    10,
+                    "draft-send",
+                    false,
+                    &format!("draft-anchored enqueue_send failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         }
@@ -2873,26 +3611,58 @@ async fn run() -> i32 {
         }
     };
     if draft_eml.is_empty() {
-        log_step(&tracked, 10, "draft-send", false, "queued .eml unreadable for the draft server copy");
+        log_step(
+            &tracked,
+            10,
+            "draft-send",
+            false,
+            "queued .eml unreadable for the draft server copy",
+        );
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
     if let Err(e) = assert_harness_append_target(&draft_wire, &[draft_wire.clone()]) {
-        log_step(&tracked, 10, "draft-send", false, &format!("append-target guard refused the draft wire: {}", e));
+        log_step(
+            &tracked,
+            10,
+            "draft-send",
+            false,
+            &format!("append-target guard refused the draft wire: {}", e),
+        );
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
     {
         let mut lease = match manager.lease_for(&draft_wire).await {
             Ok(l) => l,
             Err(e) => {
-                log_step(&tracked, 10, "draft-send", false, &format!("draft-wire lease failed: {}", e));
+                log_step(
+                    &tracked,
+                    10,
+                    "draft-send",
+                    false,
+                    &format!("draft-wire lease failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         };
-        if let Err(e) = lease.session().append_message(&draft_wire, "\\Seen", &draft_eml).await {
-            log_step(&tracked, 10, "draft-send", false, &format!("draft server-copy APPEND failed: {}", e));
+        if let Err(e) = lease
+            .session()
+            .append_message(&draft_wire, "\\Seen", &draft_eml)
+            .await
+        {
+            log_step(
+                &tracked,
+                10,
+                "draft-send",
+                false,
+                &format!("draft server-copy APPEND failed: {}", e),
+            );
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
-        match lease.session().uid_search_header("Message-ID", &draft_mid).await {
+        match lease
+            .session()
+            .uid_search_header("Message-ID", &draft_mid)
+            .await
+        {
             Ok(hits) => match assert_exactly_one(&hits, "draft-send server copy") {
                 Ok(u) => {
                     tracked.draft_server_uid = Some(u);
@@ -2903,7 +3673,13 @@ async fn run() -> i32 {
                 }
             },
             Err(e) => {
-                log_step(&tracked, 10, "draft-send", false, &format!("draft-wire SEARCH failed: {}", e));
+                log_step(
+                    &tracked,
+                    10,
+                    "draft-send",
+                    false,
+                    &format!("draft-wire SEARCH failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         }
@@ -2912,10 +3688,18 @@ async fn run() -> i32 {
     // filing — the send half must succeed for the orphan verdict to mean
     // anything).
     let calls_before_draft = send_calls.load(Ordering::SeqCst);
-    eprintln!("[live-gate] {} (draft-send leg)", envelope_log_line(&cfg.self_addr, &[cfg.self_addr.clone()]));
+    eprintln!(
+        "[live-gate] {} (draft-send leg)",
+        envelope_log_line(&cfg.self_addr, &[cfg.self_addr.clone()])
+    );
     let draft_summary = worker.flush_send_queue(&flush_env).await;
     let calls_after_draft = send_calls.load(Ordering::SeqCst);
-    record_calls(&tracked, "draft-send", calls_before_draft, calls_after_draft);
+    record_calls(
+        &tracked,
+        "draft-send",
+        calls_before_draft,
+        calls_after_draft,
+    );
     eprintln!(
         "[live-gate] draft flush done: sent={} deferred={} failed={} uncertain={} unfiled={} transport_calls={}",
         draft_summary.sent,
@@ -2931,7 +3715,10 @@ async fn run() -> i32 {
             10,
             "draft-send",
             false,
-            &format!("draft send did not deliver once (sent={} calls {} -> {})", draft_summary.sent, calls_before_draft, calls_after_draft),
+            &format!(
+                "draft send did not deliver once (sent={} calls {} -> {})",
+                draft_summary.sent, calls_before_draft, calls_after_draft
+            ),
         );
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
@@ -2943,7 +3730,13 @@ async fn run() -> i32 {
         }
     };
     if !peek_confirms_mid(&manager, "INBOX", draft_uid, &draft_mid).await {
-        log_step(&tracked, 10, "draft-send", false, "PEEK header confirm failed (subject prefix / Message-ID)");
+        log_step(
+            &tracked,
+            10,
+            "draft-send",
+            false,
+            "PEEK header confirm failed (subject prefix / Message-ID)",
+        );
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
     let draft_sent_uid = match search_sent_for_mid(&manager, &sent_wire, &draft_mid).await {
@@ -2972,7 +3765,13 @@ async fn run() -> i32 {
             Ok(None) => true,
             Ok(Some(_)) => false,
             Err(e) => {
-                log_step(&tracked, 10, "draft-send", false, &format!("drafts-row lookup failed: {}", e));
+                log_step(
+                    &tracked,
+                    10,
+                    "draft-send",
+                    false,
+                    &format!("drafts-row lookup failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         }
@@ -2981,14 +3780,30 @@ async fn run() -> i32 {
         let mut lease = match manager.lease_for(&draft_wire).await {
             Ok(l) => l,
             Err(e) => {
-                log_step(&tracked, 10, "draft-send", false, &format!("draft-wire lease failed: {}", e));
+                log_step(
+                    &tracked,
+                    10,
+                    "draft-send",
+                    false,
+                    &format!("draft-wire lease failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         };
-        match lease.session().uid_search_header("Message-ID", &draft_mid).await {
+        match lease
+            .session()
+            .uid_search_header("Message-ID", &draft_mid)
+            .await
+        {
             Ok(h) => h,
             Err(e) => {
-                log_step(&tracked, 10, "draft-send", false, &format!("orphan re-SEARCH failed: {}", e));
+                log_step(
+                    &tracked,
+                    10,
+                    "draft-send",
+                    false,
+                    &format!("orphan re-SEARCH failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         }
@@ -3021,7 +3836,16 @@ async fn run() -> i32 {
         );
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
-    if !check_list_stable(&manager, &before, &list_guard, &tracked, 10, "draft-send-list").await {
+    if !check_list_stable(
+        &manager,
+        &before,
+        &list_guard,
+        &tracked,
+        10,
+        "draft-send-list",
+    )
+    .await
+    {
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
 
@@ -3029,7 +3853,10 @@ async fn run() -> i32 {
     // rendered bytes, printed as AUDIT-* lines for the wrapper re-check
     // (defense in depth — the bin aborts on any violation first).
     {
-        let (rows, calls_snapshot): (Vec<(String, String, String, String, String)>, Vec<(String, usize, usize)>) = {
+        let (rows, calls_snapshot): (
+            Vec<(String, String, String, String, String)>,
+            Vec<(String, usize, usize)>,
+        ) = {
             let guard = store.lock().unwrap();
             let mut rows = Vec::new();
             if let Ok(mut stmt) = guard.conn().prepare(
@@ -3057,7 +3884,10 @@ async fn run() -> i32 {
         let mut violations: Vec<String> = Vec::new();
         let mut mids: Vec<String> = Vec::new();
         for (mid, to_json, cc_json, bcc_json, eml_path) in &rows {
-            println!("AUDIT-ROW mid={} to={} cc={} bcc={}", mid, to_json, cc_json, bcc_json);
+            println!(
+                "AUDIT-ROW mid={} to={} cc={} bcc={}",
+                mid, to_json, cc_json, bcc_json
+            );
             if !audit_recipients_ok(to_json, cc_json, bcc_json, &cfg.self_addr) {
                 violations.push(format!("rule1 recipients not self-only: mid {}", mid));
             }
@@ -3070,7 +3900,10 @@ async fn run() -> i32 {
                         .unwrap_or_default();
                     let subject_ok = !subject.is_empty() && audit_subject_prefixed(&subject);
                     let bcc_absent = !eml_has_bcc_header(&bytes);
-                    println!("AUDIT-EML mid={} subject_ok={} bcc_absent={}", mid, subject_ok, bcc_absent);
+                    println!(
+                        "AUDIT-EML mid={} subject_ok={} bcc_absent={}",
+                        mid, subject_ok, bcc_absent
+                    );
                     println!("AUDIT-SUBJECT {}", subject);
                     if !subject_ok {
                         violations.push(format!("rule2 subject without prefix: mid {}", mid));
@@ -3099,11 +3932,15 @@ async fn run() -> i32 {
                 "AUDIT-CALLS leg={} delta={} expected={} ok={}",
                 leg,
                 delta,
-                exp.map(|e| e.to_string()).unwrap_or_else(|| "?".to_string()),
+                exp.map(|e| e.to_string())
+                    .unwrap_or_else(|| "?".to_string()),
                 ok
             );
             if !ok {
-                violations.push(format!("rule5 call-count mismatch: leg {} delta {} (want {:?})", leg, delta, exp));
+                violations.push(format!(
+                    "rule5 call-count mismatch: leg {} delta {} (want {:?})",
+                    leg, delta, exp
+                ));
             }
         }
         if violations.is_empty() {
@@ -3137,28 +3974,55 @@ async fn run() -> i32 {
         let mut lease = match manager.lease_for(&sent_wire).await {
             Ok(l) => l,
             Err(e) => {
-                log_step(&tracked, 11, "autosave-probe", false, &format!("Sent lease failed: {}", e));
+                log_step(
+                    &tracked,
+                    11,
+                    "autosave-probe",
+                    false,
+                    &format!("Sent lease failed: {}", e),
+                );
                 return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
             }
         };
         for mid in tracked.message_ids.iter() {
-            let count = lease.session().uid_search_header("Message-ID", mid).await.unwrap_or_default().len();
+            let count = lease
+                .session()
+                .uid_search_header("Message-ID", mid)
+                .await
+                .unwrap_or_default()
+                .len();
             let is_unfiled = tracked.unfiled.iter().any(|u| u == mid);
             let ok = count == 1 || (is_unfiled && count == 0);
             if !ok {
                 probe_ok = false;
             }
-            probe_detail.push_str(&format!("{}:sent_uids={}{}; ", mid, count, if is_unfiled { "(unfiled)" } else { "" }));
+            probe_detail.push_str(&format!(
+                "{}:sent_uids={}{}; ",
+                mid,
+                count,
+                if is_unfiled { "(unfiled)" } else { "" }
+            ));
             probe_counts.push((mid.clone(), count, is_unfiled));
         }
-        probe_detail.push_str("branch per [SGE send] flush lines in log (deduped-in-Sent vs APPENDed-to-Sent)");
+        probe_detail.push_str(
+            "branch per [SGE send] flush lines in log (deduped-in-Sent vs APPENDed-to-Sent)",
+        );
         tracked.probe_counts = probe_counts;
         tracked.probe_detail = probe_detail.clone();
         if !log_step(&tracked, 11, "autosave-probe", probe_ok, &probe_detail) {
             return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
         }
     }
-    if !check_list_stable(&manager, &before, &list_guard, &tracked, 11, "autosave-probe-list").await {
+    if !check_list_stable(
+        &manager,
+        &before,
+        &list_guard,
+        &tracked,
+        11,
+        "autosave-probe-list",
+    )
+    .await
+    {
         return cleanup(&manager, &db_path, &app_data, &before, &tracked).await;
     }
 
@@ -3189,24 +4053,19 @@ async fn cleanup(
     // SCAN-DB line instead). Fixed-substring match over the full password
     // values; any hit names WHICH artifact matched, never the secret.
     {
-        let (tables, rows, dump) =
-            match rusqlite::Connection::open_with_flags(
-                db_path,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-            ) {
-                Ok(conn) => dump_store_for_scan(&conn),
-                Err(e) => {
-                    eprintln!(
-                        "[live-gate] secret-scan: temp DB unreadable ({e}) — scanning empty dump"
-                    );
-                    (Vec::new(), 0, String::new())
-                }
-            };
-        let secrets: Vec<&str> = tracked
-            .scan_secrets
-            .iter()
-            .map(|s| s.as_str())
-            .collect();
+        let (tables, rows, dump) = match rusqlite::Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ) {
+            Ok(conn) => dump_store_for_scan(&conn),
+            Err(e) => {
+                eprintln!(
+                    "[live-gate] secret-scan: temp DB unreadable ({e}) — scanning empty dump"
+                );
+                (Vec::new(), 0, String::new())
+            }
+        };
+        let secrets: Vec<&str> = tracked.scan_secrets.iter().map(|s| s.as_str()).collect();
         let hit = scan_text_has_secret(&dump, &secrets);
         if hit {
             println!(
@@ -3277,7 +4136,10 @@ async fn cleanup(
         .clone()
         .or_else(|| tracked.draft_real_drafts_wire.clone());
     if let (Some(uid), Some(wire)) = (tracked.draft_server_uid, draft_wire.clone()) {
-        let mid = tracked.draft_mid.clone().unwrap_or_else(|| "draft".to_string());
+        let mid = tracked
+            .draft_mid
+            .clone()
+            .unwrap_or_else(|| "draft".to_string());
         if !expunge_tracked(mgr, &wire, uid, &mid).await {
             ok = false;
         }
@@ -3395,7 +4257,11 @@ async fn cleanup(
         .lock()
         .map(|log| log.iter().all(|s| s.ok))
         .unwrap_or(false);
-    if ok && clean && steps_ok { 0 } else { 1 }
+    if ok && clean && steps_ok {
+        0
+    } else {
+        1
+    }
 }
 
 const USAGE: &str = r#"live_gate_21 — Phase 21 sandboxed live gate (tracer)
@@ -3462,10 +4328,7 @@ mod live_gate_21_preflight_tests {
     #[test]
     fn live_gate_21_prefix_refuses_real_folders() {
         for wire in ["INBOX", "Drafts", "Sent", "SGE-Test", "xSGE-Test-1", ""] {
-            assert!(
-                assert_sandbox_prefix(wire).is_err(),
-                "must refuse {wire:?}"
-            );
+            assert!(assert_sandbox_prefix(wire).is_err(), "must refuse {wire:?}");
         }
     }
 
@@ -3564,7 +4427,12 @@ mod live_gate_21_preflight_tests {
             password: "p".to_string(),
         };
         assert_eq!(
-            t.send_raw(&acct, "a@example.com", &["b@example.com".to_string()], b"bytes"),
+            t.send_raw(
+                &acct,
+                "a@example.com",
+                &["b@example.com".to_string()],
+                b"bytes"
+            ),
             SmtpOutcome::Sent
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -3582,17 +4450,35 @@ mod live_gate_21_preflight_tests {
             username: "u".to_string(),
             password: "p".to_string(),
         };
-        let verdict = t.send_raw(&acct, "a@example.com", &["b@example.com".to_string()], b"bytes");
+        let verdict = t.send_raw(
+            &acct,
+            "a@example.com",
+            &["b@example.com".to_string()],
+            b"bytes",
+        );
         assert!(
             matches!(verdict, SmtpOutcome::Uncertain { .. }),
             "armed fault must surface Uncertain"
         );
-        assert_eq!(inner_calls.load(Ordering::SeqCst), 0, "zero inner calls while armed");
-        assert_eq!(forwarded.load(Ordering::SeqCst), 0, "zero forwarded calls while armed");
+        assert_eq!(
+            inner_calls.load(Ordering::SeqCst),
+            0,
+            "zero inner calls while armed"
+        );
+        assert_eq!(
+            forwarded.load(Ordering::SeqCst),
+            0,
+            "zero forwarded calls while armed"
+        );
         // Disarmed: forwards to the inner transport and counts once.
         armed.store(false, Ordering::SeqCst);
         assert_eq!(
-            t.send_raw(&acct, "a@example.com", &["b@example.com".to_string()], b"bytes"),
+            t.send_raw(
+                &acct,
+                "a@example.com",
+                &["b@example.com".to_string()],
+                b"bytes"
+            ),
             SmtpOutcome::Sent
         );
         assert_eq!(inner_calls.load(Ordering::SeqCst), 1);
@@ -3630,7 +4516,12 @@ mod live_gate_21_preflight_tests {
             .to_string();
         assert!(retry_within_bounds(&Some(in_window), 0, now, 15));
         assert!(!retry_within_bounds(&None, 0, now, 15));
-        assert!(!retry_within_bounds(&Some("not-a-timestamp".to_string()), 0, now, 15));
+        assert!(!retry_within_bounds(
+            &Some("not-a-timestamp".to_string()),
+            0,
+            now,
+            15
+        ));
         // Far-future schedule is outside the bounds (not a valid backoff).
         let far = chrono::DateTime::from_timestamp(now + 100_000, 0)
             .unwrap()
@@ -3658,9 +4549,18 @@ mod live_gate_21_preflight_tests {
     fn live_gate_21_step_log_records_outcomes_for_report() {
         let tracked = TrackedMail::empty();
         assert!(log_step(&tracked, 7, "offline-flush", true, "detail-a"));
-        assert!(!log_step(&tracked, 8, "uncertain-reconcile", false, "detail-b"));
+        assert!(!log_step(
+            &tracked,
+            8,
+            "uncertain-reconcile",
+            false,
+            "detail-b"
+        ));
         assert_eq!(logged_outcome(&tracked, 7, "offline-flush"), Some(true));
-        assert_eq!(logged_outcome(&tracked, 8, "uncertain-reconcile"), Some(false));
+        assert_eq!(
+            logged_outcome(&tracked, 8, "uncertain-reconcile"),
+            Some(false)
+        );
         assert_eq!(logged_outcome(&tracked, 9, "crash-recover"), None);
         record_calls(&tracked, "offline-flush", 3, 4);
         let calls = tracked.calls_log.lock().unwrap();
@@ -3669,7 +4569,12 @@ mod live_gate_21_preflight_tests {
 
     #[test]
     fn live_gate_21_expected_calls_delta_pins_reconcile_at_zero() {
-        for leg in ["arrival", "offline-flush", "draft-send", "crash-final-flush"] {
+        for leg in [
+            "arrival",
+            "offline-flush",
+            "draft-send",
+            "crash-final-flush",
+        ] {
             assert_eq!(expected_calls_delta(leg), Some(1));
         }
         // Reconcile / re-flush / wait-poll legs must add ZERO transport
@@ -3682,7 +4587,11 @@ mod live_gate_21_preflight_tests {
             "crash-backoff-poll",
             "sent-unfiled-reflush",
         ] {
-            assert_eq!(expected_calls_delta(leg), Some(0), "leg {leg} must add zero calls");
+            assert_eq!(
+                expected_calls_delta(leg),
+                Some(0),
+                "leg {leg} must add zero calls"
+            );
         }
         assert_eq!(expected_calls_delta("no-such-leg"), None);
     }
@@ -3694,12 +4603,24 @@ mod live_gate_21_preflight_tests {
         tracked.probe_detail =
             "branch per flush lines (deduped-in-Sent vs APPENDed-to-Sent)".to_string();
         assert!(log_step(&tracked, 3, "arrival", true, "detail-a"));
-        assert!(!log_step(&tracked, 8, "uncertain-reconcile", false, "detail-b"));
+        assert!(!log_step(
+            &tracked,
+            8,
+            "uncertain-reconcile",
+            false,
+            "detail-b"
+        ));
         record_calls(&tracked, "arrival", 5, 6);
         record_calls(&tracked, "uncertain-reconcile", 6, 6);
         let report = render_report(&tracked);
-        assert!(report.contains("REPORT live_gate_21 run=test-tag"), "header:\n{report}");
-        assert!(report.contains("REPORT-STEP 3/12 arrival: PASS detail-a"), "steps:\n{report}");
+        assert!(
+            report.contains("REPORT live_gate_21 run=test-tag"),
+            "header:\n{report}"
+        );
+        assert!(
+            report.contains("REPORT-STEP 3/12 arrival: PASS detail-a"),
+            "steps:\n{report}"
+        );
         assert!(
             report.contains("REPORT-STEP 8/12 uncertain-reconcile: FAIL"),
             "steps:\n{report}"
@@ -3712,7 +4633,10 @@ mod live_gate_21_preflight_tests {
             report.contains("REPORT gate=draft-send verdict=SKIP reason=prod-flush-performs-no-delete_draft-local-or-server"),
             "draft verdict:\n{report}"
         );
-        assert!(report.contains("resume=src-tauri/src/sync/worker.rs:flush_one_row"), "resume pointer:\n{report}");
+        assert!(
+            report.contains("resume=src-tauri/src/sync/worker.rs:flush_one_row"),
+            "resume pointer:\n{report}"
+        );
         assert!(
             report.contains("REPORT-CALLS leg=arrival delta=1 expected=1 ok=true"),
             "calls:\n{report}"
@@ -3721,11 +4645,16 @@ mod live_gate_21_preflight_tests {
             report.contains("REPORT-CALLS leg=uncertain-reconcile delta=0 expected=0 ok=true"),
             "calls:\n{report}"
         );
-        for id in ["A-01", "A-02", "A-03", "A-04", "A-05", "A-06", "A-07", "A-08", "A-09"] {
+        for id in [
+            "A-01", "A-02", "A-03", "A-04", "A-05", "A-06", "A-07", "A-08", "A-09",
+        ] {
             assert!(report.contains(id), "checklist {id} missing:\n{report}");
         }
         // Verbatim existing-component copy is referenced, never reworded.
-        assert!(report.contains("Reconciliando na pasta Enviadas"), "A-04 copy:\n{report}");
+        assert!(
+            report.contains("Reconciliando na pasta Enviadas"),
+            "A-04 copy:\n{report}"
+        );
         assert!(report.contains("FAILURES PRESENT"), "footer:\n{report}");
     }
 
@@ -3742,9 +4671,15 @@ mod live_gate_21_preflight_tests {
         let steps = manual_cleanup_steps(&tracked);
         assert!(steps.contains("<a@sge.local>"), "mids:\n{steps}");
         assert!(steps.contains("41"), "inbox uid:\n{steps}");
-        assert!(steps.contains("INBOX") && steps.contains("Sent"), "folders:\n{steps}");
+        assert!(
+            steps.contains("INBOX") && steps.contains("Sent"),
+            "folders:\n{steps}"
+        );
         assert!(steps.contains("SGE-Test-tag-1-drafts"), "sandbox:\n{steps}");
         assert!(steps.contains("webmail"), "webmail path:\n{steps}");
-        assert!(steps.contains("DELETE the sandbox folder only"), "delete scope:\n{steps}");
+        assert!(
+            steps.contains("DELETE the sandbox folder only"),
+            "delete scope:\n{steps}"
+        );
     }
 }

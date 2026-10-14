@@ -133,7 +133,8 @@ pub fn sorted_names(infos: &[MailboxInfo]) -> Vec<String> {
 
 /// LIST deltas other than the sandbox itself (D-02): any entry here aborts
 /// the run (external interference or a wrong-folder write).
-pub fn unexpected_list_delta(before: &[String], after: &[String], sandbox: &str) -> Vec<String> {    let has = |set: &[String], n: &str| set.iter().any(|x| x == n);
+pub fn unexpected_list_delta(before: &[String], after: &[String], sandbox: &str) -> Vec<String> {
+    let has = |set: &[String], n: &str| set.iter().any(|x| x == n);
     let mut delta: Vec<String> = after
         .iter()
         .filter(|n| n.as_str() != sandbox && !has(before, n))
@@ -233,11 +234,9 @@ pub fn write_sqlite_dump_text(
     db_path: &std::path::Path,
     dump_path: &std::path::Path,
 ) -> Result<usize, String> {
-    let conn = rusqlite::Connection::open_with_flags(
-        db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .map_err(|e| format!("dump open: {e}"))?;
+    let conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| format!("dump open: {e}"))?;
     let tables: Vec<String> = {
         let mut stmt = conn
             .prepare(
@@ -496,7 +495,9 @@ impl SyncSession for GateSession<'_> {
             if blocked {
                 return Err(gate_err("condstore_fetch_changedsince"));
             }
-            self.inner.condstore_fetch_changedsince(&range, modseq).await
+            self.inner
+                .condstore_fetch_changedsince(&range, modseq)
+                .await
         })
     }
 }
@@ -709,7 +710,10 @@ async fn search_msg_uids(
     msg_id: &str,
 ) -> Result<Vec<u32>, SyncError> {
     let mut lease = mgr.lease_for(wire).await?;
-    lease.session().uid_search_header("Message-ID", msg_id).await
+    lease
+        .session()
+        .uid_search_header("Message-ID", msg_id)
+        .await
 }
 
 fn draft_bytes(self_addr: &str, suffix: &str, body: &str, msg_id: &str) -> Vec<u8> {
@@ -760,7 +764,9 @@ async fn live_one_copy_second(
             .await
             .map_err(|e| e.to_string())?;
         if hits.len() != 1 {
-            return Err(format!("precondition: want 1 copy before 2nd save, got {hits:?}"));
+            return Err(format!(
+                "precondition: want 1 copy before 2nd save, got {hits:?}"
+            ));
         }
         hits[0]
     };
@@ -776,7 +782,9 @@ async fn live_one_copy_second(
         .await
         .map_err(|e| e.to_string())?;
     assert_one_copy(&hits, uid).map_err(|e| format!("one-copy: {e}"))?;
-    Ok(format!("old {old} superseded by uid {uid}, SEARCH == [uid]"))
+    Ok(format!(
+        "old {old} superseded by uid {uid}, SEARCH == [uid]"
+    ))
 }
 
 /// STEP 6 (D-06): kill between APPEND-new and expunge-old, then max-wins
@@ -804,8 +812,7 @@ async fn live_kill_reconcile(
         .await
         .map_err(|e| e.to_string())?;
     hits.sort_unstable();
-    let winner =
-        max_wins(hits.clone()).ok_or_else(|| "reconcile found zero copies".to_string())?;
+    let winner = max_wins(hits.clone()).ok_or_else(|| "reconcile found zero copies".to_string())?;
     let epoch = current_validity(mgr, wire)
         .await
         .map_err(|e| format!("validity read failed: {e}"))?;
@@ -820,7 +827,10 @@ async fn live_kill_reconcile(
         .await
         .map_err(|e| e.to_string())?;
     assert_one_copy(&after, winner).map_err(|e| format!("reconcile: {e}"))?;
-    Ok(format!("{} staged copies collapsed to uid {winner}", hits.len()))
+    Ok(format!(
+        "{} staged copies collapsed to uid {winner}",
+        hits.len()
+    ))
 }
 
 /// STEP 7 (D-07): offline edit queues a dirty draft; the reconnect flush
@@ -866,12 +876,19 @@ async fn live_offline_edit(
     }
     let bytes = {
         let mut lease = mgr.lease_for(wire).await.map_err(|e| e.to_string())?;
-        lease.session().fetch_body(hits[0]).await.map_err(|e| e.to_string())?
+        lease
+            .session()
+            .fetch_body(hits[0])
+            .await
+            .map_err(|e| e.to_string())?
     };
     let parsed = mail_parser::MessageParser::new()
         .parse(&bytes)
         .ok_or_else(|| "flushed copy unparseable".to_string())?;
-    let body = parsed.body_text(0).map(|b| b.to_string()).unwrap_or_default();
+    let body = parsed
+        .body_text(0)
+        .map(|b| b.to_string())
+        .unwrap_or_default();
     if body != BODY_V4 {
         return Err("offline edit: flushed content is not the latest".to_string());
     }
@@ -881,11 +898,7 @@ async fn live_offline_edit(
 /// STEP 8 (D-08): PEEK-only content assert — subject AND body equal the last
 /// save. `fetch_body` is `UID FETCH BODY.PEEK[]`: asserts never disturb
 /// Seen state (M1 invariant).
-async fn live_content(
-    mgr: &SessionManager,
-    wire: &str,
-    msg_id: &str,
-) -> Result<String, String> {
+async fn live_content(mgr: &SessionManager, wire: &str, msg_id: &str) -> Result<String, String> {
     let hits = search_msg_uids(mgr, wire, msg_id)
         .await
         .map_err(|e| e.to_string())?;
@@ -894,13 +907,20 @@ async fn live_content(
     }
     let bytes = {
         let mut lease = mgr.lease_for(wire).await.map_err(|e| e.to_string())?;
-        lease.session().fetch_body(hits[0]).await.map_err(|e| e.to_string())?
+        lease
+            .session()
+            .fetch_body(hits[0])
+            .await
+            .map_err(|e| e.to_string())?
     };
     let parsed = mail_parser::MessageParser::new()
         .parse(&bytes)
         .ok_or_else(|| "surviving copy unparseable".to_string())?;
     let subject = parsed.subject().unwrap_or("").to_string();
-    let body = parsed.body_text(0).map(|b| b.to_string()).unwrap_or_default();
+    let body = parsed
+        .body_text(0)
+        .map(|b| b.to_string())
+        .unwrap_or_default();
     let want_subject = format!("{SUBJECT_PREFIX}{SFX_KILL}");
     if subject != want_subject || body != BODY_V3 {
         return Err(format!(
@@ -1015,10 +1035,8 @@ async fn live_delete_double_sync(
             return Err(format!("sync #{pass}: UID resurrected by backfill"));
         }
         let guard = store.lock().unwrap();
-        let arc_id = queries::ensure_mailbox(guard.conn(), arc_wire)
-            .map_err(|e| e.to_string())?;
-        let local = queries::all_local_uids(guard.conn(), arc_id)
-            .map_err(|e| e.to_string())?;
+        let arc_id = queries::ensure_mailbox(guard.conn(), arc_wire).map_err(|e| e.to_string())?;
+        let local = queries::all_local_uids(guard.conn(), arc_id).map_err(|e| e.to_string())?;
         if local.contains(&arc_uid) {
             return Err(format!("sync #{pass}: local row survives"));
         }
@@ -1051,13 +1069,19 @@ async fn live_seen_both_ways(
     mgr.set_seen_in(wire, uid, true)
         .await
         .map_err(|e| format!("online read STORE failed: {e}"))?;
-    if !flag_has_seen(mgr, wire, uid).await.map_err(|e| e.to_string())? {
+    if !flag_has_seen(mgr, wire, uid)
+        .await
+        .map_err(|e| e.to_string())?
+    {
         return Err("online read: \\Seen absent after STORE".to_string());
     }
     mgr.set_seen_in(wire, uid, false)
         .await
         .map_err(|e| format!("online unread STORE failed: {e}"))?;
-    if flag_has_seen(mgr, wire, uid).await.map_err(|e| e.to_string())? {
+    if flag_has_seen(mgr, wire, uid)
+        .await
+        .map_err(|e| e.to_string())?
+    {
         return Err("online unread: \\Seen present after un-STORE".to_string());
     }
     let worker = SyncWorker::new(store.clone());
@@ -1091,7 +1115,9 @@ async fn live_seen_both_ways(
                 ));
             }
         }
-        let has = flag_has_seen(mgr, wire, uid).await.map_err(|e| e.to_string())?;
+        let has = flag_has_seen(mgr, wire, uid)
+            .await
+            .map_err(|e| e.to_string())?;
         if has != seen {
             return Err(format!("replayed seen={seen}: FLAGS reads {has}"));
         }
@@ -1224,11 +1250,19 @@ async fn run() -> i32 {
             1,
             "preflight",
             false,
-            &format!("sandbox present (prior failed cleanup) — {}", manual_cleanup_steps(&sandbox)),
+            &format!(
+                "sandbox present (prior failed cleanup) — {}",
+                manual_cleanup_steps(&sandbox)
+            ),
         );
         return 1;
     }
-    if !step(1, "preflight", true, &format!("LIST {} folders, sandbox absent", before.len())) {
+    if !step(
+        1,
+        "preflight",
+        true,
+        &format!("LIST {} folders, sandbox absent", before.len()),
+    ) {
         return 1;
     }
 
@@ -1251,8 +1285,7 @@ async fn run() -> i32 {
         }
     };
     let delta = unexpected_list_delta(&before, &after_create, &sandbox);
-    let created_ok =
-        after_create.iter().any(|n| n == &sandbox) && delta.is_empty();
+    let created_ok = after_create.iter().any(|n| n == &sandbox) && delta.is_empty();
     if !step(
         2,
         "create",
@@ -1273,8 +1306,7 @@ async fn run() -> i32 {
     let mb_id: u64 = {
         let guard = store.lock().unwrap();
         match (|| -> Result<u64, String> {
-            let id =
-                queries::ensure_mailbox(guard.conn(), &sandbox).map_err(|e| e.to_string())?;
+            let id = queries::ensure_mailbox(guard.conn(), &sandbox).map_err(|e| e.to_string())?;
             queries::set_sync_state(guard.conn(), &sandbox, epoch, 0).map_err(|e| e.to_string())?;
             Ok(id)
         })() {
@@ -1376,17 +1408,28 @@ async fn run() -> i32 {
         step(8, "content", false, &e);
         return cleanup(&manager, &db_path, &sandbox, &before).await;
     }
-    live_step!(8, "content", live_content(&manager, &sandbox, &msg_main).await);
+    live_step!(
+        8,
+        "content",
+        live_content(&manager, &sandbox, &msg_main).await
+    );
 
     // 9. replay-order — queued move replays pre-sweep, depth 1+ to 0 (D-10).
     if let Err(e) = guard_list_clean(&manager, &before, &sandbox, &[]).await {
         step(9, "replay-order", false, &e);
         return cleanup(&manager, &db_path, &sandbox, &before).await;
     }
-    let (arc_wire, arc_uid) =
-        match live_replay_order(&manager, &store, &sandbox, mb_id, &cfg.self_addr).await {
-            Ok(pair) => {
-                step(
+    let (arc_wire, arc_uid) = match live_replay_order(
+        &manager,
+        &store,
+        &sandbox,
+        mb_id,
+        &cfg.self_addr,
+    )
+    .await
+    {
+        Ok(pair) => {
+            step(
                     9,
                     "replay-order",
                     true,
@@ -1395,13 +1438,13 @@ async fn run() -> i32 {
                         pair.1, pair.0
                     ),
                 );
-                pair
-            }
-            Err(reason) => {
-                step(9, "replay-order", false, &reason);
-                return cleanup(&manager, &db_path, &sandbox, &before).await;
-            }
-        };
+            pair
+        }
+        Err(reason) => {
+            step(9, "replay-order", false, &reason);
+            return cleanup(&manager, &db_path, &sandbox, &before).await;
+        }
+    };
     subjects.push(format!("{SUBJECT_PREFIX}{SFX_REPLAY}"));
 
     // 10. delete-double-sync — UID stays gone across two syncs (D-11).
@@ -1499,7 +1542,10 @@ async fn cleanup_only(sandbox: &str) -> i32 {
             return 0;
         }
     }
-    println!("CLEANUP-ONLY {sandbox}: FAIL — {}", manual_cleanup_steps(sandbox));
+    println!(
+        "CLEANUP-ONLY {sandbox}: FAIL — {}",
+        manual_cleanup_steps(sandbox)
+    );
     1
 }
 
@@ -1570,11 +1616,7 @@ async fn cleanup(
     println!(
         "REPORT steps={TOTAL_STEPS} list_restored={} cleanup={} dump={}",
         if clean { "yes" } else { "no" },
-        if ok && clean {
-            "deleted"
-        } else {
-            "MANUAL"
-        },
+        if ok && clean { "deleted" } else { "MANUAL" },
         dump_path.display()
     );
     code
@@ -1614,9 +1656,7 @@ fn main() -> ExitCode {
             "--cleanup-only" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!(
-                        "usage error: --cleanup-only needs a sandbox folder name\n\n{USAGE}"
-                    );
+                    eprintln!("usage error: --cleanup-only needs a sandbox folder name\n\n{USAGE}");
                     return ExitCode::from(2);
                 }
                 cleanup_only_target = Some(args[i].clone());
@@ -1660,10 +1700,7 @@ mod live_gate_22_preflight_tests {
     #[test]
     fn live_gate_22_prefix_refuses_real_folders() {
         for wire in ["INBOX", "Drafts", "Sent", "SGE-Test", "xSGE-Test-1", ""] {
-            assert!(
-                assert_sandbox_prefix(wire).is_err(),
-                "must refuse {wire:?}"
-            );
+            assert!(assert_sandbox_prefix(wire).is_err(), "must refuse {wire:?}");
         }
     }
 
@@ -1724,8 +1761,14 @@ mod live_gate_22_preflight_tests {
         let parsed = mail_parser::MessageParser::new()
             .parse(&bytes)
             .expect("rendered bytes must parse");
-        assert_eq!(parsed.subject(), Some(format!("{SUBJECT_PREFIX}round-trip").as_str()));
+        assert_eq!(
+            parsed.subject(),
+            Some(format!("{SUBJECT_PREFIX}round-trip").as_str())
+        );
         assert_eq!(parsed.body_text(0).unwrap().to_string(), "hello body");
-        assert_eq!(parsed.message_id(), Some(msg_id.trim_matches(&['<', '>'][..])));
+        assert_eq!(
+            parsed.message_id(),
+            Some(msg_id.trim_matches(&['<', '>'][..]))
+        );
     }
 }
