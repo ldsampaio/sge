@@ -2,6 +2,7 @@ import React from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { MailboxRow } from "../types";
+import { BatchPreviewTable, type BatchPreview } from "./BatchPreviewTable";
 
 /** Phase 24 archive UI: rule editor (threshold + folder scope) with manual
  *  "Arquivar agora" trigger, live progress, persisted report, and undo.
@@ -34,6 +35,19 @@ interface BatchReport {
   remainder: number;
   undone: number;
   totals_json: string;
+  /** Phase 30: backend truth for stale/retry counts + failure count. */
+  stale_dropped?: number;
+  retry_skipped?: number;
+  failed?: number;
+}
+
+interface RetryReport {
+  run_id: number;
+  state: string;
+  retried: number;
+  moved: number;
+  skipped: number;
+  failed_remaining: number;
 }
 
 interface ArchivePanelProps {
@@ -107,6 +121,9 @@ export function ArchivePanel({ onClose }: ArchivePanelProps) {
   const [progress, setProgress] = React.useState<BatchProgressEvent | null>(null);
   const [report, setReport] = React.useState<BatchReport | null>(null);
   const [reportKind, setReportKind] = React.useState("archive");
+  /** Phase 30: transient dry-run plan (never persisted backend-side). */
+  const [preview, setPreview] = React.useState<BatchPreview | null>(null);
+  const [previewBusy, setPreviewBusy] = React.useState(false);
 
   const loadSettings = React.useCallback(async () => {
     try {
@@ -191,12 +208,47 @@ export function ArchivePanel({ onClose }: ArchivePanelProps) {
     setMessage(null);
     setReport(null);
     setProgress(null);
+    setPreview(null);
     try {
       const id = (await invoke("archive_run", { resumeRun: resume ?? null })) as number;
       setRunId(id);
       setReportKind("archive");
     } catch (e) {
       setMessage(`Falha ao iniciar: ${e}`);
+      setBusy(false);
+    }
+  };
+
+  /** Phase 30: dry-run archive preview through the shared preview path. */
+  const showPreview = async () => {
+    setPreviewBusy(true);
+    setMessage(null);
+    try {
+      const p = (await invoke("preview_archive")) as BatchPreview;
+      setPreview(p);
+    } catch (e) {
+      setMessage(`Falha na pré-visualização: ${e}`);
+    } finally {
+      setPreviewBusy(false);
+    }
+  };
+
+  /** Phase 30: retry only the failed items of the displayed run. */
+  const retry = async () => {
+    if (report === null) return;
+    setBusy(true);
+    setMessage(null);
+    try {
+      const r = (await invoke("retry_failed", { runId: report.run_id })) as RetryReport;
+      if (r.state === "already-running") {
+        setMessage("Uma repetição já está em andamento — aguarde.");
+      } else {
+        setMessage(`${r.moved} recuperados · ${r.skipped} ignorados · restam ${r.failed_remaining}.`);
+      }
+      await loadReport(report.run_id);
+    } catch (e) {
+      setMessage(`Falha ao repetir: ${e}`);
+    } finally {
       setBusy(false);
     }
   };
@@ -318,6 +370,14 @@ export function ArchivePanel({ onClose }: ArchivePanelProps) {
             <button
               type="button"
               className="btn btn-small"
+              disabled={busy || previewBusy}
+              onClick={() => void showPreview()}
+            >
+              Pré-visualizar
+            </button>
+            <button
+              type="button"
+              className="btn btn-small"
               disabled={busy}
               onClick={() => void runNow()}
             >
@@ -325,6 +385,14 @@ export function ArchivePanel({ onClose }: ArchivePanelProps) {
             </button>
           </div>
         </div>
+        {preview && !progress && !busy && (
+          <BatchPreviewTable
+            preview={preview}
+            confirming={busy}
+            confirmLabel="Executar de verdade"
+            onConfirm={() => void runNow()}
+          />
+        )}
         {(busy || progress) && (
           <div style={{ margin: "12px 0", borderTop: "1px solid #1e293b", paddingTop: 12 }}>
             <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.85rem" }}>
@@ -359,7 +427,21 @@ export function ArchivePanel({ onClose }: ArchivePanelProps) {
             <p style={{ color: "#94a3b8", fontSize: "0.85rem" }}>
               {report.per_category.reduce((a, [, n]) => a + n, 0)} arquivados · estado {report.state}
               {report.undone > 0 && ` · ${report.undone} desfeitos`}
+              {(report.stale_dropped ?? 0) > 0 && ` · ${report.stale_dropped} ignorados (mudaram)`}
+              {(report.retry_skipped ?? 0) > 0 && ` · ${report.retry_skipped} ignorados na repetição`}
             </p>
+            {(report.state === "done" || report.state === "interrupted") &&
+              (report.failed ?? 0) > 0 && (
+                <button
+                  type="button"
+                  className="btn btn-small"
+                  disabled={busy}
+                  style={{ marginRight: 8 }}
+                  onClick={() => void retry()}
+                >
+                  Repetir {report.failed} falhas
+                </button>
+              )}
             {report.state === "interrupted" && runId !== null && (
               <button
                 type="button"

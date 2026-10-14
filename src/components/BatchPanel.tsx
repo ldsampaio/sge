@@ -2,6 +2,7 @@ import React from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { kindFromReport } from "./ArchivePanel";
+import { BatchPreviewTable, type BatchPreview } from "./BatchPreviewTable";
 
 /** Phase 20 batch UI: explicit whole-account run with live progress,
  *  persisted report, and undo. Unconfirmed BY DESIGN (one account-level
@@ -29,6 +30,21 @@ interface BatchReport {
    *  archive runs — parsed client-side for LABELING ONLY, never trusted
    *  for safety decisions). Absent on old cached payloads. */
   totals_json?: string;
+  /** Phase 30: stale-drop + retry-skip counts + failed-intent count
+   *  (backend truth — the retry button gates on `failed`). Absent on
+   *  old cached payloads. */
+  stale_dropped?: number;
+  retry_skipped?: number;
+  failed?: number;
+}
+
+interface RetryReport {
+  run_id: number;
+  state: string;
+  retried: number;
+  moved: number;
+  skipped: number;
+  failed_remaining: number;
 }
 
 interface BatchPanelProps {
@@ -53,6 +69,9 @@ export function BatchPanel({ onClose }: BatchPanelProps) {
    *  resume via archive_run, classify runs via batch_classify. */
   const [runKinds, setRunKinds] = React.useState<Record<number, string>>({});
   const [runThresholds, setRunThresholds] = React.useState<Record<number, number | null>>({});
+  /** Phase 30: transient dry-run plan (never persisted backend-side). */
+  const [preview, setPreview] = React.useState<BatchPreview | null>(null);
+  const [previewBusy, setPreviewBusy] = React.useState(false);
 
   const resolveKind = React.useCallback(async (id: number) => {
     try {
@@ -115,6 +134,42 @@ export function BatchPanel({ onClose }: BatchPanelProps) {
 
   const kindOf = (id: number | null): string => (id === null ? "classify" : runKinds[id] ?? "classify");
 
+  /** Phase 30: dry-run preview (transient — confirm re-collects fresh,
+   *  never replays these rows). */
+  const showPreview = async () => {
+    setPreviewBusy(true);
+    setMessage(null);
+    try {
+      const p = (await invoke("preview_batch", { scope: null })) as BatchPreview;
+      setPreview(p);
+    } catch (e) {
+      setMessage(`Falha na pré-visualização: ${e}`);
+    } finally {
+      setPreviewBusy(false);
+    }
+  };
+
+  /** Phase 30: retry only the failed items of the displayed run. */
+  const retry = async () => {
+    if (report === null) return;
+    setBusy(true);
+    setMessage(null);
+    try {
+      const r = (await invoke("retry_failed", { runId: report.run_id })) as RetryReport;
+      if (r.state === "already-running") {
+        setMessage("Uma repetição já está em andamento — aguarde.");
+      } else {
+        setMessage(`${r.moved} recuperados · ${r.skipped} ignorados · restam ${r.failed_remaining}.`);
+      }
+      await loadReport(report.run_id);
+      await loadRuns();
+    } catch (e) {
+      setMessage(`Falha ao repetir: ${e}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const start = async (resume?: number) => {
     if (resume === undefined) {
       if (!window.confirm("Reorganizar toda a conta sem confirmação por e-mail? Dá para desfazer depois.")) return;
@@ -123,6 +178,7 @@ export function BatchPanel({ onClose }: BatchPanelProps) {
     setMessage(null);
     setReport(null);
     setProgress(null);
+    setPreview(null);
     try {
       if (resume !== undefined && kindOf(resume) === "archive") {
         // Interrupted ARCHIVE run: resume on the archive path (the
@@ -200,7 +256,10 @@ export function BatchPanel({ onClose }: BatchPanelProps) {
         )}
         {!progress && !busy && (
           <>
-            <button type="button" className="btn" onClick={() => void start()}>
+            <button type="button" className="btn" disabled={previewBusy} onClick={() => void showPreview()}>
+              Pré-visualizar
+            </button>
+            <button type="button" className="btn" style={{ marginLeft: 8 }} onClick={() => void start()}>
               Começar agora
             </button>
             {pastRuns.filter((r) => r.state === "interrupted").map((r) => (
@@ -258,13 +317,35 @@ export function BatchPanel({ onClose }: BatchPanelProps) {
             <p style={{ color: "#94a3b8", fontSize: "0.85rem" }}>
               Restam {report.remainder} para revisão · estado {report.state}
               {report.undone > 0 && ` · ${report.undone} desfeitos`}
+              {(report.stale_dropped ?? 0) > 0 && ` · ${report.stale_dropped} ignorados (mudaram)`}
+              {(report.retry_skipped ?? 0) > 0 && ` · ${report.retry_skipped} ignorados na repetição`}
             </p>
+            {(report.state === "done" || report.state === "interrupted") &&
+              (report.failed ?? 0) > 0 && (
+                <button
+                  type="button"
+                  className="btn btn-small"
+                  disabled={busy}
+                  style={{ marginRight: 8 }}
+                  onClick={() => void retry()}
+                >
+                  Repetir {report.failed} falhas
+                </button>
+              )}
             {report.state === "done" && (
               <button type="button" className="btn btn-small" onClick={() => void undo()}>
                 {kindOf(report.run_id) === "archive" ? "Desfazer arquivamento" : "Desfazer reorganização"}
               </button>
             )}
           </div>
+        )}
+        {preview && !progress && !busy && (
+          <BatchPreviewTable
+            preview={preview}
+            confirming={busy}
+            confirmLabel="Executar de verdade"
+            onConfirm={() => void start()}
+          />
         )}
         <div style={{ marginTop: 12, textAlign: "right" }}>
           <button type="button" className="btn" onClick={onClose}>

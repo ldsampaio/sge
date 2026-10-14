@@ -952,4 +952,206 @@ mod tests {
         // cleanup); the headless tests above are the assertion.
         let _store = Store::open_in_memory().unwrap();
     }
+
+    // ── Phase 30 (BATCH-04): retry-only-failures stress ───────────
+
+    /// Seed a finished run with mixed intent rows: `moved_ids` journaled
+    /// as fact, the rest left as failed intent (`moved=0`). Returns the
+    /// store + run id + (moved, failed) message ids.
+    fn retry_seeded() -> (Store, i64, Vec<u64>, Vec<u64>) {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let inbox = ensure_mailbox(conn, "INBOX").unwrap();
+        for uid in 1..=4u32 {
+            upsert_message(conn, inbox, uid, None, &format!("Assunto {uid}"), "f@x", "[]", "[]",
+                "2026-10-10T00:00:00Z", "[]", false, "").unwrap();
+        }
+        let mut mids = Vec::new();
+        for uid in 1..=4u32 {
+            mids.push(find_message_id(conn, inbox, uid).unwrap().unwrap());
+        }
+        let run = create_batch_run(conn).unwrap();
+        for (i, mid) in mids.iter().enumerate() {
+            journal_intent(conn, run, *mid, "INBOX", "Auto/Financeiro", "financeiro", 0).unwrap();
+            if i < 2 {
+                journal_moved(conn, run, *mid).unwrap();
+            }
+        }
+        finish_batch_run(conn, run, "done", r#"{"done":4,"moved":2}"#).unwrap();
+        let (moved, failed) = (mids[..2].to_vec(), mids[2..].to_vec());
+        (store, run, moved, failed)
+    }
+
+    /// Headless retry simulation over the REAL helpers (`check_retry_entry`
+    /// + `resolve_for_move` — the same functions the `retry_failed`
+    /// command calls): retry-start snapshot, optional mid-retry shift,
+    /// then resolve → transcript verb or skip-count. Returns
+    /// (transcript, retry_skipped, moved_now).
+    fn simulate_retry(
+        conn: &rusqlite::Connection,
+        run_id: i64,
+        shift: Option<(u64, u64, u32)>,
+    ) -> (Vec<String>, usize, usize) {
+        let failed = check_retry_entry(conn, run_id).unwrap();
+        // Retry-start snapshot: current location + epochs.
+        let mut snap: Vec<(u64, String, u32, u32)> = Vec::new();
+        for f in &failed {
+            let (folder, uid) = queries_message_location(conn, f.message_id).unwrap();
+            let epoch: u32 = conn.query_row(
+                "SELECT uid_validity FROM mailboxes WHERE name = ?1",
+                rusqlite::params![folder], |r| r.get(0)).unwrap_or(0);
+            snap.push((f.message_id, folder, uid, epoch));
+        }
+        // Mid-retry burst-EXISTS: relocate one message (new mailbox+uid).
+        if let Some((mid, new_mb, new_uid)) = shift {
+            let mb_id: u64 = conn.query_row(
+                "SELECT id FROM mailboxes WHERE name = ?1", rusqlite::params!["Other"],
+                |r| r.get(0)).unwrap();
+            conn.execute("UPDATE messages SET mailbox_id = ?1, uid = ?2 WHERE id = ?3",
+                rusqlite::params![mb_id, new_uid, mid]).unwrap();
+        }
+        let mut transcript = Vec::new();
+        let mut skipped = 0usize;
+        let mut moved_now = 0usize;
+        for (mid, folder, uid, epoch) in snap {
+            match resolve_for_move(conn, mid, &folder, uid, epoch).unwrap() {
+                None => skipped += 1,
+                Some(res) => {
+                    transcript.push(format!("MOVE {}:{} -> Auto/Financeiro", res.from_folder, res.uid));
+                    journal_moved(conn, run_id, mid).unwrap();
+                    moved_now += 1;
+                }
+            }
+        }
+        (transcript, skipped, moved_now)
+    }
+
+    fn queries_message_location(conn: &rusqlite::Connection, mid: u64) -> Result<(String, u32), String> {
+        queries::message_location(conn, mid)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "missing".to_string())
+    }
+
+    #[test]
+    fn retry_skips_moved() {
+        // Mixed run: retry executes EXACTLY the moved=0 subset — the
+        // transcript holds one MOVE per failed row and ZERO verbs for
+        // moved=1 rows (skip check precedes the verb, T-30-05).
+        let (store, run, moved, failed) = retry_seeded();
+        let conn = store.conn();
+        let entry = check_retry_entry(conn, run).unwrap();
+        assert_eq!(entry.len(), failed.len());
+        assert!(entry.iter().all(|f| failed.contains(&f.message_id)));
+        let (transcript, skipped, moved_now) = simulate_retry(conn, run, None);
+        assert_eq!(skipped, 0);
+        assert_eq!(moved_now, failed.len());
+        assert_eq!(transcript.len(), failed.len());
+        for mid in &moved {
+            assert!(transcript.iter().all(|v| !v.contains(&format!(":{mid} "))),
+                "moved=1 row {mid} must see zero verbs: {transcript:?}");
+        }
+        // Journal now shows all rows moved (exactly-once accumulation on
+        // the SAME run_id — no new run row created).
+        assert_eq!(failed_count(conn, run), 0);
+        let runs: i64 = conn.query_row("SELECT count(*) FROM batch_runs", [], |r| r.get(0)).unwrap();
+        assert_eq!(runs, 1, "retry must not create a new run row");
+    }
+
+    #[test]
+    fn double_click_retry_single_flight() {
+        // Run-level single-flight (SyncGate-style): the first claimant
+        // executes; concurrent claimants see running-retry and skip —
+        // second caller never executes (T-30-06).
+        let (_store, run, _, _) = retry_seeded();
+        assert!(try_claim_retry(run), "first claim must succeed");
+        assert!(!try_claim_retry(run), "second claim must skip");
+        release_retry(run);
+        assert!(try_claim_retry(run), "release must reopen the lane");
+        release_retry(run);
+        // Contention: 8 threads race one lane — prove non-overlap by
+        // tracking concurrent holders (max must be exactly 1).
+        let run2 = run + 1000;
+        let current = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let (cur, max, bar) = (current.clone(), max_seen.clone(), barrier.clone());
+            handles.push(std::thread::spawn(move || {
+                bar.wait(); // maximize contention: all threads claim at once
+                if try_claim_retry(run2) {
+                    let c = cur.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    max.fetch_max(c, std::sync::atomic::Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    cur.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    release_retry(run2);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(max_seen.load(std::sync::atomic::Ordering::SeqCst), 1,
+            "concurrent retries must never overlap on one run");
+        // Held-lane check: an owned lane refuses while held.
+        assert!(try_claim_retry(run2));
+        assert!(!try_claim_retry(run2), "held lane must refuse while owned");
+        release_retry(run2);
+    }
+
+    #[test]
+    fn burst_exists_retry_skips_shifted() {
+        // Mid-retry EXISTS burst relocates one failed row: it is SKIPPED
+        // (no double-file) and counted in retry_skipped; the unshifted
+        // row still executes exactly once.
+        let (store, run, _moved, failed) = retry_seeded();
+        let conn = store.conn();
+        ensure_mailbox(conn, "Other").unwrap();
+        let shifted = failed[0];
+        let (transcript, skipped, moved_now) =
+            simulate_retry(conn, run, Some((shifted, 0, 77)));
+        assert_eq!(skipped, 1, "shifted row must skip, got transcript {transcript:?}");
+        assert_eq!(moved_now, failed.len() - 1);
+        assert!(transcript.iter().all(|v| !v.contains(":77 ")),
+            "no verb may address the shifted UID: {transcript:?}");
+        assert_eq!(failed_count(conn, run), 1, "shifted row stays failed for the next retry");
+    }
+
+    #[test]
+    fn retry_entry_refuses_undone_and_empty() {
+        let (store, run, _, _) = retry_seeded();
+        let conn = store.conn();
+        // Undone runs never retry (undo already restored originals).
+        conn.execute("UPDATE batch_runs SET state = 'undone' WHERE id = ?1",
+            rusqlite::params![run]).unwrap();
+        let err = check_retry_entry(conn, run).unwrap_err();
+        assert!(err.contains("desfeita"), "plain-language refusal, got: {err}");
+        // Running runs never retry either.
+        conn.execute("UPDATE batch_runs SET state = 'running' WHERE id = ?1",
+            rusqlite::params![run]).unwrap();
+        assert!(check_retry_entry(conn, run).is_err());
+        // Done with zero failures has nothing to offer.
+        conn.execute("UPDATE batch_runs SET state = 'done' WHERE id = ?1",
+            rusqlite::params![run]).unwrap();
+        conn.execute("UPDATE batch_items SET moved = 1 WHERE run_id = ?1",
+            rusqlite::params![run]).unwrap();
+        let err = check_retry_entry(conn, run).unwrap_err();
+        assert!(err.contains("não tem falhas"), "got: {err}");
+        // Unknown run id refuses plainly.
+        assert!(check_retry_entry(conn, run + 9999).is_err());
+    }
+
+    #[test]
+    fn live_retry_gate_skips_offline() {
+        // Sandbox contract: without operator credentials this leg SKIPs,
+        // never fails and never touches the network.
+        if std::env::var("SGE_LIVE_IMAP_USER").is_err() {
+            eprintln!("SKIP: live batch retry leg needs SGE_LIVE_IMAP_USER (operator-only)");
+            return;
+        }
+        // With creds the operator runs the preview→run→retry round-trip
+        // externally (self-only mail, pre-flight guard, undo_batch
+        // cleanup); the headless stress tests above are the gate.
+        let _store = Store::open_in_memory().unwrap();
+    }
 }

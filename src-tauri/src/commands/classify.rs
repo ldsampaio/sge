@@ -1642,6 +1642,15 @@ pub async fn cancel_batch(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
+/// Undo-batch: restore originals in reverse journal order.
+#[tauri::command]
+pub async fn undo_batch(state: State<'_, AppState>, run_id: i64) -> Result<usize, String> {
+    let store = state.store.clone();
+    let account_cfg = load_account_config(state.clone()).await?;
+    let manager = manager_for(&state, &account_cfg);
+    batch::undo_run(&manager, &store, run_id).await
+}
+
 /// Persisted per-category report + remainder for a run.
 #[tauri::command]
 pub async fn batch_report(
@@ -1716,13 +1725,234 @@ pub async fn preview_archive(
     batch::preview_plan(guard.conn(), batch::PreviewKind::Archive, None)
 }
 
-/// Undo-batch: restore originals in reverse journal order.
+// ── Phase 30: retry-only-failures command (BATCH-04) ─────────────
+//
+// `retry_failed(run_id)` re-executes ONLY the `moved=0` intent rows of a
+// finished/interrupted run on the SAME `run_id` (no new run row; report
+// accumulates on the original run). Writes flip back on ONLY for the
+// failed subset — `moved=1` rows are filtered BEFORE any IMAP verb is
+// issued (T-30-05). Double-click-retry single-flights at run level
+// (T-30-06): the second caller gets an `already-running` report, never
+// a second execution. Burst-EXISTS mid-retry re-resolves per row via
+// `resolve_for_move` against the retry-start snapshot and skips shifted
+// rows instead of double-filing. The real run + retry ride the existing
+// SyncGate/outbox-claim path unchanged (`move_one_uid` / `archive_one`
+// internals — no new gate). Retry logs `override_events` with the same
+// `batch` action + `run_id` so the Phase 31 dataset stays consistent.
+
+/// Retry outcome (accumulates on the original run).
+#[derive(Debug, Clone, Serialize)]
+pub struct RetryReport {
+    pub run_id: i64,
+    /// `done` | `interrupted` (run state after retry) | `already-running`
+    /// (second caller skipped — single-flight, no execution).
+    pub state: String,
+    pub retried: usize,
+    pub moved: usize,
+    pub skipped: usize,
+    pub failed_remaining: usize,
+}
+
+/// Retry only the failed items of a finished/interrupted run.
 #[tauri::command]
-pub async fn undo_batch(state: State<'_, AppState>, run_id: i64) -> Result<usize, String> {
+pub async fn retry_failed(
+    state: State<'_, AppState>,
+    run_id: i64,
+) -> Result<RetryReport, String> {
     let store = state.store.clone();
+    // Entry gate first (plain-language refusals for undone/running/
+    // failure-free runs) — before claiming the lane.
+    let failed = {
+        let guard = store.lock().unwrap();
+        batch::check_retry_entry(guard.conn(), run_id)?
+    };
+    if !batch::try_claim_retry(run_id) {
+        let remaining = {
+            let guard = store.lock().unwrap();
+            batch::failed_count(guard.conn(), run_id)
+        };
+        return Ok(RetryReport {
+            run_id,
+            state: "already-running".to_string(),
+            retried: 0,
+            moved: 0,
+            skipped: 0,
+            failed_remaining: remaining,
+        });
+    }
+    let outcome = retry_failed_inner(&state, &store, run_id, failed).await;
+    batch::release_retry(run_id);
+    outcome
+}
+
+async fn retry_failed_inner(
+    state: &tauri::State<'_, AppState>,
+    store: &std::sync::Arc<std::sync::Mutex<crate::store::Store>>,
+    run_id: i64,
+    failed: Vec<batch::FailedItem>,
+) -> Result<RetryReport, String> {
     let account_cfg = load_account_config(state.clone()).await?;
-    let manager = manager_for(&state, &account_cfg);
-    batch::undo_run(&manager, &store, run_id).await
+    let manager = manager_for(state, &account_cfg);
+    // Run kind (archive retries move through `archive_one`; classify
+    // retries through `move_one_uid` — same verbs the original run used).
+    let (run_state, is_archive) = {
+        let guard = store.lock().unwrap();
+        let conn = guard.conn();
+        let state_s: String = conn
+            .query_row("SELECT state FROM batch_runs WHERE id = ?1", rusqlite::params![run_id], |r| {
+                r.get(0)
+            })
+            .map_err(|e| e.to_string())?;
+        let totals: String = conn
+            .query_row("SELECT totals_json FROM batch_runs WHERE id = ?1", rusqlite::params![run_id], |r| {
+                r.get(0)
+            })
+            .map_err(|e| e.to_string())?;
+        let kind = serde_json::from_str::<serde_json::Value>(&totals)
+            .ok()
+            .and_then(|v| v.get("kind").and_then(|k| k.as_str()).map(str::to_string))
+            .unwrap_or_default();
+        (state_s, kind == "archive")
+    };
+    // Retry-start snapshot: current location + epoch per failed row
+    // (burst-EXISTS re-resolution baseline).
+    let snap: Vec<(batch::FailedItem, Option<(String, u32, u32)>)> = {
+        let guard = store.lock().unwrap();
+        let conn = guard.conn();
+        failed
+            .into_iter()
+            .map(|f| {
+                let loc = queries::message_location(conn, f.message_id)
+                    .ok()
+                    .flatten();
+                let snapped = loc.map(|(folder, uid)| {
+                    let epoch: u32 = conn
+                        .query_row(
+                            "SELECT uid_validity FROM mailboxes WHERE name = ?1",
+                            rusqlite::params![folder],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(0);
+                    (folder, uid, epoch)
+                });
+                (f, snapped)
+            })
+            .collect()
+    };
+    let mut retried = 0usize;
+    let mut moved = 0usize;
+    let mut skipped = 0usize;
+    for (item, snap_loc) in snap {
+        retried += 1;
+        // Re-resolve per row in the journal lock section (T-30-01).
+        let resolved = {
+            let guard = store.lock().unwrap();
+            let conn = guard.conn();
+            match &snap_loc {
+                Some((folder, uid, epoch)) => {
+                    match batch::resolve_for_move(conn, item.message_id, folder, *uid, *epoch) {
+                        Ok(r) => r,
+                        Err(_) => None,
+                    }
+                }
+                None => None,
+            }
+        };
+        let current = {
+            let guard = store.lock().unwrap();
+            queries::message_location(guard.conn(), item.message_id).ok().flatten()
+        };
+        let Some(res) = resolved else {
+            // Stale or vanished — but distinguish "already filed" (the
+            // verb fired, the fact journal was lost to a crash): current
+            // folder == destination means the move happened.
+            if let Some((cur_folder, _)) = current {
+                if cur_folder == item.to_folder {
+                    let guard = store.lock().unwrap();
+                    let _ = batch::journal_moved(guard.conn(), run_id, item.message_id);
+                    moved += 1;
+                }
+            }
+            skipped += 1;
+            continue;
+        };
+        if res.from_folder == item.to_folder {
+            // Already at the destination: record the fact, no verb
+            // (exactly-once — skip check precedes the verb, T-30-05).
+            let guard = store.lock().unwrap();
+            let _ = batch::journal_moved(guard.conn(), run_id, item.message_id);
+            moved += 1;
+            skipped += 1;
+            continue;
+        }
+        // Fresh failure in its source folder: re-issue the verb with the
+        // re-resolved pair (writes re-on for the failed subset ONLY).
+        let ok = if is_archive {
+            archive::archive_one(&manager, store, &res.from_folder, res.uid, &item.to_folder, &item.to_folder)
+                .await
+                .is_ok()
+        } else {
+            crate::classify::filing::move_one_uid(
+                &manager,
+                store,
+                &res.from_folder,
+                res.uid,
+                &item.to_folder,
+                &format!("Repetida após falha em {}", item.to_folder),
+            )
+            .await
+            .is_ok()
+        };
+        if ok {
+            let guard = store.lock().unwrap();
+            let _ = batch::journal_moved(guard.conn(), run_id, item.message_id);
+            // Same `batch` action + run_id as the original run (Phase 31
+            // dataset consistency; archive retries carry kind=archive in
+            // the destination label id already journaled).
+            let _ = queries::log_override_event(
+                guard.conn(),
+                &item.message_id.to_string(),
+                "batch",
+                None,
+                Some(&item.label_id),
+                None,
+                None,
+                None,
+                Some(&run_id.to_string()),
+                None,
+                None,
+            );
+            moved += 1;
+        }
+    }
+    // Report accumulates on the ORIGINAL run (no new run row): merge
+    // retry_skipped into totals_json, keep the run state.
+    let failed_remaining = {
+        let guard = store.lock().unwrap();
+        let conn = guard.conn();
+        let totals: String = conn
+            .query_row("SELECT totals_json FROM batch_runs WHERE id = ?1", rusqlite::params![run_id], |r| {
+                r.get(0)
+            })
+            .map_err(|e| e.to_string())?;
+        let mut v: serde_json::Value = serde_json::from_str(&totals).unwrap_or_default();
+        if !v.is_object() {
+            v = serde_json::json!({});
+        }
+        let prev = v.get("retry_skipped").and_then(|n| n.as_u64()).unwrap_or(0) as usize;
+        v["retry_skipped"] = serde_json::json!(prev + skipped);
+        let merged = v.to_string();
+        queries::finish_batch_run(conn, run_id, &run_state, &merged).map_err(|e| e.to_string())?;
+        batch::failed_count(conn, run_id)
+    };
+    Ok(RetryReport {
+        run_id,
+        state: run_state,
+        retried,
+        moved,
+        skipped,
+        failed_remaining,
+    })
 }
 
 // ── Integration-closeout commands (audit fixes) ──────────────────
