@@ -4,7 +4,7 @@
 //! All parsing is read-only — `BODY.PEEK` semantics are enforced upstream
 //! by the sync worker's `UID FETCH` attributes (never bare `BODY[]`).
 
-use async_imap::imap_proto::{Address, BodyStructure};
+use async_imap::imap_proto::{Address, BodyStructure, types::AttributeValue};
 use async_imap::types::{Fetch, Flag};
 use futures::TryStreamExt;
 use mail_parser::parsers::MessageStream;
@@ -33,6 +33,7 @@ pub struct MessageHeader {
     pub flags: String,
     pub has_attachments: bool,
     pub preview: String,
+    pub modseq: Option<u64>,
 }
 
 /// Convert async-imap `Flag` list into the JSON string the DB stores.
@@ -256,6 +257,7 @@ pub fn parse_fetch_item(fetch: &Fetch, uid: u32) -> MessageHeader {
         .map(body_has_attachments)
         .unwrap_or(false);
     let preview = make_preview(&subject, message_id.as_deref());
+    let modseq = fetch.modseq;
 
     MessageHeader {
         uid,
@@ -268,6 +270,7 @@ pub fn parse_fetch_item(fetch: &Fetch, uid: u32) -> MessageHeader {
         flags,
         has_attachments,
         preview,
+        modseq,
     }
 }
 
@@ -483,4 +486,58 @@ mod tests {
             "peek_audit: all four fetch paths must be accounted for"
         );
     }
+}
+
+/// Parse `Vec<AttributeValue>` from a raw FETCH response into a `MessageHeader`.
+/// Used by `condstore_fetch_changedsince` to parse CHANGEDSINCE responses.
+pub fn parse_fetch_attributes(attrs: &[AttributeValue]) -> MessageHeader {
+    let mut header = MessageHeader {
+        uid: 0,
+        message_id: None,
+        subject: String::new(),
+        from_addr: String::new(),
+        to_addrs: String::new(),
+        cc_addrs: String::new(),
+        date_utc: String::new(),
+        flags: String::new(),
+        has_attachments: false,
+        preview: String::new(),
+        modseq: None,
+    };
+    for attr in attrs {
+        match attr {
+            AttributeValue::Uid(u) => header.uid = *u,
+            AttributeValue::ModSeq(m) => header.modseq = Some(*m),
+            AttributeValue::Envelope(env) => {
+                header.subject = decode_bytes_opt(env.subject.as_deref())
+                    .map(|s| decode_header_words(&s))
+                    .unwrap_or_default();
+                header.message_id = decode_bytes_opt(env.message_id.as_deref());
+                header.from_addr = format_addresses(env.from.as_deref());
+                header.to_addrs = format_addresses(env.to.as_deref());
+                header.cc_addrs = format_addresses(env.cc.as_deref());
+                header.date_utc = env
+                    .date
+                    .as_deref()
+                    .and_then(|b| decode_bytes_opt(Some(b)))
+                    .and_then(|dt| chrono::DateTime::parse_from_str(&dt, "%d-%b-%Y %H:%M:%S %z").ok())
+                    .map(|dt| dt.to_rfc3339())
+                    .unwrap_or_default();
+            }
+            AttributeValue::Flags(raw_flags) => {
+                header.flags = format_flags(raw_flags.iter().map(|s| Flag::from(s.as_ref())).collect())
+            }
+            AttributeValue::InternalDate(dt) => {
+                // InternalDate is Cow<str>, parse it
+                header.date_utc = chrono::DateTime::parse_from_str(dt.as_ref(), "%d-%b-%Y %H:%M:%S %z")
+                    .map(|parsed| parsed.to_rfc3339())
+                    .unwrap_or_else(|_| dt.clone().into_owned());
+            }
+            AttributeValue::BodyStructure(bs) => header.has_attachments = body_has_attachments(&bs),
+            AttributeValue::ModSeq(m) => header.modseq = Some(*m),
+            _ => {}
+        }
+    }
+    header.preview = make_preview(&header.subject, header.message_id.as_deref());
+    header
 }

@@ -1,4 +1,5 @@
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.75s
+   Compiling sge v0.1.0 (/home/lucas/Documents/Projetos/sge/src-tauri)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 14.50s
      Running `src-tauri/target/debug/imap_probe --host mail.utfpr.edu.br --port 993 --mode implicit_tls --pre-auth-only`
 # PRE-AUTH CONNECT mail.utfpr.edu.br:993 mode=implicit_tls
 C: a0 CAPABILITY

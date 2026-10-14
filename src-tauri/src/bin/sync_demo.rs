@@ -80,6 +80,7 @@ impl SyncSession for MockSession {
                     flags: String::new(),
                     has_attachments: false,
                     preview: format!("Preview of message {uid}"),
+                    modseq: None,
                 });
             }
             Ok(headers)
@@ -143,6 +144,18 @@ impl SyncSession for MockSession {
 
     fn logout(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SyncError>> + Send>> {
         Box::pin(async move { Ok(()) })
+    }
+
+    fn select_condstore(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, SyncError>> + Send>> {
+        Box::pin(async move { Ok(false) })
+    }
+
+    fn condstore_fetch_changedsince<'a>(
+        &'a mut self,
+        _range: &'a str,
+        _modseq: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<MessageHeader>, SyncError>> + Send + 'a>> {
+        Box::pin(async move { Ok(Vec::new()) })
     }
 }
 

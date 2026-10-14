@@ -2120,6 +2120,91 @@ pub fn latest_override(conn: &Connection, message_id: u64) -> StoreResult<Option
     .map_err(super::StoreError::Sql)
 }
 
+/// Log an override event for future learning (Phase 28: override_events table).
+///
+/// Fire-and-forget: caller must not await across this call (short lock section).
+/// All fields are IDs/scores/metadata — no bodies, no secrets (Pitfall 3).
+pub fn log_override_event(
+    conn: &Connection,
+    message_id: &str,
+    action: &str,
+    from_category: Option<&str>,
+    to_category: Option<&str>,
+    confidence: Option<f64>,
+    threshold: Option<f64>,
+    keywords: Option<&str>,
+    batch_run_id: Option<&str>,
+    uid_validity: Option<i64>,
+    modseq: Option<i64>,
+) -> StoreResult<()> {
+    conn.execute(
+        "INSERT INTO override_events (message_id, action, from_category, to_category, confidence, threshold, keywords, batch_run_id, uid_validity, modseq)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        rusqlite::params![
+            message_id,
+            action,
+            from_category,
+            to_category,
+            confidence,
+            threshold,
+            keywords,
+            batch_run_id,
+            uid_validity,
+            modseq,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Get the most recent override event for a message (Phase 28).
+///
+/// Returns the full row for downstream learning/auto-confirm consumption.
+pub fn latest_override_event(
+    conn: &Connection,
+    message_id: &str,
+) -> StoreResult<Option<OverrideEventRow>> {
+    conn.query_row(
+        "SELECT id, ts, action, message_id, from_category, to_category, confidence, threshold, keywords, batch_run_id, uid_validity, modseq
+         FROM override_events WHERE message_id = ?1 ORDER BY ts DESC LIMIT 1",
+        rusqlite::params![message_id],
+        |r| {
+            Ok(OverrideEventRow {
+                id: r.get(0)?,
+                ts: r.get(1)?,
+                action: r.get(2)?,
+                message_id: r.get(3)?,
+                from_category: r.get(4)?,
+                to_category: r.get(5)?,
+                confidence: r.get(6)?,
+                threshold: r.get(7)?,
+                keywords: r.get(8)?,
+                batch_run_id: r.get(9)?,
+                uid_validity: r.get(10)?,
+                modseq: r.get(11)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(super::StoreError::Sql)
+}
+
+/// Row type for override_events (Phase 28).
+#[derive(Debug, Clone)]
+pub struct OverrideEventRow {
+    pub id: i64,
+    pub ts: String,
+    pub action: String,
+    pub message_id: String,
+    pub from_category: Option<String>,
+    pub to_category: Option<String>,
+    pub confidence: Option<f64>,
+    pub threshold: Option<f64>,
+    pub keywords: Option<String>,
+    pub batch_run_id: Option<String>,
+    pub uid_validity: Option<i64>,
+    pub modseq: Option<i64>,
+}
+
 /// Enqueue a message for classification (idempotent per message+folder).
 pub fn enqueue_classify(
     conn: &Connection,

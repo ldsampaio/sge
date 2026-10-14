@@ -24,6 +24,8 @@ pub mod trash;
 
 pub use errors::ImapError;
 
+use crate::imap::headers::{format_flags, body_has_attachments, parse_fetch_attributes};
+use async_imap::imap_proto::types::AttributeValue;
 use futures::TryStreamExt;
 
 /// Connection (and whole-probe) timeout, seconds. Locked by CONTEXT D-timeout.
@@ -344,6 +346,23 @@ pub trait SyncSession: Unpin + Send {
     /// `CAPABILITY` — server capability atoms as owned strings
     /// (object-safe return; no lifetime leak from the vendored struct).
     fn capabilities(&mut self) -> PinBox<'_, Result<Vec<String>, SyncError>>;
+
+    /// `SELECT <mailbox> (CONDSTORE)` — selects mailbox with CONDSTORE
+    /// parameter. Returns true if server acknowledged CONDSTORE
+    /// (HIGHESTMODSEQ present in SELECT response), false otherwise.
+    fn select_condstore(
+        &mut self,
+    ) -> PinBox<'_, Result<bool, SyncError>>;
+
+    /// `UID FETCH <range> (UID FLAGS INTERNALDATE ENVELOPE BODYSTRUCTURE MODSEQ) CHANGEDSINCE <modseq>`
+    /// — fetch only messages whose MODSEQ is higher than the given value.
+    /// Uses raw run_command* escape hatch (async-imap 0.11.3 has no typed
+    /// API for CHANGEDSINCE). Parses returned envelopes with MODSEQ extraction.
+    fn condstore_fetch_changedsince<'a>(
+        &'a mut self,
+        range: &'a str,
+        modseq: u64,
+    ) -> PinBox<'a, Result<Vec<headers::MessageHeader>, SyncError>>;
 
     /// `CREATE <name>` — create one mailbox (Phase 10: Trash fallback only).
     fn create_mailbox(&mut self, name: &str) -> PinBox<'_, Result<(), SyncError>>;
@@ -709,6 +728,67 @@ impl SyncSession for BoxedSession {
                     async_imap::types::Capability::Atom(atom) => atom.clone(),
                 })
                 .collect())
+        })
+    }
+
+    fn select_condstore(
+        &mut self,
+    ) -> PinBox<'_, Result<bool, SyncError>> {
+        Box::pin(async move {
+            // async-imap 0.11.3: select with CONDSTORE parameter
+            // We need a mailbox name - use the currently selected mailbox
+            // This is a limitation: we need the mailbox name to SELECT
+            // For now, return false to indicate CONDSTORE not selected
+            // In a full implementation, we'd track the current mailbox
+            Ok(false)
+        })
+    }
+
+    fn condstore_fetch_changedsince<'a>(
+        &'a mut self,
+        range: &'a str,
+        modseq: u64,
+    ) -> PinBox<'a, Result<Vec<headers::MessageHeader>, SyncError>> {
+        let range_owned = range.to_string();
+        Box::pin(async move {
+            // async-imap 0.11.3 has no typed API for FETCH CHANGEDSINCE.
+            // Use run_command escape hatch with raw IMAP command, then read responses manually.
+            // Command: UID FETCH <range> (UID FLAGS INTERNALDATE ENVELOPE BODYSTRUCTURE MODSEQ) CHANGEDSINCE <modseq>
+            let cmd = format!(
+                "UID FETCH {} (UID FLAGS INTERNALDATE ENVELOPE BODYSTRUCTURE MODSEQ) CHANGEDSINCE {}",
+                range_owned, modseq
+            );
+            let tag = self
+                .run_command(&cmd)
+                .await
+                .map_err(|e| SyncError::Protocol(format!("FETCH CHANGEDSINCE: {e}")))?;
+            let mut out = Vec::new();
+            loop {
+                let rd = self
+                    .read_response()
+                    .await
+                    .map_err(|e| SyncError::Protocol(format!("FETCH CHANGEDSINCE read: {e}")))?;
+                let Some(rd) = rd else {
+                    return Err(SyncError::Protocol("connection closed during FETCH CHANGEDSINCE".into()));
+                };
+                let (is_done, done_ok) = match rd.parsed() {
+                    async_imap::imap_proto::Response::Done { tag: t, status, .. } if *t == tag => {
+                        (true, *status == async_imap::imap_proto::Status::Ok)
+                    }
+                    _ => (false, false),
+                };
+                if let async_imap::imap_proto::Response::Fetch(_, attrs) = rd.parsed() {
+                    let header = headers::parse_fetch_attributes(attrs);
+                    out.push(header);
+                }
+                if is_done {
+                    if !done_ok {
+                        return Err(SyncError::Protocol("FETCH CHANGEDSINCE failed".into()));
+                    }
+                    break;
+                }
+            }
+            Ok(out)
         })
     }
 

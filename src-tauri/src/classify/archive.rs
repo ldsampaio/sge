@@ -48,6 +48,7 @@ use chrono::{DateTime, Utc};
 use super::filing::{self, ConfirmResult};
 use super::redact;
 use super::taxonomy::{load_default, top_level};
+use crate::imap::headers::MessageHeader;
 use crate::commands::sync::{prepare_create_wire, refresh_mailbox_tree};
 use crate::imap::manager::SessionManager;
 use crate::store::queries;
@@ -683,6 +684,18 @@ mod tests {
         }
         fn logout(&mut self) -> PinBox<'_, Result<(), SyncError>> {
             Box::pin(async move { Ok(()) })
+        }
+
+        fn select_condstore(&mut self) -> PinBox<'_, Result<bool, SyncError>> {
+            Box::pin(async move { Ok(false) })
+        }
+
+        fn condstore_fetch_changedsince<'a>(
+            &'a mut self,
+            _range: &'a str,
+            _modseq: u64,
+        ) -> PinBox<'a, Result<Vec<MessageHeader>, SyncError>> {
+            Box::pin(async move { Ok(Vec::new()) })
         }
     }
 

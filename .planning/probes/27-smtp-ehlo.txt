@@ -94,29 +94,29 @@ Post-Handshake New Session Ticket arrived:
 SSL-Session:
     Protocol  : TLSv1.3
     Cipher    : TLS_AES_256_GCM_SHA384
-    Session-ID: 6201D91C6F5684B840B2261EBDC3D3D8CE5488D6E48429EB00C55364F0E1D5AC
+    Session-ID: 11354BE14A0F4A50E3817A99BDB7242C6E929B43234DD9052ADD3A42A62FE719
     Session-ID-ctx: 
-    Resumption PSK: 6AC4C35BE976C9AA6FA51665DE684B9D367676B260E4C8783E470CE293EC83459A9EB3B6776F89465849A7AA5EC4665B
+    Resumption PSK: 075115F0FE2A0F4B9F2B5DC5526DFEA199D282036A2598A73C05C279705A01CB53BA5360841C6D0E3282A15CAE4776BC
     PSK identity: None
     PSK identity hint: None
     SRP username: None
     TLS session ticket lifetime hint: 7200 (seconds)
     TLS session ticket:
-    0000 - 03 ae a5 07 02 2e 02 9c-07 40 62 aa 2e e4 ee 19   .........@b.....
-    0010 - c6 48 d9 74 03 1d 5c db-01 8e b3 82 6d 8b 04 20   .H.t..\.....m.. 
-    0020 - c4 1f 55 c8 b6 1d 00 f3-92 5a c0 18 8d 7e 9d 48   ..U......Z...~.H
-    0030 - d4 8a bb 9f 5f 68 db ef-00 a7 f2 89 83 12 ae 2b   ...._h.........+
-    0040 - 2a 89 e8 af bf 69 f6 4d-e2 2b 60 a9 6a 8b ab 30   *....i.M.+`.j..0
-    0050 - 27 b0 76 48 00 b0 0d 4f-51 f5 a6 98 c9 a2 df f0   '.vH...OQ.......
-    0060 - 6f fe 05 81 a0 dc fe 25-26 8d a4 af 6e bc 65 ef   o......%&...n.e.
-    0070 - 71 6c 69 da cb 0f ee a1-b6 93 2d b7 39 a8 c0 54   qli.......-.9..T
-    0080 - 78 8c aa 69 b9 d8 14 ac-21 21 50 63 af e5 b7 15   x..i....!!Pc....
-    0090 - 5b 22 f6 c1 18 fa 91 14-50 49 da 7b ac 28 d7 57   ["......PI.{.(.W
-    00a0 - 5f 4c 9f c6 8e 1c a1 91-86 09 8a f2 61 b9 d4 ad   _L..........a...
-    00b0 - 6c 50 02 d7 2c 61 35 fd-9a 4c ea fb 5b 9a 20 34   lP..,a5..L..[. 4
-    00c0 - 1f 28 40 8c 3d 83 28 78-c0 2e 01 1a 62 71 1a 44   .(@.=.(x....bq.D
+    0000 - c9 89 93 ea 83 e6 29 d2-be 9c 1b d4 96 7e ac 60   ......)......~.`
+    0010 - 0f d0 3b d8 36 38 0c d6-df ec 14 2e 76 4e 65 1e   ..;.68......vNe.
+    0020 - c4 d0 70 e6 e9 df c5 70-05 fd 3b 42 14 0f d0 b7   ..p....p..;B....
+    0030 - 2d d0 c7 fd b7 34 47 d0-d8 02 fe a3 93 10 27 1e   -....4G.......'.
+    0040 - 0a 05 13 eb 71 1f 43 bf-2a 12 a5 53 07 ae 1d 16   ....q.C.*..S....
+    0050 - e3 4b 3e f4 61 27 77 e6-c7 2f c2 38 7f 50 88 21   .K>.a'w../.8.P.!
+    0060 - 3c dc 0c 75 fc 05 92 a3-46 ef 16 98 d5 98 ca 60   <..u....F......`
+    0070 - 4c 3d 51 27 92 3d 0a c4-a0 98 97 61 2c 4b fd 64   L=Q'.=.....a,K.d
+    0080 - 85 3d 10 df 8c 76 cd 93-64 06 a0 5a aa 9c 02 78   .=...v..d..Z...x
+    0090 - 2e f1 e1 fe a2 81 8a e9-29 84 1e 91 a4 a1 05 3d   ........)......=
+    00a0 - 1d 55 15 e8 42 79 1d cb-bb 2a a8 8d c6 dd 89 6a   .U..By...*.....j
+    00b0 - 5f 40 0b fe 5f 1a df 16-4d ae 59 f6 ce 8c 8e 7f   _@.._...M.Y.....
+    00c0 - a4 72 5b 4b 34 07 0f 6b-df c7 87 6d f8 d7 95 69   .r[K4..k...m...i
 
-    Start Time: 1791932815
+    Start Time: 1791933502
     Timeout   : 7200 (sec)
     Verify return code: 0 (ok)
     Extended master secret: no

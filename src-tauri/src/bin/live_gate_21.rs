@@ -384,6 +384,31 @@ impl SyncSession for GateSession<'_> {
     fn logout(&mut self) -> PinBox<'_, Result<(), SyncError>> {
         Box::pin(async move { self.inner.logout().await })
     }
+
+    fn select_condstore(&mut self) -> PinBox<'_, Result<bool, SyncError>> {
+        let blocked = self.is_closed();
+        Box::pin(async move {
+            if blocked {
+                return Err(gate_err("select_condstore"));
+            }
+            self.inner.select_condstore().await
+        })
+    }
+
+    fn condstore_fetch_changedsince<'a>(
+        &'a mut self,
+        range: &'a str,
+        modseq: u64,
+    ) -> PinBox<'a, Result<Vec<MessageHeader>, SyncError>> {
+        let blocked = self.is_closed();
+        let range = range.to_string();
+        Box::pin(async move {
+            if blocked {
+                return Err(gate_err("condstore_fetch_changedsince"));
+            }
+            self.inner.condstore_fetch_changedsince(&range, modseq).await
+        })
+    }
 }
 
 // ── SMTP counting decorator (T-21-03, zero prod-code changes) ─────────────

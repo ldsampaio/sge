@@ -16,7 +16,7 @@ pub mod queries;
 pub const BODY_CACHE_CAP_BYTES: usize = 262144;
 
 /// Schema version managed by rusqlite_migration.
-pub const SCHEMA_VERSION: u32 = 11;
+pub const SCHEMA_VERSION: u32 = 12;
 
 // v1 = full schema.sql (canonical DDL from ARCHITECTURE.md)
 // M2 = flag_outbox durable queue (Phase 6, Plan 06-01). The schema.sql v1
@@ -99,6 +99,7 @@ impl Store {
             M::up(M17_FTS_BODY_SQL),
             M::up(M18_FILTERS_SQL),
             M::up(M19_RULES_SQL),
+            M::up(M20_OVERRIDE_EVENTS_SQL),
         ]);
         migrations.to_latest(conn)?;
         Ok(())
@@ -673,6 +674,32 @@ const M19_RULES_SQL: &str = concat!(
     "CREATE INDEX idx_rule_suggestions_rule ON rule_suggestions(rule_id);",
 );
 
+/// M20 forward migration: override_events append-only log (Phase 28, Plan 28-01).
+///
+/// Records every classification decision (confirm, override, dismiss, batch)
+/// for future learning (Phase 31). Action is constrained by CHECK; message_id
+/// is IMAP UID (not Message-ID header) for local joining. All metadata is
+/// IDs/scores — no bodies, no secrets (Pitfall 3, Phase 16 redaction sanitizer).
+/// Index on (message_id, ts) supports time-series queries per message.
+const M20_OVERRIDE_EVENTS_SQL: &str = concat!(
+    "CREATE TABLE override_events (",
+    "  id             INTEGER PRIMARY KEY,",
+    "  ts             TEXT NOT NULL DEFAULT (datetime('now')),",
+    "  action         TEXT NOT NULL",
+    "    CHECK (action IN ('confirm','override','dismiss','batch')),",
+    "  message_id     TEXT NOT NULL,",
+    "  from_category  TEXT,",
+    "  to_category    TEXT,",
+    "  confidence     REAL,",
+    "  threshold      REAL,",
+    "  keywords       TEXT,",
+    "  batch_run_id   TEXT,",
+    "  uid_validity   INTEGER,",
+    "  modseq         INTEGER",
+    ");",
+    "CREATE INDEX idx_override_events_msg_ts ON override_events(message_id, ts);",
+);
+
 /// Returns the app-data attachment directory for a given mailbox UID.
 ///
 /// Files live under `<app_data>/attachments/<uid_validity>/<uid>/` —
@@ -761,8 +788,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_11_with_sent_unfiled() {
-        assert_eq!(SCHEMA_VERSION, 11);
+    fn schema_version_is_12_with_m20_override_events() {
+        assert_eq!(SCHEMA_VERSION, 12);
         let store = Store::open_in_memory().expect("migration should succeed");
         let conn = store.conn();
         let count: i64 = conn

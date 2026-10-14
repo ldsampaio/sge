@@ -2024,6 +2024,18 @@ mod tests {
             self.logout_called.store(true, Ordering::SeqCst);
             Box::pin(async move { Ok(()) })
         }
+
+        fn select_condstore(&mut self) -> PinBox<'_, Result<bool, SyncError>> {
+            Box::pin(async move { Ok(false) })
+        }
+
+        fn condstore_fetch_changedsince<'a>(
+            &'a mut self,
+            _range: &'a str,
+            _modseq: u64,
+        ) -> PinBox<'a, Result<Vec<MessageHeader>, SyncError>> {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
     }
 
     /// Build a minimal `MessageHeader` with deterministic fields.
@@ -2039,6 +2051,7 @@ mod tests {
             flags: "[]".to_string(),
             has_attachments: false,
             preview: format!("Subject {uid}"),
+            modseq: None,
         }
     }
 

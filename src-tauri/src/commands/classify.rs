@@ -318,6 +318,23 @@ pub async fn confirm_suggestion(
                 &plan.destination,
             );
         }
+        // Phase 28: fire-and-forget override_events log (action="confirm")
+        {
+            let guard = store.lock().unwrap();
+            let _ = crate::store::queries::log_override_event(
+                guard.conn(),
+                &message_id.to_string(),
+                "confirm",
+                Some(&plan.rule_id),
+                Some(&plan.destination),
+                Some(1.0),
+                Some(0.0),
+                None,
+                None,
+                None,
+                None,
+            );
+        }
         eprintln!(
             "[SGE rules] confirmed rule={} message={message_id} -> {dest_wire}",
             plan.rule_id
@@ -348,6 +365,47 @@ pub async fn confirm_suggestion(
     {
         let guard = store.lock().unwrap();
         let _ = crate::store::queries::delete_rule_suggestion(guard.conn(), message_id);
+    }
+    // Phase 28: fire-and-forget override_events log (action="confirm")
+    {
+        let guard = store.lock().unwrap();
+        // Extract from_category from the label row (primary_id)
+        let from_category = {
+            let conn = guard.conn();
+            crate::store::queries::get_label(conn, message_id)
+                .map_err(|e| e.to_string())?
+                .map(|l| l.primary_id)
+        };
+        // Extract to_category from the plan (dest_display parsed to category ID)
+        let to_category = if let Some((_, child)) = split_auto_nest(&dest_wire) {
+            child
+        } else if dest_wire.starts_with("Auto/") {
+            dest_wire.strip_prefix("Auto/").map(|s| s.to_string())
+        } else {
+            None
+        };
+        // Confidence/threshold from label row
+        let (confidence, threshold) = {
+            let conn = guard.conn();
+            crate::store::queries::get_label(conn, message_id)
+                .map_err(|e| e.to_string())?
+                .map(|l| (l.confidence, l.threshold))
+                .unwrap_or((1.0, 0.0))
+        };
+        // Keywords from evidence (serialize as JSON array) - placeholder for now
+        let _ = crate::store::queries::log_override_event(
+            guard.conn(),
+            &message_id.to_string(),
+            "confirm",
+            from_category.as_deref(),
+            to_category.as_deref(),
+            Some(confidence),
+            Some(threshold),
+            None,
+            None,
+            None,
+            None,
+        );
     }
     Ok(result)
 }
@@ -403,6 +461,20 @@ pub async fn override_label(
         let _ = crate::store::queries::upsert_label(
             conn, message_id, &to_category, None, 1.0, 0.0, false,
         );
+        // Phase 28: fire-and-forget override_events log (action="override")
+        let _ = crate::store::queries::log_override_event(
+            conn,
+            &message_id.to_string(),
+            "override",
+            Some(&from_id),
+            Some(&to_category),
+            Some(1.0),
+            Some(0.0),
+            None,
+            None,
+            None,
+            None,
+        );
     }
     Ok(result)
 }
@@ -418,6 +490,27 @@ pub async fn dismiss_suggestion(
     // Dismissal keeps mail in place: a pending rule hit for the same
     // message clears alongside the label dismissal.
     let _ = crate::store::queries::delete_rule_suggestion(guard.conn(), message_id);
+    // Phase 28: fire-and-forget override_events log (action="dismiss")
+    // Extract from_category from the label row before it's dismissed
+    let from_category = {
+        let conn = guard.conn();
+        crate::store::queries::get_label(conn, message_id)
+            .map_err(|e| e.to_string())?
+            .map(|l| l.primary_id)
+    };
+    let _ = crate::store::queries::log_override_event(
+        guard.conn(),
+        &message_id.to_string(),
+        "dismiss",
+        from_category.as_deref(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
     Ok(())
 }
 
@@ -1494,6 +1587,20 @@ pub async fn batch_classify(
                         let _ = crate::store::queries::upsert_label(
                             guard.conn(), mid, &ready.primary_id,
                             ready.secondary_id.as_deref(), ready.confidence, threshold, false,
+                        );
+                        // Phase 28: fire-and-forget override_events log (action="batch")
+                        let _ = crate::store::queries::log_override_event(
+                            guard.conn(),
+                            &mid.to_string(),
+                            "batch",
+                            None,
+                            Some(&ready.primary_id),
+                            Some(ready.confidence),
+                            Some(threshold),
+                            None,
+                            Some(&run_id.to_string()),
+                            None,
+                            None,
                         );
                         moved += 1;
                     }

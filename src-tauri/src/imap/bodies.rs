@@ -279,6 +279,18 @@ mod tests {
         fn logout(&mut self) -> PinBox<'_, Result<(), SyncError>> {
             Box::pin(async move { Ok(()) })
         }
+
+        fn select_condstore(&mut self) -> PinBox<'_, Result<bool, SyncError>> {
+            Box::pin(async move { Ok(false) })
+        }
+
+        fn condstore_fetch_changedsince<'a>(
+            &'a mut self,
+            _range: &'a str,
+            _modseq: u64,
+        ) -> PinBox<'a, Result<Vec<MessageHeader>, SyncError>> {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
     }
 
     fn make_msg(text: &str) -> Vec<u8> {

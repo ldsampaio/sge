@@ -1,7 +1,7 @@
 {
   "contract": "1.0.0",
   "flavor": "core",
-  "milestone": "v1.4 — SMTP Send + Search/Filters + Live Validation + Auto-Archive + Smart Folder Rules",
+  "milestone": "v1.5",
   "phases": [
     {
       "number": "1",
@@ -102,12 +102,42 @@
       "number": "20",
       "name": "Batch Reorganization",
       "status": "complete"
+    },
+    {
+      "number": "21",
+      "name": "SMTP Send — Live Gate",
+      "status": "complete"
+    },
+    {
+      "number": "22",
+      "name": "Draft & Seen Round-Trip — Live Gate",
+      "status": "complete"
+    },
+    {
+      "number": "23",
+      "name": "Search + Filters",
+      "status": "complete"
+    },
+    {
+      "number": "24",
+      "name": "Auto-Archive",
+      "status": "complete"
+    },
+    {
+      "number": "25",
+      "name": "Smart Folder Rules",
+      "status": "complete"
+    },
+    {
+      "number": "26",
+      "name": "Live Validation Bundle",
+      "status": "complete"
     }
   ],
   "next": {
-    "command": "/gsd:progress",
-    "label": "Show progress",
-    "reason": "Unsure of state — showing progress"
+    "command": "/gsd:discuss-phase",
+    "label": "Discuss the first phase",
+    "reason": "Project initialized — plan your first phase"
   },
-  "updated_at": "2026-10-13T03:54:14.680Z"
+  "updated_at": "2026-10-13T22:31:45.093Z"
 }
