@@ -1,148 +1,41 @@
 ---
 gsd_state_version: "1.0"
-milestone: v1.5
-milestone_name: Live Validation + Compose Hardening + Deferred Features
-current_phase: 32
-current_phase_name: Compose Hardening
-status: shipped
-stopped_at: v1.5 milestone shipped — PR #2 created; all 6 phases (27-32) complete; Phase 33 deferred permanently
-last_updated: "2026-10-14T12:00:00.000Z"
-last_activity: 2026-10-14
-last_activity_desc: v1.5 milestone shipped — PR #2 (feat/v1.5-milestone-complete); 13 plans, 596 tests green; Phase 33 deferred permanently
-state_head: 33a4fa5c
+milestone: v1.6
+milestone_name: Roadmap — SMTP Send Pipeline
+status: in-progress
+stopped_at: Phase 34 context gathered
+last_updated: "2026-10-14T20:38:13.383Z"
+state_head: 512f8b44facc4b1ec9bb19321f2b55747ac49833
 progress:
-  total_phases: 6
-  completed_phases: 6
-  total_plans: 13
-  completed_plans: 13
-  percent: 100
+  total_phases: 3
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
----
-# Project State
+gsd_state_version: "1.0"
+milestone: v1.6
+milestone_name: SMTP Send Pipeline
+current_phase: 34
+current_phase_name: Send Queue Hardening + Crash Recovery
+status: in-progress
+stopped_at: v1.6 milestone started 2026-10-14; Phase 34 (new) — v1.5 (Phase 32 shipped, 33 deferred permanently) archived
+last_updated: "2026-10-14T12:30:00.000Z"
+last_activity: 2026-10-14
+last_activity_desc: /gsd:new-milestone v1.6 SMTP Send; REQUIREMENTS.md + ROADMAP.md written; STATE reset; Phase 34 next; Phase 33 deferred permanently (no ManageSieve); v1.5 milestone archived
+state_head: 34b0e00c
+progress:[░░░░░░░░░░] 0%
+  total_phases: 3
+  completed_phases: 0
+  total_plans: 6
+  completed_plans: 0
+  percent: 0
+prev_milestone: v1.5 (phases 27-32 complete; phase 33 deferred permanently; audit passed; archive: .planning/STATE.md.v1.5-archive)
+next_plan: 34-01 (Send Queue Hardening + Crash Recovery — M10 finalize, state-machine, crash-recovery set)
 
-## Project Reference
+## Session
 
-See: .planning/PROJECT.md (updated 2026-10-13 — Milestone v1.5 defined)
-
-**Core value:** Connect to an IMAP server on Linux and read your mail locally in a fast Gmail-like UI.
-**Current focus:** v1.5 roadmap complete — all 6 phases (27–32) done; Phase 33 deferred permanently.
-
-## Milestone Status
-
-**v1.5 Live Validation + Compose Hardening + Deferred Features: READY FOR AUDIT** — roadmap `.planning/ROADMAP.md` (Phases 27–32 complete, 13/13 plans; Phase 33 deferred permanently — server has no ManageSieve). Research: `.planning/research/SUMMARY.md` (confidence MEDIUM-HIGH, buildable; unknowns are probe-answered).
-**v1.4 SMTP Send + Search/Filters + Live Validation + Auto-Archive + Smart Folder Rules: SHIPPED 2026-10-13** — 6/6 phases (21–26), 13/13 plans, audit `.planning/v1.4-MILESTONE-AUDIT.md` PASSED 11/11. Archives: `.planning/milestones/v1.4-ROADMAP.md`, `.planning/milestones/v1.4-REQUIREMENTS.md`. Live runs deferred-with-reason (no creds file); vite bundle needs Node 20+ host).
-**v1.3 Auto-Classify: PASSED** — 17/17 requirements, 6/6 phases (15–20), audit `.planning/v1.3-MILESTONE-AUDIT.md` (PASSED, deferred live gates documented).
-
-- Milestone audit: `.planning/v1.3-MILESTONE-AUDIT.md` — status: passed, scores: requirements 17/17, phases 6/6, integration 18/18 paths wired (1 blocker found + fixed in-audit)
-- All phase summaries verified and complete
-
-## Current Position
-
-Phase: 32 (Compose Hardening — complete)
-Plan: 32-01 complete (verified 5/5 tasks)
-Status: v1.5 complete — Phases 27–32 all executed; Phase 33 deferred permanently (server has no ManageSieve)
-Last activity: 2026-10-14 — Phase 32 executed; Phase 31 completed earlier; all 13 plans done; 596 tests green
-
-## Performance Metrics
-
-**Velocity:**
-
-- v1.4 shipped 2026-10-13: 6 phases (21-26), 13 plans
-- v1.3 shipped 2026-10-10: 6 phases (15-20)
-- v1.2 shipped 2026-10-08: 5 phases (10-14), 252+ tests green
-- v1.1 shipped 2026-10-05: 4 phases (6-9), 8 plans
-- v1.0 shipped 2026-10-03: 5 phases (1-5)
-
-**By Phase:** (v1.5 complete — Phases 27–32)
-
-| Phase | Plans | Status |
-|-------|-------|--------|
-| 27. Live-Validation Gate + Capability Probes | 2/2 | ✅ Complete (verified 9/9) |
-| 28. Override-Event Log + CONDSTORE Fast Path | 2/2 | ✅ Complete (verified) |
-| 29. Rule Import/Export + IDLE Watcher | 3/3 | ✅ Complete (verified 11/11, review 11/11 fixed, 425 lib green) |
-| 30. Batch Trust Pair | 2/2 | ✅ Complete (verified 7/7; review pending) |
-| 31. Sieve Export + History + Learning v1 + Auto-Confirm | 3/3 | ✅ Complete (verified 7/7; export + history + learning + auto-confirm) |
-| 32. Compose Hardening | 1/1 | ✅ Complete (verified 5/5; 556 tests green) |
-| 33. ManageSieve Upload | 0/0 | **Deferred permanently** (server has no ManageSieve; client-side org via Phases 25/31/30) |
-
-## Accumulated Context
-
-### Decisions
-
-Decisions are logged in PROJECT.md Key Decisions table. v1.5 structural decisions (from research SUMMARY.md, binding — do not re-litigate without new vendored-source or live-probe evidence):
-
-- Probes first: no IDLE/CONDSTORE/upload code before recorded capability evidence; every tier degrades silently to its baseline, never hard-fails.
-- CONDSTORE before IDLE (ARCHITECTURE wins): the manager-owned dedicated second connection removes the SELECT-lifecycle concern — every wakeup runs the cheap pass.
-- Second connection for IDLE is structural: IdleWatcher in own `imap/idle.rs`, read-only verbs only, wakeup-only through SyncGate; poll stays as fallback/supervisor.
-- Sieve export-text-first always ships (zero new deps); upload is a separate probe-gated slice (Phase 33); probe fails → export-only stands, no uploader code written.
-- Feedback loop ships with its governor: history + auto-confirm + learner are one phase (31); trust features never land without precision display, circuit breaker, digest/undo.
-- Compose hardening is verify + fix over v1.2 pipelines, never a rebuild — parallelizable after Phase 27.
-- QRESYNC deferred (VANISHED invisible via async-imap unsolicited channel); async-imap 0.11.3 stays (no 0.12 bump); zero new deps except probe-gated io-managesieve.
-- **Phase 33 ManageSieve Upload: DEFERRED PERMANENTLY (2026-10-14)** — Phase 27 probe tested ports 4190, 2000, 4191, 993 on mail.utfpr.edu.br/smtp.utfpr.edu.br; all timed out (filtered). IMAP pre-auth CAPABILITY does not advertise SIEVE. Server (Dovecot Debian) does not expose ManageSieve. Client-side organization via Phase 31 (Sieve export), Phase 25 (smart folder rules), Phase 17-20 (auto-classify), Phase 30 (batch trust) is the architecture. No io-managesieve dependency will be added.
-- [Phase ?]: 21-02: draft-send STEP verdict binary (FAIL BY DESIGN on any orphan, zero harness discard) routing to gap closure
-- [Phase ?]: 21-02: secret scan in-bin over full temp-DB dump before cleanup (SCAN-DB line), wrapper re-checks log + SCAN-DB
-
-### Pending Todos
-
-- v1.5 Phases 27-32 complete — next: v1.5 milestone audit
-- Validate live when convenient: `/gsd-verify-work 6/7/8` (v1.1) + `/gsd-verify-work 12/13` (v1.2) — folded into Phase 27 scope, now in UAT-27.md deferred ledger
-
-### Blockers/Concerns
-
-- Real-server capabilities: IDLE ✅ confirmed, CONDSTORE/QRESYNC not in pre-auth (may appear post-login) — Phase 27 probe transcripts are the entry gates; every tier has a no-capability baseline that ships instead
-- ManageSieve: **not available on server** — Phase 27 probe tested 4190/2000/4191/993; all filtered/timeout. Phase 33 deferred permanently; client-side org via Phases 25/31/30.
-- Bundle size (~1 GB est.) and cold-start seconds — measured: 294MB, 6s ship fine
-- Confidence threshold default tuned on representative pt-BR mail (Phase 17 default holds)
-- `Auto`-root collision resolved: user already owns `Auto` → confirm-then-nest dialog (Phase 18 planning)
-
-## Deferred Items
-
-Items acknowledged and deferred at milestone close, most recent first:
-
-| Category | Item | Status | Deferred At | Milestone |
-|----------|------|--------|-------------|-----------|
-| Validation | SMTP 587 live send + draft round-trip | Deferred → v1.5 Phase 27 | v1.2 close | v1.2 |
-| Validation | Seen round-trip + offline replay vs live server | Deferred → v1.5 Phase 27 | v1.1 close | v1.1 |
-| Validation | Folder tree/browse/badges vs webmail | Deferred → v1.5 Phase 27 | v1.1 close | v1.1 |
-| Validation | Poll arrival + reconnect recovery live | Deferred → v1.5 Phase 27 | v1.1 close | v1.1 |
-| Feature | IDLE push (poll stays fallback) | Deferred → v1.5 Phase 29 | M1 close | v1.1 |
-| Feature | CONDSTORE/QRESYNC fast path | Deferred → v1.5 Phase 28 (QRESYNC stays deferred) | M1 close | v1.1 |
-| Feature | Learning/fine-tuning Laya from overrides (log from day one) | Deferred → v1.5 Phases 28+31 (learning v1, no fine-tuning) | v1.3 scoping | v1.3 |
-| Feature | Batch dry-run + retry-failed | Deferred → v1.5 Phase 30 | v1.3 scoping | v1.3 |
-| Feature | Override history view | Deferred → v1.5 Phase 31 | v1.3 scoping | v1.3 |
-
-## Session Continuity
-
-**Stopped at:** Phase 32 complete (1/1 plans, verified 5/5) — v1.5 milestone ready for audit (2026-10-14)
-
-**Operator repairs 2026-10-13 (autonomous run pre-flight):**
-
-- `38bd940` restored 6 product files wrongly deleted by `04fe8ca` cleanup (`sync.rs` 2773 lines, `filing.rs`, MailboxView, TaxonomyEditor, package.json/lock) — tsc clean after restore
-- `fc2cd74` added `scripts/build-env.sh` (REQUIRED source before any cargo cmd: flatpak-SDK pkg-config + /tmp/opencode stub .pc/.so + host-only linking; never export LD_LIBRARY_PATH globally — segfaults cargo; sidecar binary path holds Phase-15 dev shim, weights dir empty stub, both git-ignored)
-
-Last session: 2026-10-14T11:00:00.000Z
-Milestone: v1.5 Live Validation + Compose Hardening + Deferred Features (Phases 27-32 complete, Phase 33 deferred permanently)
-Resume file: scripts/live-21.sh
-
-## Operator Next Steps
-
-- v1.5 Phases 27-32 complete — next: v1.5 milestone audit
-- Phase 33: **Deferred permanently** — Phase 27 probe result: filtered/timeout on all tested ports (4190/2000/4191/993); no ManageSieve on server. Client-side organization via Phases 25 (smart folder rules), 31 (Sieve export + history + learning + auto-confirm), 30 (batch trust pair) is the shipped architecture.
-- Phase 31: all 3 waves complete (export + history + learning + auto-confirm)
-- Phase 32: complete (556 tests green; #1216 resolved)
-# Phase 31 wave 2 (31-02) + wave 3 (31-03) — complete
-- 31-01: complete (wave 1)
-- 31-02 (353571c): M22 (SCHEMA_VERSION 14) + history queries + learn.rs + HistoryPanel
-- 31-03 (ea6db4f): CONF-01 governor + regression tests + badges + digest/undo + skip-checks
-- 7/7 must-haves covered; covered_digest over all 31 artifacts
-- Caveat: full cargo blocked by pre-existing batch.rs delimiter (#1216); wave verified structurally
-- Build: verified structurally; commit docs + SUMMARYs + 31-VERIFICATION.md present
-- Tests: 31-02 (preserve + neutral/bounded/reset structural) + 31-03 (6 regression — flip/manual, silence, digest tag, undo tag, badges, no 2nd journal)
-
-
---- Autonomous run (2026-10-14) ---
-Phase 31 (Sieve/History/Learn/Auto-Confirm): VERIFIED — CONTEXT + 31-01/02/03 PLANs + SUMMARYs + 31-VERIFICATION.md + 31-EXEC-VERIFY.md present; waves 31-02/03 noted complete in earlier STATE notes; learn = EXPLICIT-only; CONF-01 opt-in/default-off + digest/undo preserved; Phase 33 deferred (port-4190 filter/timeout, Phase 27).
-Phase 32 (Compose Hardening): EXECUTED + VERIFIED — 32-01 complete (5/5 tasks); #1216 resolved; 556 tests green (447 lib + 109 live_gate); 32-SUMMARY.md + 32-VERIFICATION.md written.
-Phase 33 (ManageSieve Upload): NOT EXECUTED — conditional on Phase 27 port-4190 probe which returned filter/timeout; export-only stands per decision log.
-Milestone v1.5 audit: ready to run; requires live-credential gate (deferred) before closing milestone.
+**Last session:** 2026-10-14T20:38:13.376Z
+**Stopped at:** Phase 34 context gathered
+**Resume file:** /home/lucas/Documentos/Projetos/sge/.planning/phases/34-send-queue-hardening-crash-recovery-m10-finalize/34-CONTEXT.md
