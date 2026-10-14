@@ -280,7 +280,10 @@ Decimal phases appear between their surrounding integers in numeric order. v1.2 
   1. User can export smart-folder rules to versioned JSON and import them on another machine — invalid files (empty patterns, reserved names) rejected with plain-language reasons, round-trip import→export is a fixpoint
   2. User receives new INBOX mail via IDLE push (honest Push status in the UI) with advisory wakeups funneled through SyncGate — poll stays as fallback and multi-folder sweeper, never removed
   3. Killing the connection mid-IDLE reconnects (DONE-on-all-exits, 29-min re-IDLE, manager-consistent backoff) with no duplicate sync and no manager-session stall — the watcher never parks on the manager session
-**Plans**: TBD
+**Plans**: 3 plans
+- [ ] 29-01-PLAN.md — rules_io module + versioned JSON import/export + validation + round-trip fixpoint test (IMP-01 tracer)
+- [ ] 29-02-PLAN.md — IdleWatcher module + dedicated connection + DONE handling + advisory wakeup via SyncWake→SyncGate + capability gating + fake-server transcript tests (IDLE-01)
+- [ ] 29-03-PLAN.md — RulesPanel import/export UI + validation preview + Sidebar Push/Polling/Offline status + capability gates (IMP-01 + IDLE-01 UI)
 **UI hint**: yes
 
 ### Phase 30: Batch Trust Pair
