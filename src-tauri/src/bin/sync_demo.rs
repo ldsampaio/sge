@@ -8,12 +8,12 @@
 //!   2. Full sweep + incremental: second run exits 0 with 0 new messages
 //!   3. UIDVALIDITY mismatch: worker refuses to re-sync, returns Err
 
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicU32;
+use std::sync::{Arc, Mutex};
 
-use sge_lib::store::{Store, queries};
-use sge_lib::imap::{MailboxInfo, MailboxStatus, MailboxSummary, SyncError, SyncSession};
 use sge_lib::imap::headers::MessageHeader;
+use sge_lib::imap::{MailboxInfo, MailboxStatus, MailboxSummary, SyncError, SyncSession};
+use sge_lib::store::{queries, Store};
 use sge_lib::sync::worker::SyncWorker;
 
 /// Deterministic mock IMAP session returning 5 fixed messages.
@@ -24,7 +24,9 @@ struct MockSession {
 
 impl MockSession {
     fn new() -> Self {
-        Self { uid_next: AtomicU32::new(1) }
+        Self {
+            uid_next: AtomicU32::new(1),
+        }
     }
 }
 
@@ -32,7 +34,9 @@ impl SyncSession for MockSession {
     fn select_mailbox(
         &mut self,
         _name: &str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<MailboxSummary, SyncError>> + Send>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<MailboxSummary, SyncError>> + Send>,
+    > {
         Box::pin(async move {
             Ok(MailboxSummary {
                 selected_mailbox: "INBOX".to_string(),
@@ -43,11 +47,19 @@ impl SyncSession for MockSession {
         })
     }
 
-    fn list_mailboxes(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<MailboxInfo>, SyncError>> + Send>> {
+    fn list_mailboxes(
+        &mut self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<MailboxInfo>, SyncError>> + Send>,
+    > {
         Box::pin(async move { Ok(Vec::new()) })
     }
 
-    fn mailbox_status(&mut self, _name: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<MailboxStatus, SyncError>> + Send>> {
+    fn mailbox_status(
+        &mut self,
+        _name: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<MailboxStatus, SyncError>> + Send>>
+    {
         Box::pin(async move {
             Ok(MailboxStatus {
                 uid_validity: 100,
@@ -58,14 +70,19 @@ impl SyncSession for MockSession {
         })
     }
 
-    fn search_uids(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u32>, SyncError>> + Send>> {
+    fn search_uids(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u32>, SyncError>> + Send>>
+    {
         Box::pin(async move { Ok((1..=5u32).collect()) })
     }
 
     fn fetch_envelopes<'a>(
         &'a mut self,
         _range: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<MessageHeader>, SyncError>> + Send + 'a>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<MessageHeader>, SyncError>> + Send + 'a>,
+    > {
         Box::pin(async move {
             let mut headers = Vec::new();
             for uid in 1..=5u32 {
@@ -87,66 +104,122 @@ impl SyncSession for MockSession {
         })
     }
 
-    fn fetch_body(&mut self, uid: u32) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, SyncError>> + Send>> {
-        let body = format!("From: alice@example.com\r\nSubject: Test {uid}\r\n\r\nBody of message {uid}\r\n");
+    fn fetch_body(
+        &mut self,
+        uid: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, SyncError>> + Send>>
+    {
+        let body = format!(
+            "From: alice@example.com\r\nSubject: Test {uid}\r\n\r\nBody of message {uid}\r\n"
+        );
         Box::pin(async move { Ok(body.into_bytes()) })
     }
 
-    fn set_seen(&mut self, _uid: u32, _seen: bool) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SyncError>> + Send>> {
+    fn set_seen(
+        &mut self,
+        _uid: u32,
+        _seen: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SyncError>> + Send>> {
         Box::pin(async move { Ok(()) })
     }
 
     // Plan 10-01 stubs: the demo harness never exercises delete/move
     // verbs; arms exist only to satisfy the extended trait.
-    fn store_deleted(&mut self, _uid: u32, _deleted: bool) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SyncError>> + Send>> {
+    fn store_deleted(
+        &mut self,
+        _uid: u32,
+        _deleted: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SyncError>> + Send>> {
         Box::pin(async move { Ok(()) })
     }
 
-    fn expunge(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u32>, SyncError>> + Send>> {
+    fn expunge(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u32>, SyncError>> + Send>>
+    {
         Box::pin(async move { Ok(Vec::new()) })
     }
 
-    fn uid_expunge(&mut self, _uid_set: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u32>, SyncError>> + Send>> {
+    fn uid_expunge(
+        &mut self,
+        _uid_set: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u32>, SyncError>> + Send>>
+    {
         Box::pin(async move { Ok(Vec::new()) })
     }
 
-    fn uid_copy_to(&mut self, _uid_set: &str, _dest: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SyncError>> + Send>> {
+    fn uid_copy_to(
+        &mut self,
+        _uid_set: &str,
+        _dest: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SyncError>> + Send>> {
         Box::pin(async move { Ok(()) })
     }
 
-    fn uid_move_to(&mut self, _uid_set: &str, _dest: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SyncError>> + Send>> {
+    fn uid_move_to(
+        &mut self,
+        _uid_set: &str,
+        _dest: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SyncError>> + Send>> {
         Box::pin(async move { Ok(()) })
     }
 
-    fn capabilities(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<String>, SyncError>> + Send>> {
+    fn capabilities(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<String>, SyncError>> + Send>>
+    {
         Box::pin(async move { Ok(Vec::new()) })
     }
 
-    fn create_mailbox(&mut self, _name: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SyncError>> + Send>> {
+    fn create_mailbox(
+        &mut self,
+        _name: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SyncError>> + Send>> {
         Box::pin(async move { Ok(()) })
     }
 
-    fn rename_mailbox(&mut self, _old: &str, _new: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SyncError>> + Send>> {
+    fn rename_mailbox(
+        &mut self,
+        _old: &str,
+        _new: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SyncError>> + Send>> {
         Box::pin(async move { Ok(()) })
     }
 
-    fn delete_mailbox(&mut self, _name: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SyncError>> + Send>> {
+    fn delete_mailbox(
+        &mut self,
+        _name: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SyncError>> + Send>> {
         Box::pin(async move { Ok(()) })
     }
 
-    fn append_message(&mut self, _mailbox: &str, _flags: &str, _bytes: &[u8]) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SyncError>> + Send>> {
+    fn append_message(
+        &mut self,
+        _mailbox: &str,
+        _flags: &str,
+        _bytes: &[u8],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SyncError>> + Send>> {
         Box::pin(async move { Ok(()) })
     }
 
-    fn uid_search_header(&mut self, _field: &str, _value: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u32>, SyncError>> + Send>> {
+    fn uid_search_header(
+        &mut self,
+        _field: &str,
+        _value: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u32>, SyncError>> + Send>>
+    {
         Box::pin(async move { Ok(vec![]) })
     }
 
-    fn logout(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SyncError>> + Send>> {
+    fn logout(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SyncError>> + Send>> {
         Box::pin(async move { Ok(()) })
     }
 
-    fn select_condstore(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, SyncError>> + Send>> {
+    fn select_condstore(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, SyncError>> + Send>> {
         Box::pin(async move { Ok(false) })
     }
 
@@ -154,7 +227,9 @@ impl SyncSession for MockSession {
         &'a mut self,
         _range: &'a str,
         _modseq: u64,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<MessageHeader>, SyncError>> + Send + 'a>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<MessageHeader>, SyncError>> + Send + 'a>,
+    > {
         Box::pin(async move { Ok(Vec::new()) })
     }
 }
@@ -173,23 +248,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // ── Run the sync worker (full sweep) ──
         let worker = SyncWorker::new(store.clone());
         let session = MockSession::new();
-        let summary = worker.sync_with_session(Box::new(session), "INBOX", Arc::new(|_| {})).await?;
-        println!("✓ sync complete: new={} updated={} unchanged={} deleted={}",
-                 summary.new, summary.updated, summary.unchanged, summary.deleted);
+        let summary = worker
+            .sync_with_session(Box::new(session), "INBOX", Arc::new(|_| {}))
+            .await?;
+        println!(
+            "✓ sync complete: new={} updated={} unchanged={} deleted={}",
+            summary.new, summary.updated, summary.unchanged, summary.deleted
+        );
         assert_eq!(summary.new, 5, "expected 5 new messages on first sync");
 
         // ── Verify: messages in SQLite ──
         {
             let guard = store.lock().unwrap();
             let conn = guard.conn();
-            let count: i64 = conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?;
+            let count: i64 =
+                conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?;
             println!("✓ messages in SQLite: {}", count);
             assert!(count > 0, "expected at least 1 message in SQLite");
         }
 
         // ── Test incremental: second sync should find 0 new ──
         let session2 = MockSession::new();
-        let summary2 = worker.sync_with_session(Box::new(session2), "INBOX", Arc::new(|_| {})).await?;
+        let summary2 = worker
+            .sync_with_session(Box::new(session2), "INBOX", Arc::new(|_| {}))
+            .await?;
         assert_eq!(summary2.new, 0, "incremental sync: expected 0 new messages");
         println!("✓ incremental sync: 0 new messages (idempotent)");
 
@@ -200,9 +282,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             queries::set_sync_state(conn, "INBOX", 99999, 1)?;
         }
         let session3 = MockSession::new();
-        let result = worker.sync_with_session(Box::new(session3), "INBOX", Arc::new(|_| {})).await?;
-        assert!(result.uid_validity_bump, "UIDVALIDITY mismatch should trigger resync");
-        assert_eq!(result.new, 5, "UIDVALIDITY wipe should re-insert all messages");
+        let result = worker
+            .sync_with_session(Box::new(session3), "INBOX", Arc::new(|_| {}))
+            .await?;
+        assert!(
+            result.uid_validity_bump,
+            "UIDVALIDITY mismatch should trigger resync"
+        );
+        assert_eq!(
+            result.new, 5,
+            "UIDVALIDITY wipe should re-insert all messages"
+        );
         println!("✓ UIDVALIDITY mismatch triggered clean resync (uid_validity_bump=true)");
 
         println!("\nAll Phase 2 success criteria met ✓");
