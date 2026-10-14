@@ -214,7 +214,9 @@ pub async fn drive_cycle<D: IdleDriver>(
         IdleEvent::NewMail => {
             wake.request_sync();
             let now = epoch_secs_now();
-            let mut s = snap.lock().unwrap();
+            // IN-03: poison-safe — a poisoned snapshot mutex (earlier panic
+            // while held) must not kill this long-lived watcher task.
+            let mut s = snap.lock().unwrap_or_else(|e| e.into_inner());
             s.last_wakeup = Some(now);
             s.wakeups_pending = wake.pending();
             s.wakeups_requested = wake.request_count();
@@ -229,7 +231,8 @@ pub async fn drive_cycle<D: IdleDriver>(
 }
 
 fn set_state(snap: &Arc<Mutex<IdleSnapshot>>, state: IdleState, attempt: u32) {
-    let mut s = snap.lock().unwrap();
+    // IN-03: poison-safe (see above) — background task, never panic here.
+    let mut s = snap.lock().unwrap_or_else(|e| e.into_inner());
     s.state = state;
     if state == IdleState::Reconnecting {
         s.reconnect_attempt = attempt;
@@ -299,10 +302,16 @@ impl IdleWatcher {
                     driver.end_idle().await;
                     return;
                 }
-                CycleOutcome::Woke | CycleOutcome::ReIdle => {
+                CycleOutcome::Woke => {
                     attempt = 0;
                     self.wakes.fetch_add(1, Ordering::SeqCst);
                     (self.on_wake)();
+                }
+                CycleOutcome::ReIdle => {
+                    // WR-01: 29-min server silence is healthy — re-IDLE
+                    // silently. No wake counter bump, no `on_wake`, no
+                    // spurious `idle-wakeup` → no pointless sync pass.
+                    attempt = 0;
                 }
                 CycleOutcome::Backoff { attempt: next } => {
                     attempt = next;
@@ -353,7 +362,9 @@ pub struct IdleWatcherHandle {
 
 impl IdleWatcherHandle {
     pub fn snapshot(&self) -> IdleSnapshot {
-        self.snapshot.lock().unwrap().clone()
+        // IN-03: poison-safe — a wedged `idle_status` is worse than a
+        // slightly stale snapshot.
+        self.snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     pub fn stop(&self) {
@@ -416,7 +427,14 @@ impl IdleDriver for LiveIdleDriver {
             return Err("server does not advertise IDLE (poll-only)".to_string());
         }
         let mut handle = session.idle();
-        handle.init().await.map_err(|e| format!("idle init: {e}"))?;
+        // WR-05: `idle()` moved the session INTO the handle — on `init()`
+        // failure the handle must still be released best-effort (DONE +
+        // LOGOUT) or the server holds a half-open session until ITS
+        // timeout (rapid retries would accumulate server-side sessions).
+        if let Err(e) = handle.init().await {
+            release_handle(handle).await;
+            return Err(format!("idle init: {e}"));
+        }
         self.session = None;
         self.handle = Some(handle);
         Ok(())
@@ -716,6 +734,42 @@ mod tests {
         assert_eq!(outcome2, CycleOutcome::Stopped);
         assert_eq!(s.lock().unwrap().state, IdleState::Stopped);
         assert_eq!(wake.request_count(), 1, "stop adds no duplicate wakeup");
+    }
+
+    #[test]
+    fn reidle_cycles_never_fire_on_wake() {
+        // WR-01: 29-min Timeout re-IDLEs must NOT bump the wake counter nor
+        // invoke `on_wake` (no spurious `idle-wakeup` → no pointless sync).
+        // Only a real EXISTS may fire it.
+        let cfg = AccountConfig {
+            host: "mail.example".to_string(),
+            port: 993,
+            security: crate::imap::SecurityMode::ImplicitTls,
+            username: "u".to_string(),
+            password: zeroize::Zeroizing::new("p".to_string()),
+            allow_untrusted: false,
+            plain_local_confirmed: false,
+        };
+        let fired = Arc::new(AtomicU64::new(0));
+        let fired2 = fired.clone();
+        let on_wake: Arc<dyn Fn() + Send + Sync> =
+            Arc::new(move || { fired2.fetch_add(1, Ordering::SeqCst); });
+        let watcher = IdleWatcher::new(cfg, test_wake(), on_wake);
+        let stop = watcher.stop.clone();
+        // Deep Timeout script: ReIdle cycles never sleep, so the loop spins
+        // until `stop` fires — no backoff timer is ever armed here.
+        let script = vec![ScriptStep::Timeout; 100_000];
+        let join = std::thread::spawn(move || {
+            async_std::task::block_on(watcher.run_with(ScriptDriver::new(script)))
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        stop.store(true, Ordering::SeqCst);
+        join.join().expect("run_with must exit on stop");
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            0,
+            "silent 29-min periods must never fire on_wake"
+        );
     }
 
     #[test]
