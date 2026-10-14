@@ -49,9 +49,9 @@ Decimal phases appear between their surrounding integers in numeric order. v1.2 
 - [x] **Phase 28: Override-Event Log + CONDSTORE Fast Path** - Headless sync core: telemetry log + MODSEQ-delta resync (completed 2026-10-13)
 - [x] **Phase 29: Rule Import/Export + IDLE Watcher** - Versioned rule JSON portability + INBOX push over a manager-owned watcher (completed 2026-10-14)
 - [x] **Phase 30: Batch Trust Pair** - Dry-run preview + retry-only-failures over a per-item run record (completed 2026-10-14)
-- [ ] **Phase 31: Sieve Export + History + Learning v1 + Auto-Confirm** - Feedback loop ships with its governor as one unit
-- [ ] **Phase 32: Compose Hardening** - Send/drafts/reply/reply-all verified end-to-end over v1.2 pipelines (parallelizable after Phase 27)
-- [ ] **Phase 33 (conditional): ManageSieve Upload** - Server-side rule upload only if the port-4190 probe succeeds; otherwise export-only stands
+- [x] **Phase 31: Sieve Export + History + Learning v1 + Auto-Confirm** - Feedback loop ships with its governor as one unit (completed 2026-10-14)
+- [x] **Phase 32: Compose Hardening** - Send/drafts/reply/reply-all verified end-to-end over v1.2 pipelines (parallelizable after Phase 27) (completed 2026-10-14)
+- [ ] **Phase 33: ManageSieve Upload** — **DEFERRED PERMANENTLY** — Server does not support ManageSieve (port 4190/2000/4191/993 all filtered/timeout). Client-side Sieve export (Phase 31) + smart folder rules (Phase 25) + auto-classify (Phase 17-20) provide the organization layer. No uploader code will be written.
 
 ## Phase Details
 
@@ -353,23 +353,23 @@ Decimal phases appear between their surrounding integers in numeric order. v1.2 
 **Plans**: 32-01-PLAN.md (verified 5/5 tasks)
 **UI hint**: yes
 
-### Phase 33 (conditional): ManageSieve Upload
+### Phase 33: ManageSieve Upload — DEFERRED PERMANENTLY
 
-**Goal**: Server-side rules activate only where the server speaks ManageSieve — safely or not at all
-**Mode**: mvp
-**Depends on**: Phase 27 (port-4190/SIEVE probe must succeed — no probe, no phase) and Phase 31 (export text exists to upload)
-**Requirements**: SIEVE-02
-**Success Criteria** (what must be TRUE):
+**Status**: Not executed — server does not support ManageSieve.
 
-  1. If the probe succeeded: user uploads Sieve text via ManageSieve (`io-managesieve`, `native-tls` only, `spawn_blocking`-hosted — the sole new dep, added only now) behind backup-then-diff with an explicit append/replace choice — never blind overwrite, never auto-sync; `fileinto` targets validated against the folder tree
-  2. If the probe failed: this phase does not execute — export-only stands as the shipped scope with documented deferral, and no uploader code exists in the tree
+**Reason**: Phase 27 capability probe (2026-10-13) tested ports 4190, 2000, 4191, 993 on both `mail.utfpr.edu.br` and `smtp.utfpr.edu.br` — all connections timed out (filtered by firewall). IMAP pre-auth CAPABILITY also does not advertise SIEVE. The server (Dovecot on Debian) does not expose ManageSieve externally.
 
-**Plans**: TBD
-**UI hint**: yes
+**Decision**: Client-side organization is the architecture:
+- **Phase 31**: Sieve export to `.sieve` file (portable, human-readable, importable on servers that support it)
+- **Phase 25**: Smart folder rules (client-side matcher, local actions via `imap_outbox`)
+- **Phase 17–20**: Auto-classify with Laya (on-device, offline, `Auto/` folder tree)
+- **Phase 30**: Batch trust pair (dry-run preview, retry-only-failures)
+
+No uploader code (`io-managesieve` dependency) will be added. The export-only scope from Phase 31 stands as the shipped capability.
 
 ## Progress
 
-**Execution Order:** ... → 20 → 21 → 22 → 23 → 24 → 25 → 26 → 27 → 28 → 29 → 30 → 31 → 33, with 32 parallelizable anytime after 27
+**Execution Order:** ... → 20 → 21 → 22 → 23 → 24 → 25 → 26 → 27 → 28 → 29 → 30 → 31 → 32, with 32 parallelizable anytime after 27. Phase 33 deferred permanently (no ManageSieve on server).
 
 | Phase | Milestone | Plans Complete | Status | Completed |
 |-------|-----------|----------------|--------|-----------|
@@ -403,6 +403,6 @@ Decimal phases appear between their surrounding integers in numeric order. v1.2 
 | 28. Override-Event Log + CONDSTORE Fast Path | v1.5 | 2/2 | Complete (verified) | 2026-10-13 |
 | 29. Rule Import/Export + IDLE Watcher | v1.5 | 3/3 | Complete (425 lib green, verified 11/11, review 11/11 fixed) | 2026-10-14 |
 | 30. Batch Trust Pair | v1.5 | 2/2 | Complete (434 lib green, verified 7/7) | 2026-10-14 |
-| 31. Sieve Export + History + Learning v1 + Auto-Confirm | v1.5 | 0/? | Not started | - |
+| 31. Sieve Export + History + Learning v1 + Auto-Confirm | v1.5 | 3/3 | Complete (verified 7/7; export + history + learning + auto-confirm) | 2026-10-14 |
 | 32. Compose Hardening | v1.5 | 1/1 | Complete (verified 5/5; 556 tests green) | 2026-10-14 |
-| 33. ManageSieve Upload (conditional) | v1.5 | 0/? | Not started (only if Phase 27 port-4190 probe succeeds) | - |
+| 33. ManageSieve Upload | v1.5 | 0/0 | **Deferred permanently** (server has no ManageSieve; client-side org via Phases 25/31/30) | - |

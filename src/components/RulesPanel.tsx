@@ -780,5 +780,5 @@ export function RulesPanel({ onClose }: RulesPanelProps) {
     </div>
   );
 }
-# Sieve-managed badge (31-03; was 31-01 extension point)
+// Sieve-managed badge (31-03; was 31-01 extension point)
 // skip-check pre-matcher: managed rules never score locally

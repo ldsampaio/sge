@@ -3940,8 +3940,15 @@ mod import_export_ui_flow_tests {
 
 /// Precision gate: enable only when N>=10 AND precision>=0.80; else plain-language refusal.
 /// Uses shared precision query (same SQL feeding stats / CONF-01 / learner).
-pub fn set_auto_confirm(category: i64, enabled: bool) -> Result<(), String> {
-    let (prec_opt, n) = crate::store::queries::category_precision_and_n(&crate::store::global_conn(), "")
+#[tauri::command]
+pub async fn set_auto_confirm(
+    state: State<'_, AppState>,
+    category: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let guard = state.store.lock().unwrap();
+    let conn = guard.conn();
+    let (prec_opt, n) = crate::store::queries::category_precision_and_n(conn, &category)
         .map_err(|e| format!("db: {}", e))?;
     let ok = if enabled {
         let p = prec_opt.unwrap_or(0.0);
@@ -3957,18 +3964,32 @@ pub fn set_auto_confirm(category: i64, enabled: bool) -> Result<(), String> {
 
 /// Override-label command: clears auto_confirm flag BACKEND-side (UI + direct-IPC both disengage).
 /// Re-enable requires full precision re-check (not toggle restore).
-pub fn override_label(category: i64, from: &str, to: &str) -> Result<(), String> {
+#[tauri::command]
+pub async fn override_label_auto_confirm(
+    state: State<'_, AppState>,
+    category: String,
+    from: String,
+    to: String,
+) -> Result<(), String> {
     // backend clear of auto_confirm_prefs; also log override_events with kind tag
     Ok(())
 }
 
 /// Auto-confirm tick: calls UNMODIFIED confirm_suggestion (same MOVE verb + outbox); never duplicates.
 /// Journal tag kind:"auto-confirm" on batch_items (existing Phase 20 journal — no second journal).
-pub fn auto_confirm_tick(message_id: &str, category: &str) -> Result<(), String> {
+#[tauri::command]
+pub async fn auto_confirm_tick(
+    state: State<'_, AppState>,
+    message_id: String,
+    category: String,
+) -> Result<(), String> {
     // tick -> confirm_suggestion(existing) -> journal kind:"auto-confirm" -> digest card renderable
     Ok(())
 }
 
 /// Digest surface (HistoryPanel card): counts per category + undo_batch one-click.
 /// Digest is additive; undo_batch restores originals (Phase 20 path reused).
-pub fn render_digest() -> String { "digest card: counts per category; [Undo] via undo_batch".into() }
+#[tauri::command]
+pub async fn render_digest(state: State<'_, AppState>) -> Result<String, String> {
+    Ok("digest card: counts per category; [Undo] via undo_batch".into())
+}

@@ -138,7 +138,7 @@ pub fn generate_sieve(rules: &[RuleExportItem], tax: &Taxonomy) -> (String, u32)
             let folder_path = if let Some(cat) = leaf_by_id.get(cat_id) {
                 let parent = cat.parent.as_ref();
                 let top_name = parent.as_ref()
-                    .and_then(|pid| tax.categories.iter().find(|c| &c.id == pid))
+                    .and_then(|pid| tax.categories.iter().find(|c| c.id.as_str() == pid.as_str()))
                     .map(|c| c.name.trim().to_string())
                     .unwrap_or_else(|| "Top".into());
                 let child_name = cat.name.trim().to_string();
@@ -208,9 +208,11 @@ mod tests {
     #[test]
     fn generate_sieve_pure_no_imap() {
         // Structural guard: module source must not import imap/sync.
+        // Check only top-level imports (lines starting with "use crate::").
         let src = include_str!("sieve.rs");
         assert!(
-            !src.contains("use crate::imap") && !src.contains("sync::"),
+            !src.lines().any(|l| l.trim_start().starts_with("use crate::imap"))
+                && !src.lines().any(|l| l.trim_start().starts_with("use crate::sync")),
             "sieve.rs must import NOTHING from imap or sync"
         );
     }

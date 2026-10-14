@@ -83,7 +83,6 @@ impl Store {
             M::up(include_str!("schema.sql")),
             M::up(M2_FLAG_OUTBOX_SQL),
             M::up(M3_UNSEEN_COUNT_SQL),
-            M::up(M22_LEARN_SQL),
             M::up(M4_BACKFILL_SQL),
             M::up(M5_STATUS_TS_SQL),
             M::up(M6_DELIMITER_SQL),
@@ -102,6 +101,7 @@ impl Store {
             M::up(M19_RULES_SQL),
             M::up(M20_OVERRIDE_EVENTS_SQL),
             M::up(M21_RULE_VERSION_SQL),
+            M::up(M22_LEARN_SQL),
         ]);
         migrations.to_latest(conn)?;
         Ok(())
@@ -827,8 +827,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_13_with_m21_rule_version() {
-        assert_eq!(SCHEMA_VERSION, 13);
+    fn schema_version_is_14_with_m22_learn() {
+        assert_eq!(SCHEMA_VERSION, 14);
         let store = Store::open_in_memory().expect("migration should succeed");
         let conn = store.conn();
         let count: i64 = conn
@@ -893,7 +893,6 @@ mod tests {
             M::up(include_str!("schema.sql")),
             M::up(M2_FLAG_OUTBOX_SQL),
             M::up(M3_UNSEEN_COUNT_SQL),
-            M::up(M22_LEARN_SQL),
             M::up(M4_BACKFILL_SQL),
         ])
         .to_latest(&mut conn)
@@ -930,7 +929,6 @@ mod tests {
             M::up(include_str!("schema.sql")),
             M::up(M2_FLAG_OUTBOX_SQL),
             M::up(M3_UNSEEN_COUNT_SQL),
-            M::up(M22_LEARN_SQL),
             M::up(M4_BACKFILL_SQL),
             M::up(M5_STATUS_TS_SQL),
         ])
@@ -940,7 +938,6 @@ mod tests {
             M::up(include_str!("schema.sql")),
             M::up(M2_FLAG_OUTBOX_SQL),
             M::up(M3_UNSEEN_COUNT_SQL),
-            M::up(M22_LEARN_SQL),
             M::up(M4_BACKFILL_SQL),
             M::up(M5_STATUS_TS_SQL),
             M::up(M6_DELIMITER_SQL),
@@ -980,7 +977,6 @@ mod tests {
             M::up(include_str!("schema.sql")),
             M::up(M2_FLAG_OUTBOX_SQL),
             M::up(M3_UNSEEN_COUNT_SQL),
-            M::up(M22_LEARN_SQL),
             M::up(M4_BACKFILL_SQL),
         ])
         .to_latest(&mut conn)
@@ -989,7 +985,6 @@ mod tests {
             M::up(include_str!("schema.sql")),
             M::up(M2_FLAG_OUTBOX_SQL),
             M::up(M3_UNSEEN_COUNT_SQL),
-            M::up(M22_LEARN_SQL),
             M::up(M4_BACKFILL_SQL),
             M::up(M5_STATUS_TS_SQL),
         ])
@@ -1058,7 +1053,6 @@ mod tests {
             M::up(include_str!("schema.sql")),
             M::up(M2_FLAG_OUTBOX_SQL),
             M::up(M3_UNSEEN_COUNT_SQL),
-            M::up(M22_LEARN_SQL),
             M::up(M4_BACKFILL_SQL),
             M::up(M5_STATUS_TS_SQL),
             M::up(M6_DELIMITER_SQL),
@@ -1145,7 +1139,6 @@ mod tests {
             M::up(include_str!("schema.sql")),
             M::up(M2_FLAG_OUTBOX_SQL),
             M::up(M3_UNSEEN_COUNT_SQL),
-            M::up(M22_LEARN_SQL),
             M::up(M4_BACKFILL_SQL),
             M::up(M5_STATUS_TS_SQL),
             M::up(M6_DELIMITER_SQL),
@@ -1202,7 +1195,6 @@ mod tests {
             M::up(include_str!("schema.sql")),
             M::up(M2_FLAG_OUTBOX_SQL),
             M::up(M3_UNSEEN_COUNT_SQL),
-            M::up(M22_LEARN_SQL),
             M::up(M4_BACKFILL_SQL),
             M::up(M5_STATUS_TS_SQL),
             M::up(M6_DELIMITER_SQL),
@@ -1286,7 +1278,6 @@ mod tests {
             M::up(include_str!("schema.sql")),
             M::up(M2_FLAG_OUTBOX_SQL),
             M::up(M3_UNSEEN_COUNT_SQL),
-            M::up(M22_LEARN_SQL),
             M::up(M4_BACKFILL_SQL),
             M::up(M5_STATUS_TS_SQL),
             M::up(M6_DELIMITER_SQL),
@@ -1391,7 +1382,6 @@ mod tests {
             M::up(include_str!("schema.sql")),
             M::up(M2_FLAG_OUTBOX_SQL),
             M::up(M3_UNSEEN_COUNT_SQL),
-            M::up(M22_LEARN_SQL),
             M::up(M4_BACKFILL_SQL),
             M::up(M5_STATUS_TS_SQL),
             M::up(M6_DELIMITER_SQL),
@@ -1520,7 +1510,6 @@ mod tests {
             M::up(include_str!("schema.sql")),
             M::up(M2_FLAG_OUTBOX_SQL),
             M::up(M3_UNSEEN_COUNT_SQL),
-            M::up(M22_LEARN_SQL),
             M::up(M4_BACKFILL_SQL),
             M::up(M5_STATUS_TS_SQL),
             M::up(M6_DELIMITER_SQL),
@@ -1668,7 +1657,6 @@ mod m18_tests {
             M::up(include_str!("schema.sql")),
             M::up(M2_FLAG_OUTBOX_SQL),
             M::up(M3_UNSEEN_COUNT_SQL),
-            M::up(M22_LEARN_SQL),
             M::up(M4_BACKFILL_SQL),
             M::up(M5_STATUS_TS_SQL),
             M::up(M6_DELIMITER_SQL),
@@ -1763,7 +1751,6 @@ mod m18_tests {
             M::up(include_str!("schema.sql")),
             M::up(M2_FLAG_OUTBOX_SQL),
             M::up(M3_UNSEEN_COUNT_SQL),
-            M::up(M22_LEARN_SQL),
             M::up(M4_BACKFILL_SQL),
             M::up(M5_STATUS_TS_SQL),
             M::up(M6_DELIMITER_SQL),
@@ -1870,7 +1857,6 @@ mod m18_tests {
             M::up(include_str!("schema.sql")),
             M::up(M2_FLAG_OUTBOX_SQL),
             M::up(M3_UNSEEN_COUNT_SQL),
-            M::up(M22_LEARN_SQL),
             M::up(M4_BACKFILL_SQL),
             M::up(M5_STATUS_TS_SQL),
             M::up(M6_DELIMITER_SQL),
@@ -1936,9 +1922,11 @@ mod m22_preserve_tests {
     /// M22 forward-only: pre-existing rows survive migration; no data loss.
     #[test]
     fn m22_preserve_existing_rows() {
-        let conn = open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
         // table now present; seed then verify after migration reapply (idempotent CREATE IF NOT EXISTS)
         assert!(conn.execute("INSERT INTO learning_adjustments (category,keyword_or_threshold,delta,reason_event_id) VALUES(1,'k',0.1,1)", []).is_ok());
-        assert_eq!(conn.execute("SELECT COUNT(*) FROM learning_adjustments", []).unwrap(), 1);
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM learning_adjustments", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1);
     }
 }

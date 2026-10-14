@@ -420,13 +420,14 @@ fn preview_archive(conn: &rusqlite::Connection) -> Result<BatchPreview, String> 
             Ok((dest_display, _, _)) => {
                 if items.len() < PREVIEW_CAP {
                     items.push(PreviewItem {
-                    message_id: mid,
-                    from_folder: mb,
-                    to_folder: dest_display.clone(),
-                    dest_display,
-                    basis: super::archive::ARCHIVE_LABEL_ID.to_string(),
-                    skipped_reason: None,
-                });
+                        message_id: mid,
+                        from_folder: mb,
+                        to_folder: dest_display.clone(),
+                        dest_display,
+                        basis: super::archive::ARCHIVE_LABEL_ID.to_string(),
+                        skipped_reason: None,
+                    });
+                }
                 None
             }
             Err(_) => Some(PreviewItem {
@@ -1180,7 +1181,7 @@ mod tests {
     // ── Phase 30 regression tests (WR-01/02/03/06/07) ──────────────
 
     #[test]
-    fn retry_totals_honest_no_double_count_(WR_01) {
+    fn retry_totals_honest_no_double_count_wr_01() {
         // Already-filed recovery must count moved only, never skipped.
         let (store, run, _, failed) = retry_seeded();
         let conn = store.conn();
@@ -1192,25 +1193,26 @@ mod tests {
     }
 
     #[test]
-    fn wire_canonical_already_filed_(WR_02) {
+    fn wire_canonical_already_filed_wr_02() {
         // Decode both sides to display before comparing (non-ASCII / ".")
-        let s = crate::imap::mutf7::decode_modified_utf7("Auto/Acad&-mico");
+        // "Auto/Acadêmico" → "Auto/Acad&AOo-mico" (ê = U+00EA → UTF-16BE 00 EA → base64 AOo)
+        let s = crate::imap::mutf7::decode_modified_utf7("Auto/Acad&AOo-mico");
         assert_eq!(s, "Auto/Acadêmico");
     }
 
     #[test]
-    fn resolve_verb_atomicity_(WR_03) {
+    fn resolve_verb_atomicity_wr_03() {
         // Single-lock section holds resolve + journal; no split.
         // Verified structurally by the unified guard edit above.
     }
 
     #[test]
-    fn transactional_merge_mutual_exclusion_(WR_06) {
+    fn transactional_merge_mutual_exclusion_wr_06() {
         // BEGIN IMMEDIATE + claim guard prevents concurrent resume+retry.
     }
 
     #[test]
-    fn undo_mid_retry_raii_(WR_07) {
+    fn undo_mid_retry_raii_wr_07() {
         // RetryGuard releases on drop; state re-checked inside inner.
     }
 }
