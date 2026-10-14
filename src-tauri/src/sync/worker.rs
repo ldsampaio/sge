@@ -200,8 +200,7 @@ impl SyncWorker {
     }
 
     fn cancelled(&self) -> bool {
-        self.cancel
-            .load(std::sync::atomic::Ordering::SeqCst)
+        self.cancel.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Replay queued Seen toggles for `mailbox_id` through `session`.
@@ -267,22 +266,16 @@ impl SyncWorker {
             match session.set_seen(op.uid, op.seen).await {
                 Ok(()) => {
                     let guard = self.store.lock().unwrap();
-                    queries::delete_outbox_op(guard.conn(), mailbox_id, op.uid).map_err(|e| {
-                        SyncError::Protocol(format!("ack outbox op: {e}"))
-                    })?;
+                    queries::delete_outbox_op(guard.conn(), mailbox_id, op.uid)
+                        .map_err(|e| SyncError::Protocol(format!("ack outbox op: {e}")))?;
                     summary.acked += 1;
                 }
                 Err(e) => {
                     let guard = self.store.lock().unwrap();
-                    queries::record_outbox_error(
-                        guard.conn(),
-                        mailbox_id,
-                        op.uid,
-                        &e.to_string(),
-                    )
-                    .map_err(|store_err| {
-                        SyncError::Protocol(format!("record outbox error: {store_err}"))
-                    })?;
+                    queries::record_outbox_error(guard.conn(), mailbox_id, op.uid, &e.to_string())
+                        .map_err(|store_err| {
+                            SyncError::Protocol(format!("record outbox error: {store_err}"))
+                        })?;
                     eprintln!(
                         "[SGE sync] outbox uid {} replay failed ({e}) — stays queued",
                         op.uid
@@ -358,9 +351,8 @@ impl SyncWorker {
             if let Some(live) = live_uids {
                 if !live.contains(&op.uid) {
                     let guard = self.store.lock().unwrap();
-                    queries::delete_imap_outbox_op(guard.conn(), mailbox_id, op.uid).map_err(
-                        |e| SyncError::Protocol(format!("delete absent imap op: {e}")),
-                    )?;
+                    queries::delete_imap_outbox_op(guard.conn(), mailbox_id, op.uid)
+                        .map_err(|e| SyncError::Protocol(format!("delete absent imap op: {e}")))?;
                     let _ = queries::set_pending_delete(guard.conn(), mailbox_id, op.uid, false);
                     eprintln!(
                         "[SGE sync] imap outbox uid {} absent on server — dropped",
@@ -373,9 +365,8 @@ impl SyncWorker {
             let Some(dest) = op.dest_mailbox.as_deref() else {
                 // Defensive only: enqueue always stores a dest.
                 let guard = self.store.lock().unwrap();
-                queries::delete_imap_outbox_op(guard.conn(), mailbox_id, op.uid).map_err(
-                    |e| SyncError::Protocol(format!("delete destless imap op: {e}")),
-                )?;
+                queries::delete_imap_outbox_op(guard.conn(), mailbox_id, op.uid)
+                    .map_err(|e| SyncError::Protocol(format!("delete destless imap op: {e}")))?;
                 eprintln!(
                     "[SGE sync] imap outbox uid {} has no dest — dropped",
                     op.uid
@@ -383,9 +374,10 @@ impl SyncWorker {
                 summary.dropped += 1;
                 continue;
             };
-            let caps = session.capabilities().await.map_err(|e| {
-                SyncError::Protocol(format!("imap replay CAPABILITY: {e}"))
-            })?;
+            let caps = session
+                .capabilities()
+                .await
+                .map_err(|e| SyncError::Protocol(format!("imap replay CAPABILITY: {e}")))?;
             match run_move_on_session(session, &[op.uid], dest, &caps).await {
                 Ok(_) => {
                     // Move-carries-toggle: apply captured Seen state at the
@@ -402,9 +394,8 @@ impl SyncWorker {
                         .await;
                     }
                     let guard = self.store.lock().unwrap();
-                    queries::delete_imap_outbox_op(guard.conn(), mailbox_id, op.uid).map_err(
-                        |e| SyncError::Protocol(format!("ack imap op: {e}")),
-                    )?;
+                    queries::delete_imap_outbox_op(guard.conn(), mailbox_id, op.uid)
+                        .map_err(|e| SyncError::Protocol(format!("ack imap op: {e}")))?;
                     // Hidden flag stays set: the sweep's expunge-diff removes
                     // the row this same pass (the UID is gone server-side).
                     summary.acked += 1;
@@ -412,9 +403,8 @@ impl SyncWorker {
                 }
                 Err(SyncError::Refused(detail)) => {
                     let guard = self.store.lock().unwrap();
-                    queries::delete_imap_outbox_op(guard.conn(), mailbox_id, op.uid).map_err(
-                        |e| SyncError::Protocol(format!("drop refused imap op: {e}")),
-                    )?;
+                    queries::delete_imap_outbox_op(guard.conn(), mailbox_id, op.uid)
+                        .map_err(|e| SyncError::Protocol(format!("drop refused imap op: {e}")))?;
                     let _ = queries::set_pending_delete(guard.conn(), mailbox_id, op.uid, false);
                     eprintln!(
                         "[SGE sync] imap outbox uid {} refused ({detail}) — dropped, src untouched",
@@ -499,9 +489,10 @@ impl SyncWorker {
                 "[SGE sync] drafts epoch mismatch (current uid_validity={epoch}) — tracked server_uids are stale, appending fresh"
             );
         }
-        let caps = session.capabilities().await.map_err(|e| {
-            SyncError::Protocol(format!("draft replay CAPABILITY: {e}"))
-        })?;
+        let caps = session
+            .capabilities()
+            .await
+            .map_err(|e| SyncError::Protocol(format!("draft replay CAPABILITY: {e}")))?;
         let date = chrono::Utc::now()
             .format("%a, %d %b %Y %H:%M:%S +0000")
             .to_string();
@@ -542,10 +533,7 @@ impl SyncWorker {
                             row.id
                         );
                     } else {
-                        eprintln!(
-                            "[SGE sync] draft {} acknowledged as uid {new_uid}",
-                            row.id
-                        );
+                        eprintln!("[SGE sync] draft {} acknowledged as uid {new_uid}", row.id);
                         acked += 1;
                     }
                 }
@@ -612,9 +600,7 @@ impl SyncWorker {
                                 eprintln!("[SGE send] {id} recovery triage failed ({e})");
                             }
                         }
-                        eprintln!(
-                            "[SGE send] crash recovery: {n} stranded row(s) → uncertain"
-                        );
+                        eprintln!("[SGE send] crash recovery: {n} stranded row(s) → uncertain");
                     }
                 }
                 Ok(_) => {}
@@ -656,14 +642,14 @@ impl SyncWorker {
     /// the transport call itself runs on the caller's blocking thread, and
     /// the async Sent filing leg (SEARCH + APPEND) awaits in place — the
     /// whole pass already runs inside `spawn_blocking` + `block_on`.
-    async fn flush_one_row(&self, env: &SendFlushEnv, row: &queries::SendRow) -> Option<FlushOutcome> {
+    async fn flush_one_row(
+        &self,
+        env: &SendFlushEnv,
+        row: &queries::SendRow,
+    ) -> Option<FlushOutcome> {
         {
             let guard = self.store.lock().unwrap();
-            if let Err(e) = queries::set_send_state(
-                guard.conn(),
-                &row.id,
-                SEND_STATE_SENDING,
-            ) {
+            if let Err(e) = queries::set_send_state(guard.conn(), &row.id, SEND_STATE_SENDING) {
                 eprintln!("[SGE send] {} claim failed ({e}) — skipping", row.id);
                 return None;
             }
@@ -688,8 +674,7 @@ impl SyncWorker {
         {
             SmtpOutcome::Sent => {
                 let guard = self.store.lock().unwrap();
-                if let Err(e) = queries::set_send_state(guard.conn(), &row.id, SEND_STATE_SENT)
-                {
+                if let Err(e) = queries::set_send_state(guard.conn(), &row.id, SEND_STATE_SENT) {
                     eprintln!("[SGE send] {} sent but state write failed ({e})", row.id);
                     return None;
                 }
@@ -701,18 +686,13 @@ impl SyncWorker {
                 // sent_unfiled with APPEND-only retry, never re-SMTP-send.
                 if let Some(ref manager) = env.manager {
                     let mid = &row.message_id;
-                    let sent_folder =
-                        env.sent_wire.clone().unwrap_or_else(|| "Sent".to_string());
+                    let sent_folder = env.sent_wire.clone().unwrap_or_else(|| "Sent".to_string());
                     // Select Sent folder
-                    let sent_selected = manager
-                        .lease_for(&sent_folder)
-                        .await;
+                    let sent_selected = manager.lease_for(&sent_folder).await;
                     match sent_selected {
                         Ok(mut lease) => {
-                            let search_result = lease
-                                .session()
-                                .uid_search_header("Message-ID", mid)
-                                .await;
+                            let search_result =
+                                lease.session().uid_search_header("Message-ID", mid).await;
                             match search_result {
                                 Ok(hits) if !hits.is_empty() => {
                                     // Probe hit: server already auto-saved this message.
@@ -722,8 +702,15 @@ impl SyncWorker {
                                         row.id
                                     );
                                     // Still mark the state as sent
-                                    if let Err(e) = queries::set_send_state(guard.conn(), &row.id, SEND_STATE_SENT) {
-                                        eprintln!("[SGE send] {} state write failed after dedupe ({e})", row.id);
+                                    if let Err(e) = queries::set_send_state(
+                                        guard.conn(),
+                                        &row.id,
+                                        SEND_STATE_SENT,
+                                    ) {
+                                        eprintln!(
+                                            "[SGE send] {} state write failed after dedupe ({e})",
+                                            row.id
+                                        );
                                         return None;
                                     }
                                     Some(FlushOutcome::Sent)
@@ -733,11 +720,7 @@ impl SyncWorker {
                                     let bytes = std::fs::read(&row.eml_path).unwrap_or_default();
                                     let append_result = lease
                                         .session()
-                                        .append_message(
-                                            &sent_folder,
-                                            "\\Seen",
-                                            &bytes,
-                                        )
+                                        .append_message(&sent_folder, "\\Seen", &bytes)
                                         .await;
                                     match append_result {
                                         Ok(()) => {
@@ -746,7 +729,11 @@ impl SyncWorker {
                                                 row.id
                                             );
                                             // Mark the queue row as sent after successful APPEND
-                                            if let Err(e) = queries::set_send_state(guard.conn(), &row.id, SEND_STATE_SENT) {
+                                            if let Err(e) = queries::set_send_state(
+                                                guard.conn(),
+                                                &row.id,
+                                                SEND_STATE_SENT,
+                                            ) {
                                                 eprintln!("[SGE send] {} state write failed after APPEND ({e})", row.id);
                                                 return None;
                                             }
@@ -759,7 +746,11 @@ impl SyncWorker {
                                             );
                                             // Park as sent_unfiled: SMTP succeeded but APPEND failed
                                             // Never triggers re-SMTP-send; APPEND-only retry on later passes
-                                            if let Err(e) = queries::set_send_state(guard.conn(), &row.id, SEND_STATE_SENT) {
+                                            if let Err(e) = queries::set_send_state(
+                                                guard.conn(),
+                                                &row.id,
+                                                SEND_STATE_SENT,
+                                            ) {
                                                 eprintln!("[SGE send] {} state write marked sent despite APPEND failure ({e})", row.id);
                                             }
                                             Some(FlushOutcome::SentUnfiled)
@@ -775,11 +766,7 @@ impl SyncWorker {
                                     let bytes = std::fs::read(&row.eml_path).unwrap_or_default();
                                     let append_result = lease
                                         .session()
-                                        .append_message(
-                                            &sent_folder,
-                                            "\\Seen",
-                                            &bytes,
-                                        )
+                                        .append_message(&sent_folder, "\\Seen", &bytes)
                                         .await;
                                     match append_result {
                                         Ok(()) => {
@@ -787,7 +774,11 @@ impl SyncWorker {
                                                 "[SGE send] {} APPENDed to Sent after SEARCH error",
                                                 row.id
                                             );
-                                            if let Err(e) = queries::set_send_state(guard.conn(), &row.id, SEND_STATE_SENT) {
+                                            if let Err(e) = queries::set_send_state(
+                                                guard.conn(),
+                                                &row.id,
+                                                SEND_STATE_SENT,
+                                            ) {
                                                 eprintln!("[SGE send] {} state write failed after APPEND ({e})", row.id);
                                                 return None;
                                             }
@@ -798,7 +789,11 @@ impl SyncWorker {
                                                 "[SGE send] {} APPEND failed after SEARCH error ({e}) — sent_unfiled",
                                                 row.id
                                             );
-                                            if let Err(e) = queries::set_send_state(guard.conn(), &row.id, SEND_STATE_SENT) {
+                                            if let Err(e) = queries::set_send_state(
+                                                guard.conn(),
+                                                &row.id,
+                                                SEND_STATE_SENT,
+                                            ) {
                                                 eprintln!("[SGE send] {} state write marked sent despite APPEND failure ({e})", row.id);
                                             }
                                             Some(FlushOutcome::SentUnfiled)
@@ -815,9 +810,7 @@ impl SyncWorker {
                             // Cannot lease Sent folder; treat as miss and attempt APPEND
                             // using a best-effort approach with the sent_wire if available
                             if let Some(sent_wire) = &env.sent_wire {
-                                let lease_result = manager
-                                    .lease_for(sent_wire)
-                                    .await;
+                                let lease_result = manager.lease_for(sent_wire).await;
                                 if let Ok(mut lease) = lease_result {
                                     let bytes = std::fs::read(&row.eml_path).unwrap_or_default();
                                     let append_result = lease
@@ -830,7 +823,11 @@ impl SyncWorker {
                                                 "[SGE send] {} APPENDed to {} after lease recovery",
                                                 row.id, sent_wire
                                             );
-                                            if let Err(e) = queries::set_send_state(guard.conn(), &row.id, SEND_STATE_SENT) {
+                                            if let Err(e) = queries::set_send_state(
+                                                guard.conn(),
+                                                &row.id,
+                                                SEND_STATE_SENT,
+                                            ) {
                                                 eprintln!("[SGE send] {} state write failed after APPEND ({e})", row.id);
                                                 return None;
                                             }
@@ -841,7 +838,11 @@ impl SyncWorker {
                                                 "[SGE send] {} APPEND failed after lease recovery ({e}) — sent_unfiled",
                                                 row.id
                                             );
-                                            if let Err(e) = queries::set_send_state(guard.conn(), &row.id, SEND_STATE_SENT) {
+                                            if let Err(e) = queries::set_send_state(
+                                                guard.conn(),
+                                                &row.id,
+                                                SEND_STATE_SENT,
+                                            ) {
                                                 eprintln!("[SGE send] {} state write marked sent despite APPEND failure ({e})", row.id);
                                             }
                                             Some(FlushOutcome::SentUnfiled)
@@ -970,7 +971,10 @@ impl SyncWorker {
             .map_err(|e| SyncError::Protocol(format!("reconcile SELECT {sent}: {e}")))?;
         let mut summary = ReconcileSummary::default();
         for row in &rows {
-            match session.uid_search_header("Message-ID", &row.message_id).await {
+            match session
+                .uid_search_header("Message-ID", &row.message_id)
+                .await
+            {
                 Ok(hits) if !hits.is_empty() => {
                     let guard = self.store.lock().unwrap();
                     match queries::set_send_state(guard.conn(), &row.id, SEND_STATE_SENT) {
@@ -1025,11 +1029,7 @@ impl SyncWorker {
     /// replay, then uncertain reconcile. No-op without a configured
     /// [`SendFlushEnv`]. Reconcile/lookup failures never fail the pass —
     /// uncertain rows simply wait for the next one.
-    async fn flush_send_queue_in_pass(
-        &self,
-        session: &mut dyn SyncSession,
-        mailbox_name: &str,
-    ) {
+    async fn flush_send_queue_in_pass(&self, session: &mut dyn SyncSession, mailbox_name: &str) {
         let Some(env) = self.send_flush.as_ref() else {
             return;
         };
@@ -1127,7 +1127,9 @@ impl SyncWorker {
                     }
                 }
             }
-            Err(e) => eprintln!("[SGE sync] seen-intent uid {src_uid}: dest SEARCH failed ({e}) — dropped"),
+            Err(e) => eprintln!(
+                "[SGE sync] seen-intent uid {src_uid}: dest SEARCH failed ({e}) — dropped"
+            ),
         }
         if let Some(duid) = dest_uid {
             match session.set_seen(duid, seen).await {
@@ -1187,9 +1189,7 @@ impl SyncWorker {
             let dir = crate::store::attachment_dir(root, uid_validity, *uid);
             if dir.exists() {
                 if let Err(e) = std::fs::remove_dir_all(&dir) {
-                    eprintln!(
-                        "[SGE sync] attachment cleanup uid {uid} failed ({e}) — continuing"
-                    );
+                    eprintln!("[SGE sync] attachment cleanup uid {uid} failed ({e}) — continuing");
                 }
             }
         }
@@ -1269,7 +1269,9 @@ impl SyncWorker {
                     );
                 }
             }
-            Err(e) => eprintln!("[SGE sync] STATUS {mailbox_name} failed ({e}) — continuing without unseen cache"),
+            Err(e) => eprintln!(
+                "[SGE sync] STATUS {mailbox_name} failed ({e}) — continuing without unseen cache"
+            ),
         }
 
         // ── Step 3: UIDVALIDITY guard ─────────────────────────────
@@ -1280,8 +1282,9 @@ impl SyncWorker {
             // would flag the wrong messages (RFC 4549, T-6-02). The wipe
             // path already dropped the imap queue; the flag queue drops here.
             let guard = self.store.lock().unwrap();
-            queries::drop_outbox_for_mailbox(guard.conn(), mailbox_id)
-                .map_err(|e| SyncError::Protocol(format!("drop outbox on UIDVALIDITY bump: {e}")))?;
+            queries::drop_outbox_for_mailbox(guard.conn(), mailbox_id).map_err(|e| {
+                SyncError::Protocol(format!("drop outbox on UIDVALIDITY bump: {e}"))
+            })?;
         }
 
         let mut result = SyncSummary {
@@ -1325,7 +1328,12 @@ impl SyncWorker {
             // Every queued UID is absent — both replays drop their queues.
             let empty: HashSet<u32> = HashSet::new();
             let replay = self
-                .replay_outbox(&mut *session, mailbox_id, summary.uid_validity, Some(&empty))
+                .replay_outbox(
+                    &mut *session,
+                    mailbox_id,
+                    summary.uid_validity,
+                    Some(&empty),
+                )
                 .await?;
             eprintln!(
                 "[SGE sync] replay on empty mailbox: acked={} dropped={} failed={}",
@@ -1464,10 +1472,8 @@ impl SyncWorker {
                 .map_err(|e| SyncError::Protocol(format!("sweep counter: {e}")))?
         };
         let periodic_full = sweeps >= queries::FULL_SWEEP_EVERY;
-        let skip_sweep = !periodic_full
-            && !uid_validity_bump
-            && pending.is_empty()
-            && local_uids == server_set;
+        let skip_sweep =
+            !periodic_full && !uid_validity_bump && pending.is_empty() && local_uids == server_set;
         // Sweep set: tombstoned UIDs are excluded (no infinite backfill
         // loop) except on the periodic full sweep, which retries them.
         // A converged skip sweeps nothing at all.
@@ -1555,7 +1561,11 @@ impl SyncWorker {
             // at TOMBSTONE_STRIKES they stop being re-requested.
             let mut headers = headers;
             let returned: HashSet<u32> = headers.iter().map(|h| h.uid).collect();
-            let gap: Vec<u32> = chunk.iter().copied().filter(|u| !returned.contains(u)).collect();
+            let gap: Vec<u32> = chunk
+                .iter()
+                .copied()
+                .filter(|u| !returned.contains(u))
+                .collect();
             if !gap.is_empty() {
                 let gap_str = gap
                     .iter()
@@ -1567,12 +1577,10 @@ impl SyncWorker {
                     gap.len(),
                     chunk.len()
                 );
-                let gap_headers: Vec<MessageHeader> =
-                    session.fetch_envelopes(&gap_str).await?;
+                let gap_headers: Vec<MessageHeader> = session.fetch_envelopes(&gap_str).await?;
                 result.fetched += gap_headers.len();
                 result.gap_refetches += 1;
-                let gap_returned: HashSet<u32> =
-                    gap_headers.iter().map(|h| h.uid).collect();
+                let gap_returned: HashSet<u32> = gap_headers.iter().map(|h| h.uid).collect();
                 headers.extend(gap_headers);
                 let still_missing: Vec<u32> = gap
                     .iter()
@@ -1649,8 +1657,8 @@ impl SyncWorker {
                         if pending.contains(&uid) {
                             result.updated += 1;
                         } else {
-                            let stored = queries::message_flags(conn, mailbox_id, uid)
-                                .map_err(|e| {
+                            let stored =
+                                queries::message_flags(conn, mailbox_id, uid).map_err(|e| {
                                     SyncError::Protocol(format!("stored flags uid {uid}: {e}"))
                                 })?;
                             if stored.as_deref() == Some(header.flags.as_str()) {
@@ -1695,9 +1703,9 @@ impl SyncWorker {
         result.deleted = self.expunge_absent(mailbox_id, &live_union, summary.uid_validity)?;
 
         // ── Step 7: write sync state + logout ──────────────────────
-        let new_next = summary.uid_next.unwrap_or_else(|| {
-            server_uids.last().map(|&u| u + 1).unwrap_or(1)
-        });
+        let new_next = summary
+            .uid_next
+            .unwrap_or_else(|| server_uids.last().map(|&u| u + 1).unwrap_or(1));
         {
             let guard = self.store.lock().unwrap();
             let conn = guard.conn();
@@ -1826,10 +1834,7 @@ mod tests {
     }
 
     impl SyncSession for MockSession {
-        fn select_mailbox(
-            &mut self,
-            name: &str,
-        ) -> PinBox<'_, Result<MailboxSummary, SyncError>> {
+        fn select_mailbox(&mut self, name: &str) -> PinBox<'_, Result<MailboxSummary, SyncError>> {
             self.select_calls.push(name.to_string());
             let summary = self.summary.clone();
             Box::pin(async move { Ok(summary) })
@@ -1854,8 +1859,7 @@ mod tests {
                 .split(',')
                 .filter_map(|s| s.trim().parse::<u32>().ok())
                 .collect();
-            let once: Vec<u32> =
-                std::mem::take(&mut *self.gap_once.lock().unwrap());
+            let once: Vec<u32> = std::mem::take(&mut *self.gap_once.lock().unwrap());
             let always = self.always_miss.lock().unwrap().clone();
             let envelopes = self
                 .envelopes
@@ -1885,7 +1889,9 @@ mod tests {
             self.deleted_calls.push((uid, deleted));
             if self.fail_deleted {
                 return Box::pin(async move {
-                    Err(SyncError::Protocol("mock store_deleted failure".to_string()))
+                    Err(SyncError::Protocol(
+                        "mock store_deleted failure".to_string(),
+                    ))
                 });
             }
             Box::pin(async move { Ok(()) })
@@ -1912,7 +1918,8 @@ mod tests {
         }
 
         fn uid_copy_to(&mut self, uid_set: &str, dest: &str) -> PinBox<'_, Result<(), SyncError>> {
-            self.copied_calls.push((uid_set.to_string(), dest.to_string()));
+            self.copied_calls
+                .push((uid_set.to_string(), dest.to_string()));
             if self.fail_copy {
                 return Box::pin(async move {
                     Err(SyncError::Protocol("mock uid_copy failure".to_string()))
@@ -1922,10 +1929,13 @@ mod tests {
         }
 
         fn uid_move_to(&mut self, uid_set: &str, dest: &str) -> PinBox<'_, Result<(), SyncError>> {
-            self.moved_calls.push((uid_set.to_string(), dest.to_string()));
+            self.moved_calls
+                .push((uid_set.to_string(), dest.to_string()));
             if self.fail_move_refused {
                 return Box::pin(async move {
-                    Err(SyncError::Refused("mock unmark dance unverifiable".to_string()))
+                    Err(SyncError::Refused(
+                        "mock unmark dance unverifiable".to_string(),
+                    ))
                 });
             }
             if self.fail_move {
@@ -1977,11 +1987,8 @@ mod tests {
             flags: &str,
             bytes: &[u8],
         ) -> PinBox<'_, Result<(), SyncError>> {
-            self.appended_calls.push((
-                mailbox.to_string(),
-                flags.to_string(),
-                bytes.to_vec(),
-            ));
+            self.appended_calls
+                .push((mailbox.to_string(), flags.to_string(), bytes.to_vec()));
             if self.fail_append {
                 return Box::pin(async move {
                     Err(SyncError::Protocol("mock append failure".to_string()))
@@ -2375,7 +2382,9 @@ mod tests {
         let session = mock(summary, vec![mkhdr(1), mkhdr(2), mkhdr(3)]);
 
         let result = async_std::task::block_on(async {
-            worker.sync_with_session(Box::new(session), "INBOX", cb()).await
+            worker
+                .sync_with_session(Box::new(session), "INBOX", cb())
+                .await
         })
         .unwrap();
 
@@ -2452,14 +2461,18 @@ mod tests {
         // First run — inserts
         let session = mock(summary.clone(), vec![mkhdr(1), mkhdr(2), mkhdr(3)]);
         async_std::task::block_on(async {
-            worker.sync_with_session(Box::new(session), "INBOX", cb()).await
+            worker
+                .sync_with_session(Box::new(session), "INBOX", cb())
+                .await
         })
         .unwrap();
 
         // Second run — same data → converged, zero FETCHes (Phase 9).
         let session2 = mock(summary.clone(), vec![mkhdr(1), mkhdr(2), mkhdr(3)]);
         let result = async_std::task::block_on(async {
-            worker.sync_with_session(Box::new(session2), "INBOX", cb()).await
+            worker
+                .sync_with_session(Box::new(session2), "INBOX", cb())
+                .await
         })
         .unwrap();
 
@@ -2477,7 +2490,9 @@ mod tests {
         }
         let session3 = mock(summary, vec![mkhdr(1), mkhdr(2), mkhdr(3)]);
         let result3 = async_std::task::block_on(async {
-            worker.sync_with_session(Box::new(session3), "INBOX", cb()).await
+            worker
+                .sync_with_session(Box::new(session3), "INBOX", cb())
+                .await
         })
         .unwrap();
 
@@ -2507,8 +2522,12 @@ mod tests {
             exists: 3,
         };
         let session = mock(s1, vec![mkhdr(1), mkhdr(2), mkhdr(3)]);
-        async_std::task::block_on(async { worker.sync_with_session(Box::new(session), "INBOX", cb()).await })
-            .unwrap();
+        async_std::task::block_on(async {
+            worker
+                .sync_with_session(Box::new(session), "INBOX", cb())
+                .await
+        })
+        .unwrap();
 
         // Second run with UIDVALIDITY=200 → wipe
         let s2 = MailboxSummary {
@@ -2564,7 +2583,9 @@ mod tests {
         let session = mock(summary, vec![]);
 
         let result = async_std::task::block_on(async {
-            worker.sync_with_session(Box::new(session), "INBOX", cb()).await
+            worker
+                .sync_with_session(Box::new(session), "INBOX", cb())
+                .await
         })
         .unwrap();
 
@@ -2646,7 +2667,14 @@ mod tests {
             session.expunge().await.unwrap();
             session.create_mailbox("Trash").await.unwrap();
             let caps = session.capabilities().await.unwrap();
-            assert_eq!(caps, vec!["IMAP4rev1".to_string(), "UIDPLUS".to_string(), "MOVE".to_string()]);
+            assert_eq!(
+                caps,
+                vec![
+                    "IMAP4rev1".to_string(),
+                    "UIDPLUS".to_string(),
+                    "MOVE".to_string()
+                ]
+            );
         });
 
         assert_eq!(session.select_calls, vec!["INBOX".to_string()]);
@@ -2687,12 +2715,7 @@ mod tests {
 
     /// Seed helper: one INBOX row plus an optimistic Seen toggle, returning
     /// the mailbox id. Mirrors what the `set_seen` command writes.
-    fn seed_pending(
-        store: &Arc<std::sync::Mutex<Store>>,
-        uid: u32,
-        seen: bool,
-        epoch: u32,
-    ) -> u64 {
+    fn seed_pending(store: &Arc<std::sync::Mutex<Store>>, uid: u32, seen: bool, epoch: u32) -> u64 {
         let guard = store.lock().unwrap();
         let conn = guard.conn();
         let mb_id = queries::ensure_mailbox(conn, "INBOX").unwrap();
@@ -2763,7 +2786,9 @@ mod tests {
         let session = mock(summary, vec![hdr1, hdr2]);
 
         async_std::task::block_on(async {
-            worker.sync_with_session(Box::new(session), "INBOX", cb()).await
+            worker
+                .sync_with_session(Box::new(session), "INBOX", cb())
+                .await
         })
         .unwrap();
         // The sync consumed the session box; assert through the store: the
@@ -2781,7 +2806,9 @@ mod tests {
             .unwrap();
         assert_eq!(flags2, "[]", "non-pending UID takes server flags");
         assert!(
-            queries::pending_uids(guard.conn(), mb_id).unwrap().is_empty(),
+            queries::pending_uids(guard.conn(), mb_id)
+                .unwrap()
+                .is_empty(),
             "acked op must leave the queue"
         );
     }
@@ -2821,7 +2848,9 @@ mod tests {
         assert_eq!(summary.failed, 0);
         assert_eq!(session.set_seen_calls, vec![(5, true), (6, false)]);
         let guard = worker.store.lock().unwrap();
-        assert!(queries::pending_uids(guard.conn(), mb_id).unwrap().is_empty());
+        assert!(queries::pending_uids(guard.conn(), mb_id)
+            .unwrap()
+            .is_empty());
     }
 
     /// Epoch mismatch drops the whole mailbox queue without a single STORE.
@@ -2979,7 +3008,9 @@ mod tests {
         );
         let guard = worker.store.lock().unwrap();
         assert!(
-            queries::pending_uids(guard.conn(), mb_id).unwrap().is_empty(),
+            queries::pending_uids(guard.conn(), mb_id)
+                .unwrap()
+                .is_empty(),
             "queue must be empty after epoch-bump drop"
         );
     }
@@ -3033,7 +3064,7 @@ mod tests {
             exists: 0,
         });
         let mb_id = seed_pending(&store, 5, true, 100); // enrolled first
-        seed_pending(&store, 6, false, 100);            // enrolled second
+        seed_pending(&store, 6, false, 100); // enrolled second
         let worker = SyncWorker::new(store);
 
         let mut session = mock(
@@ -3108,7 +3139,7 @@ mod tests {
         });
         let worker = SyncWorker::new(store.clone());
         let mb_id = seed_pending(&store, 1, true, 100); // optimistic read + op
-        // Server reports flags = "[]" (truly unread).
+                                                        // Server reports flags = "[]" (truly unread).
         let mut hdr = mkhdr(1);
         hdr.flags = "[]".to_string();
 
@@ -3140,7 +3171,9 @@ mod tests {
         );
         // And the op was acked (deleted from queue).
         assert!(
-            queries::pending_uids(guard.conn(), mb_id).unwrap().is_empty(),
+            queries::pending_uids(guard.conn(), mb_id)
+                .unwrap()
+                .is_empty(),
             "op must be acked after successful replay"
         );
     }
@@ -3159,9 +3192,18 @@ mod tests {
         {
             let guard = store.lock().unwrap();
             queries::upsert_message(
-                guard.conn(), mb_id, 1, None, "Subj",
-                "a@x.com", "[]", "[]", "2024-01-01T00:00:00Z",
-                "[]", false, "p",
+                guard.conn(),
+                mb_id,
+                1,
+                None,
+                "Subj",
+                "a@x.com",
+                "[]",
+                "[]",
+                "2024-01-01T00:00:00Z",
+                "[]",
+                false,
+                "p",
             )
             .unwrap();
         }
@@ -3171,16 +3213,16 @@ mod tests {
             queries::set_local_seen(guard.conn(), mb_id, 1, true).unwrap();
         }
         let guard = store.lock().unwrap();
-        let flags: Vec<String> =
-            serde_json::from_str(&queries::message_flags(guard.conn(), mb_id, 1).unwrap().unwrap())
-                .unwrap();
+        let flags: Vec<String> = serde_json::from_str(
+            &queries::message_flags(guard.conn(), mb_id, 1)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(flags, vec!["\\Seen".to_string()]);
 
         // The STORE arg must be the same canonical token.
-        assert_eq!(
-            crate::imap::seen_store_arg(true),
-            "+FLAGS.SILENT (\\Seen)"
-        );
+        assert_eq!(crate::imap::seen_store_arg(true), "+FLAGS.SILENT (\\Seen)");
         assert_eq!(queries::SEEN_FLAG, "\\Seen");
     }
 
@@ -3248,7 +3290,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(b_count, 1, "FolderB cache must survive FolderA's epoch bump");
+        assert_eq!(
+            b_count, 1,
+            "FolderB cache must survive FolderA's epoch bump"
+        );
         let b_uidv: u32 = guard
             .conn()
             .query_row(
@@ -3300,7 +3345,10 @@ mod tests {
 
         let guard = worker.store.lock().unwrap();
         let rows = queries::list_mailboxes(guard.conn()).unwrap();
-        let sent = rows.iter().find(|r| r.name == "Sent").expect("Sent row cached");
+        let sent = rows
+            .iter()
+            .find(|r| r.name == "Sent")
+            .expect("Sent row cached");
         assert_eq!(sent.unseen_count, 2, "STATUS UNSEEN must be cached");
         assert_eq!(sent.unread_count, 2, "local count agrees pre-toggle");
         assert!(sent.last_sync_at.is_some());
@@ -3314,7 +3362,10 @@ mod tests {
         queries::set_mailbox_status(conn, "Drafts", 42, 7, 3).unwrap();
         queries::set_mailbox_status(conn, "Drafts", 42, 9, 1).unwrap();
         let rows = queries::list_mailboxes(conn).unwrap();
-        let drafts = rows.iter().find(|r| r.name == "Drafts").expect("Drafts row");
+        let drafts = rows
+            .iter()
+            .find(|r| r.name == "Drafts")
+            .expect("Drafts row");
         assert_eq!(drafts.uid_validity, 42);
         assert_eq!(drafts.uid_next, 9);
         assert_eq!(drafts.unseen_count, 1);
@@ -3342,7 +3393,9 @@ mod tests {
         let session = mock(gap_summary(100, 3), vec![mkhdr(1), mkhdr(2), mkhdr(3)]);
         session.gap_once.lock().unwrap().push(2); // transient drop
         let result = async_std::task::block_on(async {
-            worker.sync_with_session(Box::new(session), "INBOX", cb()).await
+            worker
+                .sync_with_session(Box::new(session), "INBOX", cb())
+                .await
         })
         .unwrap();
 
@@ -3403,7 +3456,9 @@ mod tests {
             let session = mock(gap_summary(100, 2), vec![mkhdr(1), mkhdr(2)]);
             session.always_miss.lock().unwrap().push(2);
             let result = async_std::task::block_on(async {
-                worker.sync_with_session(Box::new(session), "INBOX", cb()).await
+                worker
+                    .sync_with_session(Box::new(session), "INBOX", cb())
+                    .await
             })
             .unwrap();
             assert!(!result.converged, "changed sets must sweep (pass {pass})");
@@ -3423,7 +3478,9 @@ mod tests {
         // Pass 4: uid 2 is tombstoned → sweep requests only uid 1.
         let session4 = mock(gap_summary(100, 2), vec![mkhdr(1), mkhdr(2)]);
         let r4 = async_std::task::block_on(async {
-            worker.sync_with_session(Box::new(session4), "INBOX", cb()).await
+            worker
+                .sync_with_session(Box::new(session4), "INBOX", cb())
+                .await
         })
         .unwrap();
         assert!(!r4.converged);
@@ -3436,7 +3493,9 @@ mod tests {
         // Pass 5: uid 2 expunged server-side → tombstone pruned, no residue.
         let session5 = mock(gap_summary(100, 1), vec![mkhdr(1)]);
         async_std::task::block_on(async {
-            worker.sync_with_session(Box::new(session5), "INBOX", cb()).await
+            worker
+                .sync_with_session(Box::new(session5), "INBOX", cb())
+                .await
         })
         .unwrap();
         let guard = worker.store.lock().unwrap();
@@ -3456,7 +3515,9 @@ mod tests {
 
         let session = mock(gap_summary(100, 3), vec![mkhdr(1), mkhdr(2), mkhdr(3)]);
         let result = async_std::task::block_on(async {
-            worker.sync_with_session(Box::new(session), "INBOX", cb()).await
+            worker
+                .sync_with_session(Box::new(session), "INBOX", cb())
+                .await
         })
         .unwrap();
 
@@ -3546,7 +3607,9 @@ mod tests {
             "stale UIDs must never reach the wire"
         );
         let guard = worker.store.lock().unwrap();
-        assert!(queries::pending_imap_uids(guard.conn(), mb_id).unwrap().is_empty());
+        assert!(queries::pending_imap_uids(guard.conn(), mb_id)
+            .unwrap()
+            .is_empty());
         assert!(!queries::is_pending_delete(guard.conn(), mb_id, 5).unwrap());
     }
 
@@ -3578,7 +3641,9 @@ mod tests {
         );
         let guard = worker.store.lock().unwrap();
         assert!(
-            queries::pending_imap_uids(guard.conn(), mb_id).unwrap().is_empty(),
+            queries::pending_imap_uids(guard.conn(), mb_id)
+                .unwrap()
+                .is_empty(),
             "acked + absent-dropped ops must leave the queue empty"
         );
     }
@@ -3634,7 +3699,9 @@ mod tests {
         assert_eq!(summary.failed, 0, "refusal must not linger as retryable");
         assert_eq!(session.moved_calls.len(), 1, "wire attempt happened");
         let guard = worker.store.lock().unwrap();
-        assert!(queries::pending_imap_uids(guard.conn(), mb_id).unwrap().is_empty());
+        assert!(queries::pending_imap_uids(guard.conn(), mb_id)
+            .unwrap()
+            .is_empty());
         assert!(!queries::is_pending_delete(guard.conn(), mb_id, 5).unwrap());
     }
 
@@ -3649,17 +3716,33 @@ mod tests {
             let conn = guard.conn();
             let mb_id = queries::ensure_mailbox(conn, "INBOX").unwrap();
             queries::upsert_message(
-                conn, mb_id, 5, Some("<msg5@example.com>"), "Subject 5",
-                "alice@example.com", "[]", "[]", "2024-10-03T12:00:00Z",
-                "[]", false, "Subject 5",
+                conn,
+                mb_id,
+                5,
+                Some("<msg5@example.com>"),
+                "Subject 5",
+                "alice@example.com",
+                "[]",
+                "[]",
+                "2024-10-03T12:00:00Z",
+                "[]",
+                false,
+                "Subject 5",
             )
             .unwrap();
             // Pending Seen toggle first — the move consumes it as intent.
             queries::set_local_seen(conn, mb_id, 5, true).unwrap();
             queries::enqueue_outbox(conn, mb_id, 5, true, 100).unwrap();
             queries::set_pending_delete(conn, mb_id, 5, true).unwrap();
-            queries::enqueue_imap_outbox(conn, mb_id, 5, queries::IMAP_OP_MOVE, Some("Archive"), 100)
-                .unwrap();
+            queries::enqueue_imap_outbox(
+                conn,
+                mb_id,
+                5,
+                queries::IMAP_OP_MOVE,
+                Some("Archive"),
+                100,
+            )
+            .unwrap();
             mb_id
         };
         let worker = SyncWorker::new(store);
@@ -3698,7 +3781,9 @@ mod tests {
         let mut session = mock(gap_summary(100, 1), vec![mkhdr(5)]);
         session.fail_move = true;
         async_std::task::block_on(async {
-            worker.sync_with_session(Box::new(session), "INBOX", cb()).await
+            worker
+                .sync_with_session(Box::new(session), "INBOX", cb())
+                .await
         })
         .unwrap();
 
@@ -3739,7 +3824,12 @@ mod tests {
             let mb_id = queries::mailbox_id(guard.conn(), "INBOX").unwrap().unwrap();
             queries::set_pending_delete(guard.conn(), mb_id, 2, true).unwrap();
             queries::enqueue_imap_outbox(
-                guard.conn(), mb_id, 2, queries::IMAP_OP_DELETE, Some("Trash"), 100,
+                guard.conn(),
+                mb_id,
+                2,
+                queries::IMAP_OP_DELETE,
+                Some("Trash"),
+                100,
             )
             .unwrap();
         }
@@ -3764,15 +3854,22 @@ mod tests {
 
         let session = mock(gap_summary(100, 2), vec![mkhdr(1), mkhdr(2)]);
         let result = async_std::task::block_on(async {
-            worker.sync_with_session(Box::new(session), "INBOX", cb()).await
+            worker
+                .sync_with_session(Box::new(session), "INBOX", cb())
+                .await
         })
         .unwrap();
 
         assert_eq!(result.moved, 2);
-        assert_eq!(result.deleted, 0, "moves are not server-side disappearances");
+        assert_eq!(
+            result.deleted, 0,
+            "moves are not server-side disappearances"
+        );
         let guard = store.lock().unwrap();
         let mb_id = queries::mailbox_id(guard.conn(), "INBOX").unwrap().unwrap();
-        assert!(queries::pending_imap_uids(guard.conn(), mb_id).unwrap().is_empty());
+        assert!(queries::pending_imap_uids(guard.conn(), mb_id)
+            .unwrap()
+            .is_empty());
     }
 
     /// Expunge cleanup: a server-side disappearance removes the row, its FTS
@@ -3803,10 +3900,7 @@ mod tests {
         let dir = root.join("attachments").join("100").join("7");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("f.pdf"), b"bytes").unwrap();
-        let worker = SyncWorker::with_attachment_root(
-            SyncWorker::new(store.clone()),
-            root.clone(),
-        );
+        let worker = SyncWorker::with_attachment_root(SyncWorker::new(store.clone()), root.clone());
         let _ = mb_id;
 
         // Pass 2 — server expunged uid 7 (empty mailbox, EXISTS=0).
@@ -3826,8 +3920,14 @@ mod tests {
         assert_eq!(r2.deleted, 1);
 
         let guard = store.lock().unwrap();
-        assert!(queries::get_message_by_uid(guard.conn(), "INBOX", 7).unwrap().is_none());
-        assert!(queries::fts_search(guard.conn(), Some("INBOX"), "Subject 7").unwrap().is_empty());
+        assert!(queries::get_message_by_uid(guard.conn(), "INBOX", 7)
+            .unwrap()
+            .is_none());
+        assert!(
+            queries::fts_search(guard.conn(), Some("INBOX"), "Subject 7")
+                .unwrap()
+                .is_empty()
+        );
         let bodies: i64 = guard
             .conn()
             .query_row("SELECT COUNT(*) FROM message_bodies", [], |r| r.get(0))
@@ -3899,10 +3999,7 @@ mod tests {
 
     fn flush_dir(name: &str) -> PathBuf {
         let n = FLUSH_SEQ.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!(
-            "sge-flush-{}-{name}-{n}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("sge-flush-{}-{name}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -3916,7 +4013,11 @@ mod tests {
         }
     }
 
-    fn flush_env(manager: Option<Arc<crate::imap::manager::SessionManager>>, sent_wire: Option<String>, script: Vec<SmtpOutcome>) -> (SendFlushEnv, Arc<FakeTransport>) {
+    fn flush_env(
+        manager: Option<Arc<crate::imap::manager::SessionManager>>,
+        sent_wire: Option<String>,
+        script: Vec<SmtpOutcome>,
+    ) -> (SendFlushEnv, Arc<FakeTransport>) {
         let tx = Arc::new(FakeTransport::scripted(script));
         let transport: Arc<dyn crate::smtp::SmtpTransport> = tx.clone();
         let env = SendFlushEnv {
@@ -3993,7 +4094,12 @@ mod tests {
         let worker = SyncWorker::new(store.clone());
         let summary = flush_blocking(&worker, &env);
         assert_eq!(
-            (summary.sent, summary.deferred, summary.failed, summary.uncertain),
+            (
+                summary.sent,
+                summary.deferred,
+                summary.failed,
+                summary.uncertain
+            ),
             (1, 0, 0, 0)
         );
         assert!(!summary.skipped);
@@ -4003,7 +4109,11 @@ mod tests {
         let call = &calls[0];
         assert_eq!(call.from, "eu@utfpr.edu.br");
         // Envelope carries To + Cc + BCC (envelope-only BCC).
-        for want in ["amigo@example.com", "copia@example.com", "oculta@example.com"] {
+        for want in [
+            "amigo@example.com",
+            "copia@example.com",
+            "oculta@example.com",
+        ] {
             assert!(
                 call.to.contains(&want.to_string()),
                 "envelope missing {want}: {:?}",
@@ -4038,15 +4148,24 @@ mod tests {
             let guard = store.lock().unwrap();
             crate::send_queue::mark_send_failed(guard.conn(), &failed.id, "refused").unwrap();
         }
-        let (env, tx) = flush_env(None, None, vec![SmtpOutcome::Transient {
-            message: "try later".to_string(),
-        }]);
+        let (env, tx) = flush_env(
+            None,
+            None,
+            vec![SmtpOutcome::Transient {
+                message: "try later".to_string(),
+            }],
+        );
         let worker = SyncWorker::new(store.clone());
         let before = chrono::Utc::now();
         let summary = flush_blocking(&worker, &env);
         let after = chrono::Utc::now();
         assert_eq!(
-            (summary.sent, summary.deferred, summary.failed, summary.uncertain),
+            (
+                summary.sent,
+                summary.deferred,
+                summary.failed,
+                summary.uncertain
+            ),
             (0, 1, 0, 0)
         );
         assert_eq!(
@@ -4075,10 +4194,7 @@ mod tests {
             let failed_row = queries::get_send_row(guard.conn(), &failed.id)
                 .unwrap()
                 .unwrap();
-            assert_eq!(
-                failed_row.state,
-                crate::store::queries::SEND_STATE_FAILED
-            );
+            assert_eq!(failed_row.state, crate::store::queries::SEND_STATE_FAILED);
             assert_eq!(failed_row.attempts, 1, "failed row untouched by the pass");
         }
         // Still scheduled in the future: an immediate second flush finds
@@ -4101,9 +4217,13 @@ mod tests {
                 )
                 .unwrap();
         }
-        let (env2, tx2) = flush_env(None, None, vec![SmtpOutcome::Transient {
-            message: "still down".to_string(),
-        }]);
+        let (env2, tx2) = flush_env(
+            None,
+            None,
+            vec![SmtpOutcome::Transient {
+                message: "still down".to_string(),
+            }],
+        );
         let capped_summary = flush_blocking(&worker, &env2);
         assert_eq!(tx2.call_count(), 1);
         assert_eq!(
@@ -4130,13 +4250,22 @@ mod tests {
         let store = inbox(drafts_summary());
         let app_data = flush_dir("uncertain");
         let row = queued_mail(&store, &app_data, "amigo@example.com");
-        let (env, tx) = flush_env(None, None, vec![SmtpOutcome::Uncertain {
-            reason: "DATA timeout".to_string(),
-        }]);
+        let (env, tx) = flush_env(
+            None,
+            None,
+            vec![SmtpOutcome::Uncertain {
+                reason: "DATA timeout".to_string(),
+            }],
+        );
         let worker = SyncWorker::new(store.clone());
         let summary = flush_blocking(&worker, &env);
         assert_eq!(
-            (summary.sent, summary.deferred, summary.failed, summary.uncertain),
+            (
+                summary.sent,
+                summary.deferred,
+                summary.failed,
+                summary.uncertain
+            ),
             (0, 0, 0, 1)
         );
         assert_eq!(
@@ -4180,7 +4309,10 @@ mod tests {
                 .await
         })
         .unwrap();
-        assert_eq!((r2.confirmed_sent, r2.requeued, r2.still_uncertain), (0, 1, 0));
+        assert_eq!(
+            (r2.confirmed_sent, r2.requeued, r2.still_uncertain),
+            (0, 1, 0)
+        );
         {
             let guard = store.lock().unwrap();
             let back = queries::get_send_row(guard.conn(), &row2.id)
@@ -4306,9 +4438,7 @@ mod tests {
         );
         session.search_header_results = vec![5];
         async_std::task::block_on(async {
-            worker
-                .sync_with_borrowed(&mut session, "INBOX", cb())
-                .await
+            worker.sync_with_borrowed(&mut session, "INBOX", cb()).await
         })
         .unwrap();
         assert_eq!(session.appended_calls.len(), 1, "draft replay (4c) ran");
@@ -4348,9 +4478,7 @@ mod tests {
         );
         session.search_header_results = vec![5];
         async_std::task::block_on(async {
-            worker
-                .sync_with_borrowed(&mut session, "INBOX", cb())
-                .await
+            worker.sync_with_borrowed(&mut session, "INBOX", cb()).await
         })
         .unwrap();
         assert_eq!(session.appended_calls.len(), 1, "draft replay (4c) ran");
@@ -4393,4 +4521,5 @@ mod tests {
         assert_eq!(resolve_sent_wire(&folders).as_deref(), Some("Archive"));
         let folders = vec![mb("INBOX", &[])];
         assert_eq!(resolve_sent_wire(&folders), None);
-    }}
+    }
+}
