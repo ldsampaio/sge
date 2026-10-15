@@ -8,6 +8,7 @@
 //! construction, no `.send()` — generation egress lands in Phase 40.
 
 pub mod key;
+pub mod prompt;
 pub mod validate;
 
 use serde::{Deserialize, Serialize};
