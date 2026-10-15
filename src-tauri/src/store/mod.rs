@@ -16,7 +16,7 @@ pub mod queries;
 pub const BODY_CACHE_CAP_BYTES: usize = 262144;
 
 /// Schema version managed by rusqlite_migration.
-pub const SCHEMA_VERSION: u32 = 14;
+pub const SCHEMA_VERSION: u32 = 23;
 
 // v1 = full schema.sql (canonical DDL from ARCHITECTURE.md)
 // M2 = flag_outbox durable queue (Phase 6, Plan 06-01). The schema.sql v1
@@ -851,8 +851,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_14_with_m22_learn() {
-        assert_eq!(SCHEMA_VERSION, 14);
+    fn schema_version_is_23_with_m23_llm_settings() {
+        assert_eq!(SCHEMA_VERSION, 23);
         let store = Store::open_in_memory().expect("migration should succeed");
         let conn = store.conn();
         let count: i64 = conn
@@ -903,6 +903,26 @@ mod tests {
         assert!(
             send_check.contains("sent_unfiled"),
             "send_queue CHECK should admit sent_unfiled at schema v11"
+        );
+        // M23 (Plan 39-03): fresh opens seed the single llm_settings row
+        // with the DEFAULT_* values (schema-push gate: fresh path).
+        let seed: (String, f64, i64, i64, String) = conn
+            .query_row(
+                "SELECT base_url, temperature, max_tokens, timeout_secs, prompt_template \
+                 FROM llm_settings WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .expect("M23 must seed row id 1 on a fresh open");
+        assert_eq!(seed.0, "https://api.openai.com/v1");
+        assert_eq!(seed.1, 0.7);
+        assert_eq!(seed.2, 500);
+        assert_eq!(seed.3, 60);
+        assert!(
+            seed.4.contains("{sender}")
+                && seed.4.contains("{subject}")
+                && seed.4.contains("{body}"),
+            "seeded template must carry all three placeholders"
         );
     }
 
@@ -1975,5 +1995,121 @@ mod m22_preserve_tests {
             })
             .unwrap();
         assert_eq!(count, 1);
+    }
+}
+
+/// M23 gate tests (Phase 39, Plan 39-03): the schema-push gate equivalent.
+/// Fresh and upgraded (M1..M22) databases must both open cleanly and
+/// expose the seeded `llm_settings` row; the single-row CHECK must hold.
+/// No key material appears in any assertion (T-39-01).
+#[cfg(test)]
+mod m23_llm_settings_gate_tests {
+    use super::*;
+    use rusqlite_migration::{Migrations, M};
+
+    /// Migration prefix through M22 (as shipped before Plan 39-03).
+    fn migrations_through_m22() -> Migrations<'static> {
+        Migrations::new(vec![
+            M::up(include_str!("schema.sql")),
+            M::up(M2_FLAG_OUTBOX_SQL),
+            M::up(M3_UNSEEN_COUNT_SQL),
+            M::up(M4_BACKFILL_SQL),
+            M::up(M5_STATUS_TS_SQL),
+            M::up(M6_DELIMITER_SQL),
+            M::up(M7_IMAP_OUTBOX_SQL),
+            M::up(M8_ROLES_SQL),
+            M::up(M9_DRAFTS_SQL),
+            M::up(M10_SEND_QUEUE_SQL),
+            M::up(M11_SENT_UNFILED_SQL),
+            M::up(M12_CLASSIFY_SQL),
+            M::up(M13_EXCLUSIONS_SQL),
+            M::up(M14_REVIEW_SETTINGS_SQL),
+            M::up(M15_DISMISSED_SQL),
+            M::up(M16_BATCH_ITEMS_SQL),
+            M::up(M17_FTS_BODY_SQL),
+            M::up(M18_FILTERS_SQL),
+            M::up(M19_RULES_SQL),
+            M::up(M20_OVERRIDE_EVENTS_SQL),
+            M::up(M21_RULE_VERSION_SQL),
+            M::up(M22_LEARN_SQL),
+        ])
+    }
+
+    #[test]
+    fn m23_upgrade_from_v22_preserves_rows_and_seeds_settings() {
+        // Simulate a v22 database (through M22, as shipped after Phase 31).
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        migrations_through_m22().to_latest(&mut conn).unwrap();
+        // Seed a pre-M23 row in an older table.
+        conn.execute(
+            "INSERT INTO mailboxes (name, uid_validity, uid_next) VALUES ('INBOX', 100, 4)",
+            [],
+        )
+        .unwrap();
+        let mb: i64 = conn
+            .query_row("SELECT id FROM mailboxes WHERE name = 'INBOX'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO messages (mailbox_id, uid, subject, from_addr, date_utc, flags, preview) \
+             VALUES (?1, 1, 'Legada', 'a@x.com', '2024-01-01T00:00:00Z', '[]', 'p')",
+            rusqlite::params![mb],
+        )
+        .unwrap();
+
+        // Forward-upgrade with the production set — only M23 applies.
+        Store::apply_migrations(&mut conn).unwrap();
+
+        // Pre-existing rows survive the upgrade.
+        let msgs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(msgs, 1, "forward migration must preserve cached rows");
+        let subj: String = conn
+            .query_row(
+                "SELECT subject FROM messages WHERE mailbox_id = ?1 AND uid = 1",
+                rusqlite::params![mb],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(subj, "Legada");
+        // The seeded llm_settings row appears on the upgraded database.
+        let seed: (String, String, f64, i64, i64) = conn
+            .query_row(
+                "SELECT base_url, model, temperature, max_tokens, timeout_secs \
+                 FROM llm_settings WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .expect("M23 must seed row id 1 on upgrade");
+        assert_eq!(seed.0, "https://api.openai.com/v1");
+        assert_eq!(seed.1, "gpt-4o-mini");
+        assert_eq!(seed.2, 0.7);
+        assert_eq!(seed.3, 500);
+        assert_eq!(seed.4, 60);
+    }
+
+    #[test]
+    fn m23_single_row_check_rejects_second_id() {
+        let store = Store::open_in_memory().expect("migration should succeed");
+        let err = store
+            .conn()
+            .execute(
+                "INSERT INTO llm_settings (id, base_url, model) VALUES (2, 'https://x.example', 'm')",
+                [],
+            )
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CHECK") || msg.contains("check"),
+            "second row must violate the CHECK(id = 1) constraint: {msg}"
+        );
+        let count: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM llm_settings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "failed insert must leave the single row intact");
     }
 }
