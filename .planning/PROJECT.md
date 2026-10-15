@@ -12,19 +12,21 @@ Connect to an IMAP server on Linux and read your mail locally in a fast Gmail-li
 
 SGE is a Linux desktop email client (Rust + Tauri v2 + React + SQLite) with triage, folders, drafts, SMTP compose, on-device auto-classification, full-text search with saved filters, age-based auto-archive, and user-defined smart folder rules. v1.4 audit `.planning/v1.4-MILESTONE-AUDIT.md`: PASSED 11/11 (LIVE-01/02/03, SRCH-01/02/03, ARCH-01/02, RULE-01/02/03), 6/6 phases (21-26), 13 plans. Live-server runs deferred-with-reason (no creds file in this environment; exit-2 SKIP contracts verified). Environment caveat: `vite` bundle needs Node 20+ (env has Node 18); `tsc --noEmit` clean.
 
-## Current Milestone (2026-10-14): v1.6 SMTP Send Pipeline ✅ v1.5 closed
+## Current Milestone (2026-10-14): v1.7 Compose UX + Reply/Reply-All + New Message
 
-**Status:** Defining requirements — continues from phase 27 (v1.4 shipped 2026-10-13, audit `.planning/v1.4-MILESTONE-AUDIT.md`: PASSED 11/11).
+**Status:** Planning deferred items from v1.6 audit (New Message button + compose window, Reply/Reply-All UI/UX)
 
-**Goal:** Close every open thread — prove the live-server gates with real credentials, verify the bundle and UI end-to-end, ship the deferred classifier/sync features, and harden compose (send/drafts/reply/reply-all).
+**Goal:** Implement v1.7 deferred compose UX items: New Message button/thoroughbar entry, Compose Window (Thunderbird-style), Reply and Reply-All UI/UX with proper threading headers. Continue from v1.6 SMTP Send Pipeline completion (phases 34-36 verified, 454 lib tests passing). Defers Phase 33 permanently.
 
 **Target features:**
-- Live validation with real creds — `live-21/22/26.sh` runs vs own account under the sandbox contract + draft-send gap closure (FAIL BY DESIGN → fix or explicit deferral)
-- Bundle & UAT — Node 20+ `npm run build` check (rolldown-vite needs `node:util` styleText) + human click-through UAT (search/filter restore, archive trigger→undo, rules tracer)
-- Classifier follow-throughs — rule import/export, learning-from-overrides, per-category auto-confirm, override history view, batch dry-run + retry-failed
-- Sync protocol upgrades — IDLE push (poll stays fallback), CONDSTORE/QRESYNC fast path
-- Sieve export — server-side rule export (previously out-of-scope as "a second product"; in scope tentatively, validate complexity at plan time)
-- Compose hardening — send new email, save drafts, reply, reply-all verified end-to-end over the v1.2 pipelines (verify + fix gaps, not a rebuild)
+- New Message button + compose window (Thunderbird-style): toolbar entry → compose window → To/Cc/Bcc/Subject/Body/attachments wired to Phase 14 contract → queue_send enqueue
+- Reply / Reply-All UI/UX when message open: In-Reply-To/References header build, quote attribution, reply threading → send_queue state transitions → OutboxBadge + SendStatus update
+- Live validation with real creds — sandbox contract end-to-end (inherited from v1.6 phases 34-36)
+- Bundle & UAT — verify compose/reply/reply-all flows end-to-end
+- Classifier follow-throughs deferred to future milestone (Phase 33 permanently deferred)
+- Sync protocol upgrades deferred
+- Sieve export deferred
+- Compose hardening — send new email, save drafts, reply, reply-all — verified via v1.6 transport infrastructure
 
 **Scope guard (not in v1.5):** No cloud fallback; single account; Linux only; no Laya fine-tuning runtime changes beyond logging hooks needed for learning-from-overrides.
 

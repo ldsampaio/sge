@@ -234,3 +234,21 @@ export interface SendStatusResult {
   uncertain: number;
   sent_unfiled: number;
 }
+
+/** Reply context from message cache (BODY.PEEK-only) for threading headers and quote attribution. */
+export interface ReplyContext {
+  /** Original message's Message-ID for In-Reply-To header. */
+  message_id: string;
+  /** Original message's References header chain (if any). */
+  references: string | null;
+  /** Original message's From address. */
+  from_addr: string;
+  /** Original message's To addresses (comma-separated). */
+  to_addrs: string;
+  /** Original message's Cc addresses (comma-separated). */
+  cc_addrs: string;
+  /** Original message's date for quote attribution. */
+  date_utc: string;
+  /** Original message's text body for quoting (BODY.PEEK read from cache). */
+  body_text: string | null;
+}

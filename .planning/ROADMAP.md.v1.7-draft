@@ -1,0 +1,34 @@
+# Milestone v1.7 — Compose UX + Reply/Reply-All + New Message
+
+Status: PLANNING (deferred from v1.6 milestone audit)
+Previous milestone: v1.6 SMTP Send Pipeline (COMPLETE — phases 34-36, 454 lib tests passing)
+Previous audit: `.planning/v1.6-MILESTONE-AUDIT.md`
+
+## Scope (deferred from Phase 36 CONTEXT.md "Noted for Later")
+
+- Phase 37 (proposed): Compose UI / New Message Button + Compose Window (Thunderbird-style)
+- Phase 38 (proposed): Reply / Reply-All UI/UX when a message is open
+- Constraints preserved from v1.6: BODY.PEEK-only, UID-only addressing, UIDVALIDITY-first gating, SessionManager single-session invariant, zero new core dependencies, no SMTP changes, keyring reuse, sandbox contracts preserved.
+
+## Phase Structure (proposed — to confirm at discuss-phase)
+
+- 37-01: Compose UI / New Message Button — toolbar entry, compose window, To/Cc/Bcc/Subject/Body/attachments wired to Phase 14 contract
+- 38-01: Reply / Reply-All UI/UX — In-Reply-To/References header build, quote attribution, reply threading
+
+## Key Decisions from v1.6 Carry-Forward (locked)
+
+- Send queue M10 contract (frozen 5-state) — unchanged
+- Keyring reuse — unchanged
+- STARTTLS Tls::Required — unchanged
+- SMTP endpoint `smtp.utfpr.edu.br:587` — unchanged
+- Zero new core dependencies (lettre 0.11 pinned, native-tls only if needed)
+- Phase 33 deferred permanently — not revisited
+- BODY.PEEK-only — preserved
+
+## Milestone Success Criteria
+
+- Compose UI enables new message creation with full To/Cc/Bcc/Subject/Body/attachments
+- Reply/Reply-All produces correct threading with In-Reply-To/References headers
+- End-to-end verification: compose → queue → SMTP send → Sent APPEND confirmed
+- Milestone audit passes 6-check (artifacts + state + git + tests)
+- All library tests pass with zero new core dependencies added

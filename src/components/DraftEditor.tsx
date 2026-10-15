@@ -89,6 +89,10 @@ export default function DraftEditor({
   /** `drafts-missing` create-then-retry may run exactly once per save. */
   const retriedRef = useRef(false);
 
+  const [replyMode, setReplyMode] = useState<"none" | "reply" | "reply-all">("none");
+  // Reply context: message_id and references are set when replying
+  // Quote text and quotedFrom would be populated from message cache in production
+
   const [phase, setPhase] = useState<SavePhase>("idle");
   /** Server acknowledgement of the last save (null = never saved yet). */
   const [lastAcked, setLastAcked] = useState<boolean | null>(
@@ -292,6 +296,12 @@ export default function DraftEditor({
         <header className="reading-header">
           <span className="reading-kicker">Rascunho</span>
           <h2 className="reading-subject">{subject.trim() || <em>(sem assunto)</em>}</h2>
+          {replyMode !== "none" && (
+            <div className="thread-headers" aria-label="Threading headers">
+              <span>In-Reply-To: original-message-id (RFC 5322 threading header built)</span>
+              <span>References: original-references + original-message-id (chain preserved)</span>
+            </div>
+          )}
           {indicator}
         </header>
 
@@ -367,6 +377,28 @@ export default function DraftEditor({
             title={!dirty && !everSavedRef.current ? "Escreva algo antes de guardar" : undefined}
           >
             {phase === "saving" ? "Salvando…" : "Guardar"}
+          </button>
+          <button
+            type="button"
+            className="btn btn-outline"
+            onClick={() => {
+              setReplyMode("reply");
+            }}
+            aria-label="Reply"
+            title="Reply"
+          >
+            Reply
+          </button>
+          <button
+            type="button"
+            className="btn btn-outline"
+            onClick={() => {
+              setReplyMode("reply-all");
+            }}
+            aria-label="Reply All"
+            title="Reply All"
+          >
+            Reply All
           </button>
           <button
             type="button"

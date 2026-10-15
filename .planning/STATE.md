@@ -1,18 +1,27 @@
 ---
 gsd_state_version: "1.0"
-milestone: v1.6
-milestone_name: Roadmap — SMTP Send Pipeline
+milestone: v1.7
+milestone_name: Compose UX + Reply/Reply-All + New Message
 status: complete
-stopped_at: "Milestone v1.6 COMPLETE (Phases 34-36 done). Deferred: New Message button + compose window, Reply/Reply-All UX → v1.7 milestone"
-last_updated: "2026-10-14T23:11:21.945Z"
-state_head: 792294476af1680db7a2e5774d48d194dffd7aa8
+stopped_at: "v1.7 COMPLETE — Phase 37 (Compose UI / New Message Button + Compose Window) and Phase 38 (Reply / Reply-All UI/UX) executed. Milestone audit passed; artifacts verified; cleanup queued."
+last_updated: "2026-10-14T23:30:00.000Z"
+state_head: 61f1b13
 progress:
-  total_phases: 3
-  completed_phases: 1
-  total_plans: 3
-  completed_plans: 3
-  percent: 33
+  total_phases: 2
+  completed_phases: 2
+  total_plans: 4
+  completed_plans: 4
+  percent: 100
 ---
+
+gsd_state_version: "1.0"
+milestone: v1.7
+milestone_name: Compose UX + Reply/Reply-All + New Message
+current_phase: 37
+current_phase_name: Compose UI / New Message Button + Compose Window
+stopped_at: "v1.7 milestone started 2026-10-14; v1.6 COMPLETE (phases 34-36, 454 lib tests); deferred items (New Message button + compose window, Reply/Reply-All UX) promoted to v1.7"
+last_activity_desc: "/gsd-new-milestone v1.7 Compose UX; ROADMAP.md + STATE.md written; Phase 37 next (Compose UI / New Message Button)"
+prev_milestone: v1.6 (phases 34-36 complete; audit passed; archive: .planning/STATE.md.v1.6-archive)
 
 gsd_state_version: "1.0"
 milestone: v1.6
