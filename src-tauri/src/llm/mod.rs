@@ -7,6 +7,7 @@
 //! key (T-39-01). This lane performs zero network I/O: no `reqwest::Client`
 //! construction, no `.send()` — generation egress lands in Phase 40.
 
+pub mod commands;
 pub mod key;
 pub mod prompt;
 pub mod validate;
@@ -63,6 +64,82 @@ impl Default for LlmSettings {
             max_tokens: DEFAULT_MAX_TOKENS,
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             prompt_template: DEFAULT_TEMPLATE.to_string(),
+        }
+    }
+}
+
+/// IPC view of the settings row (Plan 39-03, D-03/D-07): all six
+/// non-secret fields plus a presence-only key flag. The key string never
+/// crosses IPC — there is no key field, only `has_api_key: bool`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LlmSettingsView {
+    pub base_url: String,
+    pub model: String,
+    pub temperature: f64,
+    pub max_tokens: i64,
+    pub timeout_secs: i64,
+    pub prompt_template: String,
+    pub has_api_key: bool,
+}
+
+impl LlmSettingsView {
+    /// Join a settings row with a keyring presence probe into one view.
+    pub fn with_presence(settings: LlmSettings, has_api_key: bool) -> Self {
+        LlmSettingsView {
+            base_url: settings.base_url,
+            model: settings.model,
+            temperature: settings.temperature,
+            max_tokens: settings.max_tokens,
+            timeout_secs: settings.timeout_secs,
+            prompt_template: settings.prompt_template,
+            has_api_key,
+        }
+    }
+}
+
+/// IPC input for saving settings (Plan 39-03, A6 resolved): the six
+/// non-secret fields plus an optional key. `api_key` semantics: `None`
+/// leaves the stored key unchanged, `Some` non-empty overwrites it,
+/// `Some` empty/whitespace-only is rejected — removal only via the
+/// dedicated clear command, never via save.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct LlmSettingsInput {
+    pub base_url: String,
+    pub model: String,
+    pub temperature: f64,
+    pub max_tokens: i64,
+    pub timeout_secs: i64,
+    pub prompt_template: String,
+    pub api_key: Option<String>,
+}
+
+// Manual `Debug`: the derived form would print key material into logs on
+// any `{:?}` of the input. Presence is shown, the value never is (T-39-01).
+impl std::fmt::Debug for LlmSettingsInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmSettingsInput")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("temperature", &self.temperature)
+            .field("max_tokens", &self.max_tokens)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("prompt_template", &self.prompt_template)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+impl From<&LlmSettingsInput> for LlmSettings {
+    /// Project the non-secret fields out of save input (the key never
+    /// enters [`LlmSettings`] — it travels a separate keyring path).
+    fn from(input: &LlmSettingsInput) -> Self {
+        LlmSettings {
+            base_url: input.base_url.clone(),
+            model: input.model.clone(),
+            temperature: input.temperature,
+            max_tokens: input.max_tokens,
+            timeout_secs: input.timeout_secs,
+            prompt_template: input.prompt_template.clone(),
         }
     }
 }

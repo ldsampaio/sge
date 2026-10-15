@@ -569,6 +569,10 @@ pub fn run() {
             commands::classify::set_archive_settings,
             sidecar_status,
             load_server_config,
+            llm::commands::get_llm_settings,
+            llm::commands::save_llm_settings,
+            llm::commands::reset_llm_template,
+            llm::commands::clear_llm_api_key,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
