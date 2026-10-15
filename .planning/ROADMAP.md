@@ -6,7 +6,7 @@ Phase range: 39–41 (3 phases, strict dependency order per research; each indep
 
 ## Phases
 
-- [ ] **Phase 39: LLM Settings Foundation** — backend store + validation + prompt render (no IPC, no UI)
+- [ ] **Phase 39: LLM Settings Foundation** — backend store + validation + prompt render (no IPC, no UI) [Plan 1/3 done: 39-01 M23 store + validation]
 - [ ] **Phase 40: Generation Flow** — LLM client + single-egress IPC chokepoint (mock-tested, no UI)
 - [ ] **Phase 41: Compose Integration + Hardening/UAT** — settings panel + Generate button + privacy audit
 
@@ -21,7 +21,7 @@ Phase range: 39–41 (3 phases, strict dependency order per research; each indep
   2. Invalid settings are rejected at save time (non-https non-loopback URL, empty model, out-of-range temperature/tokens/timeout) with plain-language reasons.
   3. Prompt template renders `{sender}`/`{subject}`/`{body}` with the body fenced as data (invisible HTML stripped, truncation cap applied with disclosure marker).
   4. `cargo tree` shows reqwest → hyper-tls → native-tls only (no `rustls`/`ring` after feature widening to `json`/`stream`/`native-tls`).
-**Plans**: TBD
+**Plans**: 1/3 complete (39-01 done: M23 store + validation; 39-02 keyring + renderer and 39-03 commands pending)
 
 ### Phase 40: Generation Flow
 **Goal**: One backend command turns validated settings + a server-side original into draft text, with plain-language failures and no other egress path.
