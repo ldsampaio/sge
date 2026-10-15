@@ -2,61 +2,51 @@
 
 ## What This Is
 
-SGE is a Linux desktop email client built with Rust + Tauri v2 + React + SQLite. The user logs in with username, password, and IMAP server URL (e.g. mail.utfpr.edu.br); the app copies mail from the server to a local SQLite database (messages stay on the server, IMAP semantics) and displays them in a Gmail-like three-pane interface. Since v1.2 the app is a full mail client: triage, folders, drafts, and SMTP compose. Milestone v1.3 adds on-device automatic email classification (Laya) that organizes mail into an `Auto/` folder tree.
+SGE is a Linux desktop email client built with Rust + Tauri v2 + React + SQLite. The user logs in with username, password, and IMAP server URL (e.g. mail.utfpr.edu.br); the app copies mail from the server to a local SQLite database (messages stay on the server, IMAP semantics) and displays them in a Gmail-like three-pane interface. Since v1.2 the app is a full mail client: triage, folders, drafts, and SMTP compose. Milestone v1.3 adds on-device automatic email classification (Laya) that organizes mail into an `Auto/` folder tree. Milestone v1.8 adds on-demand LLM-assisted reply drafting: a user-configured OpenAI-compatible endpoint plus prompt template generate a draft the user reviews before sending — nothing automatic.
 
 ## Core Value
 
 Connect to an IMAP server on Linux and read your mail locally in a fast Gmail-like UI — if this doesn't work, nothing else matters.
 
-## Current State (v1.4 shipped 2026-10-13 ✅)
+## Current State (v1.7 shipped 2026-10-15 ✅)
 
-SGE is a Linux desktop email client (Rust + Tauri v2 + React + SQLite) with triage, folders, drafts, SMTP compose, on-device auto-classification, full-text search with saved filters, age-based auto-archive, and user-defined smart folder rules. v1.4 audit `.planning/v1.4-MILESTONE-AUDIT.md`: PASSED 11/11 (LIVE-01/02/03, SRCH-01/02/03, ARCH-01/02, RULE-01/02/03), 6/6 phases (21-26), 13 plans. Live-server runs deferred-with-reason (no creds file in this environment; exit-2 SKIP contracts verified). Environment caveat: `vite` bundle needs Node 20+ (env has Node 18); `tsc --noEmit` clean.
+SGE is a Linux desktop email client (Rust + Tauri v2 + React + SQLite) with triage, folders, drafts, SMTP compose, on-device auto-classification, full-text search with saved filters, age-based auto-archive, user-defined smart folder rules, send pipeline (queue + lettre transport), and Thunderbird-style compose UX with Reply/Reply-All threading. v1.7 (phases 37-38): New Message button + Compose window wired to `queue_send`, Reply/Reply-All with RFC 5322 threading headers + quote attribution. v1.4 audit `.planning/v1.4-MILESTONE-AUDIT.md`: PASSED 11/11; v1.6 audit `.planning/v1.6-MILESTONE-AUDIT.md`: COMPLETE (454 lib tests). Environment caveat: `vite` bundle needs Node 20+ (env has Node 18); `tsc --noEmit` clean.
 
-## Current Milestone (2026-10-14): v1.7 Compose UX + Reply/Reply-All + New Message
+## Current Milestone (2026-10-15): v1.8 LLM-Assisted Replies
 
-**Status:** Planning deferred items from v1.6 audit (New Message button + compose window, Reply/Reply-All UI/UX)
+**Status:** Starting — continues from phase 38 (v1.7 compose UX complete: phases 37-38).
 
-**Goal:** Implement v1.7 deferred compose UX items: New Message button/thoroughbar entry, Compose Window (Thunderbird-style), Reply and Reply-All UI/UX with proper threading headers. Continue from v1.6 SMTP Send Pipeline completion (phases 34-36 verified, 454 lib tests passing). Defers Phase 33 permanently.
+**Goal:** Let the user draft replies with a configured LLM: settings menu for OpenAI-compatible endpoint + prompt template, one-click generation in Reply/Reply-All windows, user always reviews before sending.
 
 **Target features:**
-- New Message button + compose window (Thunderbird-style): toolbar entry → compose window → To/Cc/Bcc/Subject/Body/attachments wired to Phase 14 contract → queue_send enqueue
-- Reply / Reply-All UI/UX when message open: In-Reply-To/References header build, quote attribution, reply threading → send_queue state transitions → OutboxBadge + SendStatus update
-- Live validation with real creds — sandbox contract end-to-end (inherited from v1.6 phases 34-36)
-- Bundle & UAT — verify compose/reply/reply-all flows end-to-end
-- Classifier follow-throughs deferred to future milestone (Phase 33 permanently deferred)
-- Sync protocol upgrades deferred
-- Sieve export deferred
-- Compose hardening — send new email, save drafts, reply, reply-all — verified via v1.6 transport infrastructure
+- LLM settings menu — any OpenAI-compatible base URL + model + API key, single reply prompt template with placeholders (`{sender}`, `{subject}`, `{body}`), generation defaults (temperature/max tokens/timeout); API key in OS keyring, never plaintext
+- Generate-with-LLM button in Reply/Reply-All compose window — sends prompt + original message to configured endpoint, pastes result above the quoted original; user reviews and decides when to send
+- Privacy guard — nothing leaves the machine except on explicit button click; offline default preserved; failures surface as plain-language errors, never log key or body verbatim
+- Bundle & UAT — verify settings persistence, generation flow, and keyring secret handling end-to-end (mock transport in CI, live endpoint only with user-provided key)
 
-**Scope guard (not in v1.5):** No cloud fallback; single account; Linux only; no Laya fine-tuning runtime changes beyond logging hooks needed for learning-from-overrides.
+**Scope guard (not in v1.8):** No auto-send or background generation (user-triggered only); reply/reply-all windows only (no new-message/forward button); single account; Linux only; no cloud fallback for classification (Laya stays offline).
 
 <details>
-<summary>Previous milestone block (v1.4 in progress, archived at close)</summary>
+<summary>Previous milestone block (v1.7 Compose UX, archived at close)</summary>
 
-## Current Milestone: v1.4 SMTP Send + Search/Filters + Live Validation + Auto-Archive + Smart Folder Rules
+## Current Milestone: v1.7 Compose UX + Reply/Reply-All + New Message (Shipped 2026-10-15 ✅)
 
-**Status:** Starting — continues from phase 21 (v1.3 phases 15-20 complete, audit `.planning/v1.3-MILESTONE-AUDIT.md`: PASSED 17/17, deferred live gates documented).
+**Status:** Complete — phases 37-38 executed (New Message button + Compose window, Reply/Reply-All UI/UX).
 
-**Goal:** Close v1.2/v1.3 deferred live-validation gates against the real servers (`mail.utfpr.edu.br` / `smtp.utfpr.edu.br:587`) using user-provided credentials (git-ignored `src-tauri/.live-test.env`, never committed), under a strict sandbox safety contract — and add final capabilities: advanced search/filter, auto-archive by taxonomy age, smart folder rules (keyword/pattern auto-file).
+**Goal:** Implement v1.7 deferred compose UX items from the v1.6 audit: New Message button + Thunderbird-style compose window, Reply and Reply-All UI/UX with proper threading headers.
 
 **Target features:**
-- SMTP Send (Live Gate, SANDBOXED) — test mail only to own address, Message-ID dedupe, Sent filing, retry/backoff visible
-- Draft & Seen Round-Trip (Live Gate, SANDBOXED) — APPEND one-copy inside `SGE-Test-<run-id>`, Seen survives reconnect, `imap_outbox` replay, no silent resurrection, post-run cleanup
-- Search + Filters — SQLite search (subject/body/attach), saved filters, multi-folder, persisted state
-- Auto-Archive — aging into `Auto/Archive/`, journaled batch, taxonomy-driven
-- Smart Folder Rules — validated keyword/sender rules → folder, conflict = user confirm, SQLite-persisted
-- Live Validation Bundle — verification plan closing deferred `/gsd-verify-work` under the sandbox contract; document new deferrals
+- New Message button + compose window wired to Phase 14 contract → `queue_send` enqueue; OutboxBadge + SendStatus updates
+- Reply / Reply-All UI/UX when message open: In-Reply-To/References header build, quote attribution, reply threading
+- Live validation with real creds — sandbox contract end-to-end (inherited from v1.6 phases 34-36)
 
-**Scope guard (not in v1.4):** No cloud fallback; no Sieve server-side; single account; Linux only.
-
-**Sandbox safety contract (structural, all live phases):** dedicated `SGE-Test-<run-id>` folder per run; ALL mutating ops scoped to it; mail sent ONLY to the user's own address; existing mail/folders never touched; pre-flight guard aborts on out-of-sandbox targets; run ends with full cleanup. Offline doubles (MockSession/FakeSession, record-replay SMTP) stay as CI fallback.
+**Scope guard (not in v1.7):** No cloud fallback; single account; Linux only.
 
 </details>
 
 ## Next Milestone Goals
 
-- Post-v1.5 outlook TBD during v1.5 execution (candidates: multi-account, Sieve follow-through if deferred, mobile/remote-access stories — all currently out of scope).
-- v1.5 consumes the previous next-goals list (live runs, Node 20+ bundle check, click-through UAT, deferred ideas) — see Current Milestone above.
+- Post-v1.8 outlook TBD during v1.8 execution (candidates: multi-account, attachment streaming, draft templates/scheduled send, classifier follow-throughs, sync protocol upgrades — all currently out of scope).
 
 ## Requirements
 
@@ -84,6 +74,12 @@ SGE is a Linux desktop email client (Rust + Tauri v2 + React + SQLite) with tria
 - ✓ **v1.3: All phases complete** — 6/6 phases, milestone passed (Phase 15-20)
 - ✓ **v1.4: 11/11 requirements validated** — SMTP live gates (offline proof, live deferred-with-reason) + search/filters + auto-archive + smart rules (Phases 21-26, 13 plans)
 
+### Active (v1.8)
+
+LLM-assisted replies — unvalidated, to be scoped into REQ-IDs in REQUIREMENTS.md:
+- User can register LLM provider settings (OpenAI-compatible base URL + model + API key + prompt template + generation defaults) in a settings menu
+- User can generate a reply draft with the LLM from Reply/Reply-All windows and review/edit before sending (no auto-send)
+
 ### Active (v1.3)
 
 All v1.3 requirements validated — 17/17 passed (see `.planning/v1.3-MILESTONE-AUDIT.md`). Milestone complete.
@@ -102,6 +98,8 @@ Previous Active items all delivered (see Validated above + `.planning/v1.1-MILES
 - OAuth / magic-link / 2FA flows — user+password auth only
 - Laya checkpoint fine-tuning on user mail — zero-shot + keyword-assisted only for v1.3
 - Server-side filters/rules (Sieve) — local classification only, IMAP moves via existing verbs
+- LLM auto-send / background generation — v1.8 is user-triggered drafting only; the user always reviews before sending
+- LLM in new-message / forward windows — v1.8 scope is Reply/Reply-All only
 
 ## Context
 
@@ -113,14 +111,16 @@ Previous Active items all delivered (see Validated above + `.planning/v1.1-MILES
 - Layout decided: full three-pane Gmail look (sidebar + list + reader), not a minimal list.
 - Auth UX decided: remember everything securely (OS keyring), auto-login next launch.
 - v1.3 scoping (new-milestone questioning): classification moves mail physically (MOVE verb, Phase 10 machinery); target tree auto-created under root `Auto`; single-email flow always user-confirmed; batch flow unconfirmed with progress + report; secondary category is a local-only label; Laya runs as a bundled offline sidecar (multilingual checkpoint for pt-BR).
+- v1.8 scoping (new-milestone questioning): LLM reply drafting is strictly user-triggered (button click in Reply/Reply-All window); any OpenAI-compatible base URL + model + key; single prompt template with `{sender}`/`{subject}`/`{body}` placeholders; API key in OS keyring like mail creds; generated text pasted above quoted original for review; no auto-send, no background calls.
 
 ## Constraints
 
 - **Tech stack**: Rust + Tauri v2 + React + SQLite — fixed by request
 - **Platform**: Linux only
 - **Protocol**: IMAP must leave mail on server (no silent expunge outside user-confirmed delete); moves are UID-only addressed with UIDVALIDITY epoch gating
-- **Security**: Credentials at rest must use OS keyring, never plaintext
+- **Security**: Credentials at rest must use OS keyring, never plaintext (mail creds and LLM API keys alike; key never logged, bodies never logged verbatim)
 - **Classification**: fully offline (no mail content leaves the machine); sensitive-data rule — never reproduce senhas/códigos/dados sigilosos in justifications or logs; `Auto` root name reserved for the classifier tree
+- **LLM calls**: mail content leaves the machine ONLY on explicit user button click (v1.8 Generate-with-LLM); no automatic/background LLM traffic; endpoint + model user-configured
 
 ## Key Decisions
 
@@ -149,6 +149,7 @@ Previous Active items all delivered (see Validated above + `.planning/v1.1-MILES
 | v1.3: Laya as bundled offline sidecar, multilingual checkpoint | pt-BR mail needs the multilingual checkpoint; offline keeps mail content on-machine; user chose bundled over external service | — Pending (completed v1.3) |
 | v1.3: single-email always user-confirmed, batch unconfirmed | Trust gate for the classifier era; batch is an explicit whole-account op with progress + report | — Pending (completed v1.3) |
 | v1.3: secondary category local-only | Avoids double-filing complexity; mail lives in primary folder, second label is SQLite-only | — Pending (completed v1.3) |
+| v1.8: LLM drafting user-triggered only, OpenAI-compatible endpoint | Preserves offline-by-default trust posture; any base URL covers OpenAI + local servers (Ollama/LM Studio) without per-provider code; user always reviews generated text | — Pending (v1.8 in progress) |
 
 ## Evolution
 
@@ -167,4 +168,4 @@ This document evolves at phase transitions and milestone boundaries.
 3. Audit Out of Scope — reasons still valid?
 4. Update Context with current state
 
-*Last updated: 2026-10-13 — Milestone v1.4 shipped ✅*
+*Last updated: 2026-10-15 — Milestone v1.8 started (LLM-Assisted Replies); v1.7 shipped ✅*

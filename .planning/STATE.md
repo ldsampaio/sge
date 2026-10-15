@@ -1,17 +1,16 @@
 ---
 gsd_state_version: "1.0"
-milestone: v1.7
-milestone_name: Compose UX + Reply/Reply-All + New Message
-status: complete
-stopped_at: "v1.7 COMPLETE — Phase 37 (Compose UI / New Message Button + Compose Window) and Phase 38 (Reply / Reply-All UI/UX) executed. Milestone audit passed; artifacts verified; cleanup queued."
-last_updated: "2026-10-14T23:30:00.000Z"
-state_head: 61f1b13
+milestone: v1.8
+milestone_name: LLM-Assisted Replies
+status: planning
+last_updated: "2026-10-15T12:16:31.815Z"
+last_activity: 2026-10-15
 progress:
-  total_phases: 2
-  completed_phases: 2
-  total_plans: 4
-  completed_plans: 4
-  percent: 100
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 gsd_state_version: "1.0"
@@ -65,3 +64,10 @@ next_plan: 36-01 (Compose Integration + Outbox UX — Phase 36)
 ## Next
 
 - **Phase 36:** Compose Integration + Outbox UX (compose UI → `queue_send`; OutboxBadge; SendStatus; failed-retry action; end-to-end verification compose → queue → send → Sent-folder APPEND; audit / milestone close v1.6).
+
+## Current Position
+
+Phase: Not started (defining requirements)
+Plan: —
+Status: Defining requirements
+Last activity: 2026-10-15 — Milestone v1.8 started
