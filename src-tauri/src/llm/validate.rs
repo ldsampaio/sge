@@ -36,6 +36,11 @@ pub enum LlmSettingsError {
 /// Normalization: `base_url` is trimmed and stripped of trailing `/` (so
 /// Phase 40 can safely append `/chat/completions`); `model` is trimmed.
 /// Nothing is ever coerced to a default — out-of-range values error.
+///
+/// LLM-01 encoding probe note: no length bound is enforced here, but any
+/// future truncation-relevant length applies to the trimmed string as-is,
+/// measured in `char`s (Unicode scalar count) — no Unicode normalization
+/// form is applied before measuring.
 pub fn validate(raw: &LlmSettings) -> Result<LlmSettings, LlmSettingsError> {
     let base_url = normalize_base_url(&raw.base_url)?;
 
@@ -84,6 +89,11 @@ pub fn validate(raw: &LlmSettings) -> Result<LlmSettings, LlmSettingsError> {
 fn normalize_base_url(raw: &str) -> Result<String, LlmSettingsError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
+        return Err(LlmSettingsError::InvalidBaseUrl);
+    }
+    // Reject interior whitespace explicitly (a pasted "https://exa mple.com"
+    // must fail closed rather than depend on parser strictness per scheme).
+    if trimmed.chars().any(char::is_whitespace) {
         return Err(LlmSettingsError::InvalidBaseUrl);
     }
     let url = reqwest::Url::parse(trimmed).map_err(|_| LlmSettingsError::InvalidBaseUrl)?;
@@ -151,5 +161,60 @@ mod tests {
         let err = validate(&s).unwrap_err().to_string();
         assert!(err.contains("base URL"), "error must name the field");
         assert!(err.contains("https"), "error must state the https policy");
+    }
+
+    #[test]
+    fn rejects_non_http_schemes() {
+        for url in [
+            "file:///etc/passwd",
+            "ftp://example.com/models",
+            "gopher://example.com/1",
+        ] {
+            let mut s = valid();
+            s.base_url = url.to_string();
+            assert!(
+                matches!(validate(&s), Err(LlmSettingsError::InvalidBaseUrl)),
+                "{url} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_bare_hostname_and_whitespace() {
+        for url in [
+            "example.com",
+            "api.openai.com/v1",
+            "",
+            "   ",
+            "https://exa mple.com",
+            "https://example.com/a b",
+        ] {
+            let mut s = valid();
+            s.base_url = url.to_string();
+            assert!(
+                matches!(validate(&s), Err(LlmSettingsError::InvalidBaseUrl)),
+                "{url:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_non_loopback_http_ips() {
+        for url in ["http://192.168.1.1", "http://10.0.0.5:8080", "http://[::2]"] {
+            let mut s = valid();
+            s.base_url = url.to_string();
+            assert!(
+                matches!(validate(&s), Err(LlmSettingsError::InvalidBaseUrl)),
+                "{url} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn stored_url_is_trimmed_and_slash_stripped() {
+        let mut s = valid();
+        s.base_url = "  https://api.openai.com/v1/  ".to_string();
+        let got = validate(&s).expect("padded slash-suffixed URL must pass");
+        assert_eq!(got.base_url, "https://api.openai.com/v1");
     }
 }
