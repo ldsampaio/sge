@@ -407,6 +407,74 @@ mod tests {
     }
 
     #[test]
+    fn equal_sender_subject_land_in_own_positions() {
+        // LLM-04 ordering probe: identical values still substitute
+        // positionally — no dedupe, no merge on equality.
+        let out = render_prompt(
+            "S:[{sender}] Sub:[{subject}]",
+            "same text",
+            "same text",
+            "<p>b</p>",
+        );
+        assert_eq!(out.matches("same text").count(), 2, "both positions filled: {out}");
+        assert!(out.starts_with("S:[same text] Sub:[same text]"), "{out}");
+    }
+
+    #[test]
+    fn adjacent_placeholders_concatenate_without_collision() {
+        let out = render_prompt("{sender}{subject}", "alice", "Hello", "<p>b</p>");
+        assert_eq!(out, "aliceHello", "adjacent tokens concatenate: {out}");
+    }
+
+    #[test]
+    fn repeated_body_token_replaced_twice() {
+        let out = render_prompt("{body} :: {body}", "a", "s", "<p>hi</p>");
+        assert_eq!(
+            out.matches("--- Begin untrusted email content").count(),
+            2,
+            "both occurrences replaced: {out}"
+        );
+    }
+
+    #[test]
+    fn placeholder_free_template_returned_unchanged() {
+        let out = render_prompt("Static text, no tokens.", "a", "s", "<p>b</p>");
+        assert_eq!(out, "Static text, no tokens.", "{out}");
+    }
+
+    #[test]
+    fn truncation_boundary_marks_8001_not_8000() {
+        // Boundary probe one step either side of BODY_CHAR_LIMIT.
+        let exact = "y".repeat(BODY_CHAR_LIMIT);
+        let out_exact = render_prompt(SIMPLE_TEMPLATE, "a", "s", &exact);
+        assert!(
+            !out_exact.contains("[truncated:"),
+            "exactly-8000 body carries no marker"
+        );
+        let over = "y".repeat(BODY_CHAR_LIMIT + 1);
+        let out_over = render_prompt(SIMPLE_TEMPLATE, "a", "s", &over);
+        assert!(
+            out_over.contains("[truncated:"),
+            "8001-char body must carry the marker"
+        );
+    }
+
+    #[test]
+    fn multibyte_body_truncates_at_char_boundary() {
+        // Marker logic counts chars, not bytes: accented + CJK text
+        // stays valid UTF-8 and the limit applies in scalar values.
+        let multi = "é".repeat(4000) + &"漢".repeat(4001); // 8001 chars
+        let out = render_prompt(SIMPLE_TEMPLATE, "a", "s", &format!("<p>{multi}</p>"));
+        assert!(out.contains("[truncated:"), "8001-char multibyte body marked");
+        assert!(out.is_ascii() == false, "sanity: output holds non-ASCII");
+        // Byte length legitimately exceeds 8000 for non-ASCII bodies —
+        // validity (no panic, valid str) is the assertion, not byte size.
+        let fence_start = out.find("--- Begin").expect("fence present");
+        let fenced_section = &out[fence_start..];
+        assert!(fenced_section.contains('漢') || fenced_section.contains('é'));
+    }
+
+    #[test]
     fn renderer_performs_no_network_or_file_io() {
         // Structural backstop: this file must never grow network/file/
         // socket imports. Rendering is pure string transformation.
