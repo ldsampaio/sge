@@ -47,7 +47,11 @@ tauri-plugin-shell = "2"
 regex = "1"
 # Phase 15 pin: reqwest 0.12 line, default-features off — loopback-only plain
 # HTTP health probe (no TLS needed); async via tauri::async_runtime (tokio).
-reqwest = { version = "0.12", default-features = false }
+# Phase 39 widening: json + stream + native-tls (native-tls-only posture —
+# default-features stays off so rustls/ring never enter the tree). Enables
+# reqwest::Url parsing now and the Phase 40 generation client later; no
+# external-API surface is integrated in this phase.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "native-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-imap = "0.11"
