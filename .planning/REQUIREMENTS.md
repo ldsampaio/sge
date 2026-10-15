@@ -51,14 +51,14 @@ Constraints (carried from `.planning/PROJECT.md` / research):
 
 | Requirement | Phase | Plan | Status |
 |-------------|-------|------|--------|
-| LLM-01 | — | — | pending |
-| LLM-02 | — | — | pending |
-| LLM-03 | — | — | pending |
-| LLM-04 | — | — | pending |
-| LLM-05 | — | — | pending |
-| LLM-06 | — | — | pending |
-| LLM-07 | — | — | pending |
-| LLM-08 | — | — | pending |
-| LLM-09 | — | — | pending |
-| LLM-10 | — | — | pending |
-| LLM-11 | — | — | pending |
+| LLM-01 | Phase 39 | — | pending |
+| LLM-02 | Phase 39 | — | pending |
+| LLM-03 | Phase 39 | — | pending |
+| LLM-04 | Phase 39 | — | pending |
+| LLM-05 | Phase 40 | — | pending |
+| LLM-06 | Phase 41 | — | pending |
+| LLM-07 | Phase 40 | — | pending |
+| LLM-08 | Phase 41 | — | pending |
+| LLM-09 | Phase 40 | — | pending |
+| LLM-10 | Phase 41 | — | pending |
+| LLM-11 | Phase 41 | — | pending |
