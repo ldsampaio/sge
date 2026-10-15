@@ -7,6 +7,7 @@
 //! key (T-39-01). This lane performs zero network I/O: no `reqwest::Client`
 //! construction, no `.send()` — generation egress lands in Phase 40.
 
+pub mod key;
 pub mod validate;
 
 use serde::{Deserialize, Serialize};
