@@ -217,4 +217,75 @@ mod tests {
         let got = validate(&s).expect("padded slash-suffixed URL must pass");
         assert_eq!(got.base_url, "https://api.openai.com/v1");
     }
+
+    #[test]
+    fn temperature_edges_accept_min_max_reject_adjacent() {
+        for t in [0.0, 2.0, 0.7, 1e-10] {
+            let mut s = valid();
+            s.temperature = t;
+            assert!(validate(&s).is_ok(), "temperature {t} must be accepted");
+        }
+        for t in [-0.1, 2.1, 2.0000001, f64::NAN, f64::INFINITY] {
+            let mut s = valid();
+            s.temperature = t;
+            assert!(
+                matches!(
+                    validate(&s),
+                    Err(LlmSettingsError::TemperatureOutOfRange)
+                ),
+                "temperature {t} must be rejected"
+            );
+        }
+        let mut s = valid();
+        s.temperature = -0.1;
+        let err = validate(&s).unwrap_err().to_string();
+        assert!(err.contains("temperature"));
+        assert!(err.contains("0.0") && err.contains("2.0"));
+    }
+
+    #[test]
+    fn max_tokens_edges_accept_min_max_reject_adjacent() {
+        for n in [1, 4096, 500] {
+            let mut s = valid();
+            s.max_tokens = n;
+            assert!(validate(&s).is_ok(), "max_tokens {n} must be accepted");
+        }
+        for n in [0, 4097, -5] {
+            let mut s = valid();
+            s.max_tokens = n;
+            assert!(
+                matches!(
+                    validate(&s),
+                    Err(LlmSettingsError::MaxTokensOutOfRange)
+                ),
+                "max_tokens {n} must be rejected, never coerced"
+            );
+        }
+        let mut s = valid();
+        s.max_tokens = 0;
+        let err = validate(&s).unwrap_err().to_string();
+        assert!(err.contains("max tokens"));
+    }
+
+    #[test]
+    fn timeout_rejects_non_positive_accepts_any_positive_unclamped() {
+        for t in [0, -1, i64::MIN] {
+            let mut s = valid();
+            s.timeout_secs = t;
+            assert!(
+                matches!(validate(&s), Err(LlmSettingsError::InvalidTimeout)),
+                "timeout {t} must be rejected"
+            );
+        }
+        for t in [1, 60, 36000, i64::MAX] {
+            let mut s = valid();
+            s.timeout_secs = t;
+            assert!(validate(&s).is_ok(), "timeout {t} must pass unclamped");
+        }
+        let mut s = valid();
+        s.timeout_secs = 0;
+        let err = validate(&s).unwrap_err().to_string();
+        assert!(err.contains("timeout"));
+        assert!(err.contains("1 second"));
+    }
 }
