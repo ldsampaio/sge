@@ -7,14 +7,14 @@ current_phase_name: LLM Settings Foundation
 status: executing
 last_updated: "2026-10-15T14:41:18.358Z"
 last_activity: 2026-10-15
-last_activity_desc: Phase 39 plan 39-01 complete (M23 store + validation, 17 tests green)
-state_head: e208140
+last_activity_desc: Phase 39 plan 39-02 complete (keyring custody + fenced renderer, 21 tests green)
+state_head: 19b75c8
 progress:
   total_phases: 3
   completed_phases: 0
   total_plans: 3
-  completed_plans: 1
-  percent: 33
+  completed_plans: 2
+  percent: 67
 ---
 
 # SGE — State (v1.8 LLM-Assisted Replies)
@@ -26,9 +26,9 @@ progress:
 ## Current Position
 
 Phase: 39 (LLM Settings Foundation) — EXECUTING
-Plan: 2 of 3 (39-01 complete)
+Plan: 3 of 3 (39-01, 39-02 complete)
 Status: Executing Phase 39
-Last activity: 2026-10-15 — Phase 39 plan 39-01 complete (M23 llm_settings + validate, 17 llm tests + 70 store tests green)
+Last activity: 2026-10-15 — Phase 39 plan 39-02 complete (keyring custody + fenced renderer, 21 new tests green; full llm lane 38 passed)
 
 ## Roadmap Summary
 
@@ -38,7 +38,6 @@ Last activity: 2026-10-15 — Phase 39 plan 39-01 complete (M23 llm_settings + v
 
 ## Next
 
-- **Phase 39 Plan 39-02:** keyring API-key entry + fenced prompt renderer on the 39-01 LlmSettings foundation
 - **Phase 39 Plan 39-03:** Tauri settings commands + stale SCHEMA_VERSION (14-vs-23) fix + reqwest feature widening
 
 ## Decisions (accumulated)
@@ -46,3 +45,4 @@ Last activity: 2026-10-15 — Phase 39 plan 39-01 complete (M23 llm_settings + v
 - 39-01: `LlmSettingsError` variants are payload-free unit variants — secrets cannot be interpolated into errors by construction (T-39-01)
 - 39-01: `DEFAULT_TEMPLATE` single-line literal shared byte-identically with the M23 seed; drift guarded by `seed_defaults_equal_consts` test
 - 39-01: `pub mod llm;` one-line declaration in lib.rs required for compilation (plan's don't-touch-lib.rs honored otherwise); SCHEMA_VERSION fix deferred to 39-03
+- 39-02: `LlmKeyStore` trait injection (keyring + memory impls) with fail-closed presence-bool; RESEARCH regex unusable (no backrefs) so hidden-strip is a nesting-counted tag scanner; substitution is single-pass positional (chained replace re-expands values)
