@@ -9,6 +9,7 @@ pub mod commands;
 pub mod creds;
 pub mod drafts;
 pub mod imap;
+pub mod llm;
 pub mod send_queue;
 pub mod sidecar;
 pub mod smtp;
@@ -500,6 +501,7 @@ pub fn run() {
             commands::sync::get_draft,
             commands::sync::discard_draft,
             commands::sync::cancel_sync,
+            commands::sync::open_compose_window,
             commands::sync::idle_status,
             commands::sync::idle_start,
             commands::sync::idle_stop,
@@ -519,6 +521,9 @@ pub fn run() {
             commands::sync::queue_send,
             commands::sync::retry_send,
             commands::sync::send_status,
+            commands::sync::send_pending,
+            commands::sync::send_row_state,
+            commands::sync::close_compose_window,
             commands::classify::classify_message,
             commands::classify::classify_status,
             commands::classify::confirm_suggestion,

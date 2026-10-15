@@ -1732,6 +1732,9 @@ pub const SEND_STATE_SENDING: &str = "sending";
 pub const SEND_STATE_SENT: &str = "sent";
 pub const SEND_STATE_FAILED: &str = "failed";
 pub const SEND_STATE_UNCERTAIN: &str = "uncertain";
+/// SMTP accepted the bytes but the Sent APPEND did not land yet: APPEND-only
+/// retry, never re-SMTP-send (v1.7 compose-send filing leg).
+pub const SEND_STATE_SENT_UNFILED: &str = "sent_unfiled";
 
 /// Insert one send row. Dedupe happens in `send_queue.rs` (check
 /// [`get_send_row_by_message_id`] first): a concurrent double-insert hits
@@ -1782,6 +1785,23 @@ pub fn get_send_row_by_message_id(
         .query_row(rusqlite::params![message_id], send_from_row)
         .optional()?;
     Ok(row)
+}
+
+/// Newest failure copy across `failed` + `uncertain` + `sent_unfiled` rows
+/// (v1.7 compose-send UX): lets `send_pending` return the actionable reason
+/// instead of bare counts, so the compose window shows *why* a send did not
+/// go out (or was not filed).
+pub fn latest_send_error(conn: &Connection) -> StoreResult<Option<String>> {
+    let err: Option<Option<String>> = conn
+        .query_row(
+            "SELECT last_error FROM send_queue \
+             WHERE state IN ('failed','uncertain','sent_unfiled') AND last_error IS NOT NULL \
+             ORDER BY rowid DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(err.flatten())
 }
 
 /// Mails due for a flush pass: `queued` with no schedule or a schedule at
@@ -1841,7 +1861,7 @@ pub fn reset_sending_to_queued(conn: &Connection) -> StoreResult<usize> {
 }
 
 /// Per-state depths for `send_status` (`queued, sending, sent, failed,
-/// uncertain`) in a single scan.
+/// uncertain, sent_unfiled`) in a single scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 pub struct SendCounts {
     pub queued: i64,
@@ -1849,6 +1869,7 @@ pub struct SendCounts {
     pub sent: i64,
     pub failed: i64,
     pub uncertain: i64,
+    pub sent_unfiled: i64,
 }
 
 impl SendCounts {
@@ -1866,7 +1887,8 @@ pub fn send_state_counts(conn: &Connection) -> StoreResult<SendCounts> {
            SUM(CASE WHEN state = 'sending' THEN 1 ELSE 0 END), \
            SUM(CASE WHEN state = 'sent' THEN 1 ELSE 0 END), \
            SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END), \
-           SUM(CASE WHEN state = 'uncertain' THEN 1 ELSE 0 END) \
+           SUM(CASE WHEN state = 'uncertain' THEN 1 ELSE 0 END), \
+           SUM(CASE WHEN state = 'sent_unfiled' THEN 1 ELSE 0 END) \
          FROM send_queue",
         [],
         |r| {
@@ -1876,6 +1898,7 @@ pub fn send_state_counts(conn: &Connection) -> StoreResult<SendCounts> {
                 sent: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
                 failed: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
                 uncertain: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                sent_unfiled: r.get::<_, Option<i64>>(5)?.unwrap_or(0),
             })
         },
     )?;
@@ -1917,6 +1940,41 @@ pub fn mark_send_uncertain(conn: &Connection, id: &str, reason: &str) -> StoreRe
         rusqlite::params![reason, id],
     )?;
     Ok(())
+}
+
+/// Park a row as `sent_unfiled` (SMTP accepted, Sent APPEND missing) with
+/// the filing error. APPEND-only retry, never re-SMTP-send. Attempts are
+/// untouched — filing retries are not send attempts.
+pub fn mark_send_sent_unfiled(conn: &Connection, id: &str, error: &str) -> StoreResult<()> {
+    conn.execute(
+        "UPDATE send_queue SET state = 'sent_unfiled', last_error = ?1 WHERE id = ?2",
+        rusqlite::params![error, id],
+    )?;
+    Ok(())
+}
+
+/// Rows awaiting Sent filing (`sent_unfiled` verdicts): Sent SEARCH by
+/// Message-ID decides filed vs. APPEND-once-more. Oldest first.
+pub fn list_unfiled_sends(conn: &Connection) -> StoreResult<Vec<SendRow>> {
+    let sql = format!(
+        "SELECT {SEND_COLUMNS} FROM send_queue \
+         WHERE state = 'sent_unfiled' ORDER BY created_at, id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map([], send_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Count rows awaiting Sent filing (for the flush summary + badge).
+pub fn count_unfiled_sends(conn: &Connection) -> StoreResult<i64> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM send_queue WHERE state = 'sent_unfiled'",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(n)
 }
 
 // ── Plan 16-02: classification store queries ─────────────────────
@@ -5035,4 +5093,65 @@ pub fn category_precision_and_n(
         Some(confirms as f64 / (confirms as f64 + overrides as f64))
     };
     Ok((prec, n_total))
+}
+
+// ── Plan 39-01: LLM settings single-row (LLM-01/LLM-04) ───────────────
+// The M23 `llm_settings` row (id = 1) holds non-secret settings only —
+// no key column exists. Callers must pass [`crate::llm::validate::validate`]
+// output: unvalidated strings never reach SQLite (validate-first contract).
+// Callers hold the store Mutex (single-writer invariant): parallel calls
+// serialize on the Mutex and last-writer-wins on the single row, so
+// concurrent upserts can never fork a second row.
+
+/// Read the validated LLM settings row (`id = 1`). `None` only on a
+/// pre-M23 database that has not migrated (fresh opens always seed it).
+pub fn get_llm_settings(conn: &Connection) -> StoreResult<Option<crate::llm::LlmSettings>> {
+    conn.query_row(
+        "SELECT base_url, model, temperature, max_tokens, timeout_secs, prompt_template
+         FROM llm_settings WHERE id = 1",
+        [],
+        |r| {
+            Ok(crate::llm::LlmSettings {
+                base_url: r.get(0)?,
+                model: r.get(1)?,
+                temperature: r.get(2)?,
+                max_tokens: r.get(3)?,
+                timeout_secs: r.get(4)?,
+                prompt_template: r.get(5)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(super::StoreError::Sql)
+}
+
+/// Insert-or-replace the single settings row. Takes only validated input
+/// (see module header); idempotent — repeating the same input leaves one
+/// row with identical values.
+pub fn upsert_llm_settings(
+    conn: &Connection,
+    settings: &crate::llm::LlmSettings,
+) -> StoreResult<()> {
+    conn.execute(
+        "INSERT INTO llm_settings
+           (id, base_url, model, temperature, max_tokens, timeout_secs, prompt_template, updated_at)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
+         ON CONFLICT (id) DO UPDATE SET
+           base_url = excluded.base_url,
+           model = excluded.model,
+           temperature = excluded.temperature,
+           max_tokens = excluded.max_tokens,
+           timeout_secs = excluded.timeout_secs,
+           prompt_template = excluded.prompt_template,
+           updated_at = datetime('now')",
+        rusqlite::params![
+            settings.base_url,
+            settings.model,
+            settings.temperature,
+            settings.max_tokens,
+            settings.timeout_secs,
+            settings.prompt_template,
+        ],
+    )?;
+    Ok(())
 }

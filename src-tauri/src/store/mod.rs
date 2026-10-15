@@ -102,6 +102,7 @@ impl Store {
             M::up(M20_OVERRIDE_EVENTS_SQL),
             M::up(M21_RULE_VERSION_SQL),
             M::up(M22_LEARN_SQL),
+            M::up(M23_LLM_SETTINGS_SQL),
         ]);
         migrations.to_latest(conn)?;
         Ok(())
@@ -146,6 +147,30 @@ const M22_LEARN_SQL: &str = concat!(
     ");",
     "CREATE INDEX IF NOT EXISTS idx_override_ts ON override_events(ts DESC);",
     "CREATE INDEX IF NOT EXISTS idx_override_to ON override_events(to_category);",
+);
+
+/// M23 forward migration (Phase 39, Plan 39-01): LLM settings single row.
+///
+/// Non-secret generation settings only — there is deliberately NO key
+/// column (the API key lives in the OS keyring, Plan 39-02). Single-row
+/// shape follows the M12 `taxonomy` precedent (`CHECK (id = 1)`); defaults
+/// are seeded in-migration so a fresh install reads sane values without a
+/// lazy-seed path. The seed literals mirror `llm::DEFAULT_*` — the
+/// `seed_defaults_equal_consts` test fails on any drift.
+const M23_LLM_SETTINGS_SQL: &str = concat!(
+    "CREATE TABLE llm_settings (",
+    "  id              INTEGER PRIMARY KEY CHECK (id = 1),",
+    "  base_url        TEXT NOT NULL DEFAULT '',",
+    "  model           TEXT NOT NULL DEFAULT '',",
+    "  temperature     REAL NOT NULL DEFAULT 0.7,",
+    "  max_tokens      INTEGER NOT NULL DEFAULT 500,",
+    "  timeout_secs    INTEGER NOT NULL DEFAULT 60,",
+    "  prompt_template TEXT NOT NULL DEFAULT '',",
+    "  updated_at      TEXT NOT NULL DEFAULT (datetime('now'))",
+    ");",
+    "INSERT INTO llm_settings (id, base_url, model, temperature, max_tokens, timeout_secs, prompt_template)",
+    " VALUES (1, 'https://api.openai.com/v1', 'gpt-4o-mini', 0.7, 500, 60,",
+    " 'Write a helpful reply to the email below. From: {sender} Subject: {subject} Body: {body}');",
 );
 /// M2 forward migration: durable Seen-flag outbox (Phase 6, Plan 06-01).
 ///
