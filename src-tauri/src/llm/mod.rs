@@ -7,6 +7,7 @@
 //! key (T-39-01). This lane performs zero network I/O: no `reqwest::Client`
 //! construction, no `.send()` — generation egress lands in Phase 40.
 
+pub mod client;
 pub mod commands;
 pub mod key;
 pub mod prompt;
@@ -34,13 +35,17 @@ pub const DEFAULT_TIMEOUT_SECS: i64 = 60;
 pub const DEFAULT_TEMPLATE: &str =
     "Write a helpful reply to the email below. From: {sender} Subject: {subject} Body: {body}";
 
-/// Validated, non-secret LLM generation settings (single M23 row, `id = 1`).
+/// Validated, non-secret LLM generation settings (one row per model in `llm_models`).
 ///
-/// Persisted via `get_llm_settings` / `upsert_llm_settings`, which only
+/// Persisted via `get_llm_models` / `upsert_llm_model`, which only
 /// accept output of [`validate::validate`] — unvalidated strings never
 /// reach SQLite. No key field exists by design (T-39-01).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmSettings {
+    /// Optional row id (set when reading/updating an existing row; `None` for new inserts).
+    pub id: Option<i64>,
+    /// Provider preset key: `"groq"`, `"openrouter"`, or `"custom"`.
+    pub provider: String,
     /// Normalized base URL: trimmed, trailing `/` stripped.
     pub base_url: String,
     /// Model name, trimmed, never empty.
@@ -58,6 +63,8 @@ pub struct LlmSettings {
 impl Default for LlmSettings {
     fn default() -> Self {
         LlmSettings {
+            id: None,
+            provider: "custom".to_string(),
             base_url: DEFAULT_BASE_URL.to_string(),
             model: DEFAULT_MODEL.to_string(),
             temperature: DEFAULT_TEMPERATURE,
@@ -68,11 +75,15 @@ impl Default for LlmSettings {
     }
 }
 
-/// IPC view of the settings row (Plan 39-03, D-03/D-07): all six
-/// non-secret fields plus a presence-only key flag. The key string never
-/// crosses IPC — there is no key field, only `has_api_key: bool`.
+/// IPC view of the settings row (Plan 39-03, D-03/D-07): all non-secret
+/// fields plus a presence-only key flag. The key string never crosses IPC
+/// — there is no key field, only `has_api_key: bool`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmSettingsView {
+    /// Optional row id (used for edit/delete targeting).
+    pub id: Option<i64>,
+    /// Provider preset key: `"groq"`, `"openrouter"`, or `"custom"`.
+    pub provider: String,
     pub base_url: String,
     pub model: String,
     pub temperature: f64,
@@ -86,6 +97,8 @@ impl LlmSettingsView {
     /// Join a settings row with a keyring presence probe into one view.
     pub fn with_presence(settings: LlmSettings, has_api_key: bool) -> Self {
         LlmSettingsView {
+            id: settings.id,
+            provider: settings.provider,
             base_url: settings.base_url,
             model: settings.model,
             temperature: settings.temperature,
@@ -97,13 +110,17 @@ impl LlmSettingsView {
     }
 }
 
-/// IPC input for saving settings (Plan 39-03, A6 resolved): the six
-/// non-secret fields plus an optional key. `api_key` semantics: `None`
-/// leaves the stored key unchanged, `Some` non-empty overwrites it,
-/// `Some` empty/whitespace-only is rejected — removal only via the
-/// dedicated clear command, never via save.
+/// IPC input for saving settings (Plan 39-03, A6 resolved): the non-secret
+/// fields plus an optional key. `api_key` semantics: `None` leaves the
+/// stored key unchanged, `Some` non-empty overwrites it, `Some`
+/// empty/whitespace-only is rejected — removal only via the dedicated
+/// clear command, never via save.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmSettingsInput {
+    /// Optional row id: `Some(id)` updates that row; `None` inserts new.
+    pub id: Option<i64>,
+    /// Provider preset key: `"groq"`, `"openrouter"`, or `"custom"`.
+    pub provider: String,
     pub base_url: String,
     pub model: String,
     pub temperature: f64,
@@ -118,6 +135,8 @@ pub struct LlmSettingsInput {
 impl std::fmt::Debug for LlmSettingsInput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LlmSettingsInput")
+            .field("id", &self.id)
+            .field("provider", &self.provider)
             .field("base_url", &self.base_url)
             .field("model", &self.model)
             .field("temperature", &self.temperature)
@@ -134,6 +153,8 @@ impl From<&LlmSettingsInput> for LlmSettings {
     /// enters [`LlmSettings`] — it travels a separate keyring path).
     fn from(input: &LlmSettingsInput) -> Self {
         LlmSettings {
+            id: input.id,
+            provider: input.provider.clone(),
             base_url: input.base_url.clone(),
             model: input.model.clone(),
             temperature: input.temperature,
@@ -153,6 +174,8 @@ mod tests {
     /// Edited (non-default) settings used by the round-trip tests.
     fn edited() -> LlmSettings {
         LlmSettings {
+            id: None,
+            provider: "groq".to_string(),
             base_url: "http://localhost:11434".to_string(),
             model: "llama3".to_string(),
             temperature: 0.1,

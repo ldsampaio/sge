@@ -5095,29 +5095,54 @@ pub fn category_precision_and_n(
     Ok((prec, n_total))
 }
 
-// ── Plan 39-01: LLM settings single-row (LLM-01/LLM-04) ───────────────
-// The M23 `llm_settings` row (id = 1) holds non-secret settings only —
-// no key column exists. Callers must pass [`crate::llm::validate::validate`]
-// output: unvalidated strings never reach SQLite (validate-first contract).
-// Callers hold the store Mutex (single-writer invariant): parallel calls
-// serialize on the Mutex and last-writer-wins on the single row, so
-// concurrent upserts can never fork a second row.
+// ── Plan 39-01 / Phase 41: LLM models multi-row (LLM-01/LLM-04) ───────────
+// The `llm_models` table holds one row per configured LLM model endpoint
+// (Groq, OpenRouter, or custom Ollama). Callers must pass validated input.
+// Callers hold the store Mutex (single-writer invariant).
 
-/// Read the validated LLM settings row (`id = 1`). `None` only on a
-/// pre-M23 database that has not migrated (fresh opens always seed it).
-pub fn get_llm_settings(conn: &Connection) -> StoreResult<Option<crate::llm::LlmSettings>> {
+/// Read all configured LLM models. Empty vec if none configured yet.
+pub fn get_llm_models(conn: &Connection) -> StoreResult<Vec<crate::llm::LlmSettings>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, provider, base_url, model, temperature, max_tokens, timeout_secs, prompt_template
+         FROM llm_models ORDER BY id",
+    )?;
+    let models: Vec<crate::llm::LlmSettings> = stmt
+        .query_map([], |r| {
+            Ok(crate::llm::LlmSettings {
+                id: r.get(0)?,
+                provider: r.get(1)?,
+                base_url: r.get(2)?,
+                model: r.get(3)?,
+                temperature: r.get(4)?,
+                max_tokens: r.get(5)?,
+                timeout_secs: r.get(6)?,
+                prompt_template: r.get(7)?,
+            })
+        })?
+        .map(|r| r.map_err(super::StoreError::Sql))
+        .collect::<StoreResult<Vec<_>>>()?;
+    Ok(models)
+}
+
+/// Read a single LLM model by its row id.
+pub fn get_llm_model_by_id(
+    conn: &Connection,
+    id: i64,
+) -> StoreResult<Option<crate::llm::LlmSettings>> {
     conn.query_row(
-        "SELECT base_url, model, temperature, max_tokens, timeout_secs, prompt_template
-         FROM llm_settings WHERE id = 1",
-        [],
+        "SELECT id, provider, base_url, model, temperature, max_tokens, timeout_secs, prompt_template
+         FROM llm_models WHERE id = ?1",
+        rusqlite::params![id],
         |r| {
             Ok(crate::llm::LlmSettings {
-                base_url: r.get(0)?,
-                model: r.get(1)?,
-                temperature: r.get(2)?,
-                max_tokens: r.get(3)?,
-                timeout_secs: r.get(4)?,
-                prompt_template: r.get(5)?,
+                id: r.get(0)?,
+                provider: r.get(1)?,
+                base_url: r.get(2)?,
+                model: r.get(3)?,
+                temperature: r.get(4)?,
+                max_tokens: r.get(5)?,
+                timeout_secs: r.get(6)?,
+                prompt_template: r.get(7)?,
             })
         },
     )
@@ -5125,33 +5150,79 @@ pub fn get_llm_settings(conn: &Connection) -> StoreResult<Option<crate::llm::Llm
     .map_err(super::StoreError::Sql)
 }
 
-/// Insert-or-replace the single settings row. Takes only validated input
-/// (see module header); idempotent — repeating the same input leaves one
-/// row with identical values.
-pub fn upsert_llm_settings(
+/// Insert-or-update a single model. If `settings.id` is `Some`, updates that row;
+/// otherwise inserts a new row. Returns the row id.
+pub fn upsert_llm_model(
     conn: &Connection,
     settings: &crate::llm::LlmSettings,
-) -> StoreResult<()> {
-    conn.execute(
-        "INSERT INTO llm_settings
-           (id, base_url, model, temperature, max_tokens, timeout_secs, prompt_template, updated_at)
-         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
-         ON CONFLICT (id) DO UPDATE SET
-           base_url = excluded.base_url,
-           model = excluded.model,
-           temperature = excluded.temperature,
-           max_tokens = excluded.max_tokens,
-           timeout_secs = excluded.timeout_secs,
-           prompt_template = excluded.prompt_template,
-           updated_at = datetime('now')",
-        rusqlite::params![
-            settings.base_url,
-            settings.model,
-            settings.temperature,
-            settings.max_tokens,
-            settings.timeout_secs,
-            settings.prompt_template,
-        ],
-    )?;
+) -> StoreResult<i64> {
+    match settings.id {
+        Some(id) => {
+            conn.execute(
+                "UPDATE llm_models
+                   SET provider = ?1, base_url = ?2, model = ?3, temperature = ?4,
+                       max_tokens = ?5, timeout_secs = ?6, prompt_template = ?7,
+                       updated_at = datetime('now')
+                 WHERE id = ?8",
+                rusqlite::params![
+                    settings.provider,
+                    settings.base_url,
+                    settings.model,
+                    settings.temperature,
+                    settings.max_tokens,
+                    settings.timeout_secs,
+                    settings.prompt_template,
+                    id,
+                ],
+            )?;
+            Ok(id)
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO llm_models
+                   (provider, base_url, model, temperature, max_tokens, timeout_secs, prompt_template, has_api_key, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, datetime('now'))",
+                rusqlite::params![
+                    settings.provider,
+                    settings.base_url,
+                    settings.model,
+                    settings.temperature,
+                    settings.max_tokens,
+                    settings.timeout_secs,
+                    settings.prompt_template,
+                ],
+            )?;
+            Ok(conn.last_insert_rowid())
+        }
+    }
+}
+
+/// Delete a model by its row id.
+pub fn delete_llm_model(conn: &Connection, id: i64) -> StoreResult<()> {
+    conn.execute("DELETE FROM llm_models WHERE id = ?1", rusqlite::params![id])?;
     Ok(())
+}
+
+/// Backward-compat: read the single `llm_settings` row (id = 1) if it exists.
+/// Used only for migration/fallback; new code should use `get_llm_models`.
+pub fn get_llm_settings_legacy(conn: &Connection) -> StoreResult<Option<crate::llm::LlmSettings>> {
+    conn.query_row(
+        "SELECT id, provider, base_url, model, temperature, max_tokens, timeout_secs, prompt_template
+         FROM llm_settings WHERE id = 1",
+        [],
+        |r| {
+            Ok(crate::llm::LlmSettings {
+                id: r.get(0)?,
+                provider: r.get(1)?,
+                base_url: r.get(2)?,
+                model: r.get(3)?,
+                temperature: r.get(5)?,
+                max_tokens: r.get(6)?,
+                timeout_secs: r.get(7)?,
+                prompt_template: r.get(8)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(super::StoreError::Sql)
 }

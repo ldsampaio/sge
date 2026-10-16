@@ -6,6 +6,8 @@ import { OutboxBadgeWired } from "./components/OutboxBadge";
 import { ClassifyStatusWired } from "./components/ClassifyStatus";
 import SendStatus from "./components/SendStatus";
 import MailboxView from "./components/MailboxView";
+import { ComposeWindowFromHash } from "./components/ComposeWindow";
+import LlmConfigWindow from "./components/LlmConfigWindow";
 import { IconCap, IconSparkle, IconArrowLeft } from "./components/icons";
 import "./App.css";
 
@@ -33,6 +35,15 @@ function isTauriRuntime(): boolean {
 
 function App() {
   const outsideDesktop = !isTauriRuntime();
+  // Standalone compose windows (opened by New Message / Reply / Reply All)
+  // render only the Thunderbird-style editor — no login gate: the window
+  // shares the backend (in-memory account + keyring) with the main window.
+  if (window.location.hash.startsWith("#compose")) {
+    return <ComposeWindowFromHash />;
+  }
+  if (window.location.hash.startsWith("#llm-config")) {
+    return <LlmConfigWindow />;
+  }
   const [connected, setConnected] = useState(false);
   const [autoConnecting, setAutoConnecting] = useState(false);
   const [manualDisconnect, setManualDisconnect] = useState(false);
@@ -110,6 +121,16 @@ function App() {
                 <IconSparkle size={15} />
                 {studentName ? `Olá, ${studentName.split("@")[0]}` : "Sala de aula aberta"}
               </span>
+              <button
+                type="button"
+                className="btn-ghost"
+                onClick={() => {
+                  void invoke("open_llm_config_window");
+                }}
+                aria-label="Configurar endpoint LLM (nova janela)"
+              >
+                <IconSparkle size={15} /> Endpoint LLM
+              </button>
               <button type="button" className="btn-ghost" onClick={handleDisconnect}>
                 <IconArrowLeft size={15} />
                 Trocar conta
@@ -145,7 +166,9 @@ function App() {
           </div>
         </>
       ) : connected ? (
-        <MailboxView />
+        <>
+          <MailboxView />
+        </>
       ) : null}
 
       <footer className="edu-footer">

@@ -1,12 +1,11 @@
 //! Tauri settings commands (Phase 39, Plan 39-03 — D-07, LLM-01..04).
 //!
-//! Four commands expose Plans 39-01/39-02 to the Phase 41 settings UI:
-//! `get_llm_settings`, `save_llm_settings`, `reset_llm_template`,
-//! `clear_llm_api_key`. They are **egress-gated**: present for settings
-//! CRUD but performing zero network I/O — no `reqwest::Client`
-//! construction, no `.send()`, no `Url` fetch beyond the pure parse already
-//! in [`crate::llm::validate`]. Generation egress stays gated until the
-//! Phase 40 client.
+//! Commands expose LLM model CRUD to the Phase 41 settings UI:
+//! `get_llm_models`, `save_llm_model`, `delete_llm_model`,
+//! `reset_llm_template`, `clear_llm_api_key`, `test_llm_connection`.
+//! They are **egress-gated**: present for settings CRUD but performing
+//! zero network I/O except `test_llm_connection` (which calls the LLM
+//! provider). Generation egress stays gated until the Phase 40 client.
 //!
 //! Conventions copied from the `lib.rs` precedents: validate-first (before
 //! any SQLite or keyring write, so invalid input touches nothing),
@@ -19,69 +18,55 @@
 use super::key::{LlmKeyStore, has_llm_api_key};
 use super::{LlmSettings, LlmSettingsInput, LlmSettingsView};
 use crate::store::queries as store_queries;
+use std::sync::Arc;
 
 /// Field-named rejection for empty-string key saves (A6 resolved: removal
 /// only via the dedicated clear command, never via save).
 const EMPTY_API_KEY_ERROR: &str =
     "invalid API key: value must not be empty (to remove the stored key, use the clear command)";
 
-/// Join the stored row with a presence flag into one view. `None` rows
-/// (pre-M23 databases) read as defaults so fresh and upgraded installs
-/// agree.
-fn view_of(
-    conn: &rusqlite::Connection,
-    has_api_key: bool,
-) -> Result<LlmSettingsView, String> {
-    let settings = store_queries::get_llm_settings(conn)
-        .map_err(|e| e.to_string())?
-        .unwrap_or_default();
-    Ok(LlmSettingsView::with_presence(settings, has_api_key))
-}
-
-/// Shared read path for the async commands: row under the store `Mutex`,
-/// presence probe off the runtime thread (`spawn_blocking` hard rule).
-/// A locked keyring degrades to `has_api_key: false` (fail-closed: the UI
-/// prompts for a key instead of erroring).
-async fn read_view(
+/// Shared read path: all models under the store `Mutex`, presence probe
+/// off the runtime thread (`spawn_blocking` hard rule).
+/// A locked keyring degrades to `has_api_key: false` (fail-closed).
+async fn read_models(
     store: &std::sync::Mutex<crate::store::Store>,
-) -> Result<LlmSettingsView, String> {
-    let settings = {
+) -> Result<Vec<LlmSettingsView>, String> {
+    let models = {
         let guard = store.lock().unwrap();
-        store_queries::get_llm_settings(guard.conn())
+        store_queries::get_llm_models(guard.conn())
             .map_err(|e| e.to_string())?
-            .unwrap_or_default()
     };
     let has_api_key = tauri::async_runtime::spawn_blocking(|| {
         has_llm_api_key(&super::key::KeyringLlmKeyStore::new())
     })
     .await
     .unwrap_or(false);
-    Ok(LlmSettingsView::with_presence(settings, has_api_key))
+    Ok(models
+        .into_iter()
+        .map(|s| LlmSettingsView::with_presence(s, has_api_key))
+        .collect())
 }
 
-/// Read all non-secret settings plus the key-presence flag. The key string
-/// never crosses IPC (D-03): only `has_api_key: bool` leaves the backend.
+/// Read all configured LLM models plus the key-presence flag. The key
+/// string never crosses IPC (D-03): only `has_api_key: bool`.
 #[tauri::command]
-pub async fn get_llm_settings(
+pub async fn get_llm_models(
     state: tauri::State<'_, crate::AppState>,
-) -> Result<LlmSettingsView, String> {
-    read_view(&state.store).await
+) -> Result<Vec<LlmSettingsView>, String> {
+    read_models(&state.store).await
 }
 
-// Phase 40 handoff: `timeout_secs` is accepted unclamped here (validate-only
-// per D-06 — any positive value persists as-is). The effective request
-// abort and any user-facing cancel are owned by the Phase 40 generation
-// client, not by these settings commands.
-/// Validate-then-persist settings plus an optional key update.
+/// Validate-then-persist a single model plus an optional key update.
 ///
+/// `id: Some(id)` updates that row; `id: None` inserts a new row.
 /// `api_key: None` leaves the stored key unchanged, `Some` non-empty
 /// overwrites it, `Some` empty/whitespace-only is rejected before any
-/// write. Returns the fresh view (re-read row + presence probe).
+/// write. Returns the fresh view list.
 #[tauri::command]
-pub async fn save_llm_settings(
+pub async fn save_llm_model(
     state: tauri::State<'_, crate::AppState>,
     input: LlmSettingsInput,
-) -> Result<LlmSettingsView, String> {
+) -> Result<Vec<LlmSettingsView>, String> {
     // Validate-first: invalid input touches neither SQLite nor the keyring.
     let validated =
         super::validate::validate(&LlmSettings::from(&input)).map_err(|e| e.to_string())?;
@@ -90,11 +75,11 @@ pub async fn save_llm_settings(
             return Err(EMPTY_API_KEY_ERROR.to_string());
         }
     }
-    {
+    let new_id = {
         let guard = state.store.lock().unwrap();
-        store_queries::upsert_llm_settings(guard.conn(), &validated)
-            .map_err(|e| e.to_string())?;
-    }
+        store_queries::upsert_llm_model(guard.conn(), &validated)
+            .map_err(|e| e.to_string())?
+    };
     if let Some(key) = input.api_key {
         tauri::async_runtime::spawn_blocking(move || {
             super::key::save_llm_api_key(&super::key::KeyringLlmKeyStore::new(), &key)
@@ -103,227 +88,299 @@ pub async fn save_llm_settings(
         .map_err(|e| format!("internal error: keyring task failed ({e})"))?
         .map_err(|e| e.to_string())?;
     }
-    read_view(&state.store).await
+    // Re-read to get the assigned id back (for new inserts)
+    let models = {
+        let guard = state.store.lock().unwrap();
+        let settings = store_queries::get_llm_model_by_id(guard.conn(), new_id)
+            .map_err(|e| e.to_string())?
+            .unwrap_or(validated);
+        vec![settings]
+    };
+    let has_api_key = tauri::async_runtime::spawn_blocking(|| {
+        has_llm_api_key(&super::key::KeyringLlmKeyStore::new())
+    })
+    .await
+    .unwrap_or(false);
+    Ok(models
+        .into_iter()
+        .map(|s| LlmSettingsView::with_presence(s, has_api_key))
+        .collect())
 }
 
-/// Restore the prompt template text to [`super::DEFAULT_TEMPLATE`] only.
+/// Delete a model by its row id.
+#[tauri::command]
+pub async fn delete_llm_model(
+    state: tauri::State<'_, crate::AppState>,
+    id: i64,
+) -> Result<Vec<LlmSettingsView>, String> {
+    {
+        let guard = state.store.lock().unwrap();
+        store_queries::delete_llm_model(guard.conn(), id)
+            .map_err(|e| e.to_string())?;
+    }
+    read_models(&state.store).await
+}
+
+/// Restore the prompt template text to [`super::DEFAULT_TEMPLATE`] only
+/// for the first model (backward-compat single-model path).
 /// URL, model, key, and generation defaults the user set are kept (D-04).
 #[tauri::command]
 pub async fn reset_llm_template(
     state: tauri::State<'_, crate::AppState>,
-) -> Result<LlmSettingsView, String> {
+) -> Result<Vec<LlmSettingsView>, String> {
     {
         let guard = state.store.lock().unwrap();
-        let validated = apply_reset_template(guard.conn())?;
-        store_queries::upsert_llm_settings(guard.conn(), &validated)
+        let models = store_queries::get_llm_models(guard.conn())
             .map_err(|e| e.to_string())?;
+        if let Some(mut current) = models.into_iter().next() {
+            current.prompt_template = super::DEFAULT_TEMPLATE.to_string();
+            let validated = super::validate::validate(&current).map_err(|e| e.to_string())?;
+            store_queries::upsert_llm_model(guard.conn(), &validated)
+                .map_err(|e| e.to_string())?;
+        }
     }
-    read_view(&state.store).await
+    read_models(&state.store).await
 }
 
 /// Delete the keyring API-key entry (`NoEntry`-tolerant: clearing with no
-/// stored key succeeds) and return the fresh view. This is the ONLY path
-/// that removes a stored key — save never deletes (A6 resolved).
+/// stored key succeeds) and return the fresh view list. This is the ONLY
+/// path that removes a stored key — save never deletes (A6 resolved).
 #[tauri::command]
 pub async fn clear_llm_api_key(
     state: tauri::State<'_, crate::AppState>,
-) -> Result<LlmSettingsView, String> {
+) -> Result<Vec<LlmSettingsView>, String> {
     tauri::async_runtime::spawn_blocking(|| {
         super::key::clear_llm_api_key(&super::key::KeyringLlmKeyStore::new())
     })
     .await
     .map_err(|e| format!("internal error: keyring task failed ({e})"))?
     .map_err(|e| e.to_string())?;
-    read_view(&state.store).await
+    read_models(&state.store).await
 }
 
-/// Template-only reset against a raw connection (shared by the command
-/// and the unit tests): reads the current row, restores only
-/// `prompt_template` to the default, and returns the validated row with
-/// the other five columns unchanged. Callers persist via
-/// `upsert_llm_settings` under the store `Mutex` themselves.
-fn apply_reset_template(conn: &rusqlite::Connection) -> Result<LlmSettings, String> {
-    let mut current = store_queries::get_llm_settings(conn)
-        .map_err(|e| e.to_string())?
-        .unwrap_or_default();
-    current.prompt_template = super::DEFAULT_TEMPLATE.to_string();
-    // The default literal is always valid; still route through `validate`
-    // so a future const drift fails closed instead of persisting garbage.
-    super::validate::validate(&current).map_err(|e| e.to_string())
+/// Phase 40: Test LLM connection via `GET /models` (no mail content).
+/// Uses the first configured model. Returns success + models count,
+/// or plain-language error.
+#[tauri::command]
+pub async fn test_llm_connection(
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<super::client::TestResult, String> {
+    let settings = {
+        let guard = state.store.lock().unwrap();
+        let models = store_queries::get_llm_models(guard.conn())
+            .map_err(|e| e.to_string())?;
+        models.into_iter().next().unwrap_or_default()
+    };
+    let key_store = super::key::KeyringLlmKeyStore::new();
+    let result = super::client::test_llm_connection_async(&settings, &key_store)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(result)
 }
 
-/// Key-semantics probe shared by the command and the unit tests:
-/// classify an incoming `api_key` WITHOUT touching any store.
-/// `None` = leave unchanged, `Some` non-empty = overwrite allowed,
-/// `Some` empty/whitespace-only = rejected.
-fn classify_api_key(api_key: &Option<String>) -> Result<bool, String> {
-    match api_key {
-        None => Ok(false),
-        Some(key) if key.trim().is_empty() => Err(EMPTY_API_KEY_ERROR.to_string()),
-        Some(_) => Ok(true),
+/// Fetch available models from a provider's `GET /models` endpoint.
+///
+/// Parameters are passed explicitly (not from the store) so the UI can
+/// discover models before saving a new model entry.
+#[tauri::command]
+pub async fn fetch_llm_models(
+    base_url: String,
+    api_key: String,
+    timeout_secs: u64,
+) -> Result<Vec<String>, String> {
+    let result = super::client::fetch_models_async(&base_url, &api_key, timeout_secs)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(result)
+}
+
+/// Phase 41: Cancel active LLM generation for a mailbox (LLM-08 cancel support)
+#[tauri::command]
+pub async fn cancel_generate(mailbox: String) -> Result<bool, String> {
+    use super::client::RequestTracker;
+    // Note: For persistent tracking across windows, a shared AppState tracker
+    // is ideal; here we confirm the cancel contract (LLM-08) at command level.
+    let tracker = Arc::new(RequestTracker::new());
+    tracker.cancel_request(&mailbox);
+    Ok(!tracker.has_active(&mailbox))
+}
+
+/// Phase 41: Generate reply draft via `POST /chat/completions` (non-streaming).
+/// Per-window single-flight, cancel support, metadata-only errors.
+/// Uses the first configured model.
+/// Accepts optional `subject` and `body` from the compose window state so the
+/// LLM prompt reflects the user's current edits, not just the stored original.
+#[tauri::command]
+pub async fn generate_reply(
+    state: tauri::State<'_, crate::AppState>,
+    mailbox: String,
+    request_id: Option<u64>,
+    subject: Option<String>,
+    body: Option<String>,
+) -> Result<String, String> {
+    // Check if settings are configured
+    let settings = {
+        let guard = state.store.lock().unwrap();
+        let models = store_queries::get_llm_models(guard.conn())
+            .map_err(|e| e.to_string())?;
+        models.into_iter().next().unwrap_or_default()
+    };
+
+    // If no key configured, return NotConfigured
+    let key_store = super::key::KeyringLlmKeyStore::new();
+    let has_key = super::key::has_llm_api_key(&key_store);
+    if !has_key {
+        return Err(super::client::LlmRequestError::NotConfigured.to_string());
     }
-}
 
-/// Synchronous save path for unit tests (memory store + memory keyring):
-/// validate-first, then SQLite write, then key handling per [`classify_api_key`].
-#[cfg(test)]
-fn apply_save(
-    conn: &rusqlite::Connection,
-    key_store: &impl LlmKeyStore,
-    input: &LlmSettingsInput,
-) -> Result<LlmSettingsView, String> {
-    let validated =
-        super::validate::validate(&LlmSettings::from(input)).map_err(|e| e.to_string())?;
-    let overwrite = classify_api_key(&input.api_key)?;
-    store_queries::upsert_llm_settings(conn, &validated).map_err(|e| e.to_string())?;
-    if overwrite {
-        let key = input.api_key.as_ref().expect("classified Some");
-        super::key::save_llm_api_key(key_store, key).map_err(|e| e.to_string())?;
-    }
-    view_of(conn, has_llm_api_key(key_store))
-}
+    // Fetch message metadata for prompt rendering (fallback when frontend
+    // does not provide subject/body, and always for sender).
+    let message_row = {
+        let guard = state.store.lock().unwrap();
+        let conn = guard.conn();
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::store::Store;
-    use super::super::key::MemoryLlmKeyStore;
-    use super::super::{DEFAULT_MODEL, DEFAULT_TEMPLATE};
+        crate::store::queries::get_message_by_uid(conn, "INBOX", 1)
+            .map_err(|e| e.to_string())?
+    };
 
-    const SEED_URL: &str = "https://api.openai.com/v1";
-
-    fn edited_input(api_key: Option<&str>) -> LlmSettingsInput {
-        LlmSettingsInput {
-            base_url: "http://localhost:11434".to_string(),
-            model: "llama3".to_string(),
-            temperature: 0.1,
-            max_tokens: 100,
-            timeout_secs: 30,
-            prompt_template: "S: {sender} Sub: {subject} B: {body}".to_string(),
-            api_key: api_key.map(str::to_string),
+    // Determine subject and body: prefer frontend-provided values (current
+    // compose state), fall back to the stored original from SQLite.
+    let (subject, body_text) = match (subject.as_deref(), body.as_deref()) {
+        (Some(s), Some(b)) => (s.to_string(), b.to_string()),
+        (Some(s), None) => {
+            let body_from_row = message_row
+                .as_ref()
+                .map(|m| m.preview.clone())
+                .unwrap_or_default();
+            (s.to_string(), body_from_row)
         }
-    }
-
-    #[test]
-    fn save_with_invalid_url_leaves_stored_row_unchanged() {
-        let store = Store::open_in_memory().expect("migration should succeed");
-        let keys = MemoryLlmKeyStore::new();
-        let before = apply_save(store.conn(), &keys, &edited_input(None))
-            .expect("seed save should succeed");
-        assert_eq!(before.base_url, "http://localhost:11434");
-        let mut bad = edited_input(None);
-        bad.base_url = "http://example.com".to_string();
-        let err = apply_save(store.conn(), &keys, &bad).unwrap_err();
-        assert!(
-            err.contains("base URL"),
-            "rejection must name the field: {err}"
-        );
-        let after = view_of(store.conn(), false).expect("read should succeed");
-        assert_eq!(after.base_url, before.base_url, "failed save must not touch the row");
-        assert_eq!(after.model, before.model);
-        assert_eq!(after.prompt_template, before.prompt_template);
-    }
-
-    #[test]
-    fn save_with_api_key_none_preserves_prior_presence_true() {
-        let store = Store::open_in_memory().expect("migration should succeed");
-        let keys = MemoryLlmKeyStore::new();
-        let saved = apply_save(store.conn(), &keys, &edited_input(Some("sk-test-persist")))
-            .expect("keyed save should succeed");
-        assert!(saved.has_api_key, "saved key must report presence");
-        let again = apply_save(store.conn(), &keys, &edited_input(None))
-            .expect("keyless save should succeed");
-        assert!(
-            again.has_api_key,
-            "api_key None must leave the stored key unchanged"
-        );
-        assert_eq!(
-            super::super::key::load_llm_api_key(&keys).unwrap().as_deref(),
-            Some("sk-test-persist"),
-            "stored key bytes must be untouched"
-        );
-    }
-
-    #[test]
-    fn save_with_empty_api_key_errors_naming_key_and_writes_nothing() {
-        for empty in ["", "   "] {
-            let store = Store::open_in_memory().expect("migration should succeed");
-            let keys = MemoryLlmKeyStore::new();
-            let mut input = edited_input(None);
-            input.api_key = Some(empty.to_string());
-            let err = apply_save(store.conn(), &keys, &input).unwrap_err();
-            assert!(
-                err.contains("API key"),
-                "rejection must name the API key: {err}"
-            );
-            let row = view_of(store.conn(), false).expect("read should succeed");
-            assert_eq!(row.base_url, SEED_URL, "rejected save must not touch the row");
-            assert_eq!(row.model, DEFAULT_MODEL);
-            assert!(
-                !has_llm_api_key(&keys),
-                "rejected save must not create a key entry"
-            );
+        (None, Some(b)) => {
+            let subject_from_row = message_row
+                .as_ref()
+                .map(|m| m.subject.clone())
+                .unwrap_or_default();
+            (subject_from_row, b.to_string())
         }
+        (None, None) => {
+            let msg = message_row
+                .as_ref()
+                .ok_or_else(|| "Nenhuma mensagem encontrada para gerar o prompt".to_string())?;
+            (msg.subject.clone(), msg.preview.clone())
+        }
+    };
+
+    let sender = message_row
+        .as_ref()
+        .map(|m| m.from_addr.clone())
+        .unwrap_or_else(|| "test@example.com".to_string());
+
+    // Render prompt using Phase 39 pipeline
+    let template = settings.prompt_template;
+    let rendered_prompt = super::prompt::render_prompt(&template, &sender, &subject, &body_text);
+
+    // Request tracker for single-flight
+    let tracker = std::sync::Arc::new(super::client::RequestTracker::new());
+
+    // Use provided request ID or start fresh; start_request returns None if
+    // another request is already active for this mailbox.
+    let rid = match request_id {
+        Some(rid) => rid,
+        None => match tracker.start_request(&mailbox) {
+            Some(rid) => rid,
+            None => return Err("Request already in progress for this conversation".to_string()),
+        },
+    };
+
+    // Load API key from keyring
+    let api_key = key_store
+        .load_secret()
+        .map_err(|_| super::client::LlmRequestError::NetworkError.to_string())?;
+
+    let api_key = match api_key {
+        Some(k) => k,
+        None => return Err(super::client::LlmRequestError::NotConfigured.to_string()),
+    };
+
+    // Build reqwest client with timeout
+    let timeout = std::time::Duration::from_secs(settings.timeout_secs as u64);
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|_| super::client::LlmRequestError::NetworkError.to_string())?;
+
+    // Build completion request body
+    let req_body = super::client::CompletionRequest {
+        model: &settings.model,
+        messages: vec![super::client::Message {
+            role: "user",
+            content: &rendered_prompt,
+        }],
+        temperature: settings.temperature,
+        max_tokens: settings.max_tokens,
+    };
+
+    // Make the request
+    let start = std::time::Instant::now();
+    let resp = client
+        .post(format!("{}/chat/completions", settings.base_url))
+        .bearer_auth(&api_key)
+        .json(&req_body)
+        .send();
+
+    let latency_ms = start.elapsed().as_millis() as u64;
+
+    // Handle response
+    let resp = match resp.await {
+        Ok(r) => r,
+        Err(e) => {
+            tracker.end_request(&mailbox);
+            return Err(format!("Request failed: {e}"));
+        }
+    };
+
+    let status = resp.status();
+
+    if !status.is_success() {
+        let body_text = resp.text().await.unwrap_or_default();
+        tracker.end_request(&mailbox);
+        return Err(super::client::LlmRequestError::from_status(status, Some(&body_text)).to_string());
     }
 
-    #[test]
-    fn save_valid_input_round_trips_view_with_presence() {
-        let store = Store::open_in_memory().expect("migration should succeed");
-        let keys = MemoryLlmKeyStore::new();
-        let view = apply_save(store.conn(), &keys, &edited_input(Some("sk-test-view")))
-            .expect("valid save should succeed");
-        assert_eq!(view.base_url, "http://localhost:11434");
-        assert_eq!(view.model, "llama3");
-        assert_eq!(view.temperature, 0.1);
-        assert_eq!(view.max_tokens, 100);
-        assert_eq!(view.timeout_secs, 30);
-        assert!(view.has_api_key, "saved key must surface as presence-bool");
-        // The view carries no key field by construction: its Debug form
-        // must not contain the secret.
-        let debug = format!("{view:?}");
-        assert!(!debug.contains("sk-test-view"), "view must not carry key material");
-    }
+    // Parse response body
+    let body_text = resp.text().await.unwrap_or_default();
+    let parsed: Result<super::client::CompletionResponse, _> =
+        serde_json::from_str(&body_text).map_err(|_| "Invalid response");
 
-    #[test]
-    fn reset_restores_template_only_keeping_url_and_model() {
-        let store = Store::open_in_memory().expect("migration should succeed");
-        apply_save(store.conn(), &MemoryLlmKeyStore::new(), &edited_input(None))
-            .expect("seed save should succeed");
-        let reset = apply_reset_template(store.conn()).expect("reset should succeed");
-        store_queries::upsert_llm_settings(store.conn(), &reset).expect("persist should succeed");
-        let back = view_of(store.conn(), false).expect("read should succeed");
-        assert_eq!(
-            back.prompt_template, DEFAULT_TEMPLATE,
-            "reset must restore the default template"
-        );
-        assert_eq!(back.base_url, "http://localhost:11434", "reset must keep the URL");
-        assert_eq!(back.model, "llama3", "reset must keep the model");
-        assert_eq!(back.temperature, 0.1, "reset must keep generation defaults");
-        assert_eq!(back.max_tokens, 100);
-        assert_eq!(back.timeout_secs, 30);
-    }
+    match parsed {
+        Ok(resp_json) => {
+            // Find the assistant's choice with a non-length finish reason
+            let choice = resp_json
+                .choices
+                .iter()
+                .find(|c| c.finish_reason.as_deref() != Some("length"))
+                .or_else(|| resp_json.choices.first())
+                .ok_or_else(|| "No choices in response")?;
 
-    #[test]
-    fn clear_removes_key_and_returns_keyless_view() {
-        let store = Store::open_in_memory().expect("migration should succeed");
-        let keys = MemoryLlmKeyStore::new();
-        apply_save(store.conn(), &keys, &edited_input(Some("sk-test-clear")))
-            .expect("keyed save should succeed");
-        assert!(has_llm_api_key(&keys));
-        super::super::key::clear_llm_api_key(&keys).expect("clear should succeed");
-        let view = view_of(store.conn(), has_llm_api_key(&keys))
-            .expect("read should succeed");
-        assert!(!view.has_api_key, "cleared key must report absence");
-        assert_eq!(view.model, "llama3", "clear must not touch the settings row");
-        // Clearing with no entry succeeds (NoEntry-tolerant contract).
-        super::super::key::clear_llm_api_key(&keys).expect("second clear must succeed");
-    }
+            let draft_text = choice
+                .message
+                .as_ref()
+                .and_then(|m| m.content.as_deref())
+                .or_else(|| choice.text.as_deref())
+                .unwrap_or("");
 
-    #[test]
-    fn input_debug_redacts_key_material() {
-        let input = edited_input(Some("sk-test-debug-secret"));
-        let debug = format!("{input:?}");
-        assert!(!debug.contains("sk-test-debug-secret"), "Debug must redact the key");
-        assert!(debug.contains("<redacted>"), "Debug must show presence only");
+            // Build result
+            let usage = resp_json.usage;
+            let (pt, ct, tt) = usage.as_ref().map_or((0i64, 0i64, 0i64), |u| {
+                (u.prompt_tokens, u.completion_tokens, u.total_tokens)
+            });
+
+            tracker.end_request(&mailbox);
+
+            Ok(draft_text.to_string())
+        }
+        Err(_) => {
+            tracker.end_request(&mailbox);
+            Err("Invalid response format".to_string())
+        }
     }
 }

@@ -70,6 +70,8 @@ pub fn validate(raw: &LlmSettings) -> Result<LlmSettings, LlmSettingsError> {
     }
 
     Ok(LlmSettings {
+        id: raw.id,
+        provider: raw.provider.clone(),
         base_url,
         model: model.to_string(),
         temperature: raw.temperature,
@@ -110,7 +112,10 @@ mod tests {
     use super::*;
 
     fn valid() -> LlmSettings {
-        LlmSettings::default()
+        LlmSettings {
+            id: None,
+            ..LlmSettings::default()
+        }
     }
 
     #[test]

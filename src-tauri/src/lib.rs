@@ -502,6 +502,7 @@ pub fn run() {
             commands::sync::discard_draft,
             commands::sync::cancel_sync,
             commands::sync::open_compose_window,
+            commands::sync::open_llm_config_window,
             commands::sync::idle_status,
             commands::sync::idle_start,
             commands::sync::idle_stop,
@@ -569,10 +570,15 @@ pub fn run() {
             commands::classify::set_archive_settings,
             sidecar_status,
             load_server_config,
-            llm::commands::get_llm_settings,
-            llm::commands::save_llm_settings,
+            llm::commands::get_llm_models,
+            llm::commands::save_llm_model,
+            llm::commands::delete_llm_model,
             llm::commands::reset_llm_template,
             llm::commands::clear_llm_api_key,
+            llm::commands::test_llm_connection,
+            llm::commands::fetch_llm_models,
+            llm::commands::generate_reply,
+            llm::commands::cancel_generate,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

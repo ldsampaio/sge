@@ -16,7 +16,7 @@ pub mod queries;
 pub const BODY_CACHE_CAP_BYTES: usize = 262144;
 
 /// Schema version managed by rusqlite_migration.
-pub const SCHEMA_VERSION: u32 = 23;
+pub const SCHEMA_VERSION: u32 = 25;
 
 // v1 = full schema.sql (canonical DDL from ARCHITECTURE.md)
 // M2 = flag_outbox durable queue (Phase 6, Plan 06-01). The schema.sql v1
@@ -103,6 +103,8 @@ impl Store {
             M::up(M21_RULE_VERSION_SQL),
             M::up(M22_LEARN_SQL),
             M::up(M23_LLM_SETTINGS_SQL),
+            M::up(M24_LLM_SETTINGS_PROVIDER_SQL),
+            M::up(M25_LLM_MODELS_TABLE_SQL),
         ]);
         migrations.to_latest(conn)?;
         Ok(())
@@ -160,6 +162,7 @@ const M22_LEARN_SQL: &str = concat!(
 const M23_LLM_SETTINGS_SQL: &str = concat!(
     "CREATE TABLE llm_settings (",
     "  id              INTEGER PRIMARY KEY CHECK (id = 1),",
+    "  provider        TEXT NOT NULL DEFAULT 'custom',",
     "  base_url        TEXT NOT NULL DEFAULT '',",
     "  model           TEXT NOT NULL DEFAULT '',",
     "  temperature     REAL NOT NULL DEFAULT 0.7,",
@@ -168,10 +171,38 @@ const M23_LLM_SETTINGS_SQL: &str = concat!(
     "  prompt_template TEXT NOT NULL DEFAULT '',",
     "  updated_at      TEXT NOT NULL DEFAULT (datetime('now'))",
     ");",
-    "INSERT INTO llm_settings (id, base_url, model, temperature, max_tokens, timeout_secs, prompt_template)",
-    " VALUES (1, 'https://api.openai.com/v1', 'gpt-4o-mini', 0.7, 500, 60,",
+    "INSERT INTO llm_settings (id, provider, base_url, model, temperature, max_tokens, timeout_secs, prompt_template)",
+    " VALUES (1, 'custom', 'https://api.openai.com/v1', 'gpt-4o-mini', 0.7, 500, 60,",
     " 'Write a helpful reply to the email below. From: {sender} Subject: {subject} Body: {body}');",
 );
+/// M24 forward migration: add `provider` column to existing `llm_settings`
+/// table for databases created before provider support (Phase 41).
+const M24_LLM_SETTINGS_PROVIDER_SQL: &str = concat!(
+    "ALTER TABLE llm_settings ADD COLUMN provider TEXT NOT NULL DEFAULT 'custom';",
+);
+
+/// M25 forward migration: create `llm_models` table to support multiple
+/// configured LLM models (Phase 41).
+///
+/// Each row is one configured model endpoint (Groq, OpenRouter, or custom
+/// Ollama). The single-row `llm_settings` table is kept for backward
+/// compatibility; new code reads/writes `llm_models`.
+const M25_LLM_MODELS_TABLE_SQL: &str = concat!(
+    "CREATE TABLE IF NOT EXISTS llm_models (",
+    "  id              INTEGER PRIMARY KEY AUTOINCREMENT,",
+    "  provider        TEXT NOT NULL DEFAULT 'custom',",
+    "  base_url        TEXT NOT NULL DEFAULT '',",
+    "  model           TEXT NOT NULL DEFAULT '',",
+    "  temperature     REAL NOT NULL DEFAULT 0.7,",
+    "  max_tokens      INTEGER NOT NULL DEFAULT 500,",
+    "  timeout_secs    INTEGER NOT NULL DEFAULT 60,",
+    "  prompt_template TEXT NOT NULL DEFAULT '',",
+    "  has_api_key     INTEGER NOT NULL DEFAULT 0,",
+    "  updated_at      TEXT NOT NULL DEFAULT (datetime('now'))",
+    ");",
+    "CREATE INDEX IF NOT EXISTS idx_llm_models_provider ON llm_models(provider);",
+);
+
 /// M2 forward migration: durable Seen-flag outbox (Phase 6, Plan 06-01).
 ///
 /// Queues optimistic flag toggles made while offline so they replay on
