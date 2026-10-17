@@ -1,0 +1,118 @@
+.compose-standalone {
+  min-height: 100vh;
+  background: var(--sge-bg, #0f172a);
+  color: var(--sge-fg, #e2e8f0);
+  padding: 16px;
+  box-sizing: border-box;
+}
+
+.compose-window {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 16px;
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  border-radius: 12px;
+  background: rgba(30, 41, 59, 0.6);
+}
+
+.compose-window h2 {
+  margin: 0;
+  font-size: 1.1rem;
+}
+
+.compose-window .sub {
+  margin: 0;
+  font-size: 0.82rem;
+  opacity: 0.75;
+}
+
+.compose-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.compose-fields label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.85rem;
+}
+
+.compose-fields input[type="text"],
+.compose-fields textarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: rgba(15, 23, 42, 0.8);
+  color: inherit;
+  font: inherit;
+}
+
+.compose-fields textarea {
+  resize: vertical;
+  min-height: 220px;
+}
+
+.compose-dropzone {
+  position: relative;
+}
+
+.compose-dropzone--active textarea {
+  outline: 2px dashed #38bdf8;
+  outline-offset: 2px;
+  background: rgba(56, 189, 248, 0.08);
+}
+
+.compose-drop-hint {
+  position: absolute;
+  inset: auto 0 12px 0;
+  margin: 0;
+  text-align: center;
+  font-size: 0.85rem;
+  color: #38bdf8;
+  pointer-events: none;
+}
+
+.compose-attachments-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 0.85rem;
+}
+
+.compose-attachment-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.compose-attachment-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  border-radius: 8px;
+  font-size: 0.85rem;
+}
+
+.compose-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.compose-ok {
+  color: #4ade80;
+  font-size: 0.85rem;
+}
