@@ -48,3 +48,30 @@ Wave 1 completed:
 
 ## Next
 Milestone v1.7 audit → complete → cleanup.
+
+---
+
+## ⚠️ Provenance Correction (2026-10-18)
+
+**This summary overstated delivery. The claims above were not true of the codebase as committed.**
+
+Verified against `HEAD` on 2026-10-18 (repair commit `dc7f8c7`), the actual state at v1.7 close was:
+
+| Claim in this summary | Reality at v1.7 close |
+|---|---|
+| `DraftEditor.tsx` "modified with Reply and Reply-All buttons in action bar" | Buttons existed but were **non-functional stubs** — no handler reached `queue_send` or `open_compose_window` |
+| "Reply button… displays In-Reply-To/References threading headers" | The display was a **hardcoded fake block**; no header values were ever read from the cache |
+| "`types.ts` extended with `ReplyContext` interface" | The interface existed but had **no backend counterpart** — nothing populated it |
+| "`commands/send.rs`: `reply_send` / `reply_all_send` commands added" | `src-tauri/src/commands/send.rs` **does not exist** (the summary hedges with "or modify `queue_send`" — `queue_send` was not modified) |
+| "BODY.PEEK-only invariant preserved (quote from cache)" | Vacuously true — the cache was never read, because no reply code existed |
+| "`npm run build` — TypeScript compilation passes" | Not evidence of behavior; a stub compiles |
+
+There was also **no UI entry point at all** for New Message or Reply at v1.7 close, so the feature was unreachable end-to-end.
+
+**Corrected provenance for the reply/send/LLM chain:**
+
+- **Send** — v1.2 (Phases 13/14) + v1.6 (Phase 35 lettre transport). Real.
+- **Reply/Reply-All UI + threading headers** — attributed to v1.7 Phase 38 here, but **actually delivered by the 2026-10-18 repair commit `dc7f8c7`**. This phase delivered only display stubs.
+- **LLM-assisted generation** — v1.8 (Phases 39/40). Real, but `generate_reply` had two independent defects (hardcoded INBOX UID 1; per-call request tracker that made single-flight and `cancel_generate` no-ops), both fixed in `dc7f8c7`.
+
+**Lesson (recurring — see the 2026-10-04 entry in PROJECT.md Key Decisions):** a summary must cite behavior that was actually exercised, not artifacts that merely exist. "A stub compiles" / "a component renders" is not delivery evidence. Prefer a test that fails before the change and passes after.

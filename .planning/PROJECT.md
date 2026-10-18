@@ -8,9 +8,13 @@ SGE is a Linux desktop email client built with Rust + Tauri v2 + React + SQLite.
 
 Connect to an IMAP server on Linux and read your mail locally in a fast Gmail-like UI — if this doesn't work, nothing else matters.
 
-## Current State (v1.7 shipped 2026-10-15 ✅)
+## Current State (repair pass 2026-10-18; v1.7 shipped 2026-10-15 ⚠️ partially)
 
-SGE is a Linux desktop email client (Rust + Tauri v2 + React + SQLite) with triage, folders, drafts, SMTP compose, on-device auto-classification, full-text search with saved filters, age-based auto-archive, user-defined smart folder rules, send pipeline (queue + lettre transport), and Thunderbird-style compose UX with Reply/Reply-All threading. v1.7 (phases 37-38): New Message button + Compose window wired to `queue_send`, Reply/Reply-All with RFC 5322 threading headers + quote attribution. v1.4 audit `.planning/v1.4-MILESTONE-AUDIT.md`: PASSED 11/11; v1.6 audit `.planning/v1.6-MILESTONE-AUDIT.md`: COMPLETE (454 lib tests). Environment caveat: `vite` bundle needs Node 20+ (env has Node 18); `tsc --noEmit` clean.
+SGE is a Linux desktop email client (Rust + Tauri v2 + React + SQLite) with triage, folders, drafts, SMTP compose, on-device auto-classification, full-text search with saved filters, age-based auto-archive, user-defined smart folder rules, send pipeline (queue + lettre transport), and Thunderbird-style compose UX with Reply/Reply-All threading.
+
+⚠️ **v1.7 over-claim, corrected:** the v1.7 Phase 38 summary stated that Reply/Reply-All with RFC 5322 threading headers shipped. That was **not true** — the repo had non-functional display stubs and no UI entry point at all, so reply was unreachable ("o botão nem existe"). A repair pass on **2026-10-18** (commit `dc7f8c7`) delivered the real feature: Reply/Reply-All/New-Message entry points, `In-Reply-To`/`References` on the wire, `multipart/mixed` attachments with drag-and-drop staging, and a corrected `generate_reply`.
+
+Suite: **525 lib tests green** (was 503), `cargo check --all-targets` clean, `tsc --noEmit` clean. v1.4 audit `.planning/v1.4-MILESTONE-AUDIT.md`: PASSED 11/11; v1.6 audit `.planning/v1.6-MILESTONE-AUDIT.md`: COMPLETE (454 lib tests). Environment caveat: `vite` bundle needs Node 20+ (env has Node 18); `cargo clippy` is skipped in CI (needs the local Laya sidecar binary).
 
 ## Current Milestone (2026-10-15): v1.8 LLM-Assisted Replies
 
@@ -112,6 +116,16 @@ Previous Active items all delivered (see Validated above + `.planning/v1.1-MILES
 - Auth UX decided: remember everything securely (OS keyring), auto-login next launch.
 - v1.3 scoping (new-milestone questioning): classification moves mail physically (MOVE verb, Phase 10 machinery); target tree auto-created under root `Auto`; single-email flow always user-confirmed; batch flow unconfirmed with progress + report; secondary category is a local-only label; Laya runs as a bundled offline sidecar (multilingual checkpoint for pt-BR).
 - v1.8 scoping (new-milestone questioning): LLM reply drafting is strictly user-triggered (button click in Reply/Reply-All window); any OpenAI-compatible base URL + model + key; single prompt template with `{sender}`/`{subject}`/`{body}` placeholders; API key in OS keyring like mail creds; generated text pasted above quoted original for review; no auto-send, no background calls.
+- 2026-10-18 repair pass: milestone provenance re-established by reading the code, not the summaries — **send** = v1.2 (Phases 13/14) + v1.6 (Phase 35); **reply/threading** attributed to v1.7/38 but actually delivered by `dc7f8c7`; **LLM generation** = v1.8 (Phases 39/40), which was real but had two defects (hardcoded INBOX UID 1, per-call request tracker). Reply context comes from the local BODY.PEEK cache rather than new header fetches.
+
+## Untested / Not Yet Proven
+
+Carried forward honestly — these are recorded as facts, not risks:
+
+- **Live-server legs have never run in this environment:** SMTP 587 send, draft round-trip, Seen round-trip (LIVE-01/02/03). Offline proofs exist; the live runs need real creds and are `exit-2 SKIP` by contract.
+- **The 2026-10-18 reply/attachment work is unit-tested only.** No real reply has been observed threading in a recipient's client, and no attachment has completed a real send. The MIME renderer has a `mail-parser` round-trip test, which is evidence of well-formedness, not of interop.
+- **LLM generation has never run against a real endpoint** with a real key — settings validation, prompt rendering, cancel, and retry are unit-tested; the wire is not.
+- **Drag-and-drop attachment staging is manual-only** (no DOM test). The 18 MiB pre-check is a UX guard; `SEND_MAX_BYTES` is the authority.
 
 ## Constraints
 
@@ -150,6 +164,11 @@ Previous Active items all delivered (see Validated above + `.planning/v1.1-MILES
 | v1.3: single-email always user-confirmed, batch unconfirmed | Trust gate for the classifier era; batch is an explicit whole-account op with progress + report | — Pending (completed v1.3) |
 | v1.3: secondary category local-only | Avoids double-filing complexity; mail lives in primary folder, second label is SQLite-only | — Pending (completed v1.3) |
 | v1.8: LLM drafting user-triggered only, OpenAI-compatible endpoint | Preserves offline-by-default trust posture; any base URL covers OpenAI + local servers (Ollama/LM Studio) without per-provider code; user always reviews generated text | — Pending (v1.8 in progress) |
+| 2026-10-18: v1.7 Phase 38 summary overstated delivery — reply was stub-only | Verified against code: fake threading-header block, no `commands/send.rs`, no UI entry point; "a stub compiles" is not delivery evidence | ✓ Corrected — real feature delivered in `dc7f8c7`; provenance note appended to the 38-01 summary |
+| 2026-10-18: reply threading reads the local cache, no new IMAP fetch | `In-Reply-To`/`References` come from `messages.message_id` (BODY.PEEK data). No `references` column: when absent, `References = In-Reply-To`, which still threads correctly in practice | ✓ Good — preserves the BODY.PEEK-only and UID-only invariants |
+| 2026-10-18: attachments ride `multipart/mixed`, base64, RFC 2231 names | Non-ASCII filenames need `filename*=UTF-8''`; base64 wrapped at 76 cols for line-length-safe transport; render with no attachments stays byte-identical to Phase 12, guarded by a test | ✓ Good |
+| 2026-10-18: attachment pre-check 18 MiB decoded vs 25 MiB rendered cap | Base64 inflates by 4/3, so a 20 MiB+ file would pass a naive check and then fail server-side; backend remains authority via `send-too-large`/`send-bad-attachment` | ✓ Good |
+| 2026-10-18: LLM request tracker is shared state on `AppState` | The tracker was constructed per call, so single-flight and `cancel_generate` were silently no-ops; one shared tracker restores both | ✓ Good |
 
 ## Evolution
 
@@ -168,4 +187,4 @@ This document evolves at phase transitions and milestone boundaries.
 3. Audit Out of Scope — reasons still valid?
 4. Update Context with current state
 
-*Last updated: 2026-10-15 — Milestone v1.8 started (LLM-Assisted Replies); v1.7 shipped ✅*
+*Last updated: 2026-10-18 — reply/send/LLM-reply wiring repaired (`dc7f8c7`); v1.7 Phase 38 over-claim corrected; v1.4/v1.6 audits unchanged.*

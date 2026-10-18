@@ -1,5 +1,28 @@
 # Milestones
 
+## v1.8 LLM-Assisted Replies (In progress — repaired 2026-10-18)
+
+**Phases:** 39 LLM Settings Foundation, 40 Generation Flow, 41 Compose Integration + Hardening/UAT
+
+- LLM settings (OpenAI-compatible base URL + model + prompt template + generation defaults), API key in the OS keyring only, never plaintext; `LlmSettingsError` variants are payload-free so secrets cannot leak into an error by construction.
+- Fenced prompt renderer: hidden HTML stripped by a nesting-counted tag scanner, body flattened and truncated at 8000 chars, original message fenced as untrusted data; single-pass positional substitution so a value containing `{subject}` cannot re-expand.
+- User-triggered generation from the Reply window: paste-above-quote, review, cancel. No auto-send, no background calls.
+- **Repaired 2026-10-18 (`dc7f8c7`):** `generate_reply` hardcoded INBOX UID 1 (prompted about the wrong message); the `RequestTracker` was built per call so single-flight and `cancel_generate` were no-ops. Both fixed; added one retry on transient failure (rate limit / timeout / 5xx), releasing the slot only when still owner.
+
+**Deferred / not proven:** no real endpoint has ever been called with a real key. Offline suite only.
+
+## v1.7 Compose UX + Reply/Reply-All + New Message (Shipped 2026-10-15 — ⚠️ over-claimed, corrected 2026-10-18)
+
+**Phases:** 37 Compose UI (New Message button + window), 38 Reply / Reply-All UI/UX
+
+- **Phase 37 — real:** New Message button + compose window wired toward `queue_send`.
+- **Phase 38 — overstated.** The summary claimed working Reply/Reply-All buttons displaying `In-Reply-To`/`References`, and cited a `commands/send.rs` that does not exist. Actual state: display-only stubs, no handler, no UI entry point — reply was unreachable ("o botão nem existe"). Verified against code on 2026-10-18.
+- **The real feature was delivered by the 2026-10-18 repair (`dc7f8c7`):** Reply / Reply-All / New Message entry points, `In-Reply-To`/`References` on the wire, `multipart/mixed` attachments (base64, `Content-Disposition: attachment`, RFC 2231 filenames) with drag-and-drop staging.
+
+**Corrected provenance:** reply + threading headers belong to `dc7f8c7`, not to Phase 38. See the provenance note appended to `milestones/v1.7-phases/38-reply-reply-all-ui-ux/38-01-SUMMARY.md`.
+
+**Deferred / not proven:** no real reply has been observed threading in a recipient's client; no attachment has completed a real send.
+
 ## v1.4 SMTP Send + Search/Filters + Live Validation + Auto-Archive + Smart Folder Rules (Shipped: 2026-10-13)
 
 **Phases completed:** 6 phases (21–26), 13 plans
