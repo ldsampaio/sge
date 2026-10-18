@@ -31,6 +31,14 @@ export interface MessageView {
   text: string | null;
   has_attachments: boolean;
   attachments: AttachmentInfo[];
+  /** Cc recipients — reply seeding. NOT returned by `fetch_message` yet
+   *  (`MessageView` in `commands/sync.rs` has no such field), so reply
+   *  prefills degrade to empty instead of failing to type-check. */
+  cc_addrs?: string[];
+  /** Original Message-ID — reply threading (`In-Reply-To`). Backend gap, as above. */
+  message_id?: string | null;
+  /** Original References chain — reply threading. Backend gap, as above. */
+  references?: string | null;
 }
 
 /** Cached mailbox row from the local store, surfaced to the sidebar. */
@@ -233,6 +241,58 @@ export interface SendStatusResult {
   sending: number;
   uncertain: number;
   sent_unfiled: number;
+}
+
+/** Compose window mode — the `#compose?mode=` values `open_compose_window`
+ *  accepts (`commands/window.rs` rejects anything else by name). */
+export type ComposeMode = "new" | "reply" | "reply-all";
+
+/** Staged attachment sent with `queue_send`.
+ *
+ *  NOTE: `queue_send` (Rust) does not accept attachments yet — the extra
+ *  field is currently ignored by the backend, so attachments are dropped at
+ *  enqueue time. Tracked as a known gap, not a silent success. */
+export interface OutgoingAttachmentPayload {
+  filename: string;
+  content_type: string;
+  /** Data URL (`data:<mime>;base64,<payload>`) or bare base64. */
+  data_base64: string;
+}
+
+/** `queue_send` result — mirrors `send_queue::EnqueueOutcome`. */
+export interface QueueSendResult {
+  queue_id: string;
+  message_id: string;
+  /** Send-queue state after enqueue (`queued`). */
+  state: string;
+  /** True when this Message-ID was already queued (dedupe hit, not a resend). */
+  deduped: boolean;
+}
+
+/** `send_pending` result — mirrors `commands::sync::SendPendingResult`. */
+export interface SendPendingResult {
+  /** Relay accepted the bytes and the Sent copy landed. */
+  sent: number;
+  /** Delivered but the Sent copy is still missing (filing/APPEND leg). */
+  sent_unfiled: number;
+  failed: number;
+  uncertain: number;
+  deferred: number;
+  /** True when another flush pass held the gate — nothing was attempted. */
+  skipped: boolean;
+  /** Plain-language reason for the newest parked row (never a body or a key). */
+  last_error: string | null;
+  /** Resolved Sent mailbox wire name, for an immediate Sent re-sync. */
+  sent_wire: string | null;
+}
+
+/** `send_row_state` result — mirrors `commands::sync::SendRowStateResult`. */
+export interface SendRowState {
+  queue_id: string;
+  /** `queued|sending|sent|sent_unfiled|failed|uncertain`. */
+  state: string;
+  attempts: number;
+  last_error: string | null;
 }
 
 /** Reply context from message cache (BODY.PEEK-only) for threading headers and quote attribution. */

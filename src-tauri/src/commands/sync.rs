@@ -25,9 +25,10 @@ use crate::imap::session::connect_sync;
 use crate::imap::trash::{detect_trash, TrashResolution};
 use crate::imap::SyncSession;
 use crate::imap::{AccountConfig, MailboxInfo, SecurityMode, SyncError};
+use crate::smtp::SmtpAccount;
 use crate::store::queries;
 use crate::sync::bodies;
-use crate::sync::worker::SyncWorker;
+use crate::sync::worker::{SendFlushEnv, SyncWorker};
 use crate::sync::{SyncCallback, SyncEvent};
 
 /// Load the active account config: prefer in-memory `active_account`
@@ -1232,6 +1233,220 @@ pub async fn send_status(
     .map_err(|e| format!("internal error: send_status task failed ({e})"))?
 }
 
+/// Submission port for the SMTP relay (RFC 6409 submission). Fixed by the
+/// project's server facts (`smtp.utfpr.edu.br:587`, STARTTLS): Phase 35 built
+/// the transport around one pinned relay and Phase 36 pinned host/port as
+/// "no SMTP server config changes", so there is deliberately no settings
+/// field for it — only the host is derived from the IMAP login.
+const SMTP_SUBMISSION_PORT: u16 = 587;
+
+/// SMTP relay host for an IMAP host: same-domain service-label swap
+/// (`mail.utfpr.edu.br` → `smtp.utfpr.edu.br`, `imap.example.org` →
+/// `smtp.example.org`). A name that is already a relay (`smtp.*`) or that
+/// carries no service label is used unchanged — many providers serve both
+/// protocols on one name.
+fn smtp_host_for(imap_host: &str) -> String {
+    let host = imap_host.trim().trim_end_matches('.').to_ascii_lowercase();
+    for prefix in ["mail.", "imap.", "pop.", "pop3."] {
+        if let Some(rest) = host.strip_prefix(prefix) {
+            if !rest.is_empty() {
+                return format!("smtp.{rest}");
+            }
+        }
+    }
+    host
+}
+
+/// SMTP account for the active login: the mail credentials (same user and
+/// password as IMAP) against the derived relay host on the submission port.
+/// A `Debug` of this struct is safe to log — the password prints `<redacted>`.
+pub(crate) fn smtp_account_for(cfg: &AccountConfig) -> Result<SmtpAccount, String> {
+    let host = smtp_host_for(&cfg.host);
+    if host.is_empty() || !host.contains('.') {
+        return Err(format!(
+            "could not derive an SMTP relay from the server address '{}' — \
+             sending needs a mail relay host",
+            cfg.host
+        ));
+    }
+    Ok(SmtpAccount {
+        host,
+        port: SMTP_SUBMISSION_PORT,
+        username: cfg.username.clone(),
+        password: cfg.password.as_str().to_string(),
+    })
+}
+
+/// Result of one `send_pending` pass (Compose Send + filing retry). Mirrors
+/// `SendPendingResult` in `src/types.ts`.
+#[derive(Debug, Clone, Serialize)]
+pub struct SendPendingResult {
+    /// Relay accepted the bytes and the Sent copy landed.
+    pub sent: usize,
+    /// Relay accepted the bytes but the Sent copy is still missing — the
+    /// APPEND-only retry territory, never re-sent over SMTP.
+    pub sent_unfiled: usize,
+    pub failed: usize,
+    pub uncertain: usize,
+    pub deferred: usize,
+    /// True when another flush held the gate: nothing was attempted.
+    pub skipped: bool,
+    /// Plain-language reason for the newest parked row (never a body or key).
+    pub last_error: Option<String>,
+    /// Resolved Sent wire name so the UI can re-sync that folder immediately.
+    pub sent_wire: Option<String>,
+}
+
+/// Flush the send queue once and return what happened.
+///
+/// The one path by which queued mail leaves the machine: compose Enviar
+/// enqueues durably (`queue_send`) and then calls this to deliver now, and the
+/// compose window's "Tentar arquivar" calls it again to retry a missing Sent
+/// copy. Both are explicit user actions — this command never runs on its own,
+/// and nothing about the message body or the API surface reaches a log.
+///
+/// Order (mirrors the sync pass's step 4d, minus the IMAP sweep):
+/// 1. Build the flush env: pooled transport, the account's fixed SMTP relay,
+///    one shared [`SendGate`] (no double-flush between two compose windows),
+///    the account's own session manager lease, and the resolved Sent wire.
+///    The Sent LIST is best-effort: a failure degrades the filing leg (rows
+///    report `sent_unfiled`) instead of blocking delivery.
+/// 2. `flush_send_queue`: crash-recovery triage → per-row claim → SMTP →
+///    probe-before-APPEND filing (never a duplicate Sent copy).
+/// 3. Reconcile rows whose SMTP verdict was uncertain — SEARCH Sent by
+///    Message-ID before any re-send, so a timeout that actually landed is
+///    never delivered twice.
+#[tauri::command]
+pub async fn send_pending(
+    state: State<'_, crate::AppState>,
+) -> Result<SendPendingResult, String> {
+    let account_cfg: AccountConfig = load_account_config(state.clone()).await?;
+    let manager = manager_for(&state, &account_cfg);
+    let store = state.store.clone();
+    let gate = state.send_gate.clone();
+    let transport = state.send_transport.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        async_std::task::block_on(async move {
+            let account = smtp_account_for(&account_cfg)?;
+            let sent_wire = match manager.resolve_sent_wire().await {
+                Ok(wire) => wire,
+                Err(e) => {
+                    eprintln!(
+                        "[SGE send] Sent lookup failed ({e}) — filing leg degraded, \
+                         delivery unaffected"
+                    );
+                    None
+                }
+            };
+            let env = SendFlushEnv {
+                gate,
+                transport,
+                account,
+                manager: Some(manager.clone()),
+                sent_wire: sent_wire.clone(),
+            };
+            let worker = SyncWorker::new(store.clone());
+            let summary = worker.flush_send_queue(&env).await;
+
+            let uncertain_waiting = {
+                let guard = store.lock().unwrap();
+                queries::list_uncertain_sends(guard.conn())
+                    .map(|rows| !rows.is_empty())
+                    .unwrap_or(false)
+            };
+            if !summary.skipped && uncertain_waiting {
+                match manager.lease_for("INBOX").await {
+                    Ok(mut lease) => {
+                        if let Err(e) = worker
+                            .reconcile_uncertain_sends(
+                                lease.session(),
+                                sent_wire.as_deref(),
+                                "INBOX",
+                            )
+                            .await
+                        {
+                            eprintln!("[SGE send] reconcile failed ({e}) — rows stay uncertain");
+                        }
+                    }
+                    Err(e) => eprintln!(
+                        "[SGE send] reconcile lease failed ({e}) — rows stay uncertain"
+                    ),
+                }
+            }
+
+            let last_error = {
+                let guard = store.lock().unwrap();
+                queries::latest_send_error(guard.conn()).ok().flatten()
+            };
+            eprintln!(
+                "[SGE send] send_pending: sent={} unfiled={} failed={} uncertain={} \
+                 deferred={} skipped={}",
+                summary.sent,
+                summary.sent_unfiled,
+                summary.failed,
+                summary.uncertain,
+                summary.deferred,
+                summary.skipped
+            );
+            Ok(SendPendingResult {
+                sent: summary.sent,
+                sent_unfiled: summary.sent_unfiled,
+                failed: summary.failed,
+                uncertain: summary.uncertain,
+                deferred: summary.deferred,
+                skipped: summary.skipped,
+                last_error,
+                sent_wire,
+            })
+        })
+    })
+    .await
+    .map_err(|e| format!("internal error: send task failed ({e})"))?
+}
+
+/// Per-row send state for one `queue_id`. Mirrors `SendRowState` in
+/// `src/types.ts`.
+#[derive(Debug, Clone, Serialize)]
+pub struct SendRowStateResult {
+    pub queue_id: String,
+    /// `queued|sending|sent|sent_unfiled|failed|uncertain` (the `send_queue`
+    /// CHECK vocabulary verbatim).
+    pub state: String,
+    pub attempts: i64,
+    pub last_error: Option<String>,
+}
+
+/// Read this window's own queue row.
+///
+/// The compose window asks about ITS `queue_id` only: aggregate
+/// `send_status()` counts mix every row in the table, so a stranded row from
+/// yesterday could otherwise hold today's window open (or close it early).
+/// An unknown id surfaces the frozen `send-missing:` text rather than a raw
+/// SQL error.
+#[tauri::command]
+pub async fn send_row_state(
+    state: State<'_, crate::AppState>,
+    queue_id: String,
+) -> Result<SendRowStateResult, String> {
+    let store = state.store.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let guard = store.lock().unwrap();
+        match queries::get_send_row(guard.conn(), &queue_id).map_err(|e| e.to_string())? {
+            Some(row) => Ok(SendRowStateResult {
+                queue_id: row.id,
+                state: row.state,
+                attempts: row.attempts,
+                last_error: row.last_error,
+            }),
+            None => Err(format!(
+                "send-missing: unknown send '{queue_id}' — it may already be sent"
+            )),
+        }
+    })
+    .await
+    .map_err(|e| format!("internal error: send_row_state task failed ({e})"))?
+}
+
 /// Cancel the currently running sync pass.
 ///
 /// Sets the cooperative flag; the worker checks it between sweep batches
@@ -2285,6 +2500,8 @@ mod tests {
             classify_gate: Arc::new(crate::classify::worker::ClassifyGate::default()),
             batch_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             idle: Mutex::new(None),
+            send_gate: crate::send_queue::SendGate::default(),
+            send_transport: Arc::new(crate::smtp::SmtpTransporter::new()),
         };
         assert!(state.idle.lock().unwrap().is_none());
     }

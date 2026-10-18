@@ -1,12 +1,15 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window",
+  "description": "Capability for the app's windows: main, compose-*, llm-config",
   "windows": [
-    "main"
+    "main",
+    "compose-*",
+    "llm-config"
   ],
   "permissions": [
     "core:default",
+    "core:window:allow-close",
     "dialog:default",
     "shell:default",
     {

@@ -81,6 +81,15 @@ pub struct AppState {
             tauri::async_runtime::JoinHandle<()>,
         )>,
     >,
+    /// Send-lane single-flight gate, shared by every `send_pending` caller
+    /// (two compose windows, or a send racing a sync-pass flush): the clone
+    /// shares the flag, so at most one SMTP flush pass runs at a time and a
+    /// row can never be delivered twice by overlapping passes.
+    pub send_gate: send_queue::SendGate,
+    /// One pooled SMTP transport for the whole process (lettre recycles
+    /// connections per account). A fresh transport per send would reconnect
+    /// every time and risk a second client against the relay.
+    pub send_transport: Arc<dyn smtp::SmtpTransport>,
 }
 
 /// In-memory credentials + server config for the connected session.
@@ -443,6 +452,8 @@ pub fn run() {
         classify_gate: Arc::new(classify::worker::ClassifyGate::default()),
         batch_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         idle: Mutex::new(None),
+        send_gate: send_queue::SendGate::default(),
+        send_transport: Arc::new(smtp::SmtpTransporter::new()),
     };
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -472,8 +483,11 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Kill-on-exit: no orphan sidecar survives app quit.
-            if matches!(event, tauri::WindowEvent::Destroyed) {
+            // Kill-on-exit: no orphan sidecar survives app quit. Gated on the
+            // MAIN window label — compose / LLM-settings windows are created
+            // and destroyed while the app keeps running, and closing one must
+            // never kill the classifier.
+            if window.label() == "main" && matches!(event, tauri::WindowEvent::Destroyed) {
                 if let Some(state) = window.app_handle().try_state::<AppState>() {
                     if let Some(child) = state.sidecar_child.lock().unwrap().take() {
                         let _ = child.kill();
@@ -501,8 +515,9 @@ pub fn run() {
             commands::sync::get_draft,
             commands::sync::discard_draft,
             commands::sync::cancel_sync,
-            commands::sync::open_compose_window,
-            commands::sync::open_llm_config_window,
+            commands::window::open_compose_window,
+            commands::window::open_llm_config_window,
+            commands::window::close_compose_window,
             commands::sync::idle_status,
             commands::sync::idle_start,
             commands::sync::idle_stop,
@@ -524,7 +539,6 @@ pub fn run() {
             commands::sync::send_status,
             commands::sync::send_pending,
             commands::sync::send_row_state,
-            commands::sync::close_compose_window,
             commands::classify::classify_message,
             commands::classify::classify_status,
             commands::classify::confirm_suggestion,

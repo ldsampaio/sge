@@ -16,6 +16,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use chrono::Utc;
 use rusqlite::Connection;
@@ -68,16 +69,14 @@ impl SendState {
 /// never block a retry. At most one flush runs at a time — a second caller
 /// gets `None` from [`try_begin`](SendGate::try_begin) and must skip, never
 /// overlap (double-flush would risk double-SMTP-send).
+///
+/// Cloning shares the flag (`Arc` inside): the app holds ONE gate in
+/// `AppState` and hands a clone to every `SendFlushEnv`, so the compose
+/// window's `send_pending`, a second compose window, and a sync-pass flush
+/// can never overlap each other.
+#[derive(Clone, Default)]
 pub struct SendGate {
-    in_flight: AtomicBool,
-}
-
-impl Default for SendGate {
-    fn default() -> Self {
-        Self {
-            in_flight: AtomicBool::new(false),
-        }
-    }
+    in_flight: Arc<AtomicBool>,
 }
 
 impl SendGate {
