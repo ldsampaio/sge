@@ -159,10 +159,14 @@ const M22_LEARN_SQL: &str = concat!(
 /// are seeded in-migration so a fresh install reads sane values without a
 /// lazy-seed path. The seed literals mirror `llm::DEFAULT_*` — the
 /// `seed_defaults_equal_consts` test fails on any drift.
+/// NOTE: `provider` is deliberately absent here — M24 adds it. This table is
+/// replayed from scratch on a fresh database, so a column here AND an
+/// `ALTER TABLE ... ADD COLUMN` for the same column in M24 would make M24
+/// fail with `duplicate column name: provider` and every fresh install (plus
+/// every in-memory test database) unopenable.
 const M23_LLM_SETTINGS_SQL: &str = concat!(
     "CREATE TABLE llm_settings (",
     "  id              INTEGER PRIMARY KEY CHECK (id = 1),",
-    "  provider        TEXT NOT NULL DEFAULT 'custom',",
     "  base_url        TEXT NOT NULL DEFAULT '',",
     "  model           TEXT NOT NULL DEFAULT '',",
     "  temperature     REAL NOT NULL DEFAULT 0.7,",
@@ -171,8 +175,8 @@ const M23_LLM_SETTINGS_SQL: &str = concat!(
     "  prompt_template TEXT NOT NULL DEFAULT '',",
     "  updated_at      TEXT NOT NULL DEFAULT (datetime('now'))",
     ");",
-    "INSERT INTO llm_settings (id, provider, base_url, model, temperature, max_tokens, timeout_secs, prompt_template)",
-    " VALUES (1, 'custom', 'https://api.openai.com/v1', 'gpt-4o-mini', 0.7, 500, 60,",
+    "INSERT INTO llm_settings (id, base_url, model, temperature, max_tokens, timeout_secs, prompt_template)",
+    " VALUES (1, 'https://api.openai.com/v1', 'gpt-4o-mini', 0.7, 500, 60,",
     " 'Write a helpful reply to the email below. From: {sender} Subject: {subject} Body: {body}');",
 );
 /// M24 forward migration: add `provider` column to existing `llm_settings`
@@ -882,8 +886,10 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_23_with_m23_llm_settings() {
-        assert_eq!(SCHEMA_VERSION, 23);
+    fn schema_version_is_25_with_m23_llm_settings() {
+        // 23 → 25 when M24 (llm_settings.provider) and M25 (llm_models) landed.
+        // The assertions below still only exercise M2/M6-era shape.
+        assert_eq!(SCHEMA_VERSION, 25);
         let store = Store::open_in_memory().expect("migration should succeed");
         let conn = store.conn();
         let count: i64 = conn

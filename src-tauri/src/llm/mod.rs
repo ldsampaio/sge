@@ -168,7 +168,7 @@ impl From<&LlmSettingsInput> for LlmSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::queries::{get_llm_settings, upsert_llm_settings};
+    use crate::store::queries::{get_llm_models, get_llm_settings_legacy, upsert_llm_model};
     use crate::store::Store;
 
     /// Edited (non-default) settings used by the round-trip tests.
@@ -188,7 +188,7 @@ mod tests {
     #[test]
     fn seed_defaults_equal_consts() {
         let store = Store::open_in_memory().expect("migration should succeed");
-        let got = get_llm_settings(store.conn())
+        let got = get_llm_settings_legacy(store.conn())
             .expect("read should succeed")
             .expect("M23 must seed row id 1");
         assert_eq!(got.base_url, DEFAULT_BASE_URL);
@@ -203,13 +203,24 @@ mod tests {
 
     #[test]
     fn save_then_read_round_trips_edited_values() {
+        // Multi-model lane (M25): the save path writes `llm_models`, so the
+        // round-trip reads it back through `get_llm_models` (the legacy
+        // single-row `llm_settings` table now only carries the M23 seed).
         let store = Store::open_in_memory().expect("migration should succeed");
         let validated = validate::validate(&edited()).expect("edited values are valid");
-        upsert_llm_settings(store.conn(), &validated).expect("upsert should succeed");
-        let got = get_llm_settings(store.conn())
-            .expect("read should succeed")
-            .expect("row must exist after upsert");
-        assert_eq!(got, validated);
+        let id = upsert_llm_model(store.conn(), &validated).expect("upsert should succeed");
+        let rows = get_llm_models(store.conn()).expect("read should succeed");
+        assert_eq!(rows.len(), 1, "one configured model after one insert");
+        let got = &rows[0];
+        assert_eq!(got.id, Some(id), "the insert reports the stored row id");
+        assert_eq!(
+            *got,
+            LlmSettings {
+                id: Some(id),
+                ..validated.clone()
+            },
+            "every validated field round-trips unchanged"
+        );
         assert_eq!(got.base_url, "http://localhost:11434");
         assert_eq!(got.model, "llama3");
     }
@@ -248,19 +259,24 @@ mod tests {
 
     #[test]
     fn double_save_leaves_one_identical_row() {
+        // `upsert_llm_model` inserts when `id` is `None` and updates in place
+        // when it is `Some` — so "double save" is save-then-update-its-id, and
+        // the invariant to keep is one row carrying the last values.
         let store = Store::open_in_memory().expect("migration should succeed");
         let validated = validate::validate(&edited()).expect("edited values are valid");
-        upsert_llm_settings(store.conn(), &validated).expect("first upsert");
-        upsert_llm_settings(store.conn(), &validated).expect("second upsert");
+        let id = upsert_llm_model(store.conn(), &validated).expect("first save");
+        let with_id = LlmSettings {
+            id: Some(id),
+            ..validated.clone()
+        };
+        upsert_llm_model(store.conn(), &with_id).expect("second save");
         let count: i64 = store
             .conn()
-            .query_row("SELECT COUNT(*) FROM llm_settings", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM llm_models", [], |r| r.get(0))
             .expect("count should succeed");
         assert_eq!(count, 1, "double-save must stay a single row");
-        let got = get_llm_settings(store.conn())
-            .expect("read should succeed")
-            .expect("row must exist");
-        assert_eq!(got, validated, "double-save must keep identical values");
+        let rows = get_llm_models(store.conn()).expect("read should succeed");
+        assert_eq!(rows, vec![with_id], "double-save must keep identical values");
     }
 
     #[test]
@@ -271,15 +287,26 @@ mod tests {
         const FAKE_KEY: &str = "sk-test-fake-key-material-never-stored";
         let store = Store::open_in_memory().expect("migration should succeed");
         let validated = validate::validate(&edited()).expect("edited values are valid");
-        upsert_llm_settings(store.conn(), &validated).expect("upsert should succeed");
+        let saved = upsert_llm_model(store.conn(), &validated).expect("save should succeed");
+        assert!(saved > 0, "the save must report the stored row id");
+        // Scan every settings text cell in the store — the row this test just
+        // wrote in `llm_models` AND the M23 seed row in the legacy
+        // `llm_settings` table.
         let dump: String = store
             .conn()
             .query_row(
-                "SELECT base_url || '|' || model || '|' || prompt_template FROM llm_settings WHERE id = 1",
+                "SELECT group_concat(line, '|') FROM (
+                     SELECT provider || '|' || base_url || '|' || model || '|' || prompt_template AS line
+                       FROM llm_settings
+                     UNION ALL
+                     SELECT provider || '|' || base_url || '|' || model || '|' || prompt_template
+                       FROM llm_models
+                 )",
                 [],
                 |r| r.get(0),
             )
             .expect("dump should succeed");
+        let debug = format!("{validated:?}");
         assert!(
             !dump.contains(FAKE_KEY),
             "settings row must not contain key material"

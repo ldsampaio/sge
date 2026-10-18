@@ -5205,6 +5205,11 @@ pub fn delete_llm_model(conn: &Connection, id: i64) -> StoreResult<()> {
 
 /// Backward-compat: read the single `llm_settings` row (id = 1) if it exists.
 /// Used only for migration/fallback; new code should use `get_llm_models`.
+///
+/// Column offsets are positional and 0-based against the SELECT below — the
+/// previous revision read `temperature` from index 5 and `prompt_template`
+/// from index 8 of an 8-column row, so the read always failed at runtime
+/// (`Invalid column index`). No caller existed yet, which is why it was silent.
 pub fn get_llm_settings_legacy(conn: &Connection) -> StoreResult<Option<crate::llm::LlmSettings>> {
     conn.query_row(
         "SELECT id, provider, base_url, model, temperature, max_tokens, timeout_secs, prompt_template
@@ -5216,10 +5221,10 @@ pub fn get_llm_settings_legacy(conn: &Connection) -> StoreResult<Option<crate::l
                 provider: r.get(1)?,
                 base_url: r.get(2)?,
                 model: r.get(3)?,
-                temperature: r.get(5)?,
-                max_tokens: r.get(6)?,
-                timeout_secs: r.get(7)?,
-                prompt_template: r.get(8)?,
+                temperature: r.get(4)?,
+                max_tokens: r.get(5)?,
+                timeout_secs: r.get(6)?,
+                prompt_template: r.get(7)?,
             })
         },
     )

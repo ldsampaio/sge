@@ -516,7 +516,11 @@ mod tests {
     use crate::llm::{LlmSettings, DEFAULT_BASE_URL, DEFAULT_MODEL};
 
     fn test_settings() -> LlmSettings {
+        // Multi-model lane shape (M25): every configured model carries an
+        // `id` (None until stored) and a provider preset key.
         LlmSettings {
+            id: None,
+            provider: "custom".to_string(),
             base_url: "http://localhost:11434".to_string(),
             model: "test-model".to_string(),
             temperature: 0.7,
@@ -585,7 +589,13 @@ mod tests {
     fn generate_reply_no_key_returns_not_configured() {
         let settings = test_settings();
         let key_store = MemoryLlmKeyStore::new();
-        let result = generate_reply(&settings, "test body", &key_store, "INBOX", None);
+        let result = tauri::async_runtime::block_on(generate_reply_async(
+            &settings,
+            "test body",
+            &key_store,
+            "INBOX",
+            None,
+        ));
         assert!(matches!(result, Err(LlmRequestError::NotConfigured)));
     }
 }
