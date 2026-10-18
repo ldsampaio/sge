@@ -6,6 +6,7 @@ import FolderDeleteModal from "./FolderDeleteModal";
 import MessageList, { type ListState } from "./MessageList";
 import ReadingPane from "./ReadingPane";
 import DraftEditor from "./DraftEditor";
+import ComposeWindow, { type ComposePrefill } from "./ComposeWindow";
 import SyncStatus from "./SyncStatus";
 import SearchBar from "./SearchBar";
 import SearchScopeSelector, {
@@ -13,10 +14,7 @@ import SearchScopeSelector, {
   scopeToFolders,
   scopeLabel,
 } from "./SearchScopeSelector";
-import SavedFiltersPanel, {
-  type SavedFilterRow,
-  type SearchSort,
-} from "./SavedFiltersPanel";
+import SavedFiltersPanel, { type SavedFilterRow, type SearchSort } from "./SavedFiltersPanel";
 import type {
   MessageRow,
   MessageView,
@@ -28,7 +26,8 @@ import type {
   DeleteFolderResult,
   SyncStatusInfo,
 } from "../types";
-import { IconCap } from "./icons";
+import { IconCap, IconNewMessage } from "./icons";
+import { openComposeWindow } from "../lib/compose";
 import "./MailboxView.css";
 
 /** True when the raw wire name is the Drafts folder (role first, name fallback). */
@@ -91,6 +90,9 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
   } | null>(null);
   const [draftLoading, setDraftLoading] = useState(false);
   const [draftNotice, setDraftNotice] = useState<string | null>(null);
+  /** Draft handed to the send lane: the compose window owns SMTP/Sent filing
+   *  (the Drafts editor only persists locally). Non-null = compose pane. */
+  const [composeFromDraft, setComposeFromDraft] = useState<ComposePrefill | null>(null);
   /** Server UIDs saved by this session → compose-session ids (row→session map). */
   const sessionDraftsRef = useRef<Map<number, string>>(new Map());
   /** Monotonic mint for per-open editor session keys (MJ-01/MJ-02). */
@@ -269,17 +271,47 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
     setRefreshKey((k) => k + 1);
   }
 
-  const handleSearch = useCallback((query: string) => {
-    // Manual typing detaches the active filter (it no longer describes
-    // the query) and persists the new view.
-    setSearchQuery((prev) => {
-      const next = query.length > 0 ? query : null;
-      if (next !== prev) setSelectedMessage(null);
-      return next;
+  /** The draft is saved; hand its fields to the compose pane, which is the
+   *  only surface that can actually send (queue_send + send_pending). */
+  function handleSendFromDraft(fields: {
+    to: string;
+    cc: string;
+    bcc: string;
+    subject: string;
+    body: string;
+  }) {
+    setDraftEditor(null);
+    setSelectedMessage(null);
+    setComposeFromDraft({
+      to: fields.to,
+      cc: fields.cc,
+      bcc: fields.bcc,
+      subject: fields.subject,
+      body: fields.body,
+      in_reply_to: null,
+      references: null,
     });
-    setActiveFilterId(null);
-    persistSearchState(query.length > 0 ? query : null, searchScopeRef.current, searchSortRef.current, null);
-  }, [persistSearchState]);
+  }
+
+  const handleSearch = useCallback(
+    (query: string) => {
+      // Manual typing detaches the active filter (it no longer describes
+      // the query) and persists the new view.
+      setSearchQuery((prev) => {
+        const next = query.length > 0 ? query : null;
+        if (next !== prev) setSelectedMessage(null);
+        return next;
+      });
+      setActiveFilterId(null);
+      persistSearchState(
+        query.length > 0 ? query : null,
+        searchScopeRef.current,
+        searchSortRef.current,
+        null,
+      );
+    },
+    [persistSearchState],
+  );
 
   /** Scope change: narrowing re-runs the live search and persists. */
   function handleScopeChange(scope: SearchScope) {
@@ -438,9 +470,7 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
         // surface the backend copy, never the raw wire protocol string.
         const needTyped = /^need_typed_confirm:(.+)$/.exec(msg);
         setDeleteError(
-          needTyped
-            ? `O nome da pasta mudou — digite ${needTyped[1]} para confirmar.`
-            : msg,
+          needTyped ? `O nome da pasta mudou — digite ${needTyped[1]} para confirmar.` : msg,
         );
       }
     } finally {
@@ -539,6 +569,15 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
                 {messageCount} {messageCount === 1 ? "mensagem" : "mensagens"}
               </span>
             )}
+            <button
+              type="button"
+              className="btn new-message-btn"
+              onClick={() => void openComposeWindow("new")}
+              aria-label="Nova mensagem"
+              title="Nova mensagem — abre uma janela de composição"
+            >
+              <IconNewMessage size={16} /> Nova mensagem
+            </button>
           </div>
           {showFilters && (
             <SavedFiltersPanel
@@ -584,12 +623,20 @@ export default function MailboxView({ mailbox = "INBOX" }: MailboxViewProps) {
             onMessageCount={setMessageCount}
           />
         </main>
-        {draftEditor !== null || draftLoading ? (
+        {composeFromDraft !== null ? (
+          <ComposeWindow
+            mode="new"
+            initial={composeFromDraft}
+            onSent={() => setRefreshKey((k) => k + 1)}
+            onClose={() => setComposeFromDraft(null)}
+          />
+        ) : draftEditor !== null || draftLoading ? (
           <DraftEditorPane
             draftEditor={draftEditor}
             loading={draftLoading}
             onSaved={handleDraftSaved}
             onDiscarded={handleDraftDiscarded}
+            onSend={handleSendFromDraft}
             onClose={() => setDraftEditor(null)}
           />
         ) : (
@@ -648,12 +695,14 @@ function DraftEditorPane({
   loading,
   onSaved,
   onDiscarded,
+  onSend,
   onClose,
 }: {
   draftEditor: { draftId: string | null; initial?: DraftRow | null; key: string } | null;
   loading: boolean;
   onSaved: (result: DraftSaveResult) => void;
   onDiscarded: (id: string) => void;
+  onSend: (fields: { to: string; cc: string; bcc: string; subject: string; body: string }) => void;
   onClose: () => void;
 }) {
   if (draftEditor === null) {
@@ -672,6 +721,7 @@ function DraftEditorPane({
       initial={draftEditor.initial}
       onSaved={onSaved}
       onDiscarded={onDiscarded}
+      onSend={onSend}
       onClose={onClose}
     />
   );

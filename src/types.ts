@@ -31,13 +31,15 @@ export interface MessageView {
   text: string | null;
   has_attachments: boolean;
   attachments: AttachmentInfo[];
-  /** Cc recipients — reply seeding. NOT returned by `fetch_message` yet
-   *  (`MessageView` in `commands/sync.rs` has no such field), so reply
-   *  prefills degrade to empty instead of failing to type-check. */
-  cc_addrs?: string[];
-  /** Original Message-ID — reply threading (`In-Reply-To`). Backend gap, as above. */
-  message_id?: string | null;
-  /** Original References chain — reply threading. Backend gap, as above. */
+  /** Cc recipients — seeded into "Responder a todos". */
+  cc_addrs: string[];
+  /** Original RFC822 Message-ID — `In-Reply-To` for replies (`null` when the
+   *  server sent none, in which case no threading header is built). */
+  message_id: string | null;
+  /** Original References chain. NOT parsed by the backend today (the header
+   *  fetch lane does not extract it), so `buildReplySeed` degrades to
+   *  `References = In-Reply-To` — which still threads correctly, it just
+   *  does not list the whole ancestor chain. */
   references?: string | null;
 }
 
@@ -249,9 +251,11 @@ export type ComposeMode = "new" | "reply" | "reply-all";
 
 /** Staged attachment sent with `queue_send`.
  *
- *  NOTE: `queue_send` (Rust) does not accept attachments yet — the extra
- *  field is currently ignored by the backend, so attachments are dropped at
- *  enqueue time. Tracked as a known gap, not a silent success. */
+ *  `queue_send` renders these as `multipart/mixed` base64 parts with a
+ *  `Content-Disposition: attachment` header (25 MB cap on the rendered
+ *  message). `data_base64` accepts a `data:<mime>;base64,<payload>` URL or
+ *  bare base64; the backend normalizes both. Invalid base64 is refused with
+ *  `send-bad-attachment`. */
 export interface OutgoingAttachmentPayload {
   filename: string;
   content_type: string;
@@ -296,19 +300,8 @@ export interface SendRowState {
 }
 
 /** Reply context from message cache (BODY.PEEK-only) for threading headers and quote attribution. */
-export interface ReplyContext {
-  /** Original message's Message-ID for In-Reply-To header. */
-  message_id: string;
-  /** Original message's References header chain (if any). */
-  references: string | null;
-  /** Original message's From address. */
-  from_addr: string;
-  /** Original message's To addresses (comma-separated). */
-  to_addrs: string;
-  /** Original message's Cc addresses (comma-separated). */
-  cc_addrs: string;
-  /** Original message's date for quote attribution. */
-  date_utc: string;
-  /** Original message's text body for quoting (BODY.PEEK read from cache). */
-  body_text: string | null;
-}
+/** Where the reply context comes from: `fetch_message`'s [`MessageView`].
+ *  The backend also exposes an internal `store::queries::get_reply_context`
+ *  read (sender/subject/Cc/Message-ID + cached body) used by the LLM prompt
+ *  builder — it is not part of the IPC surface. */
+export type ReplyContextSource = MessageView;

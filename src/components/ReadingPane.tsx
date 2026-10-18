@@ -3,7 +3,16 @@ import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import type { MessageRow, MessageView, SetSeenResult, MailboxRow } from "../types";
 import { isUnread, dispatchFlagUpdate } from "../types";
-import { IconBook, IconDownload, IconMail, IconTrash, IconMove } from "./icons";
+import { openComposeWindow } from "../lib/compose";
+import {
+  IconBook,
+  IconDownload,
+  IconMail,
+  IconReply,
+  IconReplyAll,
+  IconTrash,
+  IconMove,
+} from "./icons";
 import MoveMenu from "./MoveMenu";
 import ExpungeModal from "./ExpungeModal";
 import { SuggestionBar } from "./ClassifyBadges";
@@ -37,7 +46,11 @@ interface ReadingPaneProps {
   mailboxes?: MailboxRow[];
 }
 
-export default function ReadingPane({ selectedMessage, mailbox = "INBOX", mailboxes = [] }: ReadingPaneProps) {
+export default function ReadingPane({
+  selectedMessage,
+  mailbox = "INBOX",
+  mailboxes = [],
+}: ReadingPaneProps) {
   const [message, setMessage] = useState<MessageView | null>(null);
   const [status, setStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
   const [errorMsg, setErrorMsg] = useState("");
@@ -146,6 +159,13 @@ export default function ReadingPane({ selectedMessage, mailbox = "INBOX", mailbo
       setSuggestBusy(false);
     }
   };
+  /** Open the compose window seeded from this message (BODY.PEEK-only read
+   *  inside the new window; the reader's message is never mutated). */
+  function handleReply(mode: "reply" | "reply-all"): void {
+    if (!selectedMessage) return;
+    void openComposeWindow(mode, { uid: selectedMessage.uid, mailbox });
+  }
+
   // Expunge modal state
   const [expungeModal, setExpungeModal] = useState<{
     open: boolean;
@@ -289,14 +309,11 @@ export default function ReadingPane({ selectedMessage, mailbox = "INBOX", mailbo
     if (!selectedMessage || !isTauriRuntime()) return;
     const uid = selectedMessage.uid;
     try {
-      await invoke<{ acked: boolean; pending_count: number; detail: string }>(
-        "delete_message",
-        { uid, mailbox }
-      );
-      showUndoToast(
-        `Mensagem movida para a Lixeira.`,
-        () => handleUndoDelete(uid)
-      );
+      await invoke<{ acked: boolean; pending_count: number; detail: string }>("delete_message", {
+        uid,
+        mailbox,
+      });
+      showUndoToast(`Mensagem movida para a Lixeira.`, () => handleUndoDelete(uid));
     } catch (err) {
       const msg = String(err);
       if (msg.startsWith("need_trash_confirm:")) {
@@ -322,22 +339,19 @@ export default function ReadingPane({ selectedMessage, mailbox = "INBOX", mailbo
     const uid = selectedMessage.uid;
     closeMoveMenu();
     try {
-      await invoke<{ acked: boolean; pending_count: number; detail: string }>(
-        "move_message",
-        { uid, dest: destRaw, mailbox }
-      );
+      await invoke<{ acked: boolean; pending_count: number; detail: string }>("move_message", {
+        uid,
+        dest: destRaw,
+        mailbox,
+      });
       const folderLabel = mailboxes.find((mb) => mb.name === destRaw)?.display_name ?? destRaw;
-      showUndoToast(
-        `Mensagem movida para ${folderLabel}.`,
-        () => handleUndoMove(uid, destRaw)
-      );
+      showUndoToast(`Mensagem movida para ${folderLabel}.`, () => handleUndoMove(uid, destRaw));
     } catch (err) {
       const msg = String(err);
       setErrorMsg(`Não foi possível mover: ${msg}`);
       const folderLabel = mailboxes.find((mb) => mb.name === destRaw)?.display_name ?? destRaw;
-      showUndoToast(
-        `Não foi possível mover para ${folderLabel}: ${msg}`,
-        () => handleMove(moveMenu.triggerRef)
+      showUndoToast(`Não foi possível mover para ${folderLabel}: ${msg}`, () =>
+        handleMove(moveMenu.triggerRef),
       );
     }
   };
@@ -382,10 +396,10 @@ export default function ReadingPane({ selectedMessage, mailbox = "INBOX", mailbo
 
   const onExpungeConfirm = async (uids: number[]) => {
     try {
-      await invoke<{ removed: number; acked: boolean; detail: string }>(
-        "expunge_messages",
-        { uids, mailbox }
-      );
+      await invoke<{ removed: number; acked: boolean; detail: string }>("expunge_messages", {
+        uids,
+        mailbox,
+      });
       closeExpungeModal();
     } catch (err) {
       const msg = String(err);
@@ -400,15 +414,13 @@ export default function ReadingPane({ selectedMessage, mailbox = "INBOX", mailbo
     const uid = selectedMessage.uid;
     const destRaw = "INBOX"; // Default restore destination
     try {
-      await invoke<{ acked: boolean; pending_count: number; detail: string }>(
-        "move_message",
-        { uid, dest: destRaw, mailbox }
-      );
+      await invoke<{ acked: boolean; pending_count: number; detail: string }>("move_message", {
+        uid,
+        dest: destRaw,
+        mailbox,
+      });
       const folderLabel = mailboxes.find((mb) => mb.name === destRaw)?.display_name ?? destRaw;
-      showUndoToast(
-        `Mensagem movida para ${folderLabel}.`,
-        () => handleUndoMove(uid, destRaw)
-      );
+      showUndoToast(`Mensagem movida para ${folderLabel}.`, () => handleUndoMove(uid, destRaw));
     } catch (err) {
       const msg = String(err);
       setErrorMsg(`Não foi possível restaurar: ${msg}`);
@@ -490,18 +502,30 @@ export default function ReadingPane({ selectedMessage, mailbox = "INBOX", mailbo
           />
         )}
         {suggestion && suggestion.stale && (
-          <div role="group" aria-label="Sugestão desatualizada" style={{ margin: "8px 0", fontSize: "0.82rem" }}>
-            <span style={{ color: "#eab308" }}>
-              A taxonomia mudou desde esta sugestão —{" "}
-            </span>
-            <button type="button" className="btn btn-small" disabled={suggestBusy} onClick={() => void classifyNow()}>
+          <div
+            role="group"
+            aria-label="Sugestão desatualizada"
+            style={{ margin: "8px 0", fontSize: "0.82rem" }}
+          >
+            <span style={{ color: "#eab308" }}>A taxonomia mudou desde esta sugestão — </span>
+            <button
+              type="button"
+              className="btn btn-small"
+              disabled={suggestBusy}
+              onClick={() => void classifyNow()}
+            >
               Reclassificar
             </button>
           </div>
         )}
         {!suggestion && selectedMessage && (
           <div style={{ margin: "8px 0", fontSize: "0.82rem" }}>
-            <button type="button" className="btn btn-small" disabled={suggestBusy} onClick={() => void classifyNow()}>
+            <button
+              type="button"
+              className="btn btn-small"
+              disabled={suggestBusy}
+              onClick={() => void classifyNow()}
+            >
               Classificar agora
             </button>
             {suggestMsg && (
@@ -530,7 +554,9 @@ export default function ReadingPane({ selectedMessage, mailbox = "INBOX", mailbo
               </button>
               <button
                 type="button"
-                ref={(el) => { expungeModal.triggerRef.current = el; }}
+                ref={(el) => {
+                  expungeModal.triggerRef.current = el;
+                }}
                 className="btn btn-destructive"
                 onClick={() => openExpungeModal(expungeModal.triggerRef)}
                 title="Apagar para sempre"
@@ -543,6 +569,22 @@ export default function ReadingPane({ selectedMessage, mailbox = "INBOX", mailbo
               <button
                 type="button"
                 className="btn"
+                onClick={() => handleReply("reply")}
+                title="Responder — abre uma janela de composição com os destinatários e a citação"
+              >
+                <IconReply size={16} /> Responder
+              </button>
+              <button
+                type="button"
+                className="btn btn-outline"
+                onClick={() => handleReply("reply-all")}
+                title="Responder a todos — inclui os demais destinatários em Para e Cc"
+              >
+                <IconReplyAll size={16} /> Responder a todos
+              </button>
+              <button
+                type="button"
+                className="btn"
                 onClick={() => void handleDelete()}
                 title="Apagar — vai para a Lixeira"
               >
@@ -550,7 +592,9 @@ export default function ReadingPane({ selectedMessage, mailbox = "INBOX", mailbo
               </button>
               <button
                 type="button"
-                ref={(el) => { moveMenu.triggerRef.current = el; }}
+                ref={(el) => {
+                  moveMenu.triggerRef.current = el;
+                }}
                 className="btn"
                 onClick={() => handleMove(moveMenu.triggerRef)}
                 title="Mover para outra pasta"
@@ -560,11 +604,7 @@ export default function ReadingPane({ selectedMessage, mailbox = "INBOX", mailbo
             </>
           )}
         </div>
-        <button
-          type="button"
-          className="btn"
-          onClick={() => void handleToggleSeen()}
-        >
+        <button type="button" className="btn" onClick={() => void handleToggleSeen()}>
           {localUnread ? "Marcar como lido" : "Marcar como não lido"}
         </button>
       </header>

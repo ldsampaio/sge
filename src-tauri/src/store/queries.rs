@@ -762,6 +762,85 @@ pub fn get_message_by_uid(
     }
 }
 
+/// Everything the reply windows (and the LLM prompt builder) need about one
+/// cached original message, in a single read.
+///
+/// This is a *local-cache* read: `body_text` holds the sanitized text cached
+/// by `fetch_message` (`message_bodies`, BODY.PEEK path) and is `None` when the
+/// body was never fetched or was over the cache cap — callers fall back to
+/// `preview` (header-only row) instead of failing. `message_id` feeds
+/// `In-Reply-To`; `cc_addrs_json` feeds Reply-All. Never a key, never a
+/// server call, never a flag write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplyContextRow {
+    pub sender: String,
+    pub subject: String,
+    /// JSON array of Cc addresses as stored (may be `''`).
+    pub cc_addrs_json: String,
+    /// RFC822 Message-ID (`Some` when the server sent one).
+    pub message_id: Option<String>,
+    /// Header preview — the fallback original text when no body is cached.
+    pub preview: String,
+    /// Cached sanitized `text/plain` body, when one was fetched.
+    pub body_text: Option<String>,
+}
+
+/// Read the reply-seeding context for one cached message.
+///
+/// Returns `Ok(None)` when the UID is not in the local cache for `mailbox`
+/// (the caller must surface a plain-language "message not available"
+/// rather than a raw SQL error).
+pub fn get_reply_context(
+    conn: &Connection,
+    mailbox: &str,
+    uid: u32,
+) -> StoreResult<Option<ReplyContextRow>> {
+    match conn.query_row(
+        "SELECT m.from_addr, m.subject, m.cc_addrs, m.message_id, m.preview, \
+         (SELECT b.body_text FROM message_bodies b WHERE b.message_id = m.id) \
+         FROM messages m JOIN mailboxes mb ON m.mailbox_id = mb.id \
+         WHERE mb.name = ?1 AND m.uid = ?2",
+        rusqlite::params![mailbox, uid],
+        |row| {
+            Ok(ReplyContextRow {
+                sender: row.get::<_, String>(0)?,
+                subject: row.get::<_, String>(1)?,
+                cc_addrs_json: row.get::<_, String>(2)?,
+                message_id: row.get::<_, Option<String>>(3)?,
+                preview: row.get::<_, String>(4)?,
+                body_text: row.get::<_, Option<String>>(5)?,
+            })
+        },
+    ) {
+        Ok(row) => Ok(Some(row)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(StoreError::Sql(e)),
+    }
+}
+
+/// Parse a stored address list (`JSON array` or a bare comma/semicolon
+/// string) into a clean `Vec`, dropping blanks. `fetch_message` and the
+/// reply context share this so To/Cc decode identically on every path.
+pub fn parse_addr_list(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "[]" {
+        return Vec::new();
+    }
+    if trimmed.starts_with('[') {
+        return serde_json::from_str::<Vec<String>>(trimmed)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+    trimmed
+        .split([',', ';'])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 /// Metadata for a single attachment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AttachmentInfo {
@@ -2967,6 +3046,83 @@ mod tests {
         assert!(tables.contains(&"message_bodies".to_string()));
         assert!(tables.contains(&"attachment_parts".to_string()));
         assert!(tables.contains(&"messages_fts".to_string()));
+    }
+
+    // ── Reply context (reply windows + LLM prompt) ───────────────
+
+    #[test]
+    fn reply_context_reads_message_id_cc_and_cached_body() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let mb_id = ensure_mailbox(conn, "INBOX").unwrap();
+        upsert_message(
+            conn,
+            mb_id,
+            7,
+            Some("<orig-7@utfpr.edu.br>"),
+            "Aviso",
+            "prof@utfpr.edu.br",
+            "[\"eu@utfpr.edu.br\"]",
+            "[\"cc1@utfpr.edu.br\", \"cc2@utfpr.edu.br\"]",
+            "2024-01-01T00:00:00Z",
+            "[]",
+            false,
+            "primeiros 200 chars",
+        )
+        .unwrap();
+        let mid = find_message_id(conn, mb_id, 7).unwrap().unwrap();
+        insert_body(conn, mid, Some("corpo completo da mensagem"), None).unwrap();
+
+        let ctx = get_reply_context(conn, "INBOX", 7).unwrap().unwrap();
+        assert_eq!(ctx.sender, "prof@utfpr.edu.br");
+        assert_eq!(ctx.subject, "Aviso");
+        assert_eq!(ctx.message_id.as_deref(), Some("<orig-7@utfpr.edu.br>"));
+        assert_eq!(
+            parse_addr_list(&ctx.cc_addrs_json),
+            vec!["cc1@utfpr.edu.br", "cc2@utfpr.edu.br"]
+        );
+        assert_eq!(ctx.body_text.as_deref(), Some("corpo completo da mensagem"));
+    }
+
+    #[test]
+    fn reply_context_falls_back_to_preview_and_reports_unknown_uid() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let mb_id = ensure_mailbox(conn, "INBOX").unwrap();
+        // Header-only row: no message_bodies entry at all.
+        insert_msg(conn, mb_id, 9, "Só cabeçalho", "a@b.c", "[]");
+
+        let ctx = get_reply_context(conn, "INBOX", 9).unwrap().unwrap();
+        assert_eq!(ctx.message_id, None, "no Message-ID means no threading");
+        assert_eq!(ctx.body_text, None, "uncached body must stay None");
+        assert_eq!(ctx.preview, "preview", "preview is the documented fallback");
+
+        assert!(
+            get_reply_context(conn, "INBOX", 424242).unwrap().is_none(),
+            "an uncached UID is a plain None, never a SQL error"
+        );
+        assert!(
+            get_reply_context(conn, "Trash", 9).unwrap().is_none(),
+            "the same UID in another folder is a different message"
+        );
+    }
+
+    #[test]
+    fn parse_addr_list_handles_json_bare_and_blank_forms() {
+        assert_eq!(
+            parse_addr_list("[\"a@x.com\", \"b@y.com\"]"),
+            vec!["a@x.com", "b@y.com"]
+        );
+        assert_eq!(parse_addr_list("a@x.com, b@y.com"), vec!["a@x.com", "b@y.com"]);
+        assert_eq!(parse_addr_list("a@x.com;b@y.com"), vec!["a@x.com", "b@y.com"]);
+        assert!(parse_addr_list("").is_empty(), "empty string = no addresses");
+        assert!(parse_addr_list("[]").is_empty(), "empty JSON array = none");
+        assert!(parse_addr_list("  ").is_empty(), "whitespace-only = none");
+        assert_eq!(
+            parse_addr_list("[\"a@x.com\", \"\"]"),
+            vec!["a@x.com"],
+            "blank entries are dropped"
+        );
     }
 
     // ── Task 2 verification: round-trip upsert/expunge/search ───

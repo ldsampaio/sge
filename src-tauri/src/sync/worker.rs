@@ -512,6 +512,7 @@ impl SyncWorker {
                 subject: row.subject.clone(),
                 body: row.body.clone(),
                 message_id: row.message_id.clone(),
+                ..Default::default()
             };
             let bytes = crate::drafts::render_draft_rfc5322(&fields, &date);
             let old_uid = if stale_epoch { None } else { row.server_uid };
@@ -4061,6 +4062,7 @@ mod tests {
             subject: "Oi".to_string(),
             body: "corpo".to_string(),
             draft_id: None,
+            ..Default::default()
         };
         let guard = store.lock().unwrap();
         let out = crate::send_queue::enqueue_send(guard.conn(), app_data, input).unwrap();

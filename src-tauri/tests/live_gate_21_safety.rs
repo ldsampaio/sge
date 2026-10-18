@@ -344,6 +344,7 @@ fn self_input(subject_suffix: &str) -> EnqueueInput {
         subject: format!("{}live21-{subject_suffix}", harness::SUBJECT_PREFIX),
         body: "live gate probe".to_string(),
         draft_id: None,
+        ..Default::default()
     }
 }
 
@@ -559,6 +560,7 @@ fn live_gate_21_double_enqueue_same_draft_dedupes_to_one_row() {
         subject: format!("{}safety-nondup", harness::SUBJECT_PREFIX),
         body: "probe".to_string(),
         draft_id: Some(draft_id.to_string()),
+        ..Default::default()
     };
     let first = send_queue::enqueue_send(conn, &app_data, mk()).unwrap();
     assert!(!first.deduped);

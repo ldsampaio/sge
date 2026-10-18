@@ -1473,6 +1473,7 @@ async fn run() -> i32 {
                 subject: arrival_subject.clone(),
                 body: "live gate arrival probe".to_string(),
                 draft_id: None,
+                ..Default::default()
             },
         ) {
             Ok(out) => {
@@ -1863,6 +1864,7 @@ async fn run() -> i32 {
             subject: format!("{}{}-nondup", SUBJECT_PREFIX, tag),
             body: "live gate no-duplicate probe".to_string(),
             draft_id: did,
+            ..Default::default()
         };
         let first = match send_queue::enqueue_send(
             guard.conn(),
@@ -2093,6 +2095,7 @@ async fn run() -> i32 {
                 subject: format!("{}{}-unfiled", SUBJECT_PREFIX, tag),
                 body: "live gate sent-unfiled probe".to_string(),
                 draft_id: None,
+                ..Default::default()
             },
         ) {
             Ok(out) => out.message_id,
@@ -2355,6 +2358,7 @@ async fn run() -> i32 {
                     subject: format!("{}{}-offline", SUBJECT_PREFIX, tag),
                     body: "live gate offline-flush probe".to_string(),
                     draft_id: None,
+                    ..Default::default()
                 },
             ) {
                 Ok(out) => out.message_id,
@@ -2637,6 +2641,7 @@ async fn run() -> i32 {
                 subject: format!("{}{}-uncertain", SUBJECT_PREFIX, tag),
                 body: "live gate uncertain-reconcile probe".to_string(),
                 draft_id: None,
+                ..Default::default()
             },
         ) {
             Ok(out) => out.message_id,
@@ -2990,6 +2995,7 @@ async fn run() -> i32 {
                 subject: format!("{}{}-crash", SUBJECT_PREFIX, tag),
                 body: "live gate crash-recover probe".to_string(),
                 draft_id: None,
+                ..Default::default()
             },
         ) {
             Ok(out) => (out.message_id, out.queue_id),
@@ -3575,6 +3581,7 @@ async fn run() -> i32 {
                 subject: draft_subject.clone(),
                 body: "live gate draft-send probe".to_string(),
                 draft_id: Some(draft_id.clone()),
+                ..Default::default()
             },
         ) {
             Ok(out) => {

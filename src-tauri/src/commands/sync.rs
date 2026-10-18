@@ -862,6 +862,7 @@ pub async fn save_draft(
                 subject: subject.clone(),
                 body: body.clone(),
                 message_id: message_id.clone(),
+                ..Default::default()
             };
             let bytes = crate::drafts::render_draft_rfc5322(&fields, &date);
             let (acked, server_uid) = match manager
@@ -1146,6 +1147,11 @@ pub async fn search_messages(
 /// returns `{queue_id, message_id, state, pending_count}`.
 /// Error prefixes verbatim: `send-too-large`, `send-no-recipient`,
 /// `send-missing` (unknown `draft_id` at enqueue).
+///
+/// Phase 38 adds three optional reply/compose args — `in_reply_to`,
+/// `references` (RFC 5322 threading) and `attachments` (base64 payloads
+/// rendered as `multipart/mixed`) — and the new `send-bad-attachment`
+/// refusal. Old callers that omit them keep the exact text-only behavior.
 #[tauri::command]
 pub async fn queue_send(
     state: State<'_, crate::AppState>,
@@ -1156,6 +1162,9 @@ pub async fn queue_send(
     subject: String,
     body: String,
     draft_id: Option<String>,
+    in_reply_to: Option<String>,
+    references: Option<String>,
+    attachments: Option<Vec<crate::drafts::AttachmentInput>>,
 ) -> Result<crate::send_queue::EnqueueOutcome, String> {
     let app_data = state.app_data.clone();
     let store = state.store.clone();
@@ -1172,6 +1181,9 @@ pub async fn queue_send(
                 subject,
                 body,
                 draft_id,
+                in_reply_to,
+                references,
+                attachments: attachments.unwrap_or_default(),
             },
         )
         .map_err(|e| e.to_string())?;
@@ -2216,11 +2228,16 @@ pub struct MessageView {
     pub subject: String,
     pub from_addr: String,
     pub to_addrs: Vec<String>,
+    /// Cc recipients (reply-all seeding; never used for the envelope here).
+    pub cc_addrs: Vec<String>,
     pub date_utc: String,
     pub html: Option<String>,
     pub text: Option<String>,
     pub has_attachments: bool,
     pub attachments: Vec<crate::store::queries::AttachmentInfo>,
+    /// Original RFC822 Message-ID — `In-Reply-To` for replies (`None` when
+    /// the server sent none, in which case no threading header is built).
+    pub message_id: Option<String>,
 }
 
 /// Fetch a single message body, sanitize HTML, extract headers + attachments.
@@ -2294,19 +2311,33 @@ pub async fn fetch_message(
                 .parse(&raw)
                 .ok_or("Failed to parse message body")?;
 
-            // Headers from SQLite (stored during sync).
-            let (subject, from_addr, to_addrs, date_utc) = {
+            // Headers from SQLite (stored during sync). `cc_addrs` and
+            // `message_id` come from the reply context so Reply-All seeds Cc
+            // and replies build `In-Reply-To`; both are local-cache reads only.
+            let (subject, from_addr, to_addrs, date_utc, cc_addrs, message_id) = {
                 let guard = store.lock().unwrap();
                 let conn = guard.conn();
                 let row = crate::store::queries::get_message_by_uid(conn, &mailbox, uid)
                     .map_err(|e| format!("store error: {e}"))?
                     .ok_or("Message not found in local store")?;
-                let to_vec = if row.to_addrs.is_empty() || row.to_addrs == "[]" {
-                    Vec::new()
-                } else {
-                    serde_json::from_str(&row.to_addrs).unwrap_or_default()
+                let to_vec = crate::store::queries::parse_addr_list(&row.to_addrs);
+                let ctx = crate::store::queries::get_reply_context(conn, &mailbox, uid)
+                    .map_err(|e| format!("store error: {e}"))?;
+                let (cc_vec, msg_id) = match ctx {
+                    Some(c) => (
+                        crate::store::queries::parse_addr_list(&c.cc_addrs_json),
+                        c.message_id,
+                    ),
+                    None => (Vec::new(), None),
                 };
-                (row.subject, row.from_addr, to_vec, row.date_utc)
+                (
+                    row.subject,
+                    row.from_addr,
+                    to_vec,
+                    row.date_utc,
+                    cc_vec,
+                    msg_id,
+                )
             };
 
             // Extract + sanitize body content.
@@ -2352,11 +2383,13 @@ pub async fn fetch_message(
                 subject,
                 from_addr,
                 to_addrs,
+                cc_addrs,
                 date_utc,
                 html,
                 text,
                 has_attachments,
                 attachments,
+                message_id,
             })
         })
     })
@@ -2502,6 +2535,7 @@ mod tests {
             idle: Mutex::new(None),
             send_gate: crate::send_queue::SendGate::default(),
             send_transport: Arc::new(crate::smtp::SmtpTransporter::new()),
+            llm_tracker: Arc::new(crate::llm::client::RequestTracker::new()),
         };
         assert!(state.idle.lock().unwrap().is_none());
     }

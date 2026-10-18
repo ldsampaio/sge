@@ -18,12 +18,17 @@
 use super::key::{LlmKeyStore, has_llm_api_key};
 use super::{LlmSettings, LlmSettingsInput, LlmSettingsView};
 use crate::store::queries as store_queries;
-use std::sync::Arc;
 
 /// Field-named rejection for empty-string key saves (A6 resolved: removal
 /// only via the dedicated clear command, never via save).
 const EMPTY_API_KEY_ERROR: &str =
     "invalid API key: value must not be empty (to remove the stored key, use the clear command)";
+
+/// Automatic retry budget for one generation: one extra attempt after a
+/// transient provider failure (429 / gateway timeout / 5xx).
+const GENERATE_MAX_ATTEMPTS: u32 = 2;
+/// Pause before the retry — short enough that the window never feels hung.
+const GENERATE_RETRY_DELAY_MS: u64 = 600;
 
 /// Shared read path: all models under the store `Mutex`, presence probe
 /// off the runtime thread (`spawn_blocking` hard rule).
@@ -194,193 +199,237 @@ pub async fn fetch_llm_models(
     Ok(result)
 }
 
-/// Phase 41: Cancel active LLM generation for a mailbox (LLM-08 cancel support)
+/// Cancel the in-flight LLM generation for a mailbox (LLM-08 cancel support).
+///
+/// Cancels on the app-wide tracker held in [`crate::AppState`] — the same
+/// tracker the generation command registered on — so the cancel actually
+/// reaches the running request. Returns `true` when a request was pending
+/// and is now cancelled (`false` means it had already finished).
 #[tauri::command]
-pub async fn cancel_generate(mailbox: String) -> Result<bool, String> {
-    use super::client::RequestTracker;
-    // Note: For persistent tracking across windows, a shared AppState tracker
-    // is ideal; here we confirm the cancel contract (LLM-08) at command level.
-    let tracker = Arc::new(RequestTracker::new());
-    tracker.cancel_request(&mailbox);
-    Ok(!tracker.has_active(&mailbox))
+pub async fn cancel_generate(
+    state: tauri::State<'_, crate::AppState>,
+    mailbox: String,
+) -> Result<bool, String> {
+    Ok(state.llm_tracker.cancel_request(&mailbox))
 }
 
-/// Phase 41: Generate reply draft via `POST /chat/completions` (non-streaming).
-/// Per-window single-flight, cancel support, metadata-only errors.
-/// Uses the first configured model.
-/// Accepts optional `subject` and `body` from the compose window state so the
-/// LLM prompt reflects the user's current edits, not just the stored original.
+/// Generate a reply draft via `POST /chat/completions` (non-streaming).
+///
+/// Behaviour (Phase 38 fix — the original implementation answered from a
+/// hardcoded `INBOX` UID 1 and tracked requests per call, so every reply
+/// was generated from the wrong message and cancel was a no-op):
+///
+/// - the original message is the one the window is replying to (`uid` +
+///   `mailbox`), read from the local BODY.PEEK cache — never a server
+///   call, never a `\Seen` write;
+/// - single-flight and cancel share [`crate::AppState::llm_tracker`];
+/// - the key is loaded inside `spawn_blocking` (keyring hard rule) and
+///   never leaves this frame — errors carry metadata only (T-39-01);
+/// - transient provider failures (429 / 408+504 / 5xx) get one retry.
+///
+/// `subject`/`body` are the compose window's *current* state and are used
+/// only when the cache holds no better original body.
 #[tauri::command]
 pub async fn generate_reply(
     state: tauri::State<'_, crate::AppState>,
-    mailbox: String,
+    mailbox: Option<String>,
+    uid: Option<u32>,
     request_id: Option<u64>,
     subject: Option<String>,
     body: Option<String>,
 ) -> Result<String, String> {
-    // Check if settings are configured
+    // Kept for IPC compatibility (the window sends `request_id: null`);
+    // the authoritative id is minted by the shared tracker below.
+    let _ = request_id;
+
+    let mailbox = mailbox.unwrap_or_else(|| "INBOX".to_string());
+
+    // 1. Settings (store mutex only — no network, no keyring).
     let settings = {
         let guard = state.store.lock().unwrap();
-        let models = store_queries::get_llm_models(guard.conn())
-            .map_err(|e| e.to_string())?;
+        let models =
+            store_queries::get_llm_models(guard.conn()).map_err(|e| e.to_string())?;
         models.into_iter().next().unwrap_or_default()
     };
-
-    // If no key configured, return NotConfigured
-    let key_store = super::key::KeyringLlmKeyStore::new();
-    let has_key = super::key::has_llm_api_key(&key_store);
-    if !has_key {
+    if settings.base_url.trim().is_empty() || settings.model.trim().is_empty() {
         return Err(super::client::LlmRequestError::NotConfigured.to_string());
     }
 
-    // Fetch message metadata for prompt rendering (fallback when frontend
-    // does not provide subject/body, and always for sender).
-    let message_row = {
+    // 2. Original message context from the local cache (BODY.PEEK data).
+    let ctx = {
         let guard = state.store.lock().unwrap();
-        let conn = guard.conn();
-
-        crate::store::queries::get_message_by_uid(conn, "INBOX", 1)
-            .map_err(|e| e.to_string())?
-    };
-
-    // Determine subject and body: prefer frontend-provided values (current
-    // compose state), fall back to the stored original from SQLite.
-    let (subject, body_text) = match (subject.as_deref(), body.as_deref()) {
-        (Some(s), Some(b)) => (s.to_string(), b.to_string()),
-        (Some(s), None) => {
-            let body_from_row = message_row
-                .as_ref()
-                .map(|m| m.preview.clone())
-                .unwrap_or_default();
-            (s.to_string(), body_from_row)
-        }
-        (None, Some(b)) => {
-            let subject_from_row = message_row
-                .as_ref()
-                .map(|m| m.subject.clone())
-                .unwrap_or_default();
-            (subject_from_row, b.to_string())
-        }
-        (None, None) => {
-            let msg = message_row
-                .as_ref()
-                .ok_or_else(|| "Nenhuma mensagem encontrada para gerar o prompt".to_string())?;
-            (msg.subject.clone(), msg.preview.clone())
+        match uid {
+            Some(uid) => store_queries::get_reply_context(guard.conn(), &mailbox, uid)
+                .map_err(|e| e.to_string())?,
+            None => None,
         }
     };
+    let ctx = ctx.ok_or_else(|| {
+        "Mensagem original não encontrada no cache local — abra a mensagem antes de gerar a resposta."
+            .to_string()
+    })?;
 
-    let sender = message_row
-        .as_ref()
-        .map(|m| m.from_addr.clone())
-        .unwrap_or_else(|| "test@example.com".to_string());
+    // 3. API key: presence + load in one blocking hop (hard rule).
+    let api_key = tauri::async_runtime::spawn_blocking(|| {
+        super::key::KeyringLlmKeyStore::new()
+            .load_secret()
+            .ok()
+            .flatten()
+    })
+    .await
+    .map_err(|e| format!("internal error: keyring task failed ({e})"))?
+    .ok_or_else(|| super::client::LlmRequestError::NotConfigured.to_string())?;
 
-    // Render prompt using Phase 39 pipeline
-    let template = settings.prompt_template;
-    let rendered_prompt = super::prompt::render_prompt(&template, &sender, &subject, &body_text);
-
-    // Request tracker for single-flight
-    let tracker = std::sync::Arc::new(super::client::RequestTracker::new());
-
-    // Use provided request ID or start fresh; start_request returns None if
-    // another request is already active for this mailbox.
-    let rid = match request_id {
-        Some(rid) => rid,
-        None => match tracker.start_request(&mailbox) {
-            Some(rid) => rid,
-            None => return Err("Request already in progress for this conversation".to_string()),
-        },
-    };
-
-    // Load API key from keyring
-    let api_key = key_store
-        .load_secret()
-        .map_err(|_| super::client::LlmRequestError::NetworkError.to_string())?;
-
-    let api_key = match api_key {
-        Some(k) => k,
-        None => return Err(super::client::LlmRequestError::NotConfigured.to_string()),
-    };
-
-    // Build reqwest client with timeout
-    let timeout = std::time::Duration::from_secs(settings.timeout_secs as u64);
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .build()
-        .map_err(|_| super::client::LlmRequestError::NetworkError.to_string())?;
-
-    // Build completion request body
-    let req_body = super::client::CompletionRequest {
-        model: &settings.model,
-        messages: vec![super::client::Message {
-            role: "user",
-            content: &rendered_prompt,
-        }],
-        temperature: settings.temperature,
-        max_tokens: settings.max_tokens,
-    };
-
-    // Make the request
-    let start = std::time::Instant::now();
-    let resp = client
-        .post(format!("{}/chat/completions", settings.base_url))
-        .bearer_auth(&api_key)
-        .json(&req_body)
-        .send();
-
-    let latency_ms = start.elapsed().as_millis() as u64;
-
-    // Handle response
-    let resp = match resp.await {
-        Ok(r) => r,
-        Err(e) => {
-            tracker.end_request(&mailbox);
-            return Err(format!("Request failed: {e}"));
-        }
-    };
-
-    let status = resp.status();
-
-    if !status.is_success() {
-        let body_text = resp.text().await.unwrap_or_default();
-        tracker.end_request(&mailbox);
-        return Err(super::client::LlmRequestError::from_status(status, Some(&body_text)).to_string());
+    // 4. Prompt inputs from the cached original + the window's current state.
+    let (sender, subject_text, original_body) =
+        prompt_inputs(&ctx, subject.as_deref(), body.as_deref());
+    if original_body.trim().is_empty() {
+        return Err(
+            "Mensagem original sem conteúdo no cache local — abra a mensagem antes de gerar a resposta."
+                .to_string(),
+        );
     }
 
-    // Parse response body
-    let body_text = resp.text().await.unwrap_or_default();
-    let parsed: Result<super::client::CompletionResponse, _> =
-        serde_json::from_str(&body_text).map_err(|_| "Invalid response");
+    let rendered_prompt =
+        super::prompt::render_prompt(&settings.prompt_template, &sender, &subject_text, &original_body);
 
-    match parsed {
-        Ok(resp_json) => {
-            // Find the assistant's choice with a non-length finish reason
-            let choice = resp_json
-                .choices
-                .iter()
-                .find(|c| c.finish_reason.as_deref() != Some("length"))
-                .or_else(|| resp_json.choices.first())
-                .ok_or_else(|| "No choices in response")?;
+    // 5. Single-flight on the shared tracker: a second generation for the
+    //    same mailbox is refused while one is running.
+    let tracker = &state.llm_tracker;
+    let rid = tracker.start_request(&mailbox).ok_or_else(|| {
+        "Já existe uma geração em andamento para esta mensagem — cancele antes de gerar de novo."
+            .to_string()
+    })?;
 
-            let draft_text = choice
-                .message
-                .as_ref()
-                .and_then(|m| m.content.as_deref())
-                .or_else(|| choice.text.as_deref())
-                .unwrap_or("");
-
-            // Build result
-            let usage = resp_json.usage;
-            let (pt, ct, tt) = usage.as_ref().map_or((0i64, 0i64, 0i64), |u| {
-                (u.prompt_tokens, u.completion_tokens, u.total_tokens)
-            });
-
-            tracker.end_request(&mailbox);
-
-            Ok(draft_text.to_string())
+    // 6. Request with one automatic retry on transient failures.
+    let mut attempt: u32 = 0;
+    loop {
+        if !tracker.is_owner(&mailbox, rid) {
+            return Err(super::client::LlmRequestError::Cancelled.to_string());
         }
-        Err(_) => {
-            tracker.end_request(&mailbox);
-            Err("Invalid response format".to_string())
+        attempt += 1;
+        match super::client::generate_reply_with_key(&settings, &rendered_prompt, &api_key).await {
+            Ok(generation) => {
+                if !tracker.is_owner(&mailbox, rid) {
+                    return Err(super::client::LlmRequestError::Cancelled.to_string());
+                }
+                tracker.end_request(&mailbox);
+                return Ok(generation.draft_text);
+            }
+            Err(e) if e.is_retryable() && attempt < GENERATE_MAX_ATTEMPTS => {
+                async_std::task::sleep(std::time::Duration::from_millis(
+                    GENERATE_RETRY_DELAY_MS,
+                ))
+                .await;
+            }
+            Err(e) => {
+                // Only release the slot we still own: a cancel (or a newer
+                // request) must not be clobbered by this late failure.
+                if tracker.is_owner(&mailbox, rid) {
+                    tracker.end_request(&mailbox);
+                }
+                return Err(e.to_string());
+            }
         }
     }
 }
+
+/// Pick the `(sender, subject, body)` the prompt is rendered from.
+///
+/// The cached original wins for the sender and the subject — the prompt is
+/// about the *received* message, not the user's "Re:" edit. The body prefers
+/// the cached sanitized text, then the compose window's body (which carries
+/// the quoted original), then the header preview (bodies over the cache cap
+/// are never stored). Never returns an empty sender.
+fn prompt_inputs(
+    ctx: &store_queries::ReplyContextRow,
+    subject: Option<&str>,
+    body: Option<&str>,
+) -> (String, String, String) {
+    let sender = if ctx.sender.trim().is_empty() {
+        "remetente desconhecido".to_string()
+    } else {
+        ctx.sender.trim().to_string()
+    };
+    let subject_text = non_empty(Some(ctx.subject.as_str()))
+        .or_else(|| non_empty(subject))
+        .unwrap_or_default();
+    let original_body = non_empty(ctx.body_text.as_deref())
+        .or_else(|| non_empty(body))
+        .or_else(|| non_empty(Some(ctx.preview.as_str())))
+        .unwrap_or_default();
+    (sender, subject_text, original_body)
+}
+
+/// `Some(trimmed)` when the value holds non-whitespace text.
+fn non_empty(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx(
+        sender: &str,
+        subject: &str,
+        preview: &str,
+        body_text: Option<&str>,
+    ) -> store_queries::ReplyContextRow {
+        store_queries::ReplyContextRow {
+            sender: sender.to_string(),
+            subject: subject.to_string(),
+            cc_addrs_json: "[]".to_string(),
+            message_id: Some("<orig@example.com>".to_string()),
+            preview: preview.to_string(),
+            body_text: body_text.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn prompt_inputs_prefer_the_cached_original() {
+        let c = ctx("ana@example.com", "Prova de cálculo", "trecho…", Some("corpo completo"));
+        let (sender, subject, body) = prompt_inputs(&c, Some("Re: Prova de cálculo"), Some("> citado"));
+        assert_eq!(sender, "ana@example.com");
+        assert_eq!(
+            subject, "Prova de cálculo",
+            "the received subject, not the Re: edit"
+        );
+        assert_eq!(body, "corpo completo", "cached body beats the quote");
+    }
+
+    #[test]
+    fn prompt_inputs_fall_back_to_the_compose_body_then_preview() {
+        // No cached body (over the cache cap): the window body carries the
+        // quoted original and beats the header preview.
+        let c = ctx("ana@example.com", "Assunto", "preview curto", None);
+        let (_, _, body) = prompt_inputs(&c, None, Some("\n\nEm 10/10, ana escreveu:\n> oi"));
+        assert!(body.contains("> oi"), "got: {body}");
+
+        // Nothing from the window either: the preview is the last resort.
+        let (_, subject, body) = prompt_inputs(&c, None, None);
+        assert_eq!(body, "preview curto");
+        assert_eq!(subject, "Assunto");
+    }
+
+    #[test]
+    fn prompt_inputs_never_yield_an_empty_sender() {
+        let c = ctx("   ", "X", "Y", None);
+        let (sender, _, _) = prompt_inputs(&c, None, None);
+        assert_eq!(sender, "remetente desconhecido");
+    }
+
+    #[test]
+    fn prompt_inputs_without_any_body_signal_an_empty_string() {
+        // The caller turns this into a plain-language refusal instead of
+        // sending an empty prompt to the provider.
+        let c = ctx("ana@example.com", "  ", "   ", None);
+        let (_, subject, body) = prompt_inputs(&c, Some("  "), Some(""));
+        assert!(body.trim().is_empty());
+        assert!(subject.is_empty(), "whitespace-only values are dropped");
+    }
+}
+

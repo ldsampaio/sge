@@ -65,7 +65,16 @@ interface ServerConfig {
   security: string;
 }
 
-const MAX_TOTAL_ATTACH_BYTES = 20 * 1024 * 1024;
+/** Client-side pre-check on the *decoded* attachment size. The backend cap
+ *  is 25 MB on the rendered message, and base64 inflates by 4/3 — so ~18 MB
+ *  of files is the largest payload that still fits under the wire limit.
+ *  The backend remains the authority (`send-too-large`). */
+const MAX_TOTAL_ATTACH_BYTES = 18 * 1024 * 1024;
+
+/** True when a `generate_reply` rejection is the user's own cancel. */
+function isCancelledError(message: string): boolean {
+  return /cancel/i.test(message);
+}
 
 function isTauriRuntime(): boolean {
   const w = window as unknown as Record<string, unknown>;
@@ -273,7 +282,7 @@ export default function ComposeWindow({
         if (total > MAX_TOTAL_ATTACH_BYTES) {
           setNotice({
             kind: "error",
-            text: `Anexos somam ${formatBytes(total)} — o limite de envio é 25 MB. Remova arquivos para continuar.`,
+            text: `Anexos somam ${formatBytes(total)} — o limite de envio é 25 MB (cerca de 18 MB de arquivos, por causa da codificação). Remova arquivos para continuar.`,
           });
         }
         return next;
@@ -482,9 +491,13 @@ export default function ComposeWindow({
     setNotice(null);
 
     try {
-      // Pass mailbox, subject and body for LLM prompt context
+      // The backend rebuilds the prompt from the *original* message in the
+      // local BODY.PEEK cache (sender/subject/body) and only falls back to
+      // these compose-state values — so replies are never generated from
+      // the wrong message anymore.
       const draft = await invoke<string>("generate_reply", {
         mailbox: replySource.mailbox,
+        uid: replySource.uid,
         request_id: null,
         subject,
         body,
@@ -497,9 +510,14 @@ export default function ComposeWindow({
 
       setLlmGeneration("idle");
       setNotice({ kind: "ok", text: "Rascunho gerado — revise e edite antes de enviar." });
-    } catch (e: any) {
+    } catch (e: unknown) {
+      const errMsg = e instanceof Error ? e.message : String(e);
+      if (isCancelledError(errMsg)) {
+        // User pressed Cancelar: never an error state, never a body change.
+        setLlmGeneration("idle");
+        return;
+      }
       setLlmGeneration("error");
-      const errMsg = e?.message || String(e);
       setLlmError(errMsg);
       // LLM-10: Failed generation never clobbers the body — do NOT modify body state
       setNotice({ kind: "error", text: `Falha ao gerar: ${errMsg}` });
@@ -509,7 +527,13 @@ export default function ComposeWindow({
   }
 
   async function handleCancelGenerate(): Promise<void> {
-    // Frontend-level cancel: just stop waiting (backend single-flight handled by request_id)
+    // Real cancel: clears the shared tracker slot in the backend so an
+    // in-flight request is discarded instead of being inserted into the body.
+    try {
+      await invoke<boolean>("cancel_generate", { mailbox: replySource?.mailbox ?? "INBOX" });
+    } catch {
+      // Best-effort: the generation result is still dropped locally below.
+    }
     setLlmGeneration("idle");
     setGenerateRequested(false);
     setNotice({ kind: "ok", text: "Geração cancelada." });

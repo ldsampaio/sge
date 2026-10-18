@@ -1482,6 +1482,12 @@
   margin-bottom: 8px;
 }
 
+/* Compose entry point lives with the count pill in the list header. */
+.new-message-btn {
+  margin-left: auto;
+  white-space: nowrap;
+}
+
 .folder-dialog-actions {
   display: flex;
   justify-content: flex-end;

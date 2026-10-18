@@ -17,6 +17,8 @@ export interface DraftEditorProps {
   initial?: DraftRow | null;
   onSaved: (result: DraftSaveResult) => void;
   onDiscarded: (id: string) => void;
+  /** Hand the current fields to the send lane (persists first). */
+  onSend?: (fields: { to: string; cc: string; bcc: string; subject: string; body: string }) => void;
   onClose?: () => void;
 }
 
@@ -69,6 +71,7 @@ export default function DraftEditor({
   initial,
   onSaved,
   onDiscarded,
+  onSend,
   onClose,
 }: DraftEditorProps) {
   const seed = useMemo(() => snapshotOf(initial), [initial]);
@@ -88,10 +91,6 @@ export default function DraftEditor({
   const inFlightRef = useRef(false);
   /** `drafts-missing` create-then-retry may run exactly once per save. */
   const retriedRef = useRef(false);
-
-  const [replyMode, setReplyMode] = useState<"none" | "reply" | "reply-all">("none");
-  // Reply context: message_id and references are set when replying
-  // Quote text and quotedFrom would be populated from message cache in production
 
   const [phase, setPhase] = useState<SavePhase>("idle");
   /** Server acknowledgement of the last save (null = never saved yet). */
@@ -127,15 +126,20 @@ export default function DraftEditor({
     body.trim() !== "" ||
     everSavedRef.current;
 
-  async function doSave(): Promise<void> {
-    if (inFlightRef.current) return;
+  async function doSave(): Promise<boolean> {
+    if (inFlightRef.current) return false;
     inFlightRef.current = true;
     setPhase("saving");
     setErrorMsg("");
     // Read through the live mirror: manual saves and autosave ticks share
     // this exact path, so a tick can never persist a stale keystroke.
-    const { to: liveTo, cc: liveCc, bcc: liveBcc, subject: liveSubject, body: liveBody } =
-      liveRef.current;
+    const {
+      to: liveTo,
+      cc: liveCc,
+      bcc: liveBcc,
+      subject: liveSubject,
+      body: liveBody,
+    } = liveRef.current;
     try {
       if (sessionIdRef.current === null) {
         sessionIdRef.current = newComposeId();
@@ -160,6 +164,7 @@ export default function DraftEditor({
       retriedRef.current = false;
       setLastAcked(result.acked);
       onSavedRef.current(result);
+      return true;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       if (message.startsWith("drafts-missing") && !retriedRef.current) {
@@ -171,6 +176,7 @@ export default function DraftEditor({
       } else {
         setErrorMsg(message || "Não foi possível guardar o rascunho.");
       }
+      return false;
     } finally {
       inFlightRef.current = false;
       setPhase("idle");
@@ -197,6 +203,28 @@ export default function DraftEditor({
     } finally {
       setCreatePending(false);
     }
+  }
+
+  /** Save first (so the row exists server-side), then hand the fields to the
+   *  send lane: the compose window owns recipients/threading/attachments and
+   *  is the only path that can actually reach SMTP. */
+  async function handleSendRequest(): Promise<void> {
+    const saved = await doSave();
+    if (!saved) return;
+    const {
+      to: liveTo,
+      cc: liveCc,
+      bcc: liveBcc,
+      subject: liveSubject,
+      body: liveBody,
+    } = liveRef.current;
+    onSend?.({
+      to: liveTo,
+      cc: liveCc,
+      bcc: liveBcc,
+      subject: liveSubject,
+      body: liveBody,
+    });
   }
 
   function handleDiscardRequest(): void {
@@ -296,12 +324,6 @@ export default function DraftEditor({
         <header className="reading-header">
           <span className="reading-kicker">Rascunho</span>
           <h2 className="reading-subject">{subject.trim() || <em>(sem assunto)</em>}</h2>
-          {replyMode !== "none" && (
-            <div className="thread-headers" aria-label="Threading headers">
-              <span>In-Reply-To: original-message-id (RFC 5322 threading header built)</span>
-              <span>References: original-references + original-message-id (chain preserved)</span>
-            </div>
-          )}
           {indicator}
         </header>
 
@@ -378,28 +400,18 @@ export default function DraftEditor({
           >
             {phase === "saving" ? "Salvando…" : "Guardar"}
           </button>
-          <button
-            type="button"
-            className="btn btn-outline"
-            onClick={() => {
-              setReplyMode("reply");
-            }}
-            aria-label="Reply"
-            title="Reply"
-          >
-            Reply
-          </button>
-          <button
-            type="button"
-            className="btn btn-outline"
-            onClick={() => {
-              setReplyMode("reply-all");
-            }}
-            aria-label="Reply All"
-            title="Reply All"
-          >
-            Reply All
-          </button>
+          {onSend && (
+            <button
+              type="button"
+              className="btn"
+              onClick={() => void handleSendRequest()}
+              disabled={phase === "saving" || (!dirty && !everSavedRef.current)}
+              aria-label="Enviar rascunho"
+              title="Guardar e abrir o envio"
+            >
+              Enviar…
+            </button>
+          )}
           <button
             type="button"
             className="btn btn-destructive"
@@ -410,7 +422,12 @@ export default function DraftEditor({
             Descartar
           </button>
           {onClose && (
-            <button type="button" className="btn btn-outline" onClick={onClose} aria-label="Fechar editor">
+            <button
+              type="button"
+              className="btn btn-outline"
+              onClick={onClose}
+              aria-label="Fechar editor"
+            >
               Fechar
             </button>
           )}

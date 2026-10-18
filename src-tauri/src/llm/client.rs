@@ -101,6 +101,19 @@ impl RequestTracker {
             .get(mailbox)
             .is_some_and(|v| v.is_some())
     }
+
+    /// True when `rid` is still the active owner of `mailbox`.
+    ///
+    /// Used after an awaited request returns: a `cancel_request` (or a newer
+    /// request) in the meantime means this result must be discarded instead
+    /// of handed to the caller (LLM-08 cancel).
+    pub fn is_owner(&self, mailbox: &str, rid: RequestId) -> bool {
+        self.slots
+            .lock()
+            .expect("request tracker lock")
+            .get(mailbox)
+            .is_some_and(|v| *v == Some(rid))
+    }
 }
 
 /// Plain-language error for LLM operations (LLM-09 compliance).
@@ -139,6 +152,27 @@ pub enum LlmRequestError {
 }
 
 impl LlmRequestError {
+    /// Map a transport failure to a plain-language error: a request that
+    /// outlived `timeout_secs` is a timeout the user can retry, anything
+    /// else is a connection problem. Never carries the URL or the key.
+    pub fn from_reqwest(e: &reqwest::Error) -> Self {
+        if e.is_timeout() {
+            LlmRequestError::Timeout
+        } else {
+            LlmRequestError::NetworkError
+        }
+    }
+
+    /// True for transient provider failures worth one automatic retry
+    /// (429 rate limits, gateway timeouts, and 5xx provider errors).
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            LlmRequestError::RateLimited | LlmRequestError::Timeout => true,
+            LlmRequestError::ProviderError { code, .. } => *code >= 500,
+            _ => false,
+        }
+    }
+
     /// Map HTTP status and response to plain-language error.
     pub fn from_status(status: reqwest::StatusCode, body: Option<&str>) -> Self {
         match status {
@@ -324,14 +358,19 @@ impl MockTransport {
 ///
 /// Returns the draft text on success, or a plain-language error.
 /// Key and body never appear in errors.
-/// 
+///
 /// This is an async function - callers should use `.await` or call from an async context.
+///
+/// NOTE: this variant loads the API key from `key_store`, and every
+/// keyring call blocks the calling thread — the Tauri command layer must
+/// therefore call [`generate_reply_with_key`] with a key it loaded inside
+/// `spawn_blocking` (see `llm::commands::generate_reply`).
 pub async fn generate_reply_async(
     settings: &LlmSettings,
     template: &str,
     key_store: &impl LlmKeyStore,
-    mailbox: &str,
-    request_id: Option<RequestId>,
+    _mailbox: &str,
+    _request_id: Option<RequestId>,
 ) -> Result<GenerationResult, LlmRequestError> {
     // Load key from keyring
     let api_key = key_store
@@ -343,6 +382,16 @@ pub async fn generate_reply_async(
         None => return Err(LlmRequestError::NotConfigured),
     };
 
+    generate_reply_with_key(settings, template, &api_key).await
+}
+
+/// Same as [`generate_reply_async`] but with the key already in hand, so
+/// no keyring I/O happens on the async runtime thread (hard rule).
+pub async fn generate_reply_with_key(
+    settings: &LlmSettings,
+    template: &str,
+    api_key: &str,
+) -> Result<GenerationResult, LlmRequestError> {
     // Build client with timeout
     let timeout = Duration::from_secs(settings.timeout_secs as u64);
     let client = reqwest::Client::builder()
@@ -365,11 +414,11 @@ pub async fn generate_reply_async(
     let start = Instant::now();
     let resp = client
         .post(format!("{}/chat/completions", settings.base_url))
-        .bearer_auth(&api_key)
+        .bearer_auth(api_key)
         .json(&request_body)
         .send()
         .await
-        .map_err(|_| LlmRequestError::NetworkError)?;
+        .map_err(|e| LlmRequestError::from_reqwest(&e))?;
 
     let latency_ms = start.elapsed().as_millis() as u64;
 
@@ -552,6 +601,60 @@ mod tests {
         assert!(tracker.has_active("INBOX"));
         assert!(tracker.cancel_request("INBOX"));
         assert!(!tracker.has_active("INBOX"));
+        assert!(!tracker.is_owner("INBOX", rid));
+    }
+
+    #[test]
+    fn request_tracker_is_owner_is_per_request_id() {
+        let tracker = RequestTracker::new();
+        let first = tracker.start_request("INBOX").unwrap();
+        assert!(tracker.is_owner("INBOX", first));
+        tracker.end_request("INBOX");
+        let second = tracker.start_request("INBOX").unwrap();
+        assert!(tracker.is_owner("INBOX", second));
+        assert!(
+            !tracker.is_owner("INBOX", first),
+            "a stale id must never own the slot"
+        );
+        assert!(!tracker.is_owner("Sent", second), "per-mailbox slots");
+    }
+
+    #[test]
+    fn retryable_covers_rate_limit_timeout_and_5xx_only() {
+        assert!(LlmRequestError::RateLimited.is_retryable());
+        assert!(LlmRequestError::Timeout.is_retryable());
+        assert!(LlmRequestError::ProviderError {
+            code: 503,
+            message: "down".to_string()
+        }
+        .is_retryable());
+        assert!(!LlmRequestError::Unauthorized.is_retryable());
+        assert!(!LlmRequestError::NotConfigured.is_retryable());
+        assert!(!LlmRequestError::Cancelled.is_retryable());
+        assert!(!LlmRequestError::ProviderError {
+            code: 400,
+            message: "bad request".to_string()
+        }
+        .is_retryable());
+    }
+
+    #[test]
+    fn from_status_marks_transient_failures_retryable() {
+        assert_eq!(
+            LlmRequestError::from_status(reqwest::StatusCode::TOO_MANY_REQUESTS, None),
+            LlmRequestError::RateLimited
+        );
+        assert_eq!(
+            LlmRequestError::from_status(reqwest::StatusCode::GATEWAY_TIMEOUT, None),
+            LlmRequestError::Timeout
+        );
+        match LlmRequestError::from_status(reqwest::StatusCode::BAD_GATEWAY, None) {
+            LlmRequestError::ProviderError { code, .. } => {
+                assert_eq!(code, 502);
+                assert!(code >= 500);
+            }
+            other => panic!("expected ProviderError, got {other:?}"),
+        }
     }
 
     #[test]

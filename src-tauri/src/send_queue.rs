@@ -127,6 +127,9 @@ pub enum SendQueueError {
     /// Row exists in a state the transition does not allow.
     #[error("{0}")]
     Refused(String),
+    /// Attachment payload is not valid base64 (or has no filename).
+    #[error("{0}")]
+    BadAttachment(String),
     #[error("database error: {0}")]
     Store(#[from] StoreError),
     #[error("outbox file error: {0}")]
@@ -214,8 +217,14 @@ pub fn compute_next_retry_at(post_attempts: u32, now: &chrono::DateTime<Utc>) ->
 /// these fields — and returns `{queue_id, message_id, state, pending_count}`.
 /// Error strings keep their prefixes verbatim: `send-too-large`,
 /// `send-no-recipient`, `send-missing` (unknown `draft_id` at enqueue),
-/// matching the `drafts-missing` precedent from Phase 12.
-#[derive(Debug, Clone)]
+/// `send-bad-attachment` (undecodable attachment payload), matching the
+/// `drafts-missing` precedent from Phase 12.
+///
+/// Phase 38 adds the optional reply fields: `in_reply_to`/`references`
+/// emit the RFC 5322 threading headers and `attachments` switches the
+/// rendered bytes to `multipart/mixed`. All three default to "none", so
+/// a caller that omits them gets the exact Phase-13 text-only render.
+#[derive(Debug, Clone, Default)]
 pub struct EnqueueInput {
     pub from: String,
     pub to: Vec<String>,
@@ -227,6 +236,12 @@ pub struct EnqueueInput {
     /// link) so the send transaction and the draft reconcile key on the
     /// same ID; otherwise a fresh `<...@sge.local>` is minted.
     pub draft_id: Option<String>,
+    /// RFC 822 Message-ID of the answered message → `In-Reply-To`.
+    pub in_reply_to: Option<String>,
+    /// Space-separated ancestor Message-IDs → `References`.
+    pub references: Option<String>,
+    /// Attachments to embed (base64); empty = legacy `text/plain` body.
+    pub attachments: Vec<crate::drafts::AttachmentInput>,
 }
 
 /// Enqueue result. `deduped` is true when the Message-ID was already queued
@@ -304,6 +319,25 @@ pub fn enqueue_send(
         ));
     }
 
+    // Attachments are validated before anything is written: an undecodable
+    // payload would otherwise reach the recipient as a corrupt file.
+    for att in &input.attachments {
+        let name = att.filename.trim();
+        if name.is_empty() {
+            return Err(SendQueueError::BadAttachment(
+                "send-bad-attachment: an attachment has no file name — \
+                 remove it and attach the file again (nothing was queued)"
+                    .to_string(),
+            ));
+        }
+        if !crate::drafts::is_valid_base64(&att.data_base64) {
+            return Err(SendQueueError::BadAttachment(format!(
+                "send-bad-attachment: '{name}' could not be read as a file — \
+                 remove it and attach the file again (nothing was queued)"
+            )));
+        }
+    }
+
     let queue_id = new_queue_id();
     let message_id = match &input.draft_id {
         Some(draft_id) => match queries::get_draft(conn, draft_id)? {
@@ -332,6 +366,9 @@ pub fn enqueue_send(
         subject: input.subject.clone(),
         body: input.body.clone(),
         message_id: message_id.clone(),
+        in_reply_to: input.in_reply_to.clone(),
+        references: input.references.clone(),
+        attachments: input.attachments.clone(),
     };
     let rendered = crate::drafts::render_draft_rfc5322(&fields, &rfc2822_now());
     if rendered.len() > SEND_MAX_BYTES {
@@ -491,6 +528,7 @@ pub fn send_status_snapshot(conn: &Connection) -> StoreResult<SendStatusSnapshot
 mod tests {
     use super::*;
     use crate::store::Store;
+    use mail_parser::MimeHeaders;
 
     fn test_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -512,6 +550,7 @@ mod tests {
             subject: "Oi".to_string(),
             body: "corpo".to_string(),
             draft_id: None,
+            ..Default::default()
         }
     }
 
@@ -622,6 +661,7 @@ mod tests {
             subject: "Assunto".to_string(),
             body: "corpo do rascunho".to_string(),
             draft_id: Some("draft-dedupe".to_string()),
+            ..Default::default()
         };
         let first = enqueue_send(conn, &app_data, with_draft()).unwrap();
         assert!(!first.deduped);
@@ -935,6 +975,83 @@ mod tests {
         // Row should still be uncertain (SEARCH reconciliation happens in sync/worker)
         let row_after = queries::get_send_row(conn, &out.queue_id).unwrap().unwrap();
         assert_eq!(row_after.state, SEND_STATE_UNCERTAIN, "row should remain uncertain");
+        std::fs::remove_dir_all(&app_data).ok();
+    }
+
+    // ---- Phase 38: threading headers + attachments ride the immutable .eml ----
+
+    #[test]
+    fn reply_enqueue_renders_threading_headers_into_eml() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let app_data = test_dir("reply-threading");
+        let mut reply = input("amigo@example.com");
+        reply.subject = "Re: Oi".to_string();
+        reply.in_reply_to = Some("<original@example.com>".to_string());
+        reply.references = Some("<root@example.com> <original@example.com>".to_string());
+        let out = enqueue_send(conn, &app_data, reply).unwrap();
+        let row = queries::get_send_row(conn, &out.queue_id).unwrap().unwrap();
+        let bytes = std::fs::read(&row.eml_path).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("In-Reply-To: <original@example.com>\r\n"),
+            "queued .eml must carry the threading header: {text}"
+        );
+        assert!(
+            text.contains("References: <root@example.com> <original@example.com>\r\n"),
+            "queued .eml must carry the References chain: {text}"
+        );
+        std::fs::remove_dir_all(&app_data).ok();
+    }
+
+    #[test]
+    fn attachment_enqueue_renders_multipart_and_counts_toward_cap() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let app_data = test_dir("attach");
+        let mut mail = input("amigo@example.com");
+        mail.attachments = vec![crate::drafts::AttachmentInput {
+            filename: "dados.csv".to_string(),
+            content_type: "text/csv".to_string(),
+            data_base64: "YSxiLGM=".to_string(),
+        }];
+        let out = enqueue_send(conn, &app_data, mail).unwrap();
+        let row = queries::get_send_row(conn, &out.queue_id).unwrap().unwrap();
+        let bytes = std::fs::read(&row.eml_path).unwrap();
+        let msg = mail_parser::MessageParser::new().parse(&bytes).expect("parses");
+        let atts: Vec<_> = msg.attachments().collect();
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].attachment_name(), Some("dados.csv"));
+        assert_eq!(
+            atts[0].contents(),
+            b"a,b,c",
+            "attachment payload must decode back to the original bytes"
+        );
+        assert_eq!(msg.body_text(0).unwrap().to_string(), "corpo");
+        std::fs::remove_dir_all(&app_data).ok();
+    }
+
+    #[test]
+    fn undecodable_attachment_refuses_before_writing_anything() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let app_data = test_dir("bad-attach");
+        let mut mail = input("amigo@example.com");
+        mail.attachments = vec![crate::drafts::AttachmentInput {
+            filename: "quebrado.bin".to_string(),
+            content_type: "application/octet-stream".to_string(),
+            data_base64: "!!! not base64 !!!".to_string(),
+        }];
+        let err = enqueue_send(conn, &app_data, mail).unwrap_err();
+        assert!(
+            err.to_string().starts_with("send-bad-attachment"),
+            "unexpected: {err}"
+        );
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM send_queue", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "refusal must leave no partial row");
+        assert_eq!(outbox_file_count(&app_data), 0, "no .eml may be written");
         std::fs::remove_dir_all(&app_data).ok();
     }
 }

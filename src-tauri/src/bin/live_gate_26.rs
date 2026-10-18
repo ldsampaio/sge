@@ -106,6 +106,7 @@ pub fn render_test_draft(
         subject: format!("{SUBJECT_PREFIX}{subject_suffix}"),
         body: body.to_string(),
         message_id: message_id.to_string(),
+        ..Default::default()
     };
     render_draft_rfc5322(&fields, date_rfc2822)
 }

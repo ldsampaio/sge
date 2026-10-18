@@ -90,6 +90,10 @@ pub struct AppState {
     /// connections per account). A fresh transport per send would reconnect
     /// every time and risk a second client against the relay.
     pub send_transport: Arc<dyn smtp::SmtpTransport>,
+    /// App-wide LLM generation tracker: single-flight per mailbox plus the
+    /// cancel handle. Shared (not per-call) so `cancel_generate` reaches
+    /// the request `generate_reply` actually started.
+    pub llm_tracker: Arc<llm::client::RequestTracker>,
 }
 
 /// In-memory credentials + server config for the connected session.
@@ -454,6 +458,7 @@ pub fn run() {
         idle: Mutex::new(None),
         send_gate: send_queue::SendGate::default(),
         send_transport: Arc::new(smtp::SmtpTransporter::new()),
+        llm_tracker: Arc::new(llm::client::RequestTracker::new()),
     };
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())

@@ -161,6 +161,40 @@ export function IconDownload({ size = 16, className }: IconProps) {
   );
 }
 
+export function IconReply({ size = 16, className }: IconProps) {
+  return base(
+    size,
+    className,
+    <>
+      <path d="m9 17-5-5 5-5" />
+      <path d="M4 12h9a6 6 0 0 1 6 6v1" />
+    </>,
+  );
+}
+
+export function IconReplyAll({ size = 16, className }: IconProps) {
+  return base(
+    size,
+    className,
+    <>
+      <path d="m7 17-5-5 5-5" />
+      <path d="m12 17-5-5 5-5" />
+      <path d="M7 12h8a6 6 0 0 1 6 6v1" />
+    </>,
+  );
+}
+
+export function IconNewMessage({ size = 16, className }: IconProps) {
+  return base(
+    size,
+    className,
+    <>
+      <path d="M12 5v14" />
+      <path d="M5 12h14" />
+    </>,
+  );
+}
+
 export function IconTrash({ size = 20, className }: IconProps) {
   return base(
     size,
