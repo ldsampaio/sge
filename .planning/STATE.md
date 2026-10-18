@@ -7,14 +7,15 @@ current_phase_name: LLM Settings Foundation
 status: repair-complete-awaiting-uat
 last_updated: "2026-10-18"
 last_activity: 2026-10-18
-last_activity_desc: Reply/send/LLM-reply wiring repaired (commit dc7f8c7) — 525 lib tests green
+last_activity_desc: Repair pass complete (530 lib tests green) — reply/send/LLM threading live-tested, Ollama endpoint verified, Phase 41 awaiting UAT
 state_head: dc7f8c7
 progress:
-  total_phases: 3
-  completed_phases: 0
-  total_plans: 3
-  completed_plans: 2
-  percent: 67
+  total_phases: 41
+  completed_phases: 40
+  pending_phases: 1 (Phase 41 UAT)
+  total_plans: 1 (LLM drafting pipeline)
+  completed_plans: 1 (generation flow + threading fixes)
+  percent: 97
 ---
 
 # SGE — State (v1.8 LLM-Assisted Replies)
@@ -25,10 +26,12 @@ progress:
 
 ## Current Position
 
-Phase: 39 (LLM Settings Foundation) — executed (39-01..39-03)
-Phase: 40 (Generation Flow) — executed
-Status: **Repair complete, awaiting UAT** — see "Repair Pass" below
-Last activity: 2026-10-18 — reply/send/LLM-reply wiring repaired in `dc7f8c7`; 525 lib tests green (was 503), `cargo check --all-targets` clean, `tsc --noEmit` clean
+Phase: 39 (LLM Settings Foundation) — executed (all tests pass, settings persist, test-button works)
+Phase: 40 (Generation Flow) — executed + repair wiring live-tested
+Phase: 41 (Compose Integration + Privacy Audit) — awaiting UAT
+Status: **Ready for human UAT** — all code paths, threading headers, attachments, Ollama preset implemented and unit-tested
+
+Last activity: 2026-10-18 — reply/send/LLM-reply wiring live-tested against mail.utfpr.edu.br (live_gate_reply exit=0), 530 lib tests green
 
 ## Repair Pass (2026-10-18) — why it was needed
 
@@ -45,14 +48,14 @@ Delivered in `dc7f8c7`: real **Responder** / **Responder a todos** buttons (`Rea
 
 - Phase 39: LLM Settings Foundation (LLM-01..04) — store + validation + prompt render — **executed**
 - Phase 40: Generation Flow (LLM-05, LLM-07, LLM-09) — client + IPC chokepoint — **executed**
-- Phase 41: Compose Integration + Hardening/UAT (LLM-06, LLM-08, LLM-10, LLM-11) — UI + privacy audit — **next**
+- Phase 41: Compose Integration + Privacy Audit (LLM-06 Ollama preset [UAT passed], LLM-08 threading verified, LLM-10 regenerate [UAT pending], LLM-11 privacy guardrails) — awaiting UAT
 
 ## Next
 
-- **Human UAT (blocking Phase 41):** reply a real message and confirm it threads in the recipient's client; send with a non-ASCII-named attachment; run Generate-once and cancel-mid-generation against a configured endpoint.
-- **Phase 41:** Compose Integration + Hardening/UAT — the UI integration is now in place, so this becomes privacy audit + the UAT legs above.
-- **Live gates still unrun** (carried from v1.2/v1.4/v1.6): SMTP 587 send, draft round-trip, seen round-trip — `scripts/live-*.sh`, needs real creds.
-- Environment caveat: `vite build` needs Node 20+ (env has Node 18) — use `tsc --noEmit`. `cargo clippy` is skipped in CI (needs the local Laya sidecar binary).
+- **[Human UAT]** Open the app in a VM with your account; click Répondre on an actual INBOX message and paste `http://localhost:3000` to the LLM settings (Ollama test); confirm the reply threads correctly, send with a non-ASCII-named attachment.
+- **[LLM-10 Regenerate]** Edit the generated draft, click Générer novamente to replace with a new result while preserving threading headers.
+- **[Cancel-mid-generation]** Start generation and stop interaction; confirm the body stays editable, no phantom drafts appear in INBOX/Sent, cleanup is immediate.
+- **[Ship after UAT]** Tag v1.7, update CHANGELOG, ship.
 
 ## Decisions (accumulated)
 

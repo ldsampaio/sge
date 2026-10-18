@@ -34,6 +34,13 @@ path = "src/bin/live_gate_22.rs"
 name = "live_gate_21"
 path = "src/bin/live_gate_21.rs"
 
+# Reply/threading + attachment live gate: no other gate renders
+# `In-Reply-To`/`References` or `multipart/mixed`, so the reply repair would
+# otherwise be unit-tested only.
+[[bin]]
+name = "live_gate_reply"
+path = "src/bin/live_gate_reply.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

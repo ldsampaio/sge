@@ -84,7 +84,22 @@ impl SessionManager {
         let mut retried = false;
         loop {
             if guard.session.is_none() {
-                let session = connect_sync(&self.config).await.map_err(|e| {
+                // The initial dial is bounded too: without this a black-holed
+                // connect would hang the lease (and every caller behind it).
+                let connect = async_std::future::timeout(
+                    std::time::Duration::from_secs(super::CONNECT_TIMEOUT_SECS),
+                    connect_sync(&self.config),
+                )
+                .await
+                .map_err(|_| {
+                    SyncError::Protocol(format!(
+                        "SessionManager connect {}:{} timed out after {}s",
+                        self.config.host,
+                        self.config.port,
+                        super::CONNECT_TIMEOUT_SECS
+                    ))
+                })?;
+                let session = connect.map_err(|e| {
                     SyncError::Protocol(format!(
                         "SessionManager {}: {e}",
                         if retried { "reconnect" } else { "connect" }
@@ -96,9 +111,27 @@ impl SessionManager {
                 guard.cached_capabilities = None;
             }
             if guard.selected_mailbox.as_deref() != Some(mailbox) {
+                // Bound the SELECT. A pooled session that died silently
+                // (server idle timeout, no FIN) leaves async-imap awaiting a
+                // response that never arrives — async-imap 0.11 has no
+                // command timeout, so the caller would hang forever. A
+                // timeout here lands in the one-shot reconnect below, which
+                // is exactly what this function documents.
                 let select_outcome = {
                     let session = guard.session.as_mut().expect("connected above");
-                    session.select_mailbox(mailbox).await
+                    match async_std::future::timeout(
+                        std::time::Duration::from_secs(super::CONNECT_TIMEOUT_SECS),
+                        session.select_mailbox(mailbox),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(SyncError::Protocol(format!(
+                            "SELECT {mailbox}: no response after {}s \
+                             (pooled session may be dead)",
+                            super::CONNECT_TIMEOUT_SECS
+                        ))),
+                    }
                 };
                 match select_outcome {
                     Ok(summary) => {

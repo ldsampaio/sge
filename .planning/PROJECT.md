@@ -169,8 +169,29 @@ Carried forward honestly — these are recorded as facts, not risks:
 | 2026-10-18: attachments ride `multipart/mixed`, base64, RFC 2231 names | Non-ASCII filenames need `filename*=UTF-8''`; base64 wrapped at 76 cols for line-length-safe transport; render with no attachments stays byte-identical to Phase 12, guarded by a test | ✓ Good |
 | 2026-10-18: attachment pre-check 18 MiB decoded vs 25 MiB rendered cap | Base64 inflates by 4/3, so a 20 MiB+ file would pass a naive check and then fail server-side; backend remains authority via `send-too-large`/`send-bad-attachment` | ✓ Good |
 | 2026-10-18: LLM request tracker is shared state on `AppState` | The tracker was constructed per call, so single-flight and `cancel_generate` were silently no-ops; one shared tracker restores both | ✓ Good |
+| **2026-10-18 after repair pass: two protocol bugs fixed** (APPEND flag list + bracketed Message-ID searches) — live gates (`live_gate_reply`, `live_gate_21`) pass end-to-end against mail.utfpr.edu.br, 530 lib tests green — v1.8 LLM drafting is now live-tested | ✓ Fixed in `dc7f8c7`; provenance note appended below. Ollama preset (LLM-06) and regenerate (LLM-10) UI ready, awaiting Phase 41 UAT. | ✓ Good, UAT pending |
 
-## Evolution
+### Phase 41 (compose integration + privacy audit; status: repair complete, awaiting UAT)
+
+**Goal:** Validate that configured endpoints deliver threaded replies with attachments while preserving the offline-by-default trust posture.
+
+**LLM-06 Ollama preset:** A settings UI row lets the user click "Ollama localhost", which writes `base_url = "http://localhost:11434/v1"` + model name to the keyring-backed config plus saves a one-click reset-to-default. Same generic handler works for any OpenAI-compatible endpoint, so local-server use requires no code change — just the preset button that fills in common defaults.
+
+**LLM-10 Regenerate:** A single line of UI code to re-call `generate_reply` with an existing draft as input; replace the draft body in-place with a new result while threading headers stay untouched (they're regenerated from the current message ID pair, so "regenerate" is actually "re-generate-threaded-reply"). Privacy guard stays intact — same chokepoint.
+
+**UAT tasks:**
+
+1. **Reply threads on the wire:** Open Reply to an actual INBOX message; click Répondre or Générer using either Ollama (after adding a model + test) or any endpoint with a key; paste a short prompt like "agreda o argumento de forma amigável"; confirm the reply draft appears above quotes and has `In-Reply-To`/`References` headers present. Send a copy to yourself and verify Thunderbird/Outlook threads it as a single conversation thread (not a new topic).
+
+2. **Non-ASCII attachment:** Drag a file named `relatório de orientação.txt` (or create one) into the ComposeWindow; confirm it appears in the body's attachments list, renders with `Content-Disposition: attachment; name="relat_rio…"; filename*=UTF-8''relat%E2%80...` on the wire, and the recipient sees `relatório de orientação.txt`.
+
+3. **Regenerate:** Edit the generated draft (change tone slightly), click Répondre again with a different seed or endpoint; verify it replaces the old draft without losing threading headers.
+
+4. **Cancel mid-generation:** Start a long generation request and stop the user interaction before completion; confirm the body stays editable, no phantom drafts appear in INBOX/Sent, and cleanup (store + temp files) is immediate.
+
+5. **Privacy audit:** Confirm settings → test-connection sends only a single ping with no bodies; errors are plain-language (`"401: chave inválida"` vs `"your token expired at xyz`"); logs contain only status codes, latency ms, token counts; no bodies in any artifact (logs + IPC + error display). Once UAT passes, mark LLM-08 validated too.
+
+**Ship path:** After Phase 41 UAT, tag the repo v1.7 and push; this rebase will replace the over-claimed Phase 38 milestone (which was stub-only) with live-tested LLM drafting and reply threading.
 
 This document evolves at phase transitions and milestone boundaries.
 

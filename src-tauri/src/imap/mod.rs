@@ -470,6 +470,31 @@ pub const DRAFT_FLAGS: &str = "(\\Draft \\Seen)";
 /// No `\Draft` atom: Sent copies must not read as drafts to other clients.
 pub const SENT_FLAGS: &str = "(\\Seen)";
 
+/// Normalise a `HEADER <field> "<needle>"` search value.
+///
+/// RFC 822 Message-IDs are bracketed (`<id@host>`), but servers do not agree on
+/// how `SEARCH HEADER` matches them. Probed against the real server on
+/// 2026-10-18:
+///
+/// ```text
+/// HEADER Message-ID "sq-1234-0"               -> 1 hit
+/// HEADER Message-ID "<sq-1234-0@sge.local>"   -> 0 hits
+/// ```
+///
+/// Zero hits is not a neutral result: the Sent-filing probe, the Sent
+/// reconcile, and `save_draft`'s post-APPEND lookup all key on this search, so
+/// a silent miss makes the app re-APPEND duplicates and report "persisted copy
+/// not found" for a draft the server did store. The bare id is a substring of
+/// the stored header value under either interpretation, so normalising to it is
+/// strictly more portable.
+pub fn header_search_needle<'a>(field: &str, value: &'a str) -> &'a str {
+    if field.eq_ignore_ascii_case("message-id") {
+        value.trim().trim_start_matches('<').trim_end_matches('>')
+    } else {
+        value
+    }
+}
+
 /// Which server verb carries a move, given the advertised capabilities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MovePath {
@@ -849,7 +874,8 @@ impl SyncSession for BoxedSession {
     ) -> PinBox<'_, Result<Vec<u32>, SyncError>> {
         let (field_owned, value_owned) = (field.to_string(), value.to_string());
         Box::pin(async move {
-            let query = format!("HEADER {field_owned} \"{value_owned}\"");
+            let needle = header_search_needle(&field_owned, &value_owned);
+            let query = format!("HEADER {field_owned} \"{needle}\"");
             let uids_set = self.uid_search(&query).await.map_err(|e| {
                 SyncError::Protocol(format!(
                     "UID SEARCH HEADER {field_owned} {value_owned}: {e}"
@@ -1127,6 +1153,52 @@ mod tests {
 
     fn caps(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn message_id_search_needle_drops_angle_brackets() {
+        // Live-server regression (2026-10-18): the bracketed form returns ZERO
+        // hits on mail.utfpr.edu.br, so every Sent-filing probe missed and the
+        // draft reconcile reported "persisted copy not found". Callers pass the
+        // stored `<id@host>` form, so the needle must be the bare id.
+        assert_eq!(
+            header_search_needle("Message-ID", "<sq-18dfb4e08385c116-0@sge.local>"),
+            "sq-18dfb4e08385c116-0@sge.local"
+        );
+        // Also tolerate a value that is already bare, and one with padding.
+        assert_eq!(
+            header_search_needle("Message-ID", "sq-1@sge.local"),
+            "sq-1@sge.local"
+        );
+        assert_eq!(
+            header_search_needle("Message-ID", "  <sq-2@sge.local>  "),
+            "sq-2@sge.local"
+        );
+        // Field name matching is case-insensitive (the server echoes either).
+        assert_eq!(
+            header_search_needle("message-id", "<sq-3@sge.local>"),
+            "sq-3@sge.local"
+        );
+        // Any other header keeps its value verbatim — angle brackets can be
+        // meaningful there.
+        assert_eq!(
+            header_search_needle("Subject", "<not a message id>"),
+            "<not a message id>"
+        );
+    }
+
+    #[test]
+    fn sent_flags_is_a_parenthesised_flag_list() {
+        // RFC 3501: flag-list = "(" flag *(SP flag) ")". async-imap interpolates
+        // the argument verbatim into `APPEND <mailbox> <flags> {n}`, so a bare
+        // `\Seen` makes the server answer BAD instead of the "+" continuation
+        // the client waits for (probed 2026-10-18: BAD after 5.7s, no "+").
+        for flags in [SENT_FLAGS, DRAFT_FLAGS] {
+            assert!(
+                flags.starts_with('(') && flags.ends_with(')'),
+                "APPEND flags must be a parenthesised list, got {flags:?}"
+            );
+        }
     }
 
     #[test]

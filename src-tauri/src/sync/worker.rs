@@ -24,7 +24,7 @@ use std::sync::Arc;
 use crate::imap::headers::MessageHeader;
 use crate::imap::manager::{run_move_on_session, save_draft_on_session};
 use crate::imap::roles::{resolve_roles, Role};
-use crate::imap::{MailboxInfo, MailboxSummary, SyncError, SyncSession};
+use crate::imap::{MailboxInfo, MailboxSummary, SyncError, SyncSession, SENT_FLAGS};
 use crate::send_queue::{crash_recover, utc_now_sql, SendGate};
 use crate::smtp::{SmtpAccount, SmtpOutcome, SmtpTransport};
 use crate::store::queries;
@@ -73,6 +73,15 @@ pub struct ReplaySummary {
 /// verdicts park immediately; uncertain verdicts reconcile instead of
 /// counting here (the reconcile miss counts the attempt).
 pub const MAX_SEND_ATTEMPTS: u32 = 10;
+
+/// Bound for one Sent-filing IMAP op (SEARCH / APPEND).
+///
+/// Deliberately far larger than the connect probe's `CONNECT_TIMEOUT_SECS`
+/// (30s): an APPEND of a 25 MiB `.eml` over a slow link is legitimate. This
+/// is a liveness floor, not a performance target — it exists so a silently
+/// dead pooled session degrades to `sent_unfiled` instead of hanging the
+/// send flush forever (async-imap 0.11 has no command timeout).
+const SENT_FILING_TIMEOUT_SECS: u64 = 120;
 
 /// Delivery verdict of one flushed row.
 ///
@@ -637,6 +646,39 @@ impl SyncWorker {
         summary
     }
 
+    /// Bound one Sent-filing IMAP op.
+    ///
+    /// A pooled session can die silently (server-side idle timeout) with no
+    /// FIN, leaving async-imap waiting for a response that never arrives —
+    /// and async-imap 0.11 has no command timeout. Without this bound the
+    /// flush hangs forever instead of degrading to `sent_unfiled`
+    /// (APPEND-only retry, never a re-send). Observed on the 2026-10-18 live
+    /// gate: a successful SMTP send whose Sent-filing SEARCH never returned.
+    async fn filing_op<T>(
+        secs: u64,
+        op: impl std::future::Future<Output = Result<T, SyncError>>,
+    ) -> Result<T, SyncError> {
+        match async_std::future::timeout(std::time::Duration::from_secs(secs), op).await {
+            Ok(result) => result,
+            Err(_) => Err(SyncError::Protocol(format!(
+                "Sent filing timed out after {secs}s — the pooled session may be dead"
+            ))),
+        }
+    }
+
+    /// `set_send_state` under a short-lived store lock.
+    ///
+    /// The store lock MUST NOT be held across an `.await`: a
+    /// `std::sync::MutexGuard` alive at a suspension point keeps a blocking
+    /// mutex locked while the task yields, so any other task (or the same
+    /// flush) that blocks on the store can stall the async worker threads
+    /// and wedge the pass. Found via the 2026-10-18 live gate, which hung on
+    /// a successful send that never reached the Sent-filing await.
+    fn set_send_state_scoped(&self, id: &str, state: &str) -> Result<(), String> {
+        let guard = self.store.lock().unwrap();
+        queries::set_send_state(guard.conn(), id, state).map_err(|e| e.to_string())
+    }
+
     /// Send one due row to its verdict. Returns `None` when a store write
     /// failed before any verdict landed (row skipped, uncounted — never
     /// fails the pass). Reads the immutable `.eml` bytes off the store lock;
@@ -674,8 +716,9 @@ impl SyncWorker {
             .send_raw(&env.account, &row.from_addr, &recipients, &bytes)
         {
             SmtpOutcome::Sent => {
-                let guard = self.store.lock().unwrap();
-                if let Err(e) = queries::set_send_state(guard.conn(), &row.id, SEND_STATE_SENT) {
+                // Scoped lock only: the guard must not survive into the
+                // Sent-filing awaits below (see `set_send_state_scoped`).
+                if let Err(e) = self.set_send_state_scoped(&row.id, SEND_STATE_SENT) {
                     eprintln!("[SGE send] {} sent but state write failed ({e})", row.id);
                     return None;
                 }
@@ -692,8 +735,11 @@ impl SyncWorker {
                     let sent_selected = manager.lease_for(&sent_folder).await;
                     match sent_selected {
                         Ok(mut lease) => {
-                            let search_result =
-                                lease.session().uid_search_header("Message-ID", mid).await;
+                            let search_result = Self::filing_op(
+                                SENT_FILING_TIMEOUT_SECS,
+                                lease.session().uid_search_header("Message-ID", mid),
+                            )
+                            .await;
                             match search_result {
                                 Ok(hits) if !hits.is_empty() => {
                                     // Probe hit: server already auto-saved this message.
@@ -703,11 +749,9 @@ impl SyncWorker {
                                         row.id
                                     );
                                     // Still mark the state as sent
-                                    if let Err(e) = queries::set_send_state(
-                                        guard.conn(),
-                                        &row.id,
-                                        SEND_STATE_SENT,
-                                    ) {
+                                    if let Err(e) =
+                                        self.set_send_state_scoped(&row.id, SEND_STATE_SENT)
+                                    {
                                         eprintln!(
                                             "[SGE send] {} state write failed after dedupe ({e})",
                                             row.id
@@ -719,10 +763,15 @@ impl SyncWorker {
                                 Ok(_) => {
                                     // Probe miss: no existing copy in Sent → APPEND verbatim.
                                     let bytes = std::fs::read(&row.eml_path).unwrap_or_default();
-                                    let append_result = lease
-                                        .session()
-                                        .append_message(&sent_folder, "\\Seen", &bytes)
-                                        .await;
+                                    let append_result = Self::filing_op(
+                                        SENT_FILING_TIMEOUT_SECS,
+                                        lease.session().append_message(
+                                            &sent_folder,
+                                            SENT_FLAGS,
+                                            &bytes,
+                                        ),
+                                    )
+                                    .await;
                                     match append_result {
                                         Ok(()) => {
                                             eprintln!(
@@ -730,11 +779,9 @@ impl SyncWorker {
                                                 row.id
                                             );
                                             // Mark the queue row as sent after successful APPEND
-                                            if let Err(e) = queries::set_send_state(
-                                                guard.conn(),
-                                                &row.id,
-                                                SEND_STATE_SENT,
-                                            ) {
+                                            if let Err(e) =
+                                                self.set_send_state_scoped(&row.id, SEND_STATE_SENT)
+                                            {
                                                 eprintln!("[SGE send] {} state write failed after APPEND ({e})", row.id);
                                                 return None;
                                             }
@@ -747,11 +794,9 @@ impl SyncWorker {
                                             );
                                             // Park as sent_unfiled: SMTP succeeded but APPEND failed
                                             // Never triggers re-SMTP-send; APPEND-only retry on later passes
-                                            if let Err(e) = queries::set_send_state(
-                                                guard.conn(),
-                                                &row.id,
-                                                SEND_STATE_SENT,
-                                            ) {
+                                            if let Err(e) =
+                                                self.set_send_state_scoped(&row.id, SEND_STATE_SENT)
+                                            {
                                                 eprintln!("[SGE send] {} state write marked sent despite APPEND failure ({e})", row.id);
                                             }
                                             Some(FlushOutcome::SentUnfiled)
@@ -765,21 +810,24 @@ impl SyncWorker {
                                     );
                                     // Treat SEARCH error as miss: attempt APPEND verbatim
                                     let bytes = std::fs::read(&row.eml_path).unwrap_or_default();
-                                    let append_result = lease
-                                        .session()
-                                        .append_message(&sent_folder, "\\Seen", &bytes)
-                                        .await;
+                                    let append_result = Self::filing_op(
+                                        SENT_FILING_TIMEOUT_SECS,
+                                        lease.session().append_message(
+                                            &sent_folder,
+                                            SENT_FLAGS,
+                                            &bytes,
+                                        ),
+                                    )
+                                    .await;
                                     match append_result {
                                         Ok(()) => {
                                             eprintln!(
                                                 "[SGE send] {} APPENDed to Sent after SEARCH error",
                                                 row.id
                                             );
-                                            if let Err(e) = queries::set_send_state(
-                                                guard.conn(),
-                                                &row.id,
-                                                SEND_STATE_SENT,
-                                            ) {
+                                            if let Err(e) =
+                                                self.set_send_state_scoped(&row.id, SEND_STATE_SENT)
+                                            {
                                                 eprintln!("[SGE send] {} state write failed after APPEND ({e})", row.id);
                                                 return None;
                                             }
@@ -790,11 +838,9 @@ impl SyncWorker {
                                                 "[SGE send] {} APPEND failed after SEARCH error ({e}) — sent_unfiled",
                                                 row.id
                                             );
-                                            if let Err(e) = queries::set_send_state(
-                                                guard.conn(),
-                                                &row.id,
-                                                SEND_STATE_SENT,
-                                            ) {
+                                            if let Err(e) =
+                                                self.set_send_state_scoped(&row.id, SEND_STATE_SENT)
+                                            {
                                                 eprintln!("[SGE send] {} state write marked sent despite APPEND failure ({e})", row.id);
                                             }
                                             Some(FlushOutcome::SentUnfiled)
@@ -814,21 +860,22 @@ impl SyncWorker {
                                 let lease_result = manager.lease_for(sent_wire).await;
                                 if let Ok(mut lease) = lease_result {
                                     let bytes = std::fs::read(&row.eml_path).unwrap_or_default();
-                                    let append_result = lease
-                                        .session()
-                                        .append_message(sent_wire, "\\Seen", &bytes)
-                                        .await;
+                                    let append_result = Self::filing_op(
+                                        SENT_FILING_TIMEOUT_SECS,
+                                        lease
+                                            .session()
+                                            .append_message(sent_wire, SENT_FLAGS, &bytes),
+                                    )
+                                    .await;
                                     match append_result {
                                         Ok(()) => {
                                             eprintln!(
                                                 "[SGE send] {} APPENDed to {} after lease recovery",
                                                 row.id, sent_wire
                                             );
-                                            if let Err(e) = queries::set_send_state(
-                                                guard.conn(),
-                                                &row.id,
-                                                SEND_STATE_SENT,
-                                            ) {
+                                            if let Err(e) =
+                                                self.set_send_state_scoped(&row.id, SEND_STATE_SENT)
+                                            {
                                                 eprintln!("[SGE send] {} state write failed after APPEND ({e})", row.id);
                                                 return None;
                                             }
@@ -839,11 +886,9 @@ impl SyncWorker {
                                                 "[SGE send] {} APPEND failed after lease recovery ({e}) — sent_unfiled",
                                                 row.id
                                             );
-                                            if let Err(e) = queries::set_send_state(
-                                                guard.conn(),
-                                                &row.id,
-                                                SEND_STATE_SENT,
-                                            ) {
+                                            if let Err(e) =
+                                                self.set_send_state_scoped(&row.id, SEND_STATE_SENT)
+                                            {
                                                 eprintln!("[SGE send] {} state write marked sent despite APPEND failure ({e})", row.id);
                                             }
                                             Some(FlushOutcome::SentUnfiled)
@@ -4532,5 +4577,82 @@ mod tests {
         // This test would normally mock the session and verify the call sequence
         // For now, we verify the method exists and can be called
         assert!(true, "placeholder test for uncertain reconcile at startup");
+    }
+
+    // ── Sent-filing liveness (2026-10-18 live-gate hang) ─────────────────
+    //
+    // The live gate wedged after a successful SMTP send: the Sent-filing
+    // SEARCH on a pooled session never returned, and async-imap 0.11 has no
+    // command timeout, so the flush waited forever (0 CPU, idle sockets).
+
+    #[test]
+    fn filing_op_passes_success_and_error_through() {
+        async_std::task::block_on(async {
+            let ok = SyncWorker::filing_op(5, async { Ok::<u8, SyncError>(7) }).await;
+            assert_eq!(ok.expect("success passes through"), 7);
+
+            let err = SyncWorker::filing_op(5, async {
+                Err::<u8, SyncError>(SyncError::Protocol("server said NO".to_string()))
+            })
+            .await;
+            match err {
+                Err(SyncError::Protocol(m)) => assert_eq!(m, "server said NO"),
+                other => panic!("the server error must pass through verbatim, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn filing_op_bounds_a_session_that_never_answers() {
+        // Exactly the live symptom: a pooled session that never responds.
+        // Without the bound this future never resolves and the flush hangs.
+        let started = std::time::Instant::now();
+        let out = async_std::task::block_on(async {
+            SyncWorker::filing_op(1, std::future::pending::<Result<u8, SyncError>>()).await
+        });
+        match out {
+            Err(SyncError::Protocol(m)) => assert!(
+                m.contains("timed out") && m.contains("pooled session"),
+                "timeout error must name the cause, got {m:?}"
+            ),
+            other => panic!("expected a bounded timeout error, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "must return at the bound rather than hang: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn sent_filing_arm_never_holds_the_store_guard_across_an_await() {
+        // Structural guard for the same hang. `flush_one_row`'s Sent arm used
+        // to bind `let guard = self.store.lock().unwrap()` and keep it alive
+        // through the Sent-filing awaits — a blocking `std::sync::MutexGuard`
+        // at a suspension point, which starves the async worker threads.
+        //
+        // The filing leg cannot be driven from a unit test: `SendFlushEnv`'s
+        // `manager` field is a concrete `Arc<SessionManager>`, so there is no
+        // seam to park the search mid-await. The invariant is therefore
+        // asserted on the source: state writes go through
+        // `set_send_state_scoped`, which confines the guard to a no-await
+        // helper.
+        let src = include_str!("worker.rs");
+        let arm = src
+            .split("SmtpOutcome::Sent => {")
+            .nth(1)
+            .expect("the SmtpOutcome::Sent arm must exist")
+            .split("// ── End Sent filing leg")
+            .next()
+            .expect("the Sent arm must end at its `End Sent filing leg` marker");
+        assert!(
+            !arm.contains("guard.conn()"),
+            "the Sent arm must not reuse a long-lived store guard across its \
+             awaits — write state via `set_send_state_scoped`"
+        );
+        assert!(
+            !arm.contains("let guard"),
+            "the Sent arm must not bind a store guard at all: it spans awaits"
+        );
     }
 }
