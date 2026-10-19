@@ -114,7 +114,7 @@ MIT license — distribute and modify freely. The UI components are MIT too, per
 
 ## 📞 Support & Credits
 
-SGE is built by [lucas](https://github.com/ldsampaio), a student at UTFPR (Campus Sombrio, Brazil) on the GNU/Linux desktop stack; inspired by [Thunderbird](https://www.thunderbird.net/) and [Mastodon](https://joinmastodon.org/) — minimal, open-source, Linux-first.
+SGE is built by [lucas](https://github.com/ldsampaio), a professor at UTFPR (Cornélio Procópio, Brazil) on the GNU/Linux desktop stack; inspired by [Thunderbird](https://www.thunderbird.net/) and [Mastodon](https://joinmastodon.org/) — minimal, open-source, Linux-first.
 
 *LLM-assisted reply drafting with threading headers, RFC 2231 attachment support, privacy guardrails, Ollama local inference — ship v1.8 (Phase 41) now.*
 
