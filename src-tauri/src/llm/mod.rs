@@ -276,7 +276,11 @@ mod tests {
             .expect("count should succeed");
         assert_eq!(count, 1, "double-save must stay a single row");
         let rows = get_llm_models(store.conn()).expect("read should succeed");
-        assert_eq!(rows, vec![with_id], "double-save must keep identical values");
+        assert_eq!(
+            rows,
+            vec![with_id],
+            "double-save must keep identical values"
+        );
     }
 
     #[test]

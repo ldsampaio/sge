@@ -957,7 +957,10 @@ mod tests {
         crash_recover(conn).unwrap();
         // Row should now be in `queued` state
         let row_after = queries::get_send_row(conn, &out.queue_id).unwrap().unwrap();
-        assert_eq!(row_after.state, SEND_STATE_QUEUED, "row should be reset to queued");
+        assert_eq!(
+            row_after.state, SEND_STATE_QUEUED,
+            "row should be reset to queued"
+        );
         std::fs::remove_dir_all(&app_data).ok();
     }
 
@@ -974,7 +977,10 @@ mod tests {
         crash_recover(conn).unwrap();
         // Row should still be uncertain (SEARCH reconciliation happens in sync/worker)
         let row_after = queries::get_send_row(conn, &out.queue_id).unwrap().unwrap();
-        assert_eq!(row_after.state, SEND_STATE_UNCERTAIN, "row should remain uncertain");
+        assert_eq!(
+            row_after.state, SEND_STATE_UNCERTAIN,
+            "row should remain uncertain"
+        );
         std::fs::remove_dir_all(&app_data).ok();
     }
 
@@ -1018,7 +1024,9 @@ mod tests {
         let out = enqueue_send(conn, &app_data, mail).unwrap();
         let row = queries::get_send_row(conn, &out.queue_id).unwrap().unwrap();
         let bytes = std::fs::read(&row.eml_path).unwrap();
-        let msg = mail_parser::MessageParser::new().parse(&bytes).expect("parses");
+        let msg = mail_parser::MessageParser::new()
+            .parse(&bytes)
+            .expect("parses");
         let atts: Vec<_> = msg.attachments().collect();
         assert_eq!(atts.len(), 1);
         assert_eq!(atts[0].attachment_name(), Some("dados.csv"));

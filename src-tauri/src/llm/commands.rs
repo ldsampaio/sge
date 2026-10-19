@@ -15,7 +15,7 @@
 //! `Ok(false)` presence on the get path. Errors and views carry metadata
 //! only — the key string and mail bodies never appear (T-39-01).
 
-use super::key::{LlmKeyStore, has_llm_api_key};
+use super::key::{has_llm_api_key, LlmKeyStore};
 use super::{LlmSettings, LlmSettingsInput, LlmSettingsView};
 use crate::store::queries as store_queries;
 
@@ -38,8 +38,7 @@ async fn read_models(
 ) -> Result<Vec<LlmSettingsView>, String> {
     let models = {
         let guard = store.lock().unwrap();
-        store_queries::get_llm_models(guard.conn())
-            .map_err(|e| e.to_string())?
+        store_queries::get_llm_models(guard.conn()).map_err(|e| e.to_string())?
     };
     let has_api_key = tauri::async_runtime::spawn_blocking(|| {
         has_llm_api_key(&super::key::KeyringLlmKeyStore::new())
@@ -82,8 +81,7 @@ pub async fn save_llm_model(
     }
     let new_id = {
         let guard = state.store.lock().unwrap();
-        store_queries::upsert_llm_model(guard.conn(), &validated)
-            .map_err(|e| e.to_string())?
+        store_queries::upsert_llm_model(guard.conn(), &validated).map_err(|e| e.to_string())?
     };
     if let Some(key) = input.api_key {
         tauri::async_runtime::spawn_blocking(move || {
@@ -120,8 +118,7 @@ pub async fn delete_llm_model(
 ) -> Result<Vec<LlmSettingsView>, String> {
     {
         let guard = state.store.lock().unwrap();
-        store_queries::delete_llm_model(guard.conn(), id)
-            .map_err(|e| e.to_string())?;
+        store_queries::delete_llm_model(guard.conn(), id).map_err(|e| e.to_string())?;
     }
     read_models(&state.store).await
 }
@@ -135,13 +132,11 @@ pub async fn reset_llm_template(
 ) -> Result<Vec<LlmSettingsView>, String> {
     {
         let guard = state.store.lock().unwrap();
-        let models = store_queries::get_llm_models(guard.conn())
-            .map_err(|e| e.to_string())?;
+        let models = store_queries::get_llm_models(guard.conn()).map_err(|e| e.to_string())?;
         if let Some(mut current) = models.into_iter().next() {
             current.prompt_template = super::DEFAULT_TEMPLATE.to_string();
             let validated = super::validate::validate(&current).map_err(|e| e.to_string())?;
-            store_queries::upsert_llm_model(guard.conn(), &validated)
-                .map_err(|e| e.to_string())?;
+            store_queries::upsert_llm_model(guard.conn(), &validated).map_err(|e| e.to_string())?;
         }
     }
     read_models(&state.store).await
@@ -172,8 +167,7 @@ pub async fn test_llm_connection(
 ) -> Result<super::client::TestResult, String> {
     let settings = {
         let guard = state.store.lock().unwrap();
-        let models = store_queries::get_llm_models(guard.conn())
-            .map_err(|e| e.to_string())?;
+        let models = store_queries::get_llm_models(guard.conn()).map_err(|e| e.to_string())?;
         models.into_iter().next().unwrap_or_default()
     };
     let key_store = super::key::KeyringLlmKeyStore::new();
@@ -247,8 +241,7 @@ pub async fn generate_reply(
     // 1. Settings (store mutex only — no network, no keyring).
     let settings = {
         let guard = state.store.lock().unwrap();
-        let models =
-            store_queries::get_llm_models(guard.conn()).map_err(|e| e.to_string())?;
+        let models = store_queries::get_llm_models(guard.conn()).map_err(|e| e.to_string())?;
         models.into_iter().next().unwrap_or_default()
     };
     if settings.base_url.trim().is_empty() || settings.model.trim().is_empty() {
@@ -290,8 +283,12 @@ pub async fn generate_reply(
         );
     }
 
-    let rendered_prompt =
-        super::prompt::render_prompt(&settings.prompt_template, &sender, &subject_text, &original_body);
+    let rendered_prompt = super::prompt::render_prompt(
+        &settings.prompt_template,
+        &sender,
+        &subject_text,
+        &original_body,
+    );
 
     // 5. Single-flight on the shared tracker: a second generation for the
     //    same mailbox is refused while one is running.
@@ -317,10 +314,8 @@ pub async fn generate_reply(
                 return Ok(generation.draft_text);
             }
             Err(e) if e.is_retryable() && attempt < GENERATE_MAX_ATTEMPTS => {
-                async_std::task::sleep(std::time::Duration::from_millis(
-                    GENERATE_RETRY_DELAY_MS,
-                ))
-                .await;
+                async_std::task::sleep(std::time::Duration::from_millis(GENERATE_RETRY_DELAY_MS))
+                    .await;
             }
             Err(e) => {
                 // Only release the slot we still own: a cancel (or a newer
@@ -391,8 +386,14 @@ mod tests {
 
     #[test]
     fn prompt_inputs_prefer_the_cached_original() {
-        let c = ctx("ana@example.com", "Prova de cálculo", "trecho…", Some("corpo completo"));
-        let (sender, subject, body) = prompt_inputs(&c, Some("Re: Prova de cálculo"), Some("> citado"));
+        let c = ctx(
+            "ana@example.com",
+            "Prova de cálculo",
+            "trecho…",
+            Some("corpo completo"),
+        );
+        let (sender, subject, body) =
+            prompt_inputs(&c, Some("Re: Prova de cálculo"), Some("> citado"));
         assert_eq!(sender, "ana@example.com");
         assert_eq!(
             subject, "Prova de cálculo",
@@ -432,4 +433,3 @@ mod tests {
         assert!(subject.is_empty(), "whitespace-only values are dropped");
     }
 }
-

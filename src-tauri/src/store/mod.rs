@@ -181,9 +181,8 @@ const M23_LLM_SETTINGS_SQL: &str = concat!(
 );
 /// M24 forward migration: add `provider` column to existing `llm_settings`
 /// table for databases created before provider support (Phase 41).
-const M24_LLM_SETTINGS_PROVIDER_SQL: &str = concat!(
-    "ALTER TABLE llm_settings ADD COLUMN provider TEXT NOT NULL DEFAULT 'custom';",
-);
+const M24_LLM_SETTINGS_PROVIDER_SQL: &str =
+    concat!("ALTER TABLE llm_settings ADD COLUMN provider TEXT NOT NULL DEFAULT 'custom';",);
 
 /// M25 forward migration: create `llm_models` table to support multiple
 /// configured LLM models (Phase 41).

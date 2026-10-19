@@ -104,7 +104,9 @@ pub async fn open_compose_window(
         "reply" => "Responder",
         _ => "Responder a todos",
     };
-    let url = WebviewUrl::App(format!("index.html{}", compose_hash(mode, uid, mailbox.as_deref())).into());
+    let url = WebviewUrl::App(
+        format!("index.html{}", compose_hash(mode, uid, mailbox.as_deref())).into(),
+    );
     WebviewWindowBuilder::new(&app, &label, url)
         .title(title)
         .inner_size(760.0, 620.0)
@@ -182,10 +184,19 @@ mod tests {
 
     #[test]
     fn compose_labels_are_unique_and_capability_scoped() {
-        let a = format!("{COMPOSE_LABEL_PREFIX}{}", COMPOSE_SEQ.fetch_add(1, Ordering::SeqCst));
-        let b = format!("{COMPOSE_LABEL_PREFIX}{}", COMPOSE_SEQ.fetch_add(1, Ordering::SeqCst));
+        let a = format!(
+            "{COMPOSE_LABEL_PREFIX}{}",
+            COMPOSE_SEQ.fetch_add(1, Ordering::SeqCst)
+        );
+        let b = format!(
+            "{COMPOSE_LABEL_PREFIX}{}",
+            COMPOSE_SEQ.fetch_add(1, Ordering::SeqCst)
+        );
         assert_ne!(a, b);
-        assert!(a.starts_with("compose-"), "capability glob compose-* covers {a}");
+        assert!(
+            a.starts_with("compose-"),
+            "capability glob compose-* covers {a}"
+        );
         assert_eq!(LLM_CONFIG_LABEL, "llm-config");
     }
 }

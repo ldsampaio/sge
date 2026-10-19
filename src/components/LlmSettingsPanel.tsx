@@ -65,9 +65,10 @@ export default function LlmSettingsPanel() {
         setTestStatus("fail");
         setTestMsg(result.error ?? "Connection failed.");
       }
-    } catch (e: any) {
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
       setTestStatus("fail");
-      setTestMsg("Connection error: " + (e?.message || String(e)));
+      setTestMsg("Connection error: " + message);
     }
   };
 

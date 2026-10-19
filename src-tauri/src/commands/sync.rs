@@ -1329,9 +1329,7 @@ pub struct SendPendingResult {
 ///    Message-ID before any re-send, so a timeout that actually landed is
 ///    never delivered twice.
 #[tauri::command]
-pub async fn send_pending(
-    state: State<'_, crate::AppState>,
-) -> Result<SendPendingResult, String> {
+pub async fn send_pending(state: State<'_, crate::AppState>) -> Result<SendPendingResult, String> {
     let account_cfg: AccountConfig = load_account_config(state.clone()).await?;
     let manager = manager_for(&state, &account_cfg);
     let store = state.store.clone();
@@ -1380,9 +1378,9 @@ pub async fn send_pending(
                             eprintln!("[SGE send] reconcile failed ({e}) — rows stay uncertain");
                         }
                     }
-                    Err(e) => eprintln!(
-                        "[SGE send] reconcile lease failed ({e}) — rows stay uncertain"
-                    ),
+                    Err(e) => {
+                        eprintln!("[SGE send] reconcile lease failed ({e}) — rows stay uncertain")
+                    }
                 }
             }
 

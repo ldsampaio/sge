@@ -157,7 +157,10 @@ fn base64_payload(raw: &str) -> String {
         Some(i) if raw[..i].starts_with("data:") => &raw[i + "base64,".len()..],
         _ => raw,
     };
-    after_prefix.chars().filter(|c| !c.is_whitespace()).collect()
+    after_prefix
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect()
 }
 
 /// True when `raw` is a well-formed padded base64 payload. Refused at
@@ -221,7 +224,10 @@ fn mime_param(name: &str, value: &str) -> String {
     if value.is_ascii() {
         format!("{name}=\"{ascii}\"")
     } else {
-        format!("{name}=\"{ascii}\"; {name}*=UTF-8''{}", percent_encode(value))
+        format!(
+            "{name}=\"{ascii}\"; {name}*=UTF-8''{}",
+            percent_encode(value)
+        )
     }
 }
 
@@ -597,7 +603,10 @@ mod tests {
         }];
         let raw = render_draft_rfc5322(&d, DATE);
         let text = String::from_utf8_lossy(&raw);
-        assert!(text.contains("application/octet-stream"), "blank type defaults");
+        assert!(
+            text.contains("application/octet-stream"),
+            "blank type defaults"
+        );
         assert!(
             !text.contains("data:") && !text.contains("\nAw"),
             "the data: prefix and line breaks must be stripped: {text}"
@@ -633,7 +642,10 @@ mod tests {
         }];
         let raw = render_draft_rfc5322(&d, DATE);
         let msg = parse(&raw);
-        assert_eq!(msg.body_text(0).unwrap().to_string(), "----=_sge_compose1sgelocal_0");
+        assert_eq!(
+            msg.body_text(0).unwrap().to_string(),
+            "----=_sge_compose1sgelocal_0"
+        );
         let atts: Vec<_> = msg.attachments().collect();
         assert_eq!(atts[0].attachment_name(), Some("x.txt"));
     }

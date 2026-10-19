@@ -234,10 +234,7 @@ mod tests {
             let mut s = valid();
             s.temperature = t;
             assert!(
-                matches!(
-                    validate(&s),
-                    Err(LlmSettingsError::TemperatureOutOfRange)
-                ),
+                matches!(validate(&s), Err(LlmSettingsError::TemperatureOutOfRange)),
                 "temperature {t} must be rejected"
             );
         }
@@ -259,10 +256,7 @@ mod tests {
             let mut s = valid();
             s.max_tokens = n;
             assert!(
-                matches!(
-                    validate(&s),
-                    Err(LlmSettingsError::MaxTokensOutOfRange)
-                ),
+                matches!(validate(&s), Err(LlmSettingsError::MaxTokensOutOfRange)),
                 "max_tokens {n} must be rejected, never coerced"
             );
         }

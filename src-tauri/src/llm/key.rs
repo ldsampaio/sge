@@ -73,8 +73,7 @@ impl KeyringLlmKeyStore {
     }
 
     fn entry(&self) -> Result<keyring::Entry, LlmKeyError> {
-        keyring::Entry::new(&self.service, &self.account)
-            .map_err(|e| unavailable("open", e))
+        keyring::Entry::new(&self.service, &self.account).map_err(|e| unavailable("open", e))
     }
 }
 
@@ -181,10 +180,7 @@ mod tests {
         let saved = "sk-test-llm-custody-probe-key";
         save_llm_api_key(&store, saved).unwrap();
         assert!(has_llm_api_key(&store), "saved entry must report true");
-        assert_eq!(
-            load_llm_api_key(&store).unwrap().as_deref(),
-            Some(saved)
-        );
+        assert_eq!(load_llm_api_key(&store).unwrap().as_deref(), Some(saved));
         clear_llm_api_key(&store).unwrap();
         assert!(!has_llm_api_key(&store), "cleared entry must report false");
         assert_eq!(load_llm_api_key(&store).unwrap(), None);
@@ -240,10 +236,7 @@ mod tests {
         let saved = "sk-test-live-llm-key";
         save_llm_api_key(&store, saved).unwrap();
         assert!(has_llm_api_key(&store));
-        assert_eq!(
-            load_llm_api_key(&store).unwrap().as_deref(),
-            Some(saved)
-        );
+        assert_eq!(load_llm_api_key(&store).unwrap().as_deref(), Some(saved));
         clear_llm_api_key(&store).unwrap();
         assert!(!has_llm_api_key(&store));
     }

@@ -76,7 +76,11 @@ impl RequestTracker {
 
     /// Mark a request as completed (cancel or normal finish).
     pub fn end_request(&self, mailbox: &str) {
-        if let Some(slots) = self.slots.lock().expect("request tracker lock").get_mut(mailbox)
+        if let Some(slots) = self
+            .slots
+            .lock()
+            .expect("request tracker lock")
+            .get_mut(mailbox)
         {
             *slots = None;
         }
@@ -84,7 +88,12 @@ impl RequestTracker {
 
     /// Cancel a pending request, returning true if found and cancelled.
     pub fn cancel_request(&self, mailbox: &str) -> bool {
-        if let Some(slots) = self.slots.lock().expect("request tracker lock").get_mut(mailbox) {
+        if let Some(slots) = self
+            .slots
+            .lock()
+            .expect("request tracker lock")
+            .get_mut(mailbox)
+        {
             if slots.is_some() {
                 *slots = None;
                 return true;
@@ -187,9 +196,7 @@ impl LlmRequestError {
             }
             status if status.is_client_error() || status.is_server_error() => {
                 let msg = body
-                    .and_then(|b| {
-                        serde_json::from_str::<serde_json::Value>(b).ok()
-                    })
+                    .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
                     .and_then(|v| {
                         v.get("error")
                             .and_then(|e| e.get("message"))
@@ -336,7 +343,8 @@ impl MockTransport {
                 "type": "error",
                 "code": status
             }
-        }).to_string();
+        })
+        .to_string();
         self.responses.push(MockResponse::Error { status, body });
         self
     }
@@ -429,13 +437,14 @@ pub async fn generate_reply_with_key(
         return Err(LlmRequestError::from_status(status, body.as_deref()));
     }
 
-    let body = resp.text().await.map_err(|_| LlmRequestError::InvalidResponse)?;
+    let body = resp
+        .text()
+        .await
+        .map_err(|_| LlmRequestError::InvalidResponse)?;
 
     // Parse response
-    let resp_json = serde_json::from_slice::<CompletionResponse>(
-        &body.into_bytes(),
-    )
-    .map_err(|_| LlmRequestError::InvalidResponse)?;
+    let resp_json = serde_json::from_slice::<CompletionResponse>(&body.into_bytes())
+        .map_err(|_| LlmRequestError::InvalidResponse)?;
 
     let choice = resp_json
         .choices
@@ -680,7 +689,7 @@ mod tests {
         let mut mock = MockTransport::new();
         mock = mock.add_success("test response");
         mock = mock.add_error(429, "rate limited");
-        
+
         assert!(matches!(mock.next(), Some(MockResponse::Success { .. })));
         assert!(matches!(mock.next(), Some(MockResponse::Error { .. })));
         assert!(matches!(mock.next(), Some(MockResponse::Success { .. }))); // Wraps around

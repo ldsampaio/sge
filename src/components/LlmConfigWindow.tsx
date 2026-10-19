@@ -172,8 +172,9 @@ export default function LlmConfigWindow() {
       if (modelsList.length > 0 && !newModel.model) {
         setNewModel({ ...newModel, model: modelsList[0] });
       }
-    } catch (e: any) {
-      setFetchError("Erro ao buscar modelos: " + (e?.message || String(e)));
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      setFetchError("Erro ao buscar modelos: " + message);
       setAvailableModels([]);
     } finally {
       setIsFetchingModels(false);
@@ -189,7 +190,7 @@ export default function LlmConfigWindow() {
 
   // Salvar modelo (configurações + chave de API gravada localmente no keyring)
   const saveModel = async () => {
-    const input: any = {
+    const input = {
       id: editingId ?? null,
       provider: newModel.provider,
       base_url: newModel.base_url,
@@ -268,9 +269,10 @@ export default function LlmConfigWindow() {
         setTestStatus("fail");
         setTestMsg(result.error ?? "Falha na conexão.");
       }
-    } catch (e: any) {
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
       setTestStatus("fail");
-      setTestMsg("Erro de conexão: " + (e?.message || String(e)));
+      setTestMsg("Erro de conexão: " + message);
     }
   };
 

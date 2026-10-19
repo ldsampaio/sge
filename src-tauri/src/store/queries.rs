@@ -3113,9 +3113,18 @@ mod tests {
             parse_addr_list("[\"a@x.com\", \"b@y.com\"]"),
             vec!["a@x.com", "b@y.com"]
         );
-        assert_eq!(parse_addr_list("a@x.com, b@y.com"), vec!["a@x.com", "b@y.com"]);
-        assert_eq!(parse_addr_list("a@x.com;b@y.com"), vec!["a@x.com", "b@y.com"]);
-        assert!(parse_addr_list("").is_empty(), "empty string = no addresses");
+        assert_eq!(
+            parse_addr_list("a@x.com, b@y.com"),
+            vec!["a@x.com", "b@y.com"]
+        );
+        assert_eq!(
+            parse_addr_list("a@x.com;b@y.com"),
+            vec!["a@x.com", "b@y.com"]
+        );
+        assert!(
+            parse_addr_list("").is_empty(),
+            "empty string = no addresses"
+        );
         assert!(parse_addr_list("[]").is_empty(), "empty JSON array = none");
         assert!(parse_addr_list("  ").is_empty(), "whitespace-only = none");
         assert_eq!(
@@ -5308,10 +5317,7 @@ pub fn get_llm_model_by_id(
 
 /// Insert-or-update a single model. If `settings.id` is `Some`, updates that row;
 /// otherwise inserts a new row. Returns the row id.
-pub fn upsert_llm_model(
-    conn: &Connection,
-    settings: &crate::llm::LlmSettings,
-) -> StoreResult<i64> {
+pub fn upsert_llm_model(conn: &Connection, settings: &crate::llm::LlmSettings) -> StoreResult<i64> {
     match settings.id {
         Some(id) => {
             conn.execute(
@@ -5355,7 +5361,10 @@ pub fn upsert_llm_model(
 
 /// Delete a model by its row id.
 pub fn delete_llm_model(conn: &Connection, id: i64) -> StoreResult<()> {
-    conn.execute("DELETE FROM llm_models WHERE id = ?1", rusqlite::params![id])?;
+    conn.execute(
+        "DELETE FROM llm_models WHERE id = ?1",
+        rusqlite::params![id],
+    )?;
     Ok(())
 }
 

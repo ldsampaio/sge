@@ -30,9 +30,9 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use regex::Regex;
 use lettre::address::{Address, Envelope};
 use lettre::transport::smtp::authentication::Credentials;
+use regex::Regex;
 
 /// Per-command SMTP timeout (seconds): every command — connect, EHLO,
 /// STARTTLS upgrade, AUTH, MAIL/RCPT/DATA — must answer inside this window.
@@ -646,8 +646,14 @@ mod tests {
             Some(idx) => &src[..idx],
             None => src,
         };
-        assert!(body.contains("starttls_relay"), "must use starttls_relay (Tls::Required)");
+        assert!(
+            body.contains("starttls_relay"),
+            "must use starttls_relay (Tls::Required)"
+        );
         assert!(!body.contains("Tls::Opportunistic"), "no opportunistic TLS");
-        assert!(!body.contains("Transport::relay("), "must not use plain relay");
+        assert!(
+            !body.contains("Transport::relay("),
+            "must not use plain relay"
+        );
     }
 }
