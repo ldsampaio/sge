@@ -1,116 +1,135 @@
 # Stack Research
 
-**Domain:** SGE v1.8 — user-triggered LLM reply drafting via user-configured OpenAI-compatible endpoint (Tauri v2 + Rust + React, Linux)
-**Researched:** 2026-10-15
-**Confidence:** HIGH (all core answers grounded in pinned `Cargo.toml` + verified docs.rs `reqwest 0.12` feature/dependency list; no new core deps required)
+**Domain:** Email conversation threading (RFC 5322 References lane) + shared UI primitives (v1.9 milestone scope only)
+**Researched:** 2026-10-20
+**Confidence:** HIGH (versions verified against crates.io/npm registry APIs + library source pulled and inspected; integration points verified against SGE source)
 
-## Recommended Stack
+Supersedes the v1.9-relevant sections of the prior STACK.md. Everything not listed here is **unchanged** — the M1 baseline pins stay exactly as-is (see "Baselines That Do NOT Change").
+
+## Baselines That Do NOT Change (verified in lockfile 2026-10-20)
+
+| Package | Lockfile version | Verdict | Why |
+|---------|-----------------|---------|-----|
+| async-imap | 0.11.3 (imap-proto 0.16.7 transitively) | **Keep** | Everything v1.9 needs is already in 0.11.3 — verified directly from crate source (below). Do **not** take 0.12.0: it swaps imap-proto to 0.17, moves to Rust 2024 edition, and reshuffles the futures dep — pure regression risk against the single-session SessionManager with zero features v1.9 needs. Historical precedent (Key Decisions: imap-proto parser gaps poisoned sessions) says lockstep parser upgrades must carry a functional reason. |
+| mail-parser | 0.11.9 (`full_encoding`) | **Keep** | 0.11.9 is the latest 0.11 release (2026-09-09). References parsing does not need mail-parser at all — that lane is raw IMAP header bytes, not a MIME tree. |
+| rusqlite | 0.37.0 bundled | **Keep** | M26 is plain `ALTER TABLE` SQL. crates.io shows 0.40.2 as latest stable, but migration semantics don't change and 0.38+ would touch every `queries.rs` signature for zero benefit. |
+| rusqlite_migration | 2.3.0 (latest 2.6.0) | **Keep** | 2.3.0 behavior (`M::up(sql)` → `Migrations::to_latest`) is what M26 needs. No bump mid-milestone. |
+| tauri | 2.12.1 | **Keep** | CSP is the only v1.9 surface; config semantics verified against v2 docs (below). |
+| react / react-dom | ^19.1.0 (resolves 19.3.1) | **Keep** | caret already flattens to latest 19.3.x at install; `ref` as regular prop, hooks for primitives — all React 19. |
+| tools (next: vite@8.3.4, @vitejs/plugin-react@6.1.2, typescript ~6.0.3 tilde-pinned) | latest-registry-2026-10-20 | **Keep** | npm registry verified: `react@19.3.1`, `vite@8.3.4`, `@vitejs/plugin-react@6.1.2`, `typescript@7.0.2` exist — the tilde pin on typescript deliberately stays off the 7.x line mid-milestone. |
+
+## Recommended Stack — NEW capabilities only
 
 ### Core Technologies
 
 | Technology | Version | Purpose | Why Recommended |
 |------------|---------|---------|-----------------|
-| reqwest (feature widening, same line) | 0.12 (already pinned; add `features = ["json", "stream", "native-tls"]`, keep `default-features = false`) | HTTPS POST to `{base_url}/chat/completions` from Tauri commands | Already in the tree for the Phase 15 loopback health probe, so zero new HTTP crate to learn, audit, or bundle. `json` gives typed request/response via the already-pinned serde/serde_json; `native-tls` reuses the pinned native-tls 0.2 / tokio-native-tls stack (no second TLS trust store, no new OpenSSL build requirement — native-tls is already compiled); `stream` (bytes_stream over already-pinned futures-util 0.3) is added now so optional SSE streaming later needs no second Cargo change. Non-streaming `POST → .json()` ships first; streaming stays a UI decision, not a dep decision. |
-| serde + serde_json | 1 (already pinned) | Chat-completions request/response shapes | No change: `#[derive(Serialize, Deserialize)]` structs for `ChatRequest { model, messages, temperature, max_tokens }` / `ChatResponse { choices[0].message.content }` with `#[serde(default)]` tolerance for provider field variance (Ollama, LM Studio, vLLM, OpenAI all speak this dialect with minor extras). |
-| keyring | 3 + `sync-secret-service` (already pinned) | LLM API key storage | Reuse the exact Phase 1/5 `KeyringStore` pattern with a new service/account pair (e.g. service `sge-llm`, account `openai-compatible`). Same consent model as mail creds (saved only from the settings screen), same Linux Secret Service backend, zero new secret-handling code paths. The key is read keyring-side inside `generate_reply` and never returned to the frontend. |
-| rusqlite + rusqlite_migration | 0.37 bundled / 2.x (already pinned) | Non-secret LLM settings persistence | Same M20+ migration pattern: new single-row `llm_settings` table (`base_url`, `model`, `prompt_template`, `temperature`, `max_tokens`, `timeout_secs`, `updated_at`). No `tauri-plugin-store` (would be a second persistence mechanism for one row) and no plaintext config file (settings live next to mail data in the existing DB). |
-| tokio `time` | 1.x `rt, sync, time` (already pinned) | Per-generation timeout | `tokio::time::timeout` around the reqwest call enforces the user-configured `timeout_secs`; `Client::timeout` as backstop. No new dep. |
-| zeroize + thiserror | 1 / 2 (already pinned) | In-memory key hygiene + typed LLM errors | `zeroize::Zeroizing<String>` for the key between keyring read and request build; a `LlmError` enum (NotConfigured / NoKey / Timeout / HttpStatus / Transport / BadResponse / InvalidUrl) mapped to plain-language frontend strings. No new dep. |
+| `mail-threading` (crates.io) | 0.1.3 (pub. 2026-06-04, MIT/Apache-2.0) | JWZ / RFC 5256 `THREAD=REFERENCES` algorithm → flat thread membership → backend-computed `thread_id` | **The one justified new Rust dep.** Implements JWZ lineage with RFC 5256 semantics: Message-ID duplicate policy, phantom (missing-ancestor) containers with pruning, subject-prefix normalization for fallback — exactly the edge cases where hand-rolled JWZ goes wrong. Ships a shared JSON conformance corpus (`testdata/conformance`) + RFC coverage matrix so our own regression claims can point at real fixtures. API fits SGE precisely: caller passes `{id (our `messages.id` PK), message_id, in_reply_to, references, date, subject}` → `Vec<Thread>` with `root_message_id` + `messages: Vec<caller_id>`. Linear hash-map complexity. Per user decision, configure `subject_merge: false` (headerless @subject grouping was explicitly rejected as unreliable). |
+| chrono (already in tree) | ("0.4" present) | `Message.date` field for `mail-threading` input | Already a direct SGE dependency; `mail-threading` also depends on chrono → **zero marginal crates** unless serde feature enabled (better: map `Thread` output manually in `store/threads.rs`, skip the `serde` feature so no new derive surface). |
+| In-house msg-id/RFC 2047 tooling (no crate) | — | `references.rs`: parse `BODY[HEADER.FIELDS (REFERENCES)]` raw header bytes → normalized `Vec<String>`; extract `envelope.in_reply_to`: | `use-email-id` (0.1.0, 157 downloads) is not traction-justified. The existing house pattern (`decode_header_words`, `decode_bytes_opt` in `imap/headers.rs`) is the right home: References values are pre-encoded msg-ids (no 2047 in msg-id context). Keep same fail-visible style + tests. |
+
+**Threading lane integration points (verified from source):**
+
+- ` envelopes` land free: `imap-proto 0.16.7` `Envelope` already has `pub in_reply_to: Option<Cow<[u8]>>` (verified `src/types.rs:619`) — extend `parse_fetch_item` / `parse_fetch_attributes` in `imap/headers.rs` to copy it into `MessageHeader.in_reply_to`. **FETCH_ATTRS stays byte-identical** — no new wire bytes, no new lanes for the headers-first sweep.
+- New-lane fetch for full References chains (new messages only, optional per-folder backfill): emit `UID FETCH <range> (UID BODY.PEEK[HEADER.FIELDS (REFERENCES)])`. **Verified end-to-end against 0.11.3 source:** imap-proto 0.16.7 parses the response into `AttributeValue::BodySection { section: Some(SectionPath::Full(MessageSection::Header)), data: Some(bytes) }` (parser `rfc3501/body.rs:22-29` maps both `HEADER` and `HEADER.FIELDS` to `MessageSection::Header`; parser test `test_header_fields` at `src/parser/tests.rs:553` uses this exact response shape), and async-imap `Fetch::section(&SectionPath::Full(MessageSection::Header))` at `src/types/fetch.rs:179` is the public accessor. **Invariant push-down:** `.PEEK` keeps the read-only `\Seen` invariant; the `peek_audit` test in `headers.rs` must be extended to enumerate this new fetch path (path 5) — the test’s `fetch_attrs_are_parenthesized` guard also rejects bare `BODY.PEEK[HEADER` in `FETCH_ATTRS`, so the new lane keeps its attr set in a separate named constant at the top of `headers.rs` (parenthesized: RFC 3501 §6.4.5 multipart rule applies).
+- Wire cost: References-only sections are tiny (`References: <a@x> <b@y> ...` ≈ tens-~hundreds B/msg for short chains; Zimbra on UTFPr sends exactly the requested field + CRLF separator). Batched by UID range, same shape as `fetch_envelope_batch`. The expensive `BODY[HEADER.FIELDS (…)]` fetch failure mode is server dependency variance, cheap enough to verify at Phase 42's live gates.
+- Thread computation lives in a new small module (e.g. `imap/threads.rs` or `store/threads.rs`): load `SELECT id, message_id, in_reply_to, references_json, date_utc, subject FROM messages (per mailbox)` → `mail_threading::thread_messages_with(&msgs, &ThreadingOptions { subject_merge: false, ..default })` → `UPDATE messages SET thread_id $WHERE id $IN …`. Computed at sync-end + after backfill; `thread_id` is an INTEGER column value (e.g. root message `messages.id`), never a key — matches schema.sql's "Message-ID is a nullable display field, never a key (T-02-01)".
 
 ### Supporting Libraries
 
 | Library | Version | Purpose | When to Use |
 |---------|---------|---------|-------------|
-| (none new) | — | — | v1.8 needs no new crates. Everything above is a feature-flag or table addition to already-pinned deps. |
+| None new — no frontend additions | — | Shared UI primitives (Button, Modal/Dialog, Empty/Loading) | Plain-CSS-token codebase: new `src/components/ui/` folder + a third stylesheet (`ui-primitives.css`, imported after `tokens.css` in main.tsx) covering shared primitives + standard interaction states (hover/focus-visible/disabled/aria-busy/empty/loading). React 19: native `ref` prop, no `forwardRef`; semantic `<button>`/`<dialog>`-pattern HTML + `aria-*`; shorthand data-state attributes (`data-state="open|closed|loading"`) instead of a CSS-in-JS lib. React 19 gives `useRef`/`useImperativeHandle` no better option here. |
 
-### Development Tools
+**Frontend integration points (verified against current tree):** `src/styles/tokens.css` (font tokens already reference the right families — see "Fonts" below), `src/components/MessageList.tsx` (conversation grouping rendering; row = `data-conversation-id`, aggregate unread badge via existing `--badge-*` tokens), `src/components/ReadingPane.tsx` (expand/collapse message stack — `<details>`-free custom pattern, no ARIA anti-pattern, per-message vs per-conversation killed-action mapping keyed on the existing `(mailbox, uid)` surfaces), and `src/components/ui/*` for shared primitives consumed by new panels first, legacy panels opportunistically (revamp sweep limit).
 
-| Tool | Purpose | Notes |
-|------|---------|-------|
-| Mock chat-completions server in tests (`tokio` + `std::net::TcpListener` or `wiremock` as dev-dep only if planners insist) | Deterministic tests for prompt rendering, Bearer header, timeout, non-2xx mapping, key-never-in-error | Prefer a ~30-line hand-rolled mock on loopback (same style as the Phase 15 probe) over adding `wiremock`/`mockito` to the tree; mock transport in CI per PROJECT.md, live endpoint only with a user-provided key. |
-| `cargo tree -i native-tls / rustls` | Verify no second TLS stack enters the graph after the reqwest feature change | Must show reqwest → hyper-tls → native-tls only; if any `rustls`/`ring` crate appears, a feature flag is wrong. |
-| Existing `live-*.sh` harness pattern | One manual live gate with a real key (Ollama loopback or user endpoint) | Deferred-with-reason like all prior live gates; never commit a key. |
+### Vintage Fonts: Bundle Baloo 2 + Nunito woff2 locally (OFL)
+
+**Verified facts:** `tokens.css` already declares `--font-display: "Baloo 2"…` and `--font-body: "Nunito"…` but no font files exist — the app silently uses fallbacks (matches PROJECT.md's stated bug). Both fonts are OFL-1.1 on Google Fonts (Baloo 2 has `wght` variable 400–800 + Devanagari; Nunito is `wght` 200–1000 + italic; we need latin subset only).
+
+**Plan (no npm dep):**
+
+1. Vendor static woff2 latin subset files into `src/assets/fonts/` — one per family+weight actually used by tokens (Baloo 2 400/600/700; Nunito 400/600/700 + one italic if used). Sources: official `google/fonts` GitHub repo or fontsource CDN snapshot **at vendoring time** (not runtime). Note Baloo 2's raw OFL `fonts.google.com` download provides both static + variable woff2.
+2. Optional-but-cheaper alternative: variable single-file woff2 (`Baloo2[wght].woff2`, `Nunito[wght].woff2`) — 2 files total, weights come free. Recommend this (one file/face, ~60–150 KB each, no per-weight @font-face duplication).
+3. New `src/styles/fonts.css`: `@font-face` rules with `format('woff2-variations')` (variable) or `format('woff2')` (static), `font-display: swap` (matches tokens-first posture), latin subset `unicode-range: U+0000-00FF, …` (paste from fontsource's generated per-family css — copy verbatim to avoid mistakes in subsetting), `src: url('./../assets/fonts/<file>.woff2')` — **no `data:` base64 embedding** (bloats app.css and pollutes diff reviews).
+4. Import order in `main.tsx`: `fonts.css` **before** `tokens.css` (or put `@import url("./fonts.css");` as line 1 of tokens.css — Vite requires @import first). `@font-face` must be registered before rules they feed.
+5. License hygiene: include `OFL.txt` for each family inside `src/assets/fonts/` and a note in the CSS header. OFL redistribution as regular font files (not embedded in zipped software-token RHAs) requires license text visible — file-in-repo + vendor header satisfies the standard many-projects-fail case of over-defensiveness.
+6. `.gitignore` rule: woff2 assets may NOT be gitignored (check the repo's asset ignore rules before vendoring).
+
+**CSP consequence (verified against tauri.conf.json + Tauri v2 CSP docs):** current CSP is `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src ipc: http://ipc.localhost; frame-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none';` — **no explicit `font-src`** → falls back to `default-src 'self'`, which **already allows** same-origin woff2 from the bundled dist (prod `tauri://localhost`, dev `localhost:1420`). **No CSP change strictly required.** Recommend adding explicit `font-src: 'self';` (defensive, makes intent obvious — future CSP tightening won't silently break fonts). **Do not** add `'self' https://fonts.gstatic.com` style hole-outs — violates egress/offline posture and this codebase's own 1.9 scope guard. Note: the sandboxed reading-pane iframe inherits `'self'` too, but mail HTML should never load remote fonts (egress rule already in place; keep it).
 
 ## Installation
 
 ```bash
-# The ONLY Cargo change for v1.8 — widen reqwest features on the pinned 0.12 line:
-# reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "native-tls"] }
-cargo update -p reqwest --precise 0.12.28  # optional: lock the verified patch
+# Rust: single new direct dependency (chrono already present)
+cargo add mail-threading --package sge  # "0.1", default features (no serde; chrono comes transitively anyway)
+# → src-tauri/Cargo.toml pins line:
+#   mail-threading = "0.1"   # JWZ/RFC5256 threading for thread_id (v1.9, Phase 42)
+# Optionally pin exact: note in comment like lettre's Phase 13 record:
+#   # v1.9 pin record: mail-threading resolves to 0.1.3 (dual MIT/Apache-2.0,
+#   # conformance corpus verified against fixtures on 2026-10-20 → see research/STACK.md).
 
-# Everything else is already in src-tauri/Cargo.toml — DO NOT re-add:
-# serde / serde_json 1 (chat-completions shapes)
-# keyring 3 + sync-secret-service (API-key entry, new service/account pair)
-# rusqlite 0.37 bundled + rusqlite_migration 2.x (llm_settings table)
-# tokio 1 rt/sync/time (generation timeout) / futures 0.3 (streaming later)
-# zeroize 1 (key hygiene) / thiserror 2 (LlmError) / chrono 0.4 (updated_at)
-# lettre 0.11 / async-imap 0.11 (untouched — generated text flows into the existing queue_send path)
-```
-
-```bash
-# Frontend: no new npm packages. Generation is a Tauri invoke; insertion is plaintext.
+# Frontend: NOTHING new.
+# Fonts: 2 files vendored, no npm install:
+#   src/assets/fonts/Baloo2-latin-[wght].woff2  (+ OFL.txt)
+#   src/assets/fonts/Nunito-latin-[wght].woff2  (+ OFL.txt)
 ```
 
 ## Alternatives Considered
 
 | Recommended | Alternative | When to Use Alternative |
 |-------------|-------------|-------------------------|
-| Raw reqwest chat-completions POST (~60 lines) | `async-openai` crate | Only if v1.8 later needs assistants/vector-store/file-search APIs. For one `chat/completions` call against arbitrary base URLs, async-openai adds version churn and its own re-exported reqwest that can fight the pinned 0.12 line — all cost, no benefit now. |
-| reqwest `native-tls` feature | reqwest `rustls-tls-*` features | If OpenSSL dev headers ever become a build problem on a target distro. Today native-tls 0.2 is already compiled into the bundle (IMAP + SMTP), so rustls would add a second TLS stack and trust store for one POST — never for v1.8. |
-| Non-streaming JSON response first | SSE streaming from day one | Only if UAT shows generation latency hurts UX. Non-streaming keeps the compose-window change to "button → spinner → paste above quote"; `stream` feature is pre-enabled so streaming is a follow-up plan, not a Cargo change. |
-| Hand-rolled `{sender}/{subject}/{body}` substitution | `handlebars` / `minijinja` / `tera` | Never for v1.8: three placeholders via chained `.replace()` with a missing-placeholder guard is ~10 lines and snapshot-testable. A template engine is justified only if templates grow conditionals/loops. |
-| SQLite `llm_settings` table | `tauri-plugin-store` JSON file | If settings ever need cross-machine sync or non-DB portability. Today the DB is the established settings home; a second store doubles backup/wipe semantics for one row. |
-| Hand-rolled loopback mock | `wiremock` / `mockito` dev-deps | If the mock grows beyond one endpoint (auth-failure + timeout + truncation cases are still trivially hand-rolled). Keep the tree lean until then. |
+| `mail-threading` crate | In-house JWZ (~250 LOC in threads.rs) | If the user vetoes the one new dep at plan time, in-house is genuinely feasible — datograph containers, prune phantoms with subject-merge off. Deficit: no conformance corpus, so the reliability bar the user set (backend References lane "explicitly approved as reliable") must be re-earned with hand-written fixture tests. Cost estimate overshoots because dup-Message-ID policies and phantom handling are the hard 20%. |
+| `mail-threading` | IMAP server-side `UID THREAD REFERENCES` (Zimbra supports it) | Never for v1.9: user already approved the offline lane (Key Decision 2026-10-20); also would need `IMAPTHREAD` capability probe + async-imap doesn't wrap THREAD responses (imap-proto parses them but `Session::uid_thread` isn't exposed in 0.11 — would need raw-response plumbing), plus offline-first sync semantics conflict with an online-only grouping. |
+| Vendored woff2 + own `@font-face` | `@fontsource/baloo-2` + `@fontsource-variable/nunito` npm packages | Never for v1.9 — scope guard explicitly excludes "new UI dependencies"; vendor files instead with licenses documented above. @fontsource would normally win for auto-subsetting + license-file shipping, but the posture wins here. |
+| Backend `thread_id` per RFC 5256 strict | Frontend grouping by `in_reply_to` (client-side regroup) | Never — user rejected subject-only grouping as unreliable and explicitly approved backend references lane. |
+| Unity on `messages.thread_id` NULL = own-thread | Google-style "thread cache" table (separate `threads` table + FK) | v1.9 is read-only threading (`mail-threading` computed inline). Separate `threads` table only if per-thread mutable data ever needs to exist (e.g. aggregate read state materialization) — defer. |
 
 ## What NOT to Use
 
 | Avoid | Why | Use Instead |
 |-------|-----|-------------|
-| `async-openai`, `openai-api-rs`, `rig`, LangChain-style orchestration crates | Typed wrappers around the one endpoint v1.8 calls; each pins its own HTTP/TLS versions and update cadence, risking lockfile fights with the pinned reqwest 0.12 / native-tls 0.2 stack | Raw reqwest POST with local serde structs |
-| reqwest 0.13 bump inside v1.8 | 0.13.x exists (latest 0.13.5, 2026-09-08) but buys nothing v1.8 needs and re-opens the transitive-dependency surface (hyper/http tower versions) mid-milestone | Stay on pinned 0.12; schedule 0.13 as its own migration if ever wanted |
-| `eventsource-stream` / `reqwest-eventsource` / SSE crates now | Streaming is explicitly optional and deferred; adding an SSE crate before the non-streaming path ships is speculative complexity | `bytes_stream` (pre-enabled `stream` feature) + ~40-line manual `data:` line parser later, only if needed |
-| Template-engine crates (`handlebars`, `minijinja`, `tera`) | Three-placeholder substitution does not need a grammar, and engines invite logic-in-templates that complicates the privacy story | Chained `.replace()` + unit tests over `{sender}/{subject}/{body}` |
-| Markdown renderers (`pulldown-cmark`, react-markdown) for generated text | Model output pasted as rendered markdown is an injection surface (links, images, HTML passthrough) in a mail composer; also a new dep on both sides | Insert generated text as plaintext above the quoted original (matches "user reviews before sending"); revisit rendering only with a sanitizer (ammonia already pinned) |
-| `tauri-plugin-store` / plaintext config file for settings | Second persistence mechanism / key-adjacent secrets on disk in cleartext | SQLite row for non-secrets + keyring entry for the key (existing Phase 5 pattern) |
-| Frontend-held API key (key in React state / localStorage) | Key crosses the IPC boundary, lands in devtools-accessible memory and possibly disk; violates the keyring-only constraint | Key lives keyring-side; frontend calls `generate_reply(message_id)` and receives only generated text |
-| `http://` remote base URLs | Mail content would leave the machine in cleartext on top of leaving it at all | Enforce https-only except explicit `http://localhost|127.0.0.1` loopback exception (covers Ollama/LM Studio default); reject everything else with a plain-language error |
+| email-threading / jwz / mail-thread (crates.io) | Don't exist / not found on crates.io search 2026-10-20 | `mail-threading` |
+| `use-email-id` crate | 0.1.0, 157 downloads, single-author — no community signal for a security-adjacent parsing job | In-house `references.rs` parser following house `decode_header_words` fail-visible pattern |
+| virtualization libs (react-window, react-virtual, tanstack-virtual) | Scope guard: no new UI dependencies; MessageList already renders full mailbox at acceptable perf | Collapse message stacks to one conversation row (aggregate count) — the grouping thin-out is the perf fix; revisit virtualization only in a future perf milestone with measurements |
+| Radix / shadcn / Headless UI / MUI / Tailwind | Violates zero-new-deps + will mangle the clay token system (three-layer cascade would need re-merging) | Hand-rolled `src/components/ui/` primitives over existing tokens |
+| CSS-in-JS, styled-vanilla, panda | Project is plain `*.css` co-located per component + `tokens.css` cascade | New plain-CSS `ui-primitives.css` + data-state attributes |
+| async-imap 0.12.0 (latest, 2026-09-30) | Feature-free for v1.9; pulls imap-proto 0.17 + Rust 2024 edition migration in-place; historically, async-imap/imap-proto lockstep upgrades bit us (NAMESPACE tripwire decision) | Stay on `0.11.3`/`imap-proto 0.16.7`; record the tripwire decision |
+| rusqlite 0.40.2 / migration bump mid-milestone | all `queries.rs` signatures tie to 0.37 API-surface (bundled sqlite version differences are real but pointless now) | keep 0.37.0 + 2.3.0; bump only at M+1 boundaries with CI live-gates rerun |
+| New Table for threading precomputed at insert | Thread membership changes when any member arrives (late root arrival, dedup policy, phantom pruning) — precomputing at insert yields transient wrong groups | Recompute per-folder at sync-end / after backfill / after send (batched UPDATE); per-folder scope keeps cost linear-in-folder-messages |
+| Base64-embedding fonts in CSS (`data:` URL) | 15% size bloat + review quality worse + lazy `@font-face` swap semantics | Same-origin file URL, `font-display: swap`, with `unicode-range` latin subsetting |
 
 ## Stack Patterns by Variant
 
-**If the user points at a local server (Ollama / LM Studio default `http://localhost:11434/v1`):**
-- Allow the loopback-http exception, empty-key path (no `Authorization` header when no key stored), and longer default timeout (local model load can take 30–60 s on first token).
-- Because local inference is the privacy-best configuration and must be first-class, not a grudging fallback.
+**If `mail-threading` is rejected at plan time (user nod):**
+- Hand-roll `store/threads.rs` JWZ: ~250 LOC + fixture tests mirrored from the `mail-threading` conformance corpus (its fixtures are public JSON — we can absorb the data even if we don't take the crate).
+- Same schema and same integration points otherwise — zero migration cost this way.
 
-**If the user points at a hosted OpenAI-compatible endpoint (`https://…`):**
-- Require a keyring-stored key; send `Authorization: Bearer <key>`; enforce `timeout_secs` default ~30 s; map 401/403 to "check your API key" and 429 to "rate limited, try again later" — never surface raw bodies or the key.
-- Because hosted calls exfiltrate mail content by design and every failure message must stay key-free and body-free.
+**If Zimbra refuses `HEADER.FIELDS (REFERENCES)`** (new wire path, verified parser-side but not live-verified at UTFPr):
+- Fallback: reuse the 2026-10-18 send-path convention — References = In-Reply-To only when the field is absent, which still threads correctly for shallow chains in practice; document + record as a v1.9 Known Gap instead of blocking the phase.
 
-**If streaming is later requested (post-v1.8 or late-v1.8 UAT):**
-- Use the pre-enabled `stream` feature: `Response::bytes_stream` → split `data:` lines → `{"choices":[{"delta":{"content":…}}]}` → forward chunks via a Tauri `Channel`/event to the compose window; `[DONE]` terminates.
-- Because no Cargo change is needed, streaming stays a UI-plan delta, not a stack delta.
+**If fonts render with FOUT on slower disks (woff2 > swap window):**
+- `font-display: block` only for `--font-display` headers (Baloo 2 = title logo, non-critical path), keep `swap` everywhere else; preload the two variable files only if LCP moves — measure first, nothing else.
 
 ## Version Compatibility
 
 | Package A | Compatible With | Notes |
 |-----------|-----------------|-------|
-| reqwest 0.12 (`json`, `stream`, `native-tls`, no default features) | serde_json 1 (pinned), futures-util 0.3 (pinned), native-tls 0.2 + tokio-native-tls 0.3 (pinned transitive) | All three features resolve to crates already in the lockfile — verify with `cargo tree`; `ring`/`rustls` must NOT appear |
-| reqwest 0.12 | tokio 1 `rt` (Tauri `async_runtime`) | reqwest 0.12 runs on Tokio; Tauri v2's async runtime is Tokio-based, so `#[tauri::command(async)]` can `.await` reqwest directly — no `spawn_blocking`, unlike the io-managesieve pattern from v1.5 research |
-| keyring 3 new `sge-llm` entry | sync-secret-service backend (pinned) + existing `KeyringStore` helper | Same collection as mail creds; delete-key path must remove the entry (settings "clear key" button) so stale keys don't linger |
-| `llm_settings` migration (M-next) | rusqlite_migration 2.x + existing migrations chain | Single-row table with `CHECK` on ranges (temperature 0–2, max_tokens > 0, timeout 5–300); base_url/model/template `NOT NULL`; never store the key here — add a code comment + a test asserting no `api_key` column |
-
-## Tauri Integration Points (for roadmap)
-
-- New commands: `get_llm_settings` (returns non-secret row only), `save_llm_settings` (validates https-or-loopback URL, model non-empty, template contains `{body}`), `save_llm_api_key` / `delete_llm_api_key` (keyring write/delete), `generate_reply(message_id)` — reads settings + key server-side, renders template from the SQLite message (sender/subject/body-plaintext), POSTs, returns `{ text }` or a plain-language error. Frontend never sees the key or base URL secret material.
-- `generate_reply` is called ONLY from the Reply/Reply-All compose-window button (v1.8 scope guard); result text is prepended above the existing quoted original and flows out through the untouched `queue_send`/lettre pipeline — async-imap and lettre are explicitly out of scope for this milestone.
-- Privacy/logging contract (new code, existing ethos): no `log`/println of key, prompt body, or response body — log only `model`, `status_code`, `latency_ms`, and error kind.
+| mail-threading 0.1.3 | chrono 0.4, Rust ≥1.88 | env rustc 1.99.0 (2026-09-28) → OK. Direct dep list: chrono only (serde optional; we opt out) — verified from crates.io dependency manifest. |
+| async-imap 0.11.3 | imap-proto 0.16.7 | `Envelope.in_reply_to` + `Fetch::section()` verified present at exactly these versions — no resolution drift risk (both are in our lockfile already). |
+| rusqlite 0.37.0 + rusqlite_migration 2.3.0 | M26 plain SQL | `ALTER TABLE ADD COLUMN` (nullable/text-or-int) + `CREATE INDEX` are within 2.3.0's supported feature set; house preserve-rows regression-test pattern (tests at `store/mod.rs` `migrations_through_m22` precedent) extends as M26 case. |
+| React 19.3.x (caret-resolved) | React DOM 19.3.x, vite 8.3.x | No new hooks beyond current usage; `ref`-as-prop is 19-only — do not use it expecting back-compat guidance if we ever downgrade. |
 
 ## Sources
 
-- `src-tauri/Cargo.toml` (pinned: reqwest 0.12 default-features=false, serde/serde_json 1, keyring 3 + sync-secret-service, rusqlite 0.37 bundled, tokio rt/sync/time, zeroize, thiserror, lettre 0.11 untouched) — HIGH, project ground truth
-- docs.rs `reqwest 0.12` crate page (0.12.28 verified; 0.13.5 latest as of 2026-09-08; optional deps confirm `json`→serde_json, `stream`→futures-util/wasm-streams, `native-tls`→native-tls 0.2/hyper-tls/tokio-native-tls) — HIGH
-- `src-tauri/src/lib.rs` + `live_gate_*.rs` grep (KeyringStore save/load pattern, keyring-first auth, never-log-secrets ethos) — HIGH, existing integration surface
-- `.planning/PROJECT.md` v1.8 scope (OpenAI-compatible base URL + model + key in keyring, single `{sender}/{subject}/{body}` template, user-triggered only, mock transport in CI) — HIGH
+- crates.io API (`/api/v1/crates/<n>/versions`, User-Agent'd, dates verified 2026-10-20): async-imap (0.12.0 / 0.11.3), rusqlite (0.40.2 latest; 0.37.0 pinned), rusqlite_migration (2.6.0 latest; 2.3.0 pinned), mail-parser (0.11.9), imap-proto (0.16.7), mail-threading (0.1.3).
+- npm registry `registry.npmjs.org/<p>/latest` (2026-10-20): react@19.3.1, react-dom@19.3.1, vite@8.3.4, @vitejs/plugin-react@6.1.2, typescript@7.0.2 (kept off — tilde).
+- async-imap 0.11.3 + imap-proto 0.16.7 crate sources pulled via `crates.io …/download` and inspected directly: `src/parser/rfc3501/body.rs` (HEADER.FIELDS→MessageSection::Header), `src/parser/tests.rs:553` (`test_header_fields` — the exact response shape we'll emit), `src/types/fetch.rs:179` (`Fetch::section`). Confidence HIGH (primary source).
+- async-imap GitHub `CHANGELOG.md` (master, 2026-10-20): 0.12.0 scope (imap-proto 0.17, futures reshuffle, edition 2024, MSRV 1.88) — grounds the "do not upgrade" verdict.
+- `mail-threading` GitHub README (`github.com/planetaryescape/mail-threading`, fetched 2026-10-20): API shape, `ThreadingOptions { subject_merge, prune_phantoms, subject_prefixes }`, conformance corpus, MSRV 1.88, chrono-only dependency claim.
+- Tauri v2 CSP docs (`v2.tauri.app/security/csp/` + `/reference/config/`, fetched 2026-10-20): directive fallback to `default-src`, `font-src` semantics, dev-server/prod precedence.
+- Project-local verified integration points: `src-tauri/Cargo.toml` + `Cargo.lock` (pin record + lockfile versions), `src-tauri/src/store/mod.rs` (SCHEMA_VERSION 25, M-list shape, preserve-rows test precedent), `src-tauri/src/imap/headers.rs` (FETCH_ATTRS, `parse_fetch_attributes`, `peek_audit`), `src-tauri/tauri.conf.json` (live CSP string), `src/styles/tokens.css` (font tokens), `src-tauri/src/send_queue.rs` / `src-tauri/src/drafts.rs` (existing in_reply_to/references Features, `new_message_id`, `sanitize_header` — the v1.9 References lane reuses these helpers).
 
 ---
-*Stack research for: SGE v1.8 LLM-assisted replies (OpenAI-compatible chat completions)*
-*Researched: 2026-10-15*
+*Stack research for: SGE v1.9 — Email Threading + Interface Revamp*
+*Researched: 2026-10-20*

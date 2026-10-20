@@ -1,162 +1,160 @@
 # Project Research Summary
 
-**Project:** SGE — Linux IMAP Desktop Client (v1.8 LLM-Assisted Replies)
-**Domain:** Desktop email client — user-triggered LLM reply drafting (Tauri v2 + Rust + React + SQLite, Linux)
-**Researched:** 2026-10-15
-**Confidence:** HIGH
+**Project:** SGE v1.9 — Email Threading + Interface Revamp
+**Domain:** Desktop IMAP mail client (Rust + Tauri v2 + React 19 + SQLite) — backend References-threading lane + UI primitives/state-discipline revamp on an already-shipping three-pane client
+**Researched:** 2026-10-20
+**Confidence:** HIGH ( Stack & Architecture fully verified against source; Features MEDIUM; Pitfalls HIGH backend / MEDIUM UI)
 
 ## Executive Summary
 
-SGE v1.8 adds on-demand LLM-assisted reply drafting to a mature offline-first Linux mail client: a user-configured OpenAI-compatible endpoint plus a single prompt template generate a draft inside Reply/Reply-All windows, which the user reviews and sends manually. The closest real-world analog (Thunderbird + ThunderAI/AI-Mate) confirms the shape — BYOK endpoint settings, custom prompt with mail variables, compose-window injection, manual review gate — and SGE's stricter posture (OS keyring secrets, offline-by-default, button-only egress) is a competitive strength, not a limitation.
+v1.9 is a **two-lane milestone** on an existing, disciplined codebase. Lane 1 is a pure-backend threading lane: an M26 SQLite migration (`in_reply_to`, `references_json`, `thread_id`), a new `HEADER.FIELDS (REFERENCES)` IMAP fetch lane, and per-folder JWZ/RFC-5256 threading computed by the `mail-threading` 0.1.3 crate — the only justified new Rust dependency, chosen precisely because hand-rolled JWZ fails on duplicate Message-IDs and phantom containers. Lane 2 is a backend-independent UI foundation: vendored OFL woff2 fonts (Baloo 2 + Nunito), additive state tokens, and a small hand-rolled primitives kit (`Button`, `Dialog`, Empty/Loading/Error) — deliberately no new UI dependencies, per the scope guard. The two lanes collide in exactly one file: the message-list row. The research verdict is firm — **extract and write `MessageListRow.tsx` once, in the UI-foundation phase, before any grouping feature touches it**, so threading and revamp never re-rewrite each other's work.
 
-The unanimous architectural verdict across all four research streams: the LLM HTTP call lives in the Rust backend as a new `llm` lane module plus Tauri commands, never as frontend `fetch`. Two decisive reasons — the API key must never enter the WebView, and the locked CSP (`connect-src ipc:`-only) blocks frontend calls to user URLs anyway. Zero new core dependencies are needed: widen `reqwest 0.12` features on the pinned line, reuse keyring/SQLite/tokio/zeroize patterns already proven in earlier phases. The critical risks are key leakage (logs, IPC, SQLite), ambient egress violating the offline guarantee, and prompt injection from hostile incoming mail — all mitigated by design choices (keyring-only key, single-chokepoint command, fenced prompt + human gate) rather than by vigilance alone.
+The recommended build order is: backend lane first (shippable in isolation — flat list payload unchanged), UI foundation in parallel, then grouped conversation rows (payload extension, not a second row rewrite), then the conversation reader stack, then a consumption-only revamp sweep. All existing frozen contracts (`list_messages` signature, `fetch_message` BODY.PEEK per-message, `queue_send`) are preserved via additive payload fields and one new `get_thread` command.
+
+The top risks are all precedented in this repo, not hypothetical: Tauri silently dropping unmatched invoke/payload fields (the 2026-10-18 four-breaks), a `\Seen`-setting copy-paste in the new fetch lane (peek_audit has only 4 enumerated paths today — a 5th must be added in the same commit as the lane), an M26 SCHEMA_VERSION off-by-one (the M23 race), folder-unsafe `thread_id` keys, and the "stub compiles" over-claim trap (Phase 38) that is HIGH-risk again because v1.9 is entirely UI-driven. Every one has a mechanical counter-gate identified below; none requires new research — they require plan-time embedding of the gates and live-server verification during execution.
 
 ## Key Findings
 
 ### Recommended Stack
 
-Zero-new-core-deps: everything v1.8 needs is a feature-flag widening or table addition on already-pinned crates. The single `Cargo.toml` change is `reqwest 0.12` with `features = ["json", "stream", "native-tls"]` (details in STACK.md). Non-streaming `POST → .json()` ships first; `stream` is pre-enabled so optional SSE later needs no second Cargo change. See STACK.md for full rationale, alternatives rejected, and version pins.
+**Keep everything.** The v1.9 pins stay exactly as-is: async-imap 0.11.3 + imap-proto 0.16.7 (verdict: do NOT take 0.12.0 — it pulls imap-proto 0.17 + Rust 2024 edition for zero v1.9 benefit, and async-imap/imap-proto lockstep upgrades have poisoned sessions before), mail-parser 0.11.9, rusqlite 0.37.0 + rusqlite_migration 2.3.0, tauri 2.12.1, React 19.3.x. Two additions total:
 
-**Core technologies:**
-- reqwest 0.12 (`json`, `stream`, `native-tls`, no default features) — HTTPS POST to `{base_url}/chat/completions`; already in tree, reuse compiled native-tls stack
-- serde + serde_json 1 — typed chat-completions request/response with tolerant `#[serde(default)]` for provider variance
-- keyring 3 + sync-secret-service — LLM API key under a new service/account pair; key read keyring-side, never returned to frontend
-- rusqlite 0.37 bundled + rusqlite_migration 2.x — new single-row `llm_settings` table (no secrets; structural guarantee, tested)
-- tokio 1 `time` — per-generation timeout (`tokio::time::timeout` + `Client::timeout` backstop)
-- zeroize 1 + thiserror 2 — in-memory key hygiene (`Zeroizing`) + typed `LlmError` mapped to plain-language strings
+- **`mail-threading` 0.1.3** (crates.io, MIT/Apache-2.0, chrono-only dep we already carry) — JWZ/RFC-5256 threading with a shipped JSON conformance corpus. API: caller input `{id, message_id, in_reply_to, references, date, subject}` → thread roots + member lists. Configure `subject_merge: false` — subject-based grouping was explicitly rejected as unreliable. Fallback if vetoed at plan time: ~250 LOC in-house container algorithm + absorbed fixtures (zero migration cost either way).
+- **Vendored woff2 fonts** (2 variable files, latin subset, OFL.txt each, no npm dep) — `tokens.css` already names Baloo 2/Nunito but no files ship. CSP verified: no `font-src` exists, but `default-src 'self'` already covers bundled fonts; add `font-src: 'self'` defensively.
 
-### ⚠️ Resolved Conflict: TLS Feature (`native-tls` vs `rustls-tls`)
-
-STACK.md recommends `native-tls`; ARCHITECTURE.md (§llm module, §Integration Points) says `rustls-tls` / `rustls`. **Decision: `native-tls`. Winner, no tie.**
-
-Rationale: `native-tls 0.2` + `tokio-native-tls` are already compiled into the bundle (IMAP + SMTP paths use them), so `native-tls` adds zero new TLS code, zero new trust store, and zero new OpenSSL build requirement. `rustls-tls` would pull a second TLS stack (`rustls`/`ring`/`webpki`) plus its own root store for a single POST — pure cost. This also preserves the project's zero-new-core-deps posture: all three reqwest features resolve to crates already in the lockfile. Revisit only if OpenSSL dev headers ever become a build problem on a target distro. **Verification gate (both phases touching Cargo): `cargo tree` must show reqwest → hyper-tls → native-tls only; if any `rustls`/`ring` crate appears, a feature flag is wrong.** ARCHITECTURE.md's `rustls` mentions should be read as `native-tls` throughout.
+**Verified integration points:** `imap-proto 0.16.7` `Envelope.in_reply_to` already arrives free in the existing FETCH_ATTRS response bytes (~saves a lane); `Fetch::section()` + the exact `BodySection` parser shape for `HEADER.FIELDS` verified in crate source. New References lane must be a **separate named constant** (`REFERENCES_ATTRS`, parenthesized, `.PEEK`) so the `fetch_attrs_are_parenthesized` tripwire and `peek_audit` guards keep their semantics.
 
 ### Expected Features
 
-ThunderAI/AI-Mate (closest analog, verified) plus Superhuman/Shortwave/Missive UX patterns converge on the same v1.8 shape: settings + keyring key + template + button + insert-above-quote + plain-language errors + review gate. See FEATURES.md for competitor table and prioritization matrix.
+**Must have (table stakes, P1):**
+- Backend thread lane (M26 + References fetch + backend `thread_id`) — prerequisite for everything, explicitly approved backend References lane
+- Grouped list rows: count badge (≥2 only), aggregate unread, deduped senders "A · B +2", latest-date/snippet, `Re:`-trim — single-message rows stay **byte-compatible** with today's list (no badge, no layout shift)
+- Conversation reader: chronological stack (oldest→newest), per-message collapse/expand, expansion default = latest + through first-unread, read-on-expand per message (never whole-thread-on-open), per-message Reply/Reply-All/mark-unread re-homed to cards
+- Conversation batch actions: delete/move thread to Trash, mark-all-read — reuse `ExpungeModal` confirm pattern with member-count copy
+- Token + primitive foundation (fonts, Button/Dialog/Empty/Loading/Error, named interaction states, `:focus-visible`-only rings)
+- Listbox semantics fix (NO nested interactive elements in options) + keyboard roving (Arrows/Home/End/Enter-open) — ordered BEFORE grouped rows ship
 
-**Must have (table stakes):**
-- LLM settings section (base URL + model + keyring key + template + temperature/max-tokens/timeout + test-connection) — without this nothing works
-- Generate-with-LLM button in Reply/Reply-All only (non-streaming, cancel, loading) — the milestone's core value
-- Insert-above-quote, fully editable, threading headers untouched — the review mechanism
-- Plain-language errors + retry in existing `notice` area (unconfigured / 401 / timeout / provider) — every failure otherwise looks like an app bug
-- Button-only privacy boundary (audit-proven, documented in settings UI) — the trust contract
+**Should have (P2/P3 differentiators):**
+- Auto-scroll to first-unread card (respect `prefers-reduced-motion`) — P3
+- Lazy iframe mount with cap per expanded card; "Mostrar N anteriores" long-thread fold — P3, but the iframe cap logic ships WITH the reader
+- "N não lidas" chip, avatar cluster, participants line, plain-text quoted-trimmer (fragile — plain text only) — P3
+- Type-ahead on the list — P3, defer unless trivial
 
-**Should have (competitive, v1.8.x iff time/UAT demands):**
-- Regenerate button (cheap re-call) — add only if users dislike first drafts
-- Streaming output — add only on latency complaints (local Ollama on CPU is slow)
-- Ollama/localhost preset — polish for the blank-base-URL problem
-- Per-draft instruction override — only on explicit user request
+**Defer (explicitly out of scope):**
+- Dark theme, star/\Flagged, virtualization libs, Radix/shadcn/UI kits, multi-select toolbar, in-place list expansion, client-side subject grouping fallback, whole-thread-as-one-prompt LLM generation, legacy-panel rewrites
 
-**Defer (v2+):**
-- Multi-prompt library (contradicts single-template scope guard)
-- Forward/new-message generation (different context semantics, needs own spec)
-- Voice matching from sent mail (PII expansion + retrieval machinery)
-- Never: auto-send, background/pre-generation, per-provider native SDKs, plaintext key storage, prompt/response body logging
+**Key anti-features to hold the line on:** all-bodies-on-open (fetches N × BODY.PEEK + N iframes + N server \Seen writes), batch-undo single toast without an approved backend contract, batch server transaction (IMAP has none — N real STORE calls is correct).
 
 ### Architecture Approach
 
-New `src-tauri/src/llm/` lane module (mirroring `classify/`) + `commands::llm` IPC surface + `llm_settings` migration + keyring entry + `LlmSettingsPanel.tsx` + ~40-line `ComposeWindow.tsx` modification; `queue_send` path explicitly untouched. Prompt renders backend-side from `{uid, mailbox}` (backend re-reads the BODY.PEEK original — no body over IPC, one privacy choke point). Settings split (SQLite non-secrets / keyring secret) is a security invariant from schema.sql T-02-02, not a preference. See ARCHITECTURE.md for the system diagram, data flows, and dependency-respecting build order (with `rustls` mentions corrected to `native-tls` per the resolution above).
+Three-layer split preserved; two parallel lanes meeting only in `MessageList.tsx` row markup. Backend adds: `imap/references.rs` (strict `<...>`-framing parser — msg-ids are NOT RFC 2047; never route them through `decode_header_words`), `store/threads.rs` (thin mail-threading glue; ALL SQL stays in `queries.rs` per the 25-migration invariant), one command `get_thread` (headers-only member summaries), and the `list_messages` command body routing to `list_threads` behind an unchanged name/signature. Frontend adds `components/ui/*`, `MessageListRow.tsx` (written once), `ConversationReader.tsx` + `MessageCard.tsx` (lazy iframe), and a selection state of `{thread_key, open_uid}`.
 
 **Major components:**
-1. `src-tauri/src/llm/` (NEW: `settings.rs` validate, `prompt.rs` render, `client.rs` POST + timeout + single-flight) — the LLM lane, testable without a WebView
-2. `commands::llm` (NEW: get/save/generate/test/clear) — sole IPC surface; `generate_reply` is the single network-egress chokepoint
-3. `llm_settings` table + M-next migration + keyring `sge/llm-api-key` entry — persistence split enforcing no-secrets-in-SQLite structurally
-4. `LlmSettingsPanel.tsx` + `lib/llm.ts` (NEW) — settings form reusing existing panel idioms; thin invoke wrappers, no secrets, no prompt logic
-5. Generate button in `ComposeWindow.tsx` (MODIFY, reply/reply-all only) — pure string splice above quote; send path untouched so the review gap is enforced by doing nothing
+1. **Threading backend lane** (`imap/references.rs`, `store/threads.rs`, M26, sync-worker hooks) — thread membership as a per-folder epoch recompute (sync-end / backfill / send-file; never per-insert; dirty-set + early-exit on 0 new rows), `thread_key = (mailbox_id, thread_id)` as the universal identity, NULL thread_id = own-thread byte-compat row
+2. **UI foundation lane** (`fonts.css`, state tokens, `ui-primitives.css`, `components/ui/*`) — zero backend dependency, runs fully in parallel
+3. **Conversation UI** (`MessageListRow`, `ConversationReader`, `MessageCard`, `MailboxView` routing) — consumes both lanes; reader bodies still come from the frozen per-message `fetch_message`, one card at a time
 
 ### Critical Pitfalls
 
-Seven critical pitfalls identified (all HIGH confidence); top 5 below, full set with debt patterns and recovery costs in PITFALLS.md.
-
-1. **API key leaks into logs, errors, SQLite, or the WebView** — keyring-only from day one; no key-returning IPC (presence-bool only); header-only auth; metadata-only logs; CI grep gate rejecting `get_api_key` return paths and `api_key` in schema files.
-2. **Breaking the offline-default guarantee** — exactly one Tauri command performs egress, user-gesture-gated; no timers/hooks/queue-replay; `GET /models` probe sends no mail content; prove with a network-off UAT test.
-3. **Prompt injection via hostile incoming mail** — fence `{body}` as data (never orders), strip invisible HTML before interpolation, treat output as untrusted draft, never auto-send; injection fixtures in UAT.
-4. **Blocking the UI thread on a slow LLM call** — async command + shared client + configurable timeout + Cancel + per-window single-flight; no `reqwest::blocking` anywhere.
-5. **Unbounded token/cost exposure** — truncate body with disclosure, wire max_tokens/temperature/timeout into every request, retry only 408/429/5xx (never 401/400), log `usage` per call.
-6. **User-configured endpoint = SSRF/TLS footgun + schema drift** — https-only except loopback opt-in, never bypass cert verification, no-redirect policy for LLM POSTs, tolerant SSE/error parsing, save-time URL validation + live probe. *(Prevention leans on the `native-tls` decision above: one TLS stack, one trust store.)*
-7. **Streaming partial-text presented as complete** — mostly deferred with streaming, but the non-streaming path must still handle empty/`length`-stop responses as errors with actionable text, never as finished drafts.
+1. **Tauri silently drops unmatched invoke args/payload fields** (camel/snake drift; repair-precedent) — define TS + Rust types side-by-side in one file, same-commit both sides, round-trip serde test per new command; Phase 45 UAT re-verifies the wire live, never unit-only
+2. **`\Seen` corruption in the new fetch lane** — one copy-pasted `BODY[...]` (no `.PEEK`) permanently read-marks a real mailbox with no undo; prevents via separate `REFERENCES_ATTRS` constant + `peek_audit` path-5 extension in the SAME commit, and no dev run against live mail before that gate is green (recovery cost HIGH and trust-breaking; prevention nearly free)
+3. **References-chain parse holes** — fold continuations FIRST (RFC 5322 §2.2.3), normalize to `<...>` framing, dedupe order-preservingly, cap chain size; fixture suite (folded, bare-token, dup ID, empty-refs, never-synced parent) + live "as-received" bytes captured once into the corpus; Zimbra refusal fallback pre-declared (In-Reply-To-only, documented Known Gap)
+4. **M26 SCHEMA_VERSION off-by-one (M23 precedent)** — bump 25→26 in the same commit as the migration; two-path fixture pair (fresh install + upgrade); zero `CREATE TABLE` copies of existing tables; extend the stale SCHEMA_VERSION test so it screams
+5. **Folder-isolation / event-bus / pagination keys** — `thread_key = (mailbox_id, thread_id)` everywhere (list key, reader key, batch identity, event listener); member queries share the `pending_delete=0` predicate fragment so counts can't include tombstoned rows; FLAG_UPDATE listeners re-derive aggregates from member flags (never patch a derived thread row); page stays message-space with grouping-within-page decided up front ("cross-page thread continuation shows as a second row")
+6. **"A stub compiles" over-claim (Phase 38 precedent)** — v1.9 is UI-driven so every phase embeds acceptance-gated exit criteria verbatim from FEATURES.md's MVP gates at plan time (live References pair → one row; WebKitGTK keyboard + focus-restore checks; live payload round-trips), not "tests green"
 
 ## Implications for Roadmap
 
-Based on combined research, v1.8 decomposes into three phases in strict dependency order (condenses ARCHITECTURE.md's five-step build order into shippable phases; each phase is independently verifiable):
+Based on research, suggested phase structure (v1.9 numbering starts at 42; exact numbering is the roadmap's call):
 
-### Phase 1: LLM Settings Foundation (backend store + validation)
-**Rationale:** Everything depends on validated settings + key storage; it is also where the two cheapest catastrophic pitfalls (key leakage, endpoint validation) are prevented structurally. Pure backend logic, CI-safe with mocked keyring — no IPC, no UI.
-**Delivers:** M-next migration (`llm_settings`, CHECK constraints, no-secret-column assertion test), `queries` get/set, `creds.rs` key entry (save/load/clear), `llm/settings.rs` validation (https-or-loopback, model non-empty, ranges) + `prompt.rs` render (fenced `{body}`, invisible-HTML strip, truncation cap), reqwest feature widening with `cargo tree` no-second-TLS-stack check.
-**Addresses:** Settings + keyring + template + defaults (FEATURES.md P1); `LlmSettings` struct contract (ARCHITECTURE.md Pattern 3).
-**Avoids:** Pitfalls 1 (key leakage), 5-partial (caps persisted), 6-partial (URL validation).
-**Uses:** rusqlite_migration, keyring, zeroize, thiserror; reqwest `native-tls` per conflict resolution.
+### Phase 42: Threading Backend Lane
+**Rationale:** every display feature depends on `thread_id` + `references_json`; this phase is pure backend with an unchanged flat list payload — shippable and verifiable in isolation with zero UI risk. PITFALLS.md explicitly assigns pitfalls 1–5, 7, 12 to this phase.
+**Delivers:** M26 migration (schema 25→26, preserve-rows tests), `references.rs` parser + fixture suite, `in_reply_to` ENVELOPE extraction (free wire bytes), `REFERENCES_ATTRS` fetch lane + `peek_audit` path-5 (same commit), `store/threads.rs` per-folder recompute at sync-end/backfill/send-file hooks, live-server round-trip gate with captured as-received bytes.
+**Addresses:** backend thread lane (P1); threading lane only.
+**Avoids:** pitfalls 2, 3, 4, 5 (scope/ordering halves), 7, 12.
 
-### Phase 2: Generation Flow (client + IPC chokepoint)
-**Rationale:** The milestone's core value and highest-risk surface (egress, injection, blocking, cost, TLS) converge in one command; building it before any UI keeps the privacy choke point auditable and testable against a loopback mock.
-**Delivers:** `llm/client.rs` (shared client, total + connect timeout, single-flight `LlmGate`, tolerant response/error parsing, `usage` logging, no-redirect policy), `commands/llm.rs` (5 commands; `generate_reply{uid,mailbox}` loads settings + key + BODY.PEEK original server-side), `test_llm_connection` via `GET /models`, mock-transport tests (401 fails fast single-request, timeout, truncation-on-wire, multi-server error shapes).
-**Addresses:** Non-streaming `chat/completions` call, test-connection (FEATURES.md P1); Patterns 1–2 (ARCHITECTURE.md).
-**Avoids:** Pitfalls 2 (single chokepoint), 3 (fence + human gate), 4 (async + timeout + cancel + single-flight), 5-enforced, 6-client-side, 7-non-streaming handling.
-**Implements:** `llm/` module + `commands::llm` + keyring-at-call-time + BODY.PEEK reuse (`\Seen` invariant preserved).
+### Phase 43: UI Foundation (parallel lane — can run concurrently with 42)
+**Rationale:** the revamp has ZERO backend dependency (FEATURES.md dependency note); starting it now means it never blocks on M26. Critically, this phase **extracts `MessageListRow.tsx` in its pre-thread form** — the canonical anti-collision move: the row markup is written exactly once here, visually byte-identical, so Phase 44 is a payload/placement change inside it, not a second rewrite.
+**Delivers:** vendored woff2 + `fonts.css` + `font-src: 'self'` CSP add, additive state tokens, `ui-primitives.css`, Button/Dialog (with focus-trap + focus-restore proof tests)/Empty/Loading/Error, listbox semantics fix (no nested interactives) pre-grouping, keyboard roving + `:focus-visible` in the SAME task, `MessageListRow` extraction.
+**Addresses:** token/primitive foundation (P1), listbox + keyboard (P2), fonts.
+**Avoids:** pitfalls 9 (a11y), 10 (fonts/CSP half), 6 (dual-rewrite row).
 
-### Phase 3: Compose Integration + Hardening/UAT
-**Rationale:** UI is last because it is a thin splice over proven pieces (~40 lines); hardening closes the loop by proving the trust posture end-to-end rather than asserting it.
-**Delivers:** `LlmSettingsPanel.tsx` + menu entry + `lib/llm.ts`, Generate button + generating state + insert-above-quote splice (reply/reply-all only) + `notice`-area errors with retry, settings persistence UAT (save → restart → key absent from SQLite file), network-off egress audit, injection fixtures, double-click/Cancel tests, mock-matrix (OpenAI/Ollama/error shapes, redirect, oversized context), one deferred-with-reason live gate with a user-provided key.
-**Addresses:** Generate button + insertion + errors + privacy boundary (FEATURES.md P1); State Management (ARCHITECTURE.md).
-**Avoids:** Pitfalls 2-proven, 3-verified, 4-verified, 7-verified; UX pitfalls (frozen window, cryptic errors, lost draft on failure — failed generation never clobbers compose content).
+### Phase 44: Conversation List UI
+**Rationale:** requires Lane 1 merged (thread_id in store) and Lane 2's extracted row. Visual work is placement inside the already-existing `MessageListRow`; `list_messages` keeps its frozen name/signature while routing to `list_threads`.
+**Delivers:** extended payload (`thread_id`, `thread_count`, `thread_unread`, latest-*/member flags), `get_thread` command (headers-only, registered in `lib.rs`), grouped rows (badge ≥2, agg unread, senders "+N", latest date/snippet), search stays message-keyed and renders identically, single-message byte-compat regression gate, conversation batch actions (delete/move/mark-read) with pending_delete-filtered members and per-member undo honesty (no single-toast claim without an approved batch-undo contract), pagination-within-page grouping decision documented.
+**Addresses:** grouped rows (P1), batch actions (P2), batch-undo scope confirmation (P2 — must be confirmed at plan review).
+**Avoids:** pitfalls 1 (payload contracts), 5 (thread_key), 6 (outbox interplay), 8 (pagination).
+
+### Phase 45: Conversation Reader
+**Rationale:** depends on Phase 44's `get_thread` + types; the reader is the expansion surface (list never expands in place). Consumes frozen `fetch_message` per expanded card only.
+**Delivers:** `ConversationReader` chronological stack + expansion state machine (latest + through-first-unread expanded, history collapsed), `MessageCard` with lazy iframe + concurrent-mount cap, read-on-expand per message (set_seen + flag wash preserved), per-card action rows reusing existing action order, `ReadingPane` single-message path = reader with ONE card, `MailboxView` `{thread_key, open_uid}` selection.
+**Addresses:** reader stack + per-message re-homed actions (P1), iframe lazy-mount (P3 but the cap rides here).
+**Avoids:** pitfalls 10 (iframe budget), 11 (event-bus aggregation), 4 (whole-thread-on-open anti-feature).
+
+### Phase 46: Revamp Sweep + Live Verification
+**Rationale:** retroactive consistency pass on surfaces 43–45 touched; this phase must consume Phase 43's kit, never introduce new primitives.
+**Delivers:** state-token consistency across touched surfaces, `prefers-reduced-motion` for auto-scroll/wash, empty/loading/error states consumed everywhere touched, WebGL/WebKitGTK keyboard + focus-restore + screen-reader spot checks, live UAT gates assembled verbatim from FEATURES.md "threading done" MVP gate, Tauri wire round-trip re-verification on a real account, Inbox+Sent cross-folder thread isolation check.
+**Addresses:** revamp sweep; the anti-over-claim gate (pitfall 13).
+**Avoids:** pitfalls 9 (spot-check), 13 (acceptance-gated exits).
 
 ### Phase Ordering Rationale
 
-- **Dependencies dictate order:** settings store → client/IPC → UI is a hard chain (each phase's tests mock the next layer down, never up); no parallelization is possible beyond within-phase task splits.
-- **Risk-front-loading:** the irreversible decisions (key storage shape, TLS feature, single-chokepoint topology, prompt fencing) all land in Phases 1–2 where they are cheapest to change; Phase 3 is deliberately thin UI + verification.
-- **Scope guards as phase gates:** reply-only, single template, non-streaming, no auto-send are enforced by what each phase does NOT build (no second editor, no template CRUD, no SSE parser, no send-path coupling) — reviewers should check absences, not just presences.
-- **Pitfall-to-phase mapping** (PITFALLS.md) assigns every critical pitfall a prevention phase and a verification method; the roadmapper should copy those verification items into phase success criteria verbatim.
+- **Backend before thread UI** (42 → 44/45): no display feature can ship without `thread_id` — the dependency is total, not partial.
+- **UI foundation unconstrained** (43 parallel with 42): zero backend dependency, and it front-loads the one file collision (`MessageListRow`) so threading never competes with the revamp on the same lines.
+- **List before reader** (44 → 45): the reader consumes `get_thread`/types from 44; the list's payload contract is what the reader's member summaries must agree with.
+- **Sweep verified LAST and consumption-only** (46): standardizes consumption rather than re-inventing states, and assembles phase-exit criteria from the MVP gates so the Phase 38 over-claim class is mechanically blocked.
+- **Same-commit invariants:** peek_audit path-5 lands with the lane (42); SCHEMA_VERSION bump with M26 (42); TS+Rust payload sides in one commit (44/45); keyboard roving paired with `:focus-visible` (43).
 
 ### Research Flags
 
-Phases likely needing deeper research during planning (`--research-phase` recommended):
-- **Phase 2:** multi-server response/error-shape tolerance (Ollama vs OpenAI vs proxies: keepalives, vendor frames, `{"error"}` vs bare envelopes, context-clip detection) — provider quirks are the least stable knowledge in this stack; a phase-scoped probe of docs.rs client patterns + live-shape fixtures pays off.
-- **Phase 3 (hardening slice):** prompt-injection fixture design (hidden-div, fragmented-URL, protocol-state masquerade per ESPI/NDSS) — adversarial-tradecraft sources evolve; refresh at plan time rather than trusting this snapshot.
+Phases likely needing deeper research during planning:
+- **Phase 42 (Threading backend):** research is unusually complete (API, parser shapes, integration lines verified) — `/gsd-plan-phase` research-phase likely unnecessary, BUT the phase must embed a **live UTPR/Zimbra gate** (real `HEADER.FIELDS (REFERENCES)` round-trip with captured bytes) as an execution concern, plus plan-review confirmation of two open scope items: the thread-summary payload shape for the reader (new payload beyond `thread_id` — FEATURES.md flags it for explicit approval) and whether batch-undo gets a backend contract this milestone or ships N-toasts documented.
+- **Phase 44 (Conversation list):** confirm the `list_threads` SQL shape and pagination-within-page semantics at plan review — FEATURES/PITFALLS both flag the COUNT/OFFSET contract disagreement as an up-front decision, not a discovered one.
 
 Phases with standard patterns (skip research-phase):
-- **Phase 1:** keyring/SQLite-migration/validation patterns are established SGE precedent (Phases 1/5, M14/M18, `classify_settings`) — well-documented internally, no external research needed.
-- **Phase 3 (UI slice):** compose-window splice + settings-panel form follow existing `ComposeWindow.tsx`/`RulesPanel` idioms directly — standard React/Tauri invoke work.
+- **Phase 43 (UI foundation):** vendored-woff2 + plain-CSS primitives + APG listbox contract are fully specified with verified current-tree integration points; no further research needed.
+- **Phase 45 (Reader):** patterns verified against existing `fetch_message`/ReadingPane source; components map one-to-one to documented integration points.
+- **Phase 46 (Revamp sweep):** consumption-only polish; gates defined by existing artifacts.
 
 ## Confidence Assessment
 
 | Area | Confidence | Notes |
 |------|------------|-------|
-| Stack | HIGH | Pinned `Cargo.toml` ground truth + verified docs.rs reqwest 0.12 feature/dependency list; single-Cargo-line change |
-| Features | HIGH | Closest analog (Thunderbird + ThunderAI) verified via web; generation UX cross-checked across 3+ clients; SGE-side deps read from `ComposeWindow.tsx` directly |
-| Architecture | HIGH | Grounded in SGE source files (lib.rs, creds.rs, store, tauri.conf.json CSP, ComposeWindow); one internal conflict (TLS feature) resolved here in favor of STACK.md |
-| Pitfalls | HIGH | 7 critical pitfalls with prevention + verification each; sourced from Tauri production guides, OWASP, peer codebases (Humla, TokenGuard), and SGE's own PROJECT.md constraints |
+| Stack | HIGH | Versions verified against crates.io/npm registry APIs; async-imap/imap-proto parser + accessor source pulled and inspected; `mail-threading` API from README + conformance corpus; integration points verified against SGE source |
+| Features | MEDIUM | Gmail Help Center + W3C APG fetched live; Gecko/TB/Geary/K-9 claims from stable knowledge (live KB fetches blocked in this environment); existing-code audit first-hand (HIGH) |
+| Architecture | HIGH | Every integration point verified by reading actual source files; dep choices cross-verified; build order explicitly dependency-safe with collision pair resolved |
+| Pitfalls | HIGH (backend) / MEDIUM (UI) | All backend pitfalls anchored to concrete repo precedents (M23 race, NAMESPACE, Phase 38, 2026-10-18 four-breaks); UI pitfalls code-shape-verified + APG-fetched |
 
-**Overall confidence:** HIGH
+**Overall confidence:** HIGH — for an existing-codebase milestone, integration points are unusually well-verified (all four researchers read the live tree independently and agree).
 
 ### Gaps to Address
 
-- **ARCHITECTURE.md `rustls` mentions are stale after the TLS resolution** — planner for Phase 1/2 must treat every `rustls` reference as `native-tls` and enforce the `cargo tree` gate; consider a one-line correction pass on ARCHITECTURE.md during Phase 1 planning.
-- **Timeout value tension (30 s vs 60 s defaults across docs)** — not a real disagreement (all agree configurable 5–180 s); Phase 1 planner picks defaults (suggested: 60 s total default for local-model generosity, 10 s connect) and documents the choice.
-- **Migration number (M23 assumed)** — confirm next free migration index at Phase 1 plan time; rename accordingly.
-- **Streaming design is intentionally absent** — if UAT triggers the streaming follow-up, that work needs its own research pass (SSE state machine, `Channel` events, idle-vs-total timeouts); do not improvise it inside v1.8.
-- **Live-endpoint verification needs a user-provided key** — same deferred-with-reason harness as prior milestones; never commit a key; mock transport is the CI gate.
+- **Live server wire-shape variance:** `HEADER.FIELDS (REFERENCES)` is parser-verified but never live-verified against UTFPr Zimbra; Phase 42's first live gate must capture as-received bytes; pre-declared fallback (References = In-Reply-To) documented as Known Gap if Zimbra refuses.
+- **Batch undo backend contract:** `undo_queued_op(uid)` is single-member; conversation batch undo is a backend change flagged for explicit plan-review approval — otherwise ship N labeled toasts and document, never a fake single toast.
+- **Thread-summary payload shape:** reader needs per-member headers (uid/from/date/flags/preview) from a new `get_thread` payload — within the lane's spirit but must be confirmed at plan review.
+- **Recompute cost on first big-folder pass:** conformance fixtures bound the algorithm, real UTFPR folder sizes unmeasured; dirty-set guard + early-exit mitigations identified; measure at Phase 42 gates.
+- **`mail-threading` version floor:** 0.1.3 verified today; if plan time vetoes the dep, in-house JIT (~250 LOC + absorbed fixtures) is pre-costed — decision is a plan-review nod, not new research.
 
 ## Sources
 
 ### Primary (HIGH confidence)
-- SGE `src-tauri/Cargo.toml` (pinned reqwest 0.12, serde, keyring 3 + sync-secret-service, rusqlite 0.37, tokio, zeroize, thiserror) — stack ground truth
-- SGE codebase: `lib.rs`, `creds.rs`, `store/` (M2–M22 precedent), `schema.sql` T-02-02, `tauri.conf.json` CSP, `ComposeWindow.tsx` + `lib/compose.ts` — architecture/feature dependencies
-- `.planning/PROJECT.md` v1.8 scope + constraints (keyring-only, offline-default, no auto-send, mock-in-CI) — scope authority
-- docs.rs reqwest 0.12 (0.12.28 verified; feature → dep mapping for `json`/`stream`/`native-tls`) — stack verification
-- OpenAI-compatible `chat/completions` shape (OpenRouter/base-URL docs) — stable API contract
+- crates.io API + npm registry (versions verified 2026-10-20): async-imap, imap-proto, mail-threading, rusqlite, tauri, react, vite, typescript
+- async-imap 0.11.3 / imap-proto 0.16.7 crate source (inspected directly): parser body mapping, `test_header_fields` fixture, `Fetch::section()` accessor, `Envelope.in_reply_to`
+- `mail-threading` 0.1.3 GitHub README + conformance corpus: API, ThreadingOptions, dup policy, phantom pruning
+- SGE source tree (first-hand reads): `store/mod.rs`, `store/queries.rs`, `imap/headers.rs`, `sync/worker.rs`, `commands/sync.rs`, `lib.rs`, `MessageList.tsx`, `ReadingPane.tsx`, `MailboxView.tsx`, `types.ts`, `tauri.conf.json`, `tokens.css`
+- Tauri v2 docs (fetched live 2026-10-20): CSP directive fallback, `font-src` semantics
 
 ### Secondary (MEDIUM confidence)
-- Thunderbird ThunderAI setup + custom-prompt guides; AI-Mate add-on listings — closest-analog feature patterns
-- Superhuman/Shortwave/Missive generation UX (streaming, regenerate, review gates) — differentiator/deferral calls
-- Tauri v2 docs (CSP/CORS rationale for backend-owned HTTP) — architecture pattern
-- OWASP LLM injection prevention + LLM01; Google layered injection defense; Nylas email-agent recipe — pitfalls 3 design
-- Rust OpenAI-compatible client patterns (docs.rs: timeouts, tolerant SSE, retry allowlists, no-redirect bearer) — pitfalls 4–7 design
+- Gmail Help Center "Group emails into conversations" (fetched live 2026-10-20)
+- W3C ARIA APG Listbox pattern (fetched live 2026-10-20)
+- Thunderbird/Geary/K-9 behavior from stable training knowledge (live KB fetches blocked)
+- jwz threading doc (canonical knowledge; direct fetch timed out)
+- `.planning/PROJECT.md` Key Decisions + v1.8 closeout / deferred-UAT records
 
-### Tertiary (LOW confidence, needs validation at plan time)
-- ESPI / NDSS 2027 protocol-state masquerade; attack-chain detection preprints; hidden-HTML gateway bypasses — injection fixture design refresh (Phase 3 research flag)
-- Per-server quirks (Ollama keepalives, OpenRouter error envelopes) — tolerant-parsing matrix (Phase 2 research flag)
+### Tertiary (LOW confidence)
+- Geary handbook specifics (406s) — chronology + collapsed-history contract from stable knowledge
+- live Zimbra response-shape variance ("as-received" bytes) — to be captured at Phase 42 live gates
 
 ---
-*Research completed: 2026-10-15*
+*Research completed: 2026-10-20*
 *Ready for roadmap: yes*
