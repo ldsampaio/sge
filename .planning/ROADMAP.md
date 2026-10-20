@@ -20,6 +20,7 @@ Two lanes, one collision point: Lane 1 is a pure-backend threading lane (M26 mig
 **Goal**: Related emails are reliably linked in the data layer — `in_reply_to`/`references` stored, a stable per-folder `thread_id` computed by the backend — while the flat list payload and rendering stay *completely unchanged*, making the lane independently shippable and zero-risk to the UI.
 **Depends on**: Nothing (first phase; backend-only, no UI work)
 **Requirements**: THR-01, THR-02, THR-03, THR-04
+**Plans**: 7 plans (waves 1: 01+02, 2: 03+04, 3: 05+06, 4: 07)
 **Success Criteria** (what must be TRUE):
   1. After a refresh that synchronizes a reply (a message whose `In-Reply-To`/`References` chain reaches a locally stored message), the reply is persisted with both header fields and carries a backend-computed `thread_id` shared with its parent in the same folder — while the list payload remains unchanged and the list renders exactly as today.
   2. The new References fetch lane sends only `BODY.PEEK[HEADER.FIELDS (REFERENCES)]` as a separate named constant; `peek_audit` enumerates it as path 5 **in the same commit** and no fetch code path can set `\Seen` (extended guard tests green; no dev run against live mail before the gate passes).
