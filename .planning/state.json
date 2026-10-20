@@ -1,178 +1,28 @@
 {
   "contract": "1.0.0",
   "flavor": "core",
-  "milestone": "v1.5 — Live Validation + Compose Hardening + Deferred Features",
+  "milestone": "v1.9",
   "phases": [
     {
-      "number": "1",
-      "name": "Scaffold + Connection",
+      "number": "39",
+      "name": "LLM Settings Foundation",
       "status": "complete"
     },
     {
-      "number": "2",
-      "name": "Sync Engine + Local Store",
+      "number": "40",
+      "name": "Generation Flow",
       "status": "complete"
     },
     {
-      "number": "3",
-      "name": "Mailbox UI Shell + Search",
-      "status": "complete"
-    },
-    {
-      "number": "4",
-      "name": "Reader + Attachments",
-      "status": "complete"
-    },
-    {
-      "number": "5",
-      "name": "Keyring + Packaging",
-      "status": "complete"
-    },
-    {
-      "number": "6",
-      "name": "Flag Sync + Outbox",
-      "status": "complete"
-    },
-    {
-      "number": "7",
-      "name": "Folders + Per-Folder Sync",
-      "status": "complete"
-    },
-    {
-      "number": "8",
-      "name": "Poll + Manual Refresh",
-      "status": "complete"
-    },
-    {
-      "number": "9",
-      "name": "UID Backfill",
-      "status": "complete"
-    },
-    {
-      "number": "10",
-      "name": "Delete + Move",
-      "status": "complete"
-    },
-    {
-      "number": "11",
-      "name": "Folder CRUD",
-      "status": "complete"
-    },
-    {
-      "number": "12",
-      "name": "Drafts",
-      "status": "complete"
-    },
-    {
-      "number": "13",
-      "name": "Send Pipeline",
-      "status": "complete"
-    },
-    {
-      "number": "14",
-      "name": "Compose UI",
-      "status": "complete"
-    },
-    {
-      "number": "15",
-      "name": "Sidecar Packaging Spike",
-      "status": "complete"
-    },
-    {
-      "number": "16",
-      "name": "Taxonomy + Store",
-      "status": "complete"
-    },
-    {
-      "number": "17",
-      "name": "Classify Engine (No Moves)",
-      "status": "complete"
-    },
-    {
-      "number": "18",
-      "name": "Confirm + Trust UX",
-      "status": "complete"
-    },
-    {
-      "number": "19",
-      "name": "Taxonomy Editor + Import",
-      "status": "complete"
-    },
-    {
-      "number": "20",
-      "name": "Batch Reorganization",
-      "status": "complete"
-    },
-    {
-      "number": "21",
-      "name": "SMTP Send — Live Gate",
-      "status": "pending"
-    },
-    {
-      "number": "22",
-      "name": "Draft & Seen Round-Trip — Live Gate",
-      "status": "pending"
-    },
-    {
-      "number": "23",
-      "name": "Search + Filters",
-      "status": "pending"
-    },
-    {
-      "number": "24",
-      "name": "Auto-Archive",
-      "status": "pending"
-    },
-    {
-      "number": "25",
-      "name": "Smart Folder Rules",
-      "status": "pending"
-    },
-    {
-      "number": "26",
-      "name": "Live Validation Bundle",
-      "status": "pending"
-    },
-    {
-      "number": "27",
-      "name": "Live-Validation Gate + Capability Probes",
-      "status": "pending"
-    },
-    {
-      "number": "28",
-      "name": "Override-Event Log + CONDSTORE Fast Path",
-      "status": "pending"
-    },
-    {
-      "number": "29",
-      "name": "Rule Import/Export + IDLE Watcher",
-      "status": "pending"
-    },
-    {
-      "number": "30",
-      "name": "Batch Trust Pair",
-      "status": "complete"
-    },
-    {
-      "number": "31",
-      "name": "Sieve Export + History + Learning v1 + Auto-Confirm",
-      "status": "pending"
-    },
-    {
-      "number": "32",
-      "name": "Compose Hardening",
-      "status": "pending"
-    },
-    {
-      "number": "33",
-      "name": "ManageSieve Upload (conditional)",
+      "number": "41",
+      "name": "Compose Integration + Hardening/UAT",
       "status": "pending"
     }
   ],
   "next": {
-    "command": "/gsd:progress --next",
-    "label": "Advance to the next step (plan phase 31)",
-    "reason": "Phase 31 of 18 — needs a plan"
+    "command": "/gsd:discuss-phase",
+    "label": "Discuss the first phase",
+    "reason": "Project initialized — plan your first phase"
   },
-  "updated_at": "2026-10-14T05:50:57.031Z"
+  "updated_at": "2026-10-20T03:13:16.331Z"
 }
