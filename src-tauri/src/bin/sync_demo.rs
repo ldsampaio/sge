@@ -99,6 +99,7 @@ impl SyncSession for MockSession {
                     preview: format!("Preview of message {uid}"),
                     modseq: None,
                     in_reply_to: None,
+                    references: None,
                 });
             }
             Ok(headers)

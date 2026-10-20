@@ -109,6 +109,7 @@ impl SyncSession for FakeSession {
                             preview: String::new(),
                             modseq: None,
                             in_reply_to: None,
+                            references: None,
                         });
                     }
                 }

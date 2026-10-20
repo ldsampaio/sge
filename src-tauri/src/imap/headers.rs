@@ -23,6 +23,13 @@ use super::SyncError;
 /// empty stream (no error), i.e. a silent "0 messages" sync.
 pub const FETCH_ATTRS: &str = "(UID FLAGS INTERNALDATE ENVELOPE BODYSTRUCTURE)";
 
+/// Separate attribute set for the References lane. The `.PEEK` prefix is
+/// mandatory: a non-PEEK `BODY[HEADER.FIELDS …]` FETCH permanently sets
+/// `\Seen` server-side on every swept message with no client undo.
+/// Never folded into `FETCH_ATTRS` — `fetch_attrs_are_parenthesized`
+/// tripwires that the two constants stay disjoint.
+pub const FETCH_REFS_ATTRS: &str = "(UID BODY.PEEK[HEADER.FIELDS (REFERENCES)])";
+
 /// A single message header row extracted from an IMAP ENVELOPE FETCH.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageHeader {
@@ -39,6 +46,10 @@ pub struct MessageHeader {
     pub modseq: Option<u64>,
     /// Raw msg-id from the ENVELOPE's `In-Reply-To` (never RFC 2047-decoded).
     pub in_reply_to: Option<String>,
+    /// Ordered msg-id chain from the `BODY.PEEK[HEADER.FIELDS (REFERENCES)]`
+    /// lane, parsed only by `imap::references::parse_references`;
+    /// `None` = own-thread sentinel (absent/empty field, never a synthetic chain).
+    pub references: Option<Vec<String>>,
 }
 
 /// Convert async-imap `Flag` list into the JSON string the DB stores.
@@ -297,6 +308,7 @@ pub fn parse_fetch_item(fetch: &Fetch, uid: u32) -> MessageHeader {
         has_attachments,
         preview,
         modseq,
+        references: None,
     }
 }
 
@@ -324,6 +336,68 @@ pub async fn fetch_envelope_batch(
             .uid
             .ok_or_else(|| SyncError::Protocol("missing UID in FETCH response".into()))?;
         out.push(parse_fetch_item(&fetch, uid));
+    }
+    Ok(out)
+}
+
+/// Turn one REFERENCES-lane item into a partial `MessageHeader` row: only
+/// `uid` and `references` are populated (callers merge by uid into their
+/// envelope rows). Raw bytes go through `decode_bytes_opt` semantics then
+/// ONLY through `imap::references::parse_references` (42-02 proven unfold/
+/// tokenize) — never `split(' ')`, never `decode_header_words`.
+pub fn attach_refs_row(uid: u32, raw: &[u8]) -> MessageHeader {
+    let references = decode_bytes_opt(Some(raw))
+        .map(|s| crate::imap::references::parse_references(&s))
+        .flatten()
+        .map(|chain| chain.ids);
+    MessageHeader {
+        uid,
+        message_id: None,
+        subject: String::new(),
+        from_addr: String::new(),
+        to_addrs: String::new(),
+        cc_addrs: String::new(),
+        date_utc: String::new(),
+        flags: String::new(),
+        has_attachments: false,
+        preview: String::new(),
+        modseq: None,
+        in_reply_to: None,
+        references,
+    }
+}
+
+/// The References lane (THR-01): `UID FETCH <range> FETCH_REFS_ATTRS` over
+/// the given session — PEEK-only, so `\Seen` is never set. Emits one
+/// partial row per RECEIVED item; a UID whose response carries no
+/// REFERENCES section (`Fetch::section` → `None`, the silent empty-stream
+/// trap at this module's header doc) is deliberately not reported, so
+/// callers diff requested-vs-received UIDs and see the shape miss as a
+/// gap — never as silence.
+pub async fn fetch_refs_batch(
+    session: &mut super::BoxedSession,
+    range: &str,
+) -> Result<Vec<MessageHeader>, SyncError> {
+    let mut stream = session
+        .uid_fetch(range, FETCH_REFS_ATTRS)
+        .await
+        .map_err(|e| SyncError::Protocol(format!("REFS FETCH: {e}")))?;
+    let refs_path = SectionPath::Full(MessageSection::Header);
+    let mut out = Vec::new();
+    while let Some(fetch) = stream
+        .try_next()
+        .await
+        .map_err(|e| SyncError::Protocol(format!("REFS FETCH stream: {e}")))?
+    {
+        let uid = fetch
+            .uid
+            .ok_or_else(|| SyncError::Protocol("missing UID in refs FETCH response".into()))?;
+        match fetch.section(&refs_path) {
+            Some(raw) => out.push(attach_refs_row(uid, raw)),
+            // Shape miss: no REFERENCES section in the response — skip the
+            // UID so the requested-vs-received diff shows the gap.
+            None => {}
+        }
     }
     Ok(out)
 }
@@ -437,6 +511,34 @@ mod tests {
     }
 
     #[test]
+    fn fetch_refs_batch_attaches_parsed_chain() {
+        use crate::imap::references::parse_references;
+        // Lane bytes as received: folded continuation + trailing CR; ids
+        // keep verbatim form (`=?...?=`-shaped substrings must survive).
+        let raw = b"<a@x> <b=?utf-8?Q?=42?=@host>\r\n <c@y>\r";
+        let row = attach_refs_row(7, raw);
+        assert_eq!(row.uid, 7);
+        let chain = parse_references("<a@x> <b=?utf-8?Q?=42?=@host>\r\n <c@y>");
+        assert_eq!(row.references, chain.map(|c| c.ids));
+    }
+
+    #[test]
+    fn fetch_refs_batch_empty_field_is_own_thread() {
+        // Received item with an absent/empty REFERENCES field: UID is in the
+        // stream, chain is the `None` own-thread sentinel — no synthetic
+        // empty chain is ever attached.
+        let row = attach_refs_row(9, b"");
+        assert_eq!(row.uid, 9);
+        assert_eq!(row.references, None);
+        let row_cr = attach_refs_row(10, b"\r");
+        assert_eq!(row_cr.references, None);
+        // Shape-miss discipline: `fetch_refs_batch` skips a UID whose
+        // `Fetch::section` is `None` BEFORE attaching, so the requested-
+        // vs-received UID diff shows the gap instead of silence; attaching
+        // is never reachable for a shape miss.
+    }
+
+    #[test]
     fn parse_fetch_paths_in_reply_to_shape_equality() {
         use std::borrow::Cow;
         let env = Envelope {
@@ -498,13 +600,30 @@ mod tests {
             !FETCH_ATTRS.contains("BODY[]") && !FETCH_ATTRS.contains("BODY.PEEK[HEADER"),
             "header sweep must not fetch bodies (read-only invariant): {FETCH_ATTRS}"
         );
+        // The References lane must stay its OWN parenthesized constant…
+        assert!(
+            FETCH_REFS_ATTRS.starts_with('(') && FETCH_REFS_ATTRS.ends_with(')'),
+            "FETCH_REFS_ATTRS must be parenthesized, got: {FETCH_REFS_ATTRS}"
+        );
+        for attr in ["UID", "BODY.PEEK[HEADER.FIELDS (REFERENCES)]"] {
+            assert!(
+                FETCH_REFS_ATTRS.contains(attr),
+                "FETCH_REFS_ATTRS missing {attr}: {FETCH_REFS_ATTRS}"
+            );
+        }
+        // …never folded into FETCH_ATTRS (the negative tripwire above stays
+        // green only while the two constants remain disjoint).
+        assert!(
+            !FETCH_ATTRS.contains("REFERENCES"),
+            "References lane must not be folded into FETCH_ATTRS: {FETCH_ATTRS}"
+        );
     }
 
     /// PEEK audit over every fetch path in the crate (T-6-03).
     ///
     /// Fails the build if any fetch attribute set or body-fetch call site
     /// regresses to a bare `BODY[]` / `RFC822` form that would set `\\Seen`
-    /// as a read side effect. Audits the four paths locked in CONTEXT.md:
+    /// as a read side effect. Audits the five paths locked in CONTEXT.md:
     ///
     /// 1. **Headers attrs** — `FETCH_ATTRS` (this module): header sweep only.
     /// 2. **Body fetch impl** — `SyncSession::fetch_body` in `imap/mod.rs`:
@@ -514,6 +633,9 @@ mod tests {
     /// 4. **fetch_message command** — `commands/sync.rs`: calls
     ///    `session.fetch_body` (path 2), never `fetch_rfc822` or bare
     ///    `uid_fetch(.., "BODY[]")`.
+    /// 5. **References lane attrs** — `FETCH_REFS_ATTRS` (this module):
+    ///    the UID-only `BODY.PEEK[HEADER.FIELDS (REFERENCES)]` lane —
+    ///    `.PEEK` prefix mandatory, never a bare `BODY[HEADER.FIELDS …]`.
     ///
     /// The string checks below are the compile-time guard: a grep-style
     /// assertion that no fetch attribute constant contains a bare body token.
@@ -540,7 +662,19 @@ mod tests {
             );
         }
 
-        // All four paths are accounted for — document the audit mapping so
+        // Path 5 — References lane attribute set: PEEK-prefixed only.
+        for pat in &bare_body_patterns {
+            assert!(
+                !FETCH_REFS_ATTRS.contains(pat),
+                "peek_audit: FETCH_REFS_ATTRS contains bare body token {pat:?}: {FETCH_REFS_ATTRS}"
+            );
+        }
+        assert!(
+            FETCH_REFS_ATTRS.contains("BODY.PEEK[HEADER.FIELDS (REFERENCES)]"),
+            "peek_audit: References lane must be PEEK-guarded: {FETCH_REFS_ATTRS}"
+        );
+
+        // All five paths are accounted for — document the audit mapping so
         // a future contributor adding a new fetch must update this test.
         let audited_paths = [
             ("1. headers FETCH_ATTRS", "header sweep — no body part"),
@@ -553,11 +687,15 @@ mod tests {
                 "4. commands/sync.rs fetch_message",
                 "session.fetch_body → path 2",
             ),
+            (
+                "5. headers FETCH_REFS_ATTRS",
+                "uid_fetch(_, \"(UID BODY.PEEK[HEADER.FIELDS (REFERENCES)])\")",
+            ),
         ];
         assert_eq!(
             audited_paths.len(),
-            4,
-            "peek_audit: all four fetch paths must be accounted for"
+            5,
+            "peek_audit: all five fetch paths must be accounted for"
         );
     }
 }
@@ -578,6 +716,7 @@ pub fn parse_fetch_attributes(attrs: &[AttributeValue]) -> MessageHeader {
         preview: String::new(),
         modseq: None,
         in_reply_to: None,
+        references: None,
     };
     for attr in attrs {
         match attr {

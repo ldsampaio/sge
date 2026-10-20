@@ -2108,6 +2108,7 @@ mod tests {
             preview: format!("Subject {uid}"),
             modseq: None,
             in_reply_to: None,
+            references: None,
         }
     }
 

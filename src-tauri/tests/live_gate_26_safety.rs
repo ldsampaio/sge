@@ -100,6 +100,7 @@ impl FakeSession {
             preview: String::new(),
             modseq: None,
             in_reply_to: None,
+            references: None,
         }
     }
 
