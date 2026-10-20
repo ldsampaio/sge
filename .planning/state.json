@@ -4,25 +4,35 @@
   "milestone": "v1.9",
   "phases": [
     {
-      "number": "39",
-      "name": "LLM Settings Foundation",
-      "status": "complete"
+      "number": "42",
+      "name": "Threading Backend Lane",
+      "status": "pending"
     },
     {
-      "number": "40",
-      "name": "Generation Flow",
-      "status": "complete"
+      "number": "43",
+      "name": "UI Foundation & MessageListRow Extraction",
+      "status": "pending"
     },
     {
-      "number": "41",
-      "name": "Compose Integration + Hardening/UAT",
+      "number": "44",
+      "name": "Conversation List",
+      "status": "pending"
+    },
+    {
+      "number": "45",
+      "name": "Conversation Reader + Actions",
+      "status": "pending"
+    },
+    {
+      "number": "46",
+      "name": "Revamp Sweep + Verification",
       "status": "pending"
     }
   ],
   "next": {
-    "command": "/gsd:discuss-phase",
-    "label": "Discuss the first phase",
-    "reason": "Project initialized — plan your first phase"
+    "command": "/gsd:progress --next",
+    "label": "Advance to the next step",
+    "reason": "Phase 42 of 5 · executing"
   },
-  "updated_at": "2026-10-20T03:13:16.331Z"
+  "updated_at": "2026-10-20T13:25:59.816Z"
 }
