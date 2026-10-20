@@ -12,6 +12,10 @@ use rusqlite_migration::{Error as MigrationError, Migrations, M};
 use thiserror::Error;
 
 pub mod queries;
+/// Phase 42 (Plan 42-04): per-folder JWZ threading epoch — `mail-threading`
+/// wrapper owning folder scoping, the `(date_utc, uid)` member re-sort, and
+/// idempotent batched `thread_id` UPDATEs (D-03/D-04). SQL stays inside store/.
+pub mod threads;
 /// Per CONTEXT discretion allowance; exported for `bodies.rs`.
 pub const BODY_CACHE_CAP_BYTES: usize = 262144;
 

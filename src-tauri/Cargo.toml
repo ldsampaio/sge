@@ -76,6 +76,15 @@ lettre = "0.11"
 zeroize = "1"
 thiserror = "2"
 chrono = "0.4"
+# Phase 42 pin record: mail-threading resolves to 0.1.3 (crates.io, pub.
+# 2026-06-04, MIT OR Apache-2.0, MSRV 1.88 < env rustc 1.99; repo
+# github.com/planetaryescape/mail-threading author bhekanik). Dep tree adds
+# zero marginal crates: chrono is already pinned here; the serde feature
+# stays OFF — Thread output is mapped manually in store/threads.rs (D-03).
+# Legitimacy [SUS] gate CLEARED 2026-10-20 (user-approved checkpoint, see
+# 42-04-PLAN.md <checkpoint-resolution>). In-house ~250-LOC JWZ core remains
+# a documented GATE-ONLY fallback; never engaged silently.
+mail-threading = "0.1"
 futures = "0.3"
 native-tls = "0.2"
 ammonia = "4"
