@@ -1,10 +1,10 @@
 ---
 schema_version: 1
-open_count: 2
+open_count: 3
 waived_count: 0
 fixed_count: 0
-total_count: 2
-last_updated: 2026-10-13T14:18:15.791Z
+total_count: 3
+last_updated: 2026-10-20T13:54:44.577Z
 ---
 
 # Broken Windows Ledger
@@ -17,6 +17,7 @@ last_updated: 2026-10-13T14:18:15.791Z
 |----|-------|------|------|------|-------------|--------|--------|-------------|-------------|
 | 1 | 6 | deviation | .planning/config.json |  | git.allow_default_branch_commits=true added: pre-commit protected-branch assertion would block all task commits; project convention is GSD commits on main (solo local repo, mode yolo, all prior phases on main) | open |  | 2026-10-04T15:41:20.263Z |  |
 | 2 | 21 | unrun-verify | scripts/live-21.sh |  | Phase 21-02 live gate not yet executed against the real server (human step with git-ignored .live-test.env creds); offline doubles green (328 lib + 19 bin + 42 safety), wrapper syntax-checked, exit-2 SKIP contract intact | open |  | 2026-10-13T14:18:15.791Z |  |
+| 3 | 42 | deviation | src-tauri/src/sync/worker.rs |  | 42-01 Rule 3: upsert_message arity growth propagated None,None to 48 call sites across 10 files beyond plan files_modified list | open |  | 2026-10-20T13:54:44.577Z |  |
 
 ````json
 [
@@ -45,6 +46,19 @@ last_updated: 2026-10-13T14:18:15.791Z
     "recorded_at": "2026-10-13T14:18:15.791Z",
     "resolved_at": null,
     "milestone": "v1.4"
+  },
+  {
+    "id": 3,
+    "kind": "deviation",
+    "phase": "42",
+    "file": "src-tauri/src/sync/worker.rs",
+    "line": null,
+    "description": "42-01 Rule 3: upsert_message arity growth propagated None,None to 48 call sites across 10 files beyond plan files_modified list",
+    "status": "open",
+    "reason": "",
+    "recorded_at": "2026-10-20T13:54:44.577Z",
+    "resolved_at": null,
+    "milestone": "v1.9"
   }
 ]
 ````

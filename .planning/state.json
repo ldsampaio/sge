@@ -6,7 +6,7 @@
     {
       "number": "42",
       "name": "Threading Backend Lane",
-      "status": "pending"
+      "status": "in_progress"
     },
     {
       "number": "43",
@@ -34,5 +34,5 @@
     "label": "Advance to the next step",
     "reason": "Phase 42 of 5 · executing"
   },
-  "updated_at": "2026-10-20T13:25:59.816Z"
+  "updated_at": "2026-10-20T14:22:52.425Z"
 }
