@@ -19,6 +19,7 @@ pub mod idle;
 pub mod manager;
 pub mod mutf7;
 pub mod probe;
+pub mod references;
 pub mod roles;
 pub mod session;
 pub mod trash;
