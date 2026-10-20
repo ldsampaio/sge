@@ -93,8 +93,39 @@ Constraints (carried from `.planning/PROJECT.md` / research):
 
 ## Traceability
 
-(filled by the roadmap — requirement → phase)
-
 | Requirement | Phase | Plan | Status |
 |-------------|-------|------|--------|
-| *(pending roadmap approval)* | | | |
+| THR-01 | Phase 42 | TBD | Pending |
+| THR-02 | Phase 42 | TBD | Pending |
+| THR-03 | Phase 42 | TBD | Pending |
+| THR-04 | Phase 42 | TBD | Pending |
+| REV-01 | Phase 43 | TBD | Pending |
+| REV-02 | Phase 43 | TBD | Pending |
+| REV-03 | Phase 43 | TBD | Pending |
+| CNV-01 | Phase 44 | TBD | Pending |
+| CNV-02 | Phase 44 | TBD | Pending |
+| CNV-03 | Phase 44 | TBD | Pending |
+| CNV-04 | Phase 44 | TBD | Pending |
+| CNV-05 | Phase 44 | TBD | Pending |
+| CNV-06 | Phase 44 | TBD | Pending |
+| CNV-07 | Phase 44 | TBD | Pending |
+| CNV-08 | Phase 44 | TBD | Pending |
+| READ-01 | Phase 45 | TBD | Pending |
+| READ-02 | Phase 45 | TBD | Pending |
+| READ-03 | Phase 45 | TBD | Pending |
+| READ-04 | Phase 45 | TBD | Pending |
+| READ-05 | Phase 45 | TBD | Pending |
+| READ-06 | Phase 45 | TBD | Pending |
+| READ-07 | Phase 45 | TBD | Pending |
+| READ-08 | Phase 45 | TBD | Pending |
+| READ-09 | Phase 45 | TBD | Pending |
+| READ-10 | Phase 45 | TBD | Pending |
+| ACT-01 | Phase 45 | TBD | Pending |
+| ACT-02 | Phase 45 | TBD | Pending |
+| ACT-03 | Phase 45 | TBD | Pending |
+| ACT-04 | Phase 45 | TBD | Pending |
+| REV-04 | Phase 46 | TBD | Pending |
+| REV-05 | Phase 46 | TBD | Pending |
+| REV-06 | Phase 46 | TBD | Pending |
+| VER-01 | Phase 46 | TBD | Pending |
+| VER-02 | Phase 46 | TBD | Pending |

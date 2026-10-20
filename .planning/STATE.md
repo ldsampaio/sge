@@ -3,59 +3,91 @@ gsd_state_version: "1.0"
 milestone: v1.9
 milestone_name: Email Threading & Interface Revamp
 status: planning
-last_updated: "2026-10-20T03:13:16.330Z"
+last_updated: "2026-10-20"
 last_activity: 2026-10-20
 progress:
-  total_phases: 0
+  total_phases: 5
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
   percent: 0
 ---
 
-# SGE — State (v1.8 LLM-Assisted Replies)
+# SGE — State (v1.9 Email Threading & Interface Revamp)
 
-**Milestone:** v1.8 LLM-Assisted Replies (roadmap: phases 39–41, written 2026-10-15)
-**Status:** Phases 39–40 executed; a post-hoc repair pass on 2026-10-18 fixed the reply/send/LLM wiring. Awaiting human UAT.
-**Prev milestone:** v1.7 (phases 37–38: New Message button + Compose window — delivered, but the Reply/Reply-All half was **stub-only** and is credited to the 2026-10-18 repair, not to Phase 38)
+**Milestone:** v1.9 (roadmap: phases 42–46, written 2026-10-20)
+**Status:** Roadmap written — Phase 42 ready to plan
+**Prev milestone:** v1.8 LLM-Assisted Replies (closed 2026-10-19 with human UAT deferred; authoritative record `.planning/milestones/v1.8-closeout/v1.8-CLOSEOUT-ADDENDUM.md`). Repair context: the 2026-10-18 `dc7f8c7` pass made Reply/Reply-All real after Phase 38's over-claim ("stub compiles" precedent — Phase 46 gates exist to block this class).
+
+## Project Reference
+
+See: .planning/PROJECT.md (updated 2026-10-20)
+**Core value:** Connect to an IMAP server on Linux and read mail locally in a fast Gmail-like UI.
+**Current focus:** Phase 42 — Threading Backend Lane
 
 ## Current Position
 
-Phase: Not started (defining requirements)
-Plan: —
-Status: Defining requirements
-Last activity: 2026-10-20 — Milestone v1.9 started
+Phase: 42 of 5 v1.9 phases (Threading Backend Lane) — first pending phase
+Plan: — (none planned yet)
+Status: Ready to plan (`/gsd-discuss-phase 42` → `/gsd-plan-phase 42`)
+Last activity: 2026-10-20 — v1.9 roadmap created (phases 42–46)
 
-## Repair Pass (2026-10-18) — why it was needed
+Progress: [░░░░░░░░░░] 0%
 
-The user reported "o botão nem existe" when trying to reply. Auditing the chain against the roadmap found **four independent breaks**, all now fixed:
+## Roadmap Summary (v1.9)
 
-1. **No UI entry point.** No button anywhere reached `open_compose_window` or `queue_send` — New Message and Reply were unreachable. `DraftEditor.tsx` held a non-functional Reply/Reply-All stub pair (see the provenance correction appended to `milestones/v1.7-phases/38-reply-reply-all-ui-ux/38-01-SUMMARY.md`).
-2. **`generate_reply` ignored the opened message.** It hardcoded INBOX UID 1, so it always prompted about the wrong mail (or refused).
-3. **Single-flight and cancel were no-ops.** The `RequestTracker` was constructed per call, so nothing shared state with `cancel_generate`.
-4. **`queue_send` dropped threading headers and attachments.** Tauri silently ignores unknown invoke args, so `in_reply_to`/`references`/attachments never reached the renderer — replies were not threaded and attachments could not be sent.
+- Phase 42: Threading Backend Lane (THR-01..04) — M26, References fetch lane (BODY.PEEK-only), per-folder JWZ `thread_id`, extended payload + `get_thread` — **not started**
+- Phase 43: UI Foundation & MessageListRow Extraction (REV-01..03 + roving readiness) — fonts vendored, primitives, ONCE-only row extraction w/ a11y fix (parallel-safe with 42) — **not started**
+- Phase 44: Conversation List (CNV-01..08) — grouped rows on frozen `list_messages` contract — **not started**
+- Phase 45: Conversation Reader + Message-vs-Conversation Actions (READ-01..10, ACT-01..04) — **not started**
+- Phase 46: Revamp Sweep + Verification (REV-04..06, VER-01..02) — consumption-only sweep + full gates — **not started**
 
-Delivered in `dc7f8c7`: real **Responder** / **Responder a todos** buttons (`ReadingPane`) and **Nova mensagem** (`MailboxView`); `fetch_message` now returns `cc_addrs` + `message_id` from the BODY.PEEK cache; `queue_send` accepts threading headers + attachments; `render_draft_rfc5322` emits `In-Reply-To`/`References` and `multipart/mixed` (base64, `Content-Disposition: attachment`, RFC 2231 `filename*` for non-ASCII); drag-and-drop attachment staging in `ComposeWindow`; `llm_tracker` moved onto `AppState`; one retry on transient LLM failures.
+Same-commit invariants to enforce at plan time: peek_audit path-5 with the lane (42); SCHEMA_VERSION 25→26 with M26 (42); TS+Rust payload sides in one commit (42/44/45); keyboard roving paired with `:focus-visible` final form (46, post-REV-03 Open question: batch-undo backend contract confirmed at plan review (Phase 45); `mail-threading` 0.1.3 dep confirmation at plan review (Phase 42).
 
-## Roadmap Summary
+## Performance Metrics
 
-- Phase 39: LLM Settings Foundation (LLM-01..04) — store + validation + prompt render — **executed**
-- Phase 40: Generation Flow (LLM-05, LLM-07, LLM-09) — client + IPC chokepoint — **executed**
-- Phase 41: Compose Integration + Privacy Audit (LLM-06 Ollama preset [UAT passed], LLM-08 threading verified, LLM-10 regenerate [UAT pending], LLM-11 privacy guardrails) — awaiting UAT
+**Velocity:**
+- Total v1.9 plans completed: 0
+- Average duration: —
+- Total execution time: —
 
-## Next
+**By Phase:** (none yet)
 
-- **[Human UAT]** Open the app in a VM with your account; click Répondre on an actual INBOX message and paste `http://localhost:3000` to the LLM settings (Ollama test); confirm the reply threads correctly, send with a non-ASCII-named attachment.
-- **[LLM-10 Regenerate]** Edit the generated draft, click Générer novamente to replace with a new result while preserving threading headers.
-- **[Cancel-mid-generation]** Start generation and stop interaction; confirm the body stays editable, no phantom drafts appear in INBOX/Sent, cleanup is immediate.
-- **[Ship after UAT]** Tag v1.7, update CHANGELOG, ship.
+| Phase | Plans | Total | Avg/Plan |
+|-------|-------|-------|----------|
+| 42 | 0 | — | — |
 
-## Decisions (accumulated)
+## Accumulated Context
 
-- 39-01: `LlmSettingsError` variants are payload-free unit variants — secrets cannot be interpolated into errors by construction (T-39-01)
-- 39-01: `DEFAULT_TEMPLATE` single-line literal shared byte-identically with the M23 seed; drift guarded by `seed_defaults_equal_consts` test
-- 39-01: `pub mod llm;` one-line declaration in lib.rs required for compilation (plan's don't-touch-lib.rs honored otherwise); SCHEMA_VERSION fix deferred to 39-03
-- 39-02: `LlmKeyStore` trait injection (keyring + memory impls) with fail-closed presence-bool; RESEARCH regex unusable (no backrefs) so hidden-strip is a nesting-counted tag scanner; substitution is single-pass positional (chained replace re-expands values)
-- **2026-10-18:** reply threading reads the local cache (`messages.message_id`, `cc_addrs`) instead of issuing new IMAP header fetches — no new BODY.PEEK request, no `references` column (absent `References`, `buildReplySeed` degrades to `References = In-Reply-To`, which still threads correctly)
-- **2026-10-18:** the LLM single-flight tracker is shared state on `AppState`, never per-call — a per-call tracker makes both single-flight and `cancel_generate` no-ops
-- **2026-10-18:** attachment pre-check is 18 MiB decoded against the backend's 25 MiB *rendered* cap (base64 inflates 4/3); the backend stays the authority via `send-too-large` / `send-bad-attachment`
+### Decisions
+
+Full log in PROJECT.md Key Decisions. Recent ones affecting v1.9:
+
+- 2026-10-20: v1.8 closed with human UAT **deferred** (preceito v1.5) — deferred items are backlog, never claims
+- 2026-10-20: v1.9 threading = backend References lane (user-approved); subject-only client grouping rejected as unreliable
+- 2026-10-20: keep clay identity + embed Baloo 2/Nunito woff2 locally (no CDN), normalize fallback stack
+- 2026-10-18: reply threading reads the local BODY.PEEK cache; LLM single-flight tracker is shared `AppState` state
+
+### Pending Todos
+
+- [2026-10-20] Human UAT of v1.8 reply/send/LLM path + LLM-10 regenerate (deferred from v1.8 closeout) — carry forward; contact `milestones/v1.8-closeout/v1.8-CLOSEOUT-ADDENDUM.md`
+
+### Blockers/Concerns
+
+- 42: first live `HEADER.FIELDS (REFERENCES)` round-trip vs UTFPR Zimbra never verified — capture as-received bytes; Zimbra-refusal fallback (References=In-Reply-To) pre-declared as Known Gap; live leg deferred-with-reason (no creds in this env)
+- 44: `list_threads` COUNT/OFFSET pagination-within-page contract — decide at plan review, not discovered
+- 45: batch-undo is a backend contract change — needs explicit plan-review approval or honest N labeled toasts
+- 42: `mail-threading` 0.1.3 dep (only approved Rust dep) + in-house ~250 LOC fallback pre-costed
+
+## Deferred Items
+
+| Category | Item | Status | Deferred At | Milestone |
+|----------|------|--------|-------------|-----------|
+| UAT | v1.8 human UAT: reply threading on the wire, non-ASCII attachment, regenerate, cancel, privacy audit | Open (backlog) | 2026-10-19 | v1.8 |
+| Live gates | LIVE-01/02/03 SMTP-send/draft/Seen round-trips | exit-2 SKIP contracts | v1.6 era | carried |
+
+## Session Continuity
+
+Last session: 2026-10-20
+Stopped at: v1.9 ROADMAP.md + STATE.md + REQUIREMENTS.md traceability written
+Resume file: None
