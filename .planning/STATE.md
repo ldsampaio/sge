@@ -4,16 +4,16 @@ milestone: v1.9
 current_phase: 42
 current_phase_name: Threading Backend Lane
 status: executing
-stopped_at: Completed 42-03-PLAN.md (wire lane + peek_audit path 5; inline recovery after 3 aborted spawns)
-last_updated: "2026-10-20T15:10:00.000Z"
+stopped_at: Completed 42-04-PLAN.md (mail-threading epoch substrate; sequential lane)
+last_updated: "2026-10-20T17:00:00.000Z"
 last_activity: 2026-10-20
-last_activity_desc: Plan 42-03 complete — FETCH_REFS_ATTRS lane + same-commit peek_audit path 5
-state_head: 119d26f
+last_activity_desc: Plan 42-04 complete — store/threads.rs JWZ epoch + mail-threading 0.1.3 pin
+state_head: 810a3b6
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 7
-  completed_plans: 3
+  completed_plans: 4
 milestone_name: Email Threading & Interface Revamp
 ---
 
@@ -34,13 +34,13 @@ See: .planning/PROJECT.md (updated 2026-10-20)
 Phase: 42 (Threading Backend Lane) — EXECUTING
 Plan: 4 of 7
 Status: Executing Phase 42
-Last activity: 2026-10-20 — Plan 42-03 complete (wire lane, inline recovery)
+Last activity: 2026-10-20 — Plan 42-04 complete (store/threads.rs epoch + crate pin)
 
-Progress: [█░░░░░░░░░] 14%
+Progress: [██░░░░░░░░] 19%
 
 ## Roadmap Summary (v1.9)
 
-- Phase 42: Threading Backend Lane (THR-01..04) — M26, References fetch lane (BODY.PEEK-only), per-folder JWZ `thread_id`, extended payload + `get_thread` — **not started**
+- Phase 42: Threading Backend Lane (THR-01..04) — M26, References fetch lane (BODY.PEEK-only), per-folder JWZ `thread_id`, extended payload + `get_thread` — **in progress (4/7 plans)**
 - Phase 43: UI Foundation & MessageListRow Extraction (REV-01..03 + roving readiness) — fonts vendored, primitives, ONCE-only row extraction w/ a11y fix (parallel-safe with 42) — **not started**
 - Phase 44: Conversation List (CNV-01..08) — grouped rows on frozen `list_messages` contract — **not started**
 - Phase 45: Conversation Reader + Message-vs-Conversation Actions (READ-01..10, ACT-01..04) — **not started**
@@ -60,12 +60,13 @@ Same-commit invariants to enforce at plan time: peek_audit path-5 with the lane 
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| 42 | 0 | — | — |
+| 42 | 4 | 63 (2 plans recorded) | ~32 |
 **Per-Plan Metrics:**
 
 | Plan | Duration | Tasks | Files |
 |------|----------|-------|-------|
 | Phase 42 P01 | 23 | 2 tasks | 12 files |
+| Phase 42 P04 | 40 | 1 task (+ checkpoint) | 4 files |
 
 ## Accumulated Context
 
@@ -80,6 +81,7 @@ Full log in PROJECT.md Key Decisions. Recent ones affecting v1.9:
 - [Phase 42]: M26 threading substrate: done-bit as mailboxes.refs_backfilled_at ALTER column (D-01); resumable accounting via WHERE references_json IS NULL (D-02)
 - [Phase 42]: Thread grouping key is (mailbox_id, thread_id) — bare thread_id never a grouping key; NULL thread_id = own-thread sentinel (D-04)
 - [Phase 42]: Upsert routes in_reply_to/references_json via plain excluded.field — NULL never coalesced to empty-string sentinel; existing 48 call sites pass None until 42-02 compute lane populates
+- [Phase 42]: 42-04 epoch substrate — `mail-threading` 0.1.3 pinned (serde OFF; SUS checkpoint CLEARED 2026-10-20, user-approved); `recompute_threads(conn, mailbox_id, newly_seen_uids)` owns scoping + `(date_utc, uid)` DESC member re-sort + one-tx idempotent batched UPDATEs; hook wiring lands in 42-05
 
 ### Pending Todos
 
@@ -90,7 +92,7 @@ Full log in PROJECT.md Key Decisions. Recent ones affecting v1.9:
 - 42: first live `HEADER.FIELDS (REFERENCES)` round-trip vs UTFPR Zimbra never verified — capture as-received bytes; Zimbra-refusal fallback (References=In-Reply-To) pre-declared as Known Gap; live leg deferred-with-reason (no creds in this env)
 - 44: `list_threads` COUNT/OFFSET pagination-within-page contract — decide at plan review, not discovered
 - 45: batch-undo is a backend contract change — needs explicit plan-review approval or honest N labeled toasts
-- 42: `mail-threading` 0.1.3 dep (only approved Rust dep) + in-house ~250 LOC fallback pre-costed
+- 42: `mail-threading` 0.1.3 dep — SUS legitimacy checkpoint CLEARED 2026-10-20 (user-approved, 42-04-PLAN.md resolution); crate pinned, in-house JWZ fallback stays GATE-ONLY (never engaged)
 
 ## Deferred Items
 
@@ -101,6 +103,6 @@ Full log in PROJECT.md Key Decisions. Recent ones affecting v1.9:
 
 ## Session Continuity
 
-Last session: 2026-10-20T14:23:51.232Z
-Stopped at: Completed 42-02-PLAN.md
+Last session: 2026-10-20T17:00:00.000Z
+Stopped at: Completed 42-04-PLAN.md
 Resume file: None

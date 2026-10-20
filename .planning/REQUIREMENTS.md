@@ -25,7 +25,7 @@ Constraints (carried from `.planning/PROJECT.md` / research):
 ### THR — Threading data lane (backend)
 
 - [x] **THR-01**: The app extracts `in_reply_to` from the ENVELOPE it already fetches and `references` via a new `BODY.PEEK[HEADER.FIELDS (REFERENCES)]` UID-range lane for newly synchronized messages, with an optional per-folder backfill sweep, persisting both in migration 26 (`messages.in_reply_to`, `messages.references_json`, indexed `messages.thread_id`)
-- [ ] **THR-02**: The app computes a stable `thread_id` from the References/In-Reply-To chain (JWZ via `mail-threading`, `subject_merge: false`), recomputed as a per-folder dirty-set epoch at sync-end/backfill/send-file hooks with a documented `(date_utc, uid)` tiebreak order — never per-insert
+- [x] **THR-02**: The app computes a stable `thread_id` from the References/In-Reply-To chain (JWZ via `mail-threading`, `subject_merge: false`), recomputed as a per-folder dirty-set epoch at sync-end/backfill/send-file hooks with a documented `(date_utc, uid)` tiebreak order — never per-insert
 - [ ] **THR-03**: The list payload returns conversation-aware rows behind the unchanged `list_messages` name/signature (`thread_id`, `thread_count`, latest-message preview + date, participants), and a new `get_thread` command returns header-only member summaries (uid/from/date/flags/preview — no bodies) for the reader
 - [x] **THR-04**: All protocol/store invariants hold after the threading lane — BODY.PEEK-only, `\Seen` never set on fetch, UID-only + UIDVALIDITY gating, per-folder thread scoping, and `peek_audit`/`fetch_attrs_are_parenthesized` guards extended to the new lane in the same phase
 
@@ -98,7 +98,7 @@ Constraints (carried from `.planning/PROJECT.md` / research):
 | Requirement | Phase | Plan | Status |
 |-------------|-------|------|--------|
 | THR-01 | Phase 42 | TBD | Complete |
-| THR-02 | Phase 42 | TBD | Pending |
+| THR-02 | Phase 42 | TBD | Complete |
 | THR-03 | Phase 42 | TBD | Pending |
 | THR-04 | Phase 42 | TBD | Complete |
 | REV-01 | Phase 43 | TBD | Pending |
