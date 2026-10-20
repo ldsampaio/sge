@@ -98,6 +98,7 @@ impl SyncSession for MockSession {
                     has_attachments: false,
                     preview: format!("Preview of message {uid}"),
                     modseq: None,
+                    in_reply_to: None,
                 });
             }
             Ok(headers)

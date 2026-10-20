@@ -99,6 +99,7 @@ impl FakeSession {
             has_attachments: false,
             preview: String::new(),
             modseq: None,
+            in_reply_to: None,
         }
     }
 

@@ -4,7 +4,10 @@
 //! All parsing is read-only — `BODY.PEEK` semantics are enforced upstream
 //! by the sync worker's `UID FETCH` attributes (never bare `BODY[]`).
 
-use async_imap::imap_proto::{types::AttributeValue, Address, BodyStructure};
+use async_imap::imap_proto::{
+    types::{AttributeValue, Envelope, MessageSection, SectionPath},
+    Address, BodyStructure,
+};
 use async_imap::types::{Fetch, Flag};
 use futures::TryStreamExt;
 use mail_parser::parsers::MessageStream;
@@ -34,6 +37,8 @@ pub struct MessageHeader {
     pub has_attachments: bool,
     pub preview: String,
     pub modseq: Option<u64>,
+    /// Raw msg-id from the ENVELOPE's `In-Reply-To` (never RFC 2047-decoded).
+    pub in_reply_to: Option<String>,
 }
 
 /// Convert async-imap `Flag` list into the JSON string the DB stores.
@@ -106,6 +111,14 @@ fn decode_bytes_opt(b: Option<&[u8]>) -> Option<String> {
             .trim_end_matches('\r')
             .to_string()
     })
+}
+
+/// Copy the ENVELOPE's `In-Reply-To` msg-id: lossy decode + trailing-CR trim
+/// ONLY — msg-id bytes must never pass through `decode_header_words` (an
+/// `=?...?=`-shaped id substring would be rewritten). Both parse paths route
+/// this field through here so their `MessageHeader` shapes stay identical.
+fn copy_envelope_in_reply_to(env: &Envelope<'_>) -> Option<String> {
+    decode_bytes_opt(env.in_reply_to.as_deref())
 }
 
 /// Decode RFC 2047 encoded-words (`=?charset?Q|B?payload?=`) in a header
@@ -241,12 +254,13 @@ pub fn parse_fetch_item(fetch: &Fetch, uid: u32) -> MessageHeader {
         })
         .unwrap_or_default();
 
-    let (subject, message_id, from_addr, to_addrs, cc_addrs) = if let Some(e) = env {
+    let (subject, message_id, in_reply_to, from_addr, to_addrs, cc_addrs) = if let Some(e) = env {
         (
             decode_bytes_opt(e.subject.as_deref())
                 .map(|s| decode_header_words(&s))
                 .unwrap_or_default(),
             decode_bytes_opt(e.message_id.as_deref()),
+            copy_envelope_in_reply_to(e),
             format_addresses(e.from.as_deref()),
             format_addresses(e.to.as_deref()),
             format_addresses(e.cc.as_deref()),
@@ -254,6 +268,7 @@ pub fn parse_fetch_item(fetch: &Fetch, uid: u32) -> MessageHeader {
     } else {
         (
             String::new(),
+            None,
             None,
             String::new(),
             String::new(),
@@ -272,6 +287,7 @@ pub fn parse_fetch_item(fetch: &Fetch, uid: u32) -> MessageHeader {
     MessageHeader {
         uid,
         message_id,
+        in_reply_to,
         subject,
         from_addr,
         to_addrs,
@@ -420,6 +436,48 @@ mod tests {
         assert_eq!(decode_header_words("=?UTF-8?X?abc?="), "=?UTF-8?X?abc?=");
     }
 
+    #[test]
+    fn parse_fetch_paths_in_reply_to_shape_equality() {
+        use std::borrow::Cow;
+        let env = Envelope {
+            date: None,
+            subject: Some(Cow::Borrowed(b"Re: Thread")),
+            from: None,
+            sender: None,
+            reply_to: None,
+            to: None,
+            cc: None,
+            bcc: None,
+            in_reply_to: Some(Cow::Borrowed(b"<parent@example.com>\r")),
+            message_id: Some(Cow::Borrowed(b"<self@example.com>")),
+        };
+        let env_expected = copy_envelope_in_reply_to(&env);
+        // Trailing CR trimmed, msg-id verbatim (no RFC 2047 pass).
+        assert_eq!(env_expected.as_deref(), Some("<parent@example.com>"));
+        let via_attributes = parse_fetch_attributes(&[AttributeValue::Envelope(Box::new(env))]);
+        // Both parse paths copy the field through the SAME helper, so the
+        // ENVELOPE-driven `MessageHeader.in_reply_to` shape is identical;
+        // `parse_fetch_item` funnels `fetch.envelope()` through it too.
+        assert_eq!(via_attributes.in_reply_to, env_expected);
+        // An `=?...?=`-shaped msg-id must survive verbatim, not 2047-mangled.
+        let tricky = Envelope {
+            date: None,
+            subject: None,
+            from: None,
+            sender: None,
+            reply_to: None,
+            to: None,
+            cc: None,
+            bcc: None,
+            in_reply_to: Some(Cow::Borrowed(b"<X=?utf-8?Q?=42?=@host>")),
+            message_id: None,
+        };
+        let tricky_expected = copy_envelope_in_reply_to(&tricky);
+        let via_tricky = parse_fetch_attributes(&[AttributeValue::Envelope(Box::new(tricky))]);
+        assert_eq!(via_tricky.in_reply_to, tricky_expected);
+        assert_eq!(tricky_expected.as_deref(), Some("<X=?utf-8?Q?=42?=@host>"));
+    }
+
     /// Regression: the FETCH attribute set MUST be parenthesized (RFC 3501
     /// §6.4.5). An unparenthesized multi-attr FETCH is malformed — Zimbra
     /// rejects it with BAD, which async-imap surfaces as an empty stream,
@@ -519,6 +577,7 @@ pub fn parse_fetch_attributes(attrs: &[AttributeValue]) -> MessageHeader {
         has_attachments: false,
         preview: String::new(),
         modseq: None,
+        in_reply_to: None,
     };
     for attr in attrs {
         match attr {
@@ -529,6 +588,7 @@ pub fn parse_fetch_attributes(attrs: &[AttributeValue]) -> MessageHeader {
                     .map(|s| decode_header_words(&s))
                     .unwrap_or_default();
                 header.message_id = decode_bytes_opt(env.message_id.as_deref());
+                header.in_reply_to = copy_envelope_in_reply_to(&env);
                 header.from_addr = format_addresses(env.from.as_deref());
                 header.to_addrs = format_addresses(env.to.as_deref());
                 header.cc_addrs = format_addresses(env.cc.as_deref());

@@ -2107,6 +2107,7 @@ mod tests {
             has_attachments: false,
             preview: format!("Subject {uid}"),
             modseq: None,
+            in_reply_to: None,
         }
     }
 
