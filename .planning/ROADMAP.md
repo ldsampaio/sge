@@ -21,10 +21,10 @@ Two lanes, one collision point: Lane 1 is a pure-backend threading lane (M26 mig
 **Goal**: Related emails are reliably linked in the data layer — `in_reply_to`/`references` stored, a stable per-folder `thread_id` computed by the backend — while the flat list payload and rendering stay *completely unchanged*, making the lane independently shippable and zero-risk to the UI.
 **Depends on**: Nothing (first phase; backend-only, no UI work)
 **Requirements**: THR-01, THR-02, THR-03, THR-04
-**Plans**: 1/7 plans executed (waves 1: 01+02, 2: 03+04, 3: 05+06, 4: 07)
+**Plans**: 2/7 plans executed (waves 1: 01+02, 2: 03+04, 3: 05+06, 4: 07)
 
 - [x] 42-01-PLAN.md
-- [ ] 42-02-PLAN.md
+- [x] 42-02-PLAN.md
 - [ ] 42-03-PLAN.md
 - [ ] 42-04-PLAN.md
 - [ ] 42-05-PLAN.md
@@ -122,7 +122,7 @@ Two lanes, one collision point: Lane 1 is a pure-backend threading lane (M26 mig
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 42. Threading Backend Lane | 1/7 | In Progress|  |
+| 42. Threading Backend Lane | 2/7 | In Progress|  |
 | 43. UI Foundation & MessageListRow Extraction | 0/0 (TBD) | Not started | - |
 | 44. Conversation List | 0/0 (TBD) | Not started | - |
 | 45. Conversation Reader + Actions | 0/0 (TBD) | Not started | - |
