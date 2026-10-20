@@ -16,7 +16,7 @@ pub mod queries;
 pub const BODY_CACHE_CAP_BYTES: usize = 262144;
 
 /// Schema version managed by rusqlite_migration.
-pub const SCHEMA_VERSION: u32 = 25;
+pub const SCHEMA_VERSION: u32 = 26;
 
 // v1 = full schema.sql (canonical DDL from ARCHITECTURE.md)
 // M2 = flag_outbox durable queue (Phase 6, Plan 06-01). The schema.sql v1
@@ -105,6 +105,7 @@ impl Store {
             M::up(M23_LLM_SETTINGS_SQL),
             M::up(M24_LLM_SETTINGS_PROVIDER_SQL),
             M::up(M25_LLM_MODELS_TABLE_SQL),
+            M::up(M26_THREADING_SQL),
         ]);
         migrations.to_latest(conn)?;
         Ok(())
@@ -204,6 +205,24 @@ const M25_LLM_MODELS_TABLE_SQL: &str = concat!(
     "  updated_at      TEXT NOT NULL DEFAULT (datetime('now'))",
     ");",
     "CREATE INDEX IF NOT EXISTS idx_llm_models_provider ON llm_models(provider);",
+);
+
+/// M26 forward migration: threading backend storage base (Phase 42, Plan 42-01).
+///
+/// Three nullable `messages` columns carry the thread-identity headers (`in_reply_to`,
+/// `references_json` as normalized JSON) plus the epoch-computed `thread_id` — NULL
+/// `thread_id` rows are own-thread sentinels, never grouped (D-04); every consumer
+/// keys `(mailbox_id, thread_id)` via `idx_messages_thread` (THR-04 per-folder scoping).
+/// `mailboxes.refs_backfilled_at` (TEXT, NULL = folder backfill not done) is the D-01
+/// per-folder done-bit; the resumable set is rows WHERE references_json IS NULL (D-02).
+/// ALTER … ADD COLUMN only — no CREATE TABLE copy of messages/mailboxes; the v1
+/// `schema.sql` baseline stays untouched (M4 :260 ALTER precedent).
+const M26_THREADING_SQL: &str = concat!(
+    "ALTER TABLE messages ADD COLUMN in_reply_to TEXT;",
+    "ALTER TABLE messages ADD COLUMN references_json TEXT;",
+    "ALTER TABLE messages ADD COLUMN thread_id INTEGER;",
+    "CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(mailbox_id, thread_id);",
+    "ALTER TABLE mailboxes ADD COLUMN refs_backfilled_at TEXT;",
 );
 
 /// M2 forward migration: durable Seen-flag outbox (Phase 6, Plan 06-01).
@@ -885,10 +904,11 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_25_with_m23_llm_settings() {
-        // 23 → 25 when M24 (llm_settings.provider) and M25 (llm_models) landed.
+    fn schema_version_is_26_with_m26_threading() {
+        // 23 → 25 when M24 (llm_settings.provider) and M25 (llm_models) landed;
+        // 25 → 26 when M26 (threading storage base) landed in Phase 42, Plan 42-01.
         // The assertions below still only exercise M2/M6-era shape.
-        assert_eq!(SCHEMA_VERSION, 25);
+        assert_eq!(SCHEMA_VERSION, 26);
         let store = Store::open_in_memory().expect("migration should succeed");
         let conn = store.conn();
         let count: i64 = conn
@@ -2147,5 +2167,187 @@ mod m23_llm_settings_gate_tests {
             .query_row("SELECT COUNT(*) FROM llm_settings", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1, "failed insert must leave the single row intact");
+    }
+}
+
+/// M26 gate tests (Phase 42, Plan 42-01): the schema-push gate equivalent.
+/// A fresh install and a v25 database upgraded through the production vec
+/// must both open cleanly and expose the threading substrate — the three
+/// nullable `messages` columns, `idx_messages_thread`, and the NULL-able
+/// `mailboxes.refs_backfilled_at` done-bit. Upgraded pre-existing rows
+/// stay byte-identical over the v1 baseline columns and the new columns
+/// start NULL (D-01 done-bit, D-04 own-thread sentinel).
+#[cfg(test)]
+mod m26_threading_gate_tests {
+    use super::*;
+    use rusqlite_migration::{Migrations, M};
+
+    /// Migration prefix through M25 (as shipped before Plan 42-01).
+    fn migrations_through_m25() -> Migrations<'static> {
+        Migrations::new(vec![
+            M::up(include_str!("schema.sql")),
+            M::up(M2_FLAG_OUTBOX_SQL),
+            M::up(M3_UNSEEN_COUNT_SQL),
+            M::up(M4_BACKFILL_SQL),
+            M::up(M5_STATUS_TS_SQL),
+            M::up(M6_DELIMITER_SQL),
+            M::up(M7_IMAP_OUTBOX_SQL),
+            M::up(M8_ROLES_SQL),
+            M::up(M9_DRAFTS_SQL),
+            M::up(M10_SEND_QUEUE_SQL),
+            M::up(M11_SENT_UNFILED_SQL),
+            M::up(M12_CLASSIFY_SQL),
+            M::up(M13_EXCLUSIONS_SQL),
+            M::up(M14_REVIEW_SETTINGS_SQL),
+            M::up(M15_DISMISSED_SQL),
+            M::up(M16_BATCH_ITEMS_SQL),
+            M::up(M17_FTS_BODY_SQL),
+            M::up(M18_FILTERS_SQL),
+            M::up(M19_RULES_SQL),
+            M::up(M20_OVERRIDE_EVENTS_SQL),
+            M::up(M21_RULE_VERSION_SQL),
+            M::up(M22_LEARN_SQL),
+            M::up(M23_LLM_SETTINGS_SQL),
+            M::up(M24_LLM_SETTINGS_PROVIDER_SQL),
+            M::up(M25_LLM_MODELS_TABLE_SQL),
+        ])
+    }
+
+    /// Fingerprint over the v1 baseline `messages` columns only — columns
+    /// added by later migrations are excluded so the check measures the
+    /// per-row bytes the upgrade must never touch.
+    fn message_fingerprint(conn: &Connection, uid: i64) -> String {
+        conn.query_row(
+            concat!(
+                "SELECT CAST(id AS TEXT) || '#' || CAST(mailbox_id AS TEXT) || '#' || CAST(uid AS TEXT) || '#'",
+                "|| ifnull(message_id, '~') || '#' || subject || '#' || from_addr || '#' || to_addrs || '#'",
+                "|| cc_addrs || '#' || date_utc || '#' || flags || '#' || CAST(has_attachments AS TEXT) || '#'",
+                "|| preview FROM messages WHERE uid = ?1",
+            ),
+            rusqlite::params![uid],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Fingerprint over the v1 baseline `mailboxes` columns only.
+    fn mailbox_fingerprint(conn: &Connection) -> String {
+        conn.query_row(
+            concat!(
+                "SELECT CAST(id AS TEXT) || '#' || name || '#' || CAST(uid_validity AS TEXT) || '#'",
+                "|| CAST(uid_next AS TEXT) || '#' || ifnull(highest_modseq, '~') || '#' || ifnull(last_sync_at, '~')",
+                " FROM mailboxes",
+            ),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn m26_fresh_install_adds_thread_columns() {
+        assert_eq!(SCHEMA_VERSION, 26);
+        let store = Store::open_in_memory().expect("migration should succeed");
+        let conn = store.conn();
+        for col in ["in_reply_to", "references_json", "thread_id"] {
+            let found: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_info('messages') WHERE name = ?1",
+                    rusqlite::params![col],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(found, 1, "M26 must add the column to messages");
+        }
+        let indexed: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_messages_thread'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 1, "M26 must create idx_messages_thread");
+        let done_bit: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('mailboxes') WHERE name = 'refs_backfilled_at'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(done_bit, 1, "M26 must add the per-folder done-bit column");
+    }
+
+    #[test]
+    fn m26_upgrade_from_v25_preserves_rows() {
+        // Simulate a v25 database (through M25, as shipped after Phase 41).
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        migrations_through_m25().to_latest(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO mailboxes (name, uid_validity, uid_next) VALUES ('INBOX', 100, 6)",
+            [],
+        )
+        .unwrap();
+        let seed_mb: i64 = conn
+            .query_row("SELECT id FROM mailboxes WHERE name = 'INBOX'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        for (uid, subject) in [(11, "Alpha"), (12, "Bravo")] {
+            conn.execute(
+                "INSERT INTO messages (mailbox_id, uid, subject, from_addr, date_utc, flags, preview) \
+                 VALUES (?1, ?2, ?3, 'a@x.com', '2026-01-01T00:00:00Z', '[]', 'p')",
+                rusqlite::params![seed_mb, uid, subject],
+            )
+            .unwrap();
+        }
+
+        // Snapshot the baseline-column fingerprints before the upgrade.
+        let before = (
+            message_fingerprint(&conn, 11),
+            message_fingerprint(&conn, 12),
+            mailbox_fingerprint(&conn),
+        );
+
+        // Forward-upgrade with the production set — only M26 applies.
+        Store::apply_migrations(&mut conn).unwrap();
+
+        // Pre-existing rows survive the upgrade byte-for-byte.
+        let msgs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(msgs, 2, "forward migration must preserve cached rows");
+        assert_eq!(
+            (
+                message_fingerprint(&conn, 11),
+                message_fingerprint(&conn, 12),
+                mailbox_fingerprint(&conn)
+            ),
+            before,
+            "prior rows must stay byte-identical over the v1 baseline columns",
+        );
+        let touched: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE in_reply_to IS NOT NULL \
+                 OR references_json IS NOT NULL OR thread_id IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            touched, 0,
+            "new columns start NULL on upgraded rows (D-04 sentinel)"
+        );
+        let done_bits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mailboxes WHERE refs_backfilled_at IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            done_bits, 0,
+            "per-folder done-bit starts NULL (D-01: backfill not done)"
+        );
     }
 }
