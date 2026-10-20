@@ -54,3 +54,16 @@
 ## Deferred Ideas
 
 - Nenhuma — discussão ficou no escopo da fase.
+
+---
+
+## Planning-time gates — recorded verdicts (2026-10-20)
+
+| Gate | Raw verdict | Action taken | Rationale |
+|------|-------------|--------------|-----------|
+| `check ui-plan-gate 42` | `{frontend:true, hasUiSpec:false, block:true, matchedToken:"ui"}` | **Proceeded with `--skip-ui` equivalent** (no UI-SPEC generated for this phase) | False positive: the token matched the goal sentence "…zero-risk to the UI". Phase 42 is backend-only per its own ROADMAP/CONTEXT text ("no UI work", "no grouping UI, no reader work"), touches no file under `src/`, and its success criteria require the flat list render stay *byte-identical*. UI design contracts belong to phases 43–46. |
+| `verify context-drift 42` | `{block:false, stale_artifacts:[]}` | clean | — |
+| `verify codebase-drift` | `{skipped:true, reason:"no-structure-md"}` | skipped by tool | No `.planning/codebase/STRUCTURE.md` in this repo. |
+| `check decision-coverage-plan` | `{passed:true, covered:5/5}` | pass | D-01…D-05 all referenced by plans. |
+| `check gap-analysis.plan-post` (advisory) | `{block:false, passed:true}` but table reports `34 of 34 … Not covered` incl. THR-01…04 | **Known false negative — ignored** | Same class as the milestone `verify-summary` false negative. The canonical coverage gate already confirmed all four phase REQ-IDs present in plan frontmatter (`42-01:[THR-01,THR-04] 42-02:[THR-01] 42-03:[THR-01,THR-04] 42-04:[THR-02] 42-05:[THR-01,THR-02,THR-04] 42-06:[THR-03] 42-07:[THR-01..04]`); the post-planning heuristic scans plan *prose* and does not read `requirements:` frontmatter, so it reports every milestone-wide REQ-ID (including the 30 owned by phases 43–46) as uncovered. |
+| `check verify-command-paths` / `verify-failure-directions` | `{status:"ok"}` ×2 (both iterations) | pass | Note: these probe **paths and `<fails_when>` presence only, not flag validity** — the invalid `-x` cargo token was caught independently by the plan-checker and by direct execution in `src-tauri/`. |
