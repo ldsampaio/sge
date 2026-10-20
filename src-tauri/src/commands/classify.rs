@@ -3150,6 +3150,8 @@ mod rule_apply_tests {
                 "[]",
                 false,
                 preview,
+                None,
+                None,
             )
             .unwrap();
         }
@@ -3423,6 +3425,8 @@ mod rule_conflict_tests {
                 "[]",
                 false,
                 preview,
+                None,
+                None,
             )
             .unwrap();
         }
@@ -4141,6 +4145,8 @@ mod rule_bulk_tests {
                 "[]",
                 false,
                 preview,
+                None,
+                None,
             )
             .unwrap();
         }

@@ -518,6 +518,8 @@ mod live_gate_22 {
                     "[]",
                     false,
                     "replay",
+                    None,
+                    None,
                 )
                 .unwrap();
                 queries::set_pending_delete(guard.conn(), id, uid, true).unwrap();

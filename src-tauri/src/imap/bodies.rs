@@ -328,6 +328,8 @@ mod tests {
             "[]",
             false,
             "",
+            None,
+            None,
         )
         .unwrap();
         let msg_id = queries::find_message_id(conn, mailbox_id, 1)
@@ -379,6 +381,8 @@ mod tests {
             "[]",
             false,
             "",
+            None,
+            None,
         )
         .unwrap();
         let msg_id = queries::find_message_id(conn, mailbox_id, 1)

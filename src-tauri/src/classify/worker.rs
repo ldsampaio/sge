@@ -314,6 +314,8 @@ mod tests {
             "[]",
             false,
             "",
+            None,
+            None,
         )
         .unwrap();
         let mid = find_message_id(conn, mb, 1).unwrap().unwrap();

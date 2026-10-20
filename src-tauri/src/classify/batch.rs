@@ -806,6 +806,8 @@ mod tests {
             "[]",
             false,
             "",
+            None,
+            None,
         )
         .unwrap();
         upsert_message(
@@ -821,6 +823,8 @@ mod tests {
             "[]",
             false,
             "",
+            None,
+            None,
         )
         .unwrap();
         let a = find_message_id(conn, inbox, 1).unwrap().unwrap();
@@ -917,6 +921,8 @@ mod tests {
             "[]",
             false,
             "",
+            None,
+            None,
         )
         .unwrap();
         upsert_message(
@@ -932,6 +938,8 @@ mod tests {
             "[]",
             false,
             "",
+            None,
+            None,
         )
         .unwrap();
         let a = find_message_id(conn, inbox, 1).unwrap().unwrap();
@@ -1165,6 +1173,8 @@ mod tests {
                 "[]",
                 false,
                 "",
+                None,
+                None,
             )
             .unwrap();
         }

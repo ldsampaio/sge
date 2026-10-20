@@ -1688,6 +1688,8 @@ impl SyncWorker {
                         &flags,
                         header.has_attachments,
                         &header.preview,
+                        None,
+                        None,
                     )
                     .map_err(|e| SyncError::Protocol(format!("upsert uid {uid}: {e}")))?;
 
@@ -2778,6 +2780,8 @@ mod tests {
             "[]",
             false,
             &format!("Subject {uid}"),
+            None,
+            None,
         )
         .unwrap();
         queries::set_local_seen(conn, mb_id, uid, seen).unwrap();
@@ -2813,6 +2817,8 @@ mod tests {
                 "[]",
                 false,
                 "Subject 2",
+                None,
+                None,
             )
             .unwrap();
         }
@@ -3250,6 +3256,8 @@ mod tests {
                 "[]",
                 false,
                 "p",
+                None,
+                None,
             )
             .unwrap();
         }
@@ -3619,6 +3627,8 @@ mod tests {
             "[]",
             false,
             &format!("Subject {uid}"),
+            None,
+            None,
         )
         .unwrap();
         queries::set_pending_delete(conn, mb_id, uid, true).unwrap();
@@ -3774,6 +3784,8 @@ mod tests {
                 "[]",
                 false,
                 "Subject 5",
+                None,
+                None,
             )
             .unwrap();
             // Pending Seen toggle first — the move consumes it as intent.

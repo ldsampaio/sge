@@ -853,6 +853,8 @@ pub mod live_gate_26_filing {
             "[]",
             false,
             "",
+            None,
+            None,
         )
         .unwrap();
         let mid: u64 = store
@@ -997,6 +999,8 @@ pub mod live_gate_26_batch {
                 "[]",
                 false,
                 "",
+                None,
+                None,
             )
             .unwrap();
         }
@@ -1058,6 +1062,8 @@ pub mod live_gate_26_batch {
             "[]",
             false,
             "",
+            None,
+            None,
         )
         .unwrap();
         sge_lib::store::queries::upsert_message(
@@ -1073,6 +1079,8 @@ pub mod live_gate_26_batch {
             "[]",
             false,
             "",
+            None,
+            None,
         )
         .unwrap();
         let pinned_mid: u64 = store
@@ -1100,6 +1108,8 @@ pub mod live_gate_26_batch {
             "[]",
             false,
             "",
+            None,
+            None,
         )
         .unwrap();
         let cands =

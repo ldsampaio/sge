@@ -386,6 +386,8 @@ mod plan_tests {
             "[]",
             false,
             "fatura e pagamento do boleto",
+            None,
+            None,
         )
         .unwrap();
         store

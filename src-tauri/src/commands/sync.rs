@@ -2562,6 +2562,8 @@ mod tests {
             "[]",
             false,
             "preview one",
+            None,
+            None,
         )
         .unwrap();
         queries::upsert_message(
@@ -2577,6 +2579,8 @@ mod tests {
             "[]",
             false,
             "preview two",
+            None,
+            None,
         )
         .unwrap();
         queries::upsert_message(
@@ -2592,6 +2596,8 @@ mod tests {
             r#"["\\Seen"]"#,
             false,
             "preview three",
+            None,
+            None,
         )
         .unwrap();
 

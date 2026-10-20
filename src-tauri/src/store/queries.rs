@@ -491,8 +491,8 @@ pub fn set_sweeps_since_full(conn: &Connection, mailbox_id: u64, value: i64) -> 
 const UPSERT_MESSAGE_SQL: &str = concat!(
     "INSERT INTO messages ",
     "(mailbox_id, uid, message_id, subject, from_addr, to_addrs, ",
-    " cc_addrs, date_utc, flags, has_attachments, preview) ",
-    "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ",
+    " cc_addrs, date_utc, flags, has_attachments, preview, in_reply_to, references_json) ",
+    "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) ",
     "ON CONFLICT(mailbox_id, uid) DO UPDATE SET ",
     "  message_id      = excluded.message_id, ",
     "  subject         = excluded.subject, ",
@@ -502,7 +502,11 @@ const UPSERT_MESSAGE_SQL: &str = concat!(
     "  date_utc        = excluded.date_utc, ",
     "  flags           = excluded.flags, ",
     "  has_attachments = excluded.has_attachments, ",
-    "  preview         = excluded.preview",
+    // NULL stays NULL: plain excluded.field routing, never coalesced to an
+    // empty-string chain sentinel (D-04 — unknown threading data is NULL).
+    "  preview         = excluded.preview, ",
+    "  in_reply_to     = excluded.in_reply_to, ",
+    "  references_json = excluded.references_json",
 );
 
 /// Upsert a single message header row.  Keyed on `(mailbox_id, uid)`
@@ -522,6 +526,8 @@ pub fn upsert_message(
     flags: &str,
     has_attachments: bool,
     preview: &str,
+    in_reply_to: Option<&str>,
+    references_json: Option<&str>,
 ) -> StoreResult<()> {
     conn.execute(
         UPSERT_MESSAGE_SQL,
@@ -537,6 +543,8 @@ pub fn upsert_message(
             flags,
             has_attachments,
             preview,
+            in_reply_to,
+            references_json,
         ],
     )?;
     Ok(())
@@ -570,6 +578,8 @@ pub fn upsert_messages_batch(
                 &msg.flags,
                 msg.has_attachments,
                 &msg.preview,
+                msg.in_reply_to,
+                msg.references_json,
             ],
         )?;
     }
@@ -588,6 +598,10 @@ pub struct InsertMessage<'a> {
     pub flags: String,
     pub has_attachments: bool,
     pub preview: String,
+    /// RFC822 In-Reply-To token or NULL when unknown (threading lane, Phase 42).
+    pub in_reply_to: Option<&'a str>,
+    /// Normalized JSON array of Reference tokens or NULL when unknown.
+    pub references_json: Option<&'a str>,
 }
 
 /// Delete messages for `mailbox_id` whose `uid` is **not** in `live_uids`.
@@ -3022,6 +3036,8 @@ mod tests {
             flags,
             false,
             "preview",
+            None,
+            None,
         )
         .unwrap();
     }
@@ -3068,6 +3084,8 @@ mod tests {
             "[]",
             false,
             "primeiros 200 chars",
+            None,
+            None,
         )
         .unwrap();
         let mid = find_message_id(conn, mb_id, 7).unwrap().unwrap();
@@ -3237,6 +3255,8 @@ mod tests {
             "[]",
             false,
             "new preview",
+            None,
+            None,
         )
         .unwrap();
 
@@ -3313,6 +3333,8 @@ mod tests {
                 "[]",
                 i % 5 == 0,
                 &format!("preview {}", i),
+                None,
+                None,
             )
             .unwrap();
         }
@@ -3395,6 +3417,8 @@ mod tests {
             "[]",
             false,
             "p",
+            None,
+            None,
         )
         .unwrap();
 
@@ -3916,6 +3940,7 @@ mod tests {
     ) -> u64 {
         upsert_message(
             conn, mb_id, uid, None, subject, from, "[]", "[]", date_utc, "[]", false, preview,
+            None, None,
         )
         .unwrap();
         let msg_id = find_message_id(conn, mb_id, uid).unwrap().unwrap();
@@ -4073,6 +4098,8 @@ mod tests {
                 "[]",
                 false,
                 "p",
+                None,
+                None,
             )
             .unwrap();
         }
@@ -4204,6 +4231,8 @@ mod tests {
             "[]",
             false,
             "p",
+            None,
+            None,
         )
         .unwrap();
         assert!(fts_search(conn, None, "frescor").unwrap().is_empty());
@@ -4272,6 +4301,8 @@ mod classify_tests {
             "[]",
             false,
             "prev",
+            None,
+            None,
         )
         .unwrap();
         find_message_id(conn, mb, 1).unwrap().unwrap()
@@ -4337,6 +4368,8 @@ mod classify_tests {
             "[]",
             false,
             "",
+            None,
+            None,
         )
         .unwrap();
         let b = find_message_id(conn, mb, 2).unwrap().unwrap();
@@ -4441,6 +4474,8 @@ mod taxroundtrip_tests {
             "[]",
             false,
             "",
+            None,
+            None,
         )
         .unwrap();
         let mid = find_message_id(conn, mb, 1).unwrap().unwrap();
@@ -4857,6 +4892,8 @@ mod filter_tests {
             "[]",
             false,
             "prev",
+            None,
+            None,
         )
         .unwrap();
         let mid = find_message_id(conn, mb, 1).unwrap().unwrap();
@@ -5110,6 +5147,7 @@ mod filter_tests {
         for (uid, date) in [(1u32, "2024-01-01T00:00:00Z"), (2, "2024-06-01T00:00:00Z")] {
             upsert_message(
                 conn, mb, uid, None, "reunião", "a@x.com", "[]", "[]", date, "[]", false, "p",
+                None, None,
             )
             .unwrap();
         }

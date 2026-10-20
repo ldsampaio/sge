@@ -451,6 +451,8 @@ mod tests {
             "[]",
             false,
             "",
+            None,
+            None,
         )
         .unwrap();
         upsert_message(
@@ -466,6 +468,8 @@ mod tests {
             "[]",
             false,
             "",
+            None,
+            None,
         )
         .unwrap();
         upsert_message(
@@ -481,6 +485,8 @@ mod tests {
             "[]",
             false,
             "",
+            None,
+            None,
         )
         .unwrap();
         upsert_message(
@@ -496,6 +502,8 @@ mod tests {
             "[]",
             false,
             "",
+            None,
+            None,
         )
         .unwrap();
         upsert_message(
@@ -511,6 +519,8 @@ mod tests {
             "[]",
             false,
             "",
+            None,
+            None,
         )
         .unwrap();
         upsert_message(
@@ -526,6 +536,8 @@ mod tests {
             "[]",
             false,
             "",
+            None,
+            None,
         )
         .unwrap();
         exclude_folder(conn, "Sent", "test").unwrap();
@@ -625,6 +637,8 @@ mod tests {
             "[]",
             false,
             "",
+            None,
+            None,
         )
         .unwrap();
         let cands2 = collect_archive_candidates(conn, 7, &["INBOX".to_string()], now).unwrap();
@@ -1020,6 +1034,8 @@ mod tests {
                 "[]",
                 false,
                 "",
+                None,
+                None,
             )
             .unwrap();
             let mid = find_message_id(conn, dest, 1).unwrap().unwrap();
