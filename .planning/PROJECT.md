@@ -2,7 +2,7 @@
 
 ## What This Is
 
-SGE is a Linux desktop email client built with Rust + Tauri v2 + React + SQLite. The user logs in with username, password, and IMAP server URL (e.g. mail.utfpr.edu.br); the app copies mail from the server to a local SQLite database (messages stay on the server, IMAP semantics) and displays them in a Gmail-like three-pane interface. Since v1.2 the app is a full mail client: triage, folders, drafts, and SMTP compose. Milestone v1.3 adds on-device automatic email classification (Laya) that organizes mail into an `Auto/` folder tree. Milestone v1.8 adds on-demand LLM-assisted reply drafting: a user-configured OpenAI-compatible endpoint plus prompt template generate a draft the user reviews before sending — nothing automatic.
+SGE is a Linux desktop email client built with Rust + Tauri v2 + React + SQLite. The user logs in with username, password, and IMAP server URL (e.g. mail.utfpr.edu.br); the app copies mail from the server to a local SQLite database (messages stay on the server, IMAP semantics) and displays them in a Gmail-like three-pane interface. Since v1.2 the app is a full mail client: triage, folders, drafts, and SMTP compose. Milestone v1.3 adds on-device automatic email classification (Laya) that organizes mail into an `Auto/` folder tree. Milestone v1.8 adds on-demand LLM-assisted reply drafting. Milestone v1.9 adds real conversation threading (RFC 5322 References-backed grouping shown as a Gmail-like conversation UI) and a focused interface-quality pass over the affected surfaces.
 
 ## Core Value
 
@@ -16,9 +16,27 @@ SGE is a Linux desktop email client (Rust + Tauri v2 + React + SQLite) with tria
 
 Suite: **525 lib tests green** (was 503), `cargo check --all-targets` clean, `tsc --noEmit` clean. v1.4 audit `.planning/v1.4-MILESTONE-AUDIT.md`: PASSED 11/11; v1.6 audit `.planning/v1.6-MILESTONE-AUDIT.md`: COMPLETE (454 lib tests). Environment caveat: `vite` bundle needs Node 20+ (env has Node 18); `cargo clippy` is skipped in CI (needs the local Laya sidecar binary).
 
+## Current Milestone (2026-10-20): v1.9 Email Threading & Interface Revamp
+
+**Status:** Starting — continues from phase 41 (v1.8 closed with human UAT deferred, see `milestones/v1.8-closeout/v1.8-CLOSEOUT-ADDENDUM.md`).
+
+**Goal:** Show related emails as reliable conversations (RFC 5322 References-backed grouping computed in the backend) and raise interface quality on the affected surfaces — consistency, states, responsiveness, keyboard accessibility — while preserving every existing flow.
+
+**Target features:**
+- Threading data lane (backend): M26 migration (`references_json` + related columns), `in_reply_to` extracted from ENVELOPE (already arrives in the existing FETCH_ATTRS response), a `HEADER.FIELDS (REFERENCES)` fetch lane for newly synced messages, optional per-folder backfill, backend-computed `thread_id`, extended list payload
+- Conversation list UI: grouped rows (subject, participants, preview, count, aggregate unread), single-message conversations handled gracefully
+- Conversation reader: chronological message stack, expand/collapse per message, read/unread semantics per message, per-message vs per-conversation action split, defined edge cases (long threads, empty subjects, HTML/plain, attachments, refresh without duplication)
+- UI foundation: token hygiene (typography shipping broken today — fonts referenced but never embedded), shared primitives (Button, Modal/Dialog, Empty/Loading states), standardized interaction states
+- Revamp sweep + verification: consistency/responsive/keyboard-a11y pass over touched surfaces; build, lint, types, tests green; existing flows regression-checked
+
+**Scope guard (not in v1.9):** dark theme (none exists today), star/\Flagged actions, visual rewrite of legacy panels not touched by threading, new UI dependencies. Backend changes are limited to the approved threading data lane; any expansion beyond it requires explicit user approval at plan time.
+
+<details>
+<summary>Previous milestone block (v1.8 LLM-Assisted Replies, closed 2026-10-19 with deferred UAT)</summary>
+
 ## Current Milestone (2026-10-15): v1.8 LLM-Assisted Replies
 
-**Status:** Starting — continues from phase 38 (v1.7 compose UX complete: phases 37-38).
+**Status:** Closed 2026-10-19 — phases 39–41 executed + repair pass `dc7f8c7` (2026-10-18); human UAT of the reply/send/LLM path and LLM-10 regenerate **deferred** (preceito v1.5). Authoritative record: `.planning/milestones/v1.8-closeout/v1.8-CLOSEOUT-ADDENDUM.md`.
 
 **Goal:** Let the user draft replies with a configured LLM: settings menu for OpenAI-compatible endpoint + prompt template, one-click generation in Reply/Reply-All windows, user always reviews before sending.
 
@@ -26,12 +44,14 @@ Suite: **525 lib tests green** (was 503), `cargo check --all-targets` clean, `ts
 - LLM settings menu — any OpenAI-compatible base URL + model + API key, single reply prompt template with placeholders (`{sender}`, `{subject}`, `{body}`), generation defaults (temperature/max tokens/timeout); API key in OS keyring, never plaintext
 - Generate-with-LLM button in Reply/Reply-All compose window — sends prompt + original message to configured endpoint, pastes result above the quoted original; user reviews and decides when to send
 - Privacy guard — nothing leaves the machine except on explicit button click; offline default preserved; failures surface as plain-language errors, never log key or body verbatim
-- Bundle & UAT — verify settings persistence, generation flow, and keyring secret handling end-to-end (mock transport in CI, live endpoint only with user-provided key)
+- Bundle & UAT — verify settings persistence, generation flow, and keyring secret handling end-to-end (mock transport in CI, live endpoint only with user-provided key). UAT deferred.
 
 **Scope guard (not in v1.8):** No auto-send or background generation (user-triggered only); reply/reply-all windows only (no new-message/forward button); single account; Linux only; no cloud fallback for classification (Laya stays offline).
 
+</details>
+
 <details>
-<summary>Previous milestone block (v1.7 Compose UX, archived at close)</summary>
+<summary>Previous milestone block (v1.7 Compose UX, archived at close — ⚠️ over-claim corrected 2026-10-18)</summary>
 
 ## Current Milestone: v1.7 Compose UX + Reply/Reply-All + New Message (Shipped 2026-10-15 ✅)
 
@@ -78,11 +98,16 @@ Suite: **525 lib tests green** (was 503), `cargo check --all-targets` clean, `ts
 - ✓ **v1.3: All phases complete** — 6/6 phases, milestone passed (Phase 15-20)
 - ✓ **v1.4: 11/11 requirements validated** — SMTP live gates (offline proof, live deferred-with-reason) + search/filters + auto-archive + smart rules (Phases 21-26, 13 plans)
 
-### Active (v1.8)
+### Active (v1.9)
 
-LLM-assisted replies — unvalidated, to be scoped into REQ-IDs in REQUIREMENTS.md:
-- User can register LLM provider settings (OpenAI-compatible base URL + model + API key + prompt template + generation defaults) in a settings menu
-- User can generate a reply draft with the LLM from Reply/Reply-All windows and review/edit before sending (no auto-send)
+Email threading + interface revamp — unvalidated, to be scoped into REQ-IDs in REQUIREMENTS.md:
+- User can see related emails grouped as conversations (References-backed grouping computed in the backend)
+- User can read a conversation as an expandable chronological message stack with per-message read semantics and per-message/per-conversation actions
+- User gets a consistent, accessible, responsive interface over the touched surfaces (tokens saneados, primitivos compartilhados, estados padronizados)
+
+### Closed (v1.8 — 2026-10-19, UAT deferred)
+
+LLM-assisted replies — code shipped + offline-tested; human UAT deferred per `milestones/v1.8-closeout/v1.8-CLOSEOUT-ADDENDUM.md` (NOT marked Validated; carry to backlog).
 
 ### Active (v1.3)
 
@@ -116,6 +141,7 @@ Previous Active items all delivered (see Validated above + `.planning/v1.1-MILES
 - Auth UX decided: remember everything securely (OS keyring), auto-login next launch.
 - v1.3 scoping (new-milestone questioning): classification moves mail physically (MOVE verb, Phase 10 machinery); target tree auto-created under root `Auto`; single-email flow always user-confirmed; batch flow unconfirmed with progress + report; secondary category is a local-only label; Laya runs as a bundled offline sidecar (multilingual checkpoint for pt-BR).
 - v1.8 scoping (new-milestone questioning): LLM reply drafting is strictly user-triggered (button click in Reply/Reply-All window); any OpenAI-compatible base URL + model + key; single prompt template with `{sender}`/`{subject}`/`{body}` placeholders; API key in OS keyring like mail creds; generated text pasted above quoted original for review; no auto-send, no background calls.
+- v1.9 scoping (new-milestone questioning, 2026-10-20): threading strategy = backend References lane explicitly approved by the user (M26 migration, ENVELOPE `in_reply_to` extraction, HEADER.FIELDS References lane for new messages, optional per-folder backfill, backend-computed `thread_id`); subject-only client-side grouping rejected as unreliable. Visual direction: keep the existing clay identity + refinement (user deferred to audit recommendation); embed Baloo 2/Nunito locally (woff2, no CDN — respects offline/egress posture) with normalized system fallback. Dark theme, star/\Flagged, and legacy-panel rewrites are out of v1.9 scope. v1.8 closed with human UAT deferred before this cycle started (preceito v1.5).
 - 2026-10-18 repair pass: milestone provenance re-established by reading the code, not the summaries — **send** = v1.2 (Phases 13/14) + v1.6 (Phase 35); **reply/threading** attributed to v1.7/38 but actually delivered by `dc7f8c7`; **LLM generation** = v1.8 (Phases 39/40), which was real but had two defects (hardcoded INBOX UID 1, per-call request tracker). Reply context comes from the local BODY.PEEK cache rather than new header fetches.
 
 ## Untested / Not Yet Proven
@@ -169,6 +195,9 @@ Carried forward honestly — these are recorded as facts, not risks:
 | 2026-10-18: attachments ride `multipart/mixed`, base64, RFC 2231 names | Non-ASCII filenames need `filename*=UTF-8''`; base64 wrapped at 76 cols for line-length-safe transport; render with no attachments stays byte-identical to Phase 12, guarded by a test | ✓ Good |
 | 2026-10-18: attachment pre-check 18 MiB decoded vs 25 MiB rendered cap | Base64 inflates by 4/3, so a 20 MiB+ file would pass a naive check and then fail server-side; backend remains authority via `send-too-large`/`send-bad-attachment` | ✓ Good |
 | 2026-10-18: LLM request tracker is shared state on `AppState` | The tracker was constructed per call, so single-flight and `cancel_generate` were silently no-ops; one shared tracker restores both | ✓ Good |
+| 2026-10-20: v1.8 closed with human UAT deferred (preceito v1.5) | UAT needs the user's real account; keeping the milestone open would leave two "active" milestones and inconsistent STATE artifacts; deferred items recorded, never claimed | ✓ Good — closeout addendum is authoritative |
+| 2026-10-20: v1.9 threading = backend References lane (user-approved) | `messages` has no references/in_reply_to columns and the sync lane never parses them (ENVELOPE `in_reply_to` is available but unread); subject-only grouping is unreliable and fails the user's reliability bar; all actions already key on (mailbox, uid), so conversation actions map to batched UID sets (`expunge_messages` precedent) | — Pending (v1.9) |
+| 2026-10-20: keep clay identity, embed fonts locally | User directive "preserve a identidade visual"; tokens reference Baloo 2/Nunito but no font files ship today (fallback rendering silently used) — embed OFL woff2 locally, no CDN, respects egress posture; normalize fallback stack regardless | — Pending (v1.9) |
 | **2026-10-18 after repair pass: two protocol bugs fixed** (APPEND flag list + bracketed Message-ID searches) — live gates (`live_gate_reply`, `live_gate_21`) pass end-to-end against mail.utfpr.edu.br, 530 lib tests green — v1.8 LLM drafting is now live-tested | ✓ Fixed in `dc7f8c7`; provenance note appended below. Ollama preset (LLM-06) and regenerate (LLM-10) UI ready, awaiting Phase 41 UAT. | ✓ Good, UAT pending |
 
 ### Phase 41 (compose integration + privacy audit; status: repair complete, awaiting UAT)
@@ -208,4 +237,4 @@ This document evolves at phase transitions and milestone boundaries.
 3. Audit Out of Scope — reasons still valid?
 4. Update Context with current state
 
-*Last updated: 2026-10-18 — reply/send/LLM-reply wiring repaired (`dc7f8c7`); v1.7 Phase 38 over-claim corrected; v1.4/v1.6 audits unchanged.*
+*Last updated: 2026-10-20 — v1.8 closed with deferred UAT; milestone v1.9 Email Threading & Interface Revamp started (Phases 42+).*

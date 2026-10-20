@@ -1,21 +1,16 @@
 ---
 gsd_state_version: "1.0"
-milestone: v1.8
-milestone_name: Roadmap — LLM-Assisted Replies
-current_phase: 39
-current_phase_name: LLM Settings Foundation
-status: repair-complete-awaiting-uat
-last_updated: "2026-10-18"
-last_activity: 2026-10-18
-last_activity_desc: Repair pass complete (530 lib tests green) — reply/send/LLM threading live-tested, Ollama endpoint verified, Phase 41 awaiting UAT
-state_head: dc7f8c7
+milestone: v1.9
+milestone_name: Email Threading & Interface Revamp
+status: planning
+last_updated: "2026-10-20T03:13:16.330Z"
+last_activity: 2026-10-20
 progress:
-  total_phases: 41
-  completed_phases: 40
-  pending_phases: 1 (Phase 41 UAT)
-  total_plans: 1 (LLM drafting pipeline)
-  completed_plans: 1 (generation flow + threading fixes)
-  percent: 97
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # SGE — State (v1.8 LLM-Assisted Replies)
@@ -26,12 +21,10 @@ progress:
 
 ## Current Position
 
-Phase: 39 (LLM Settings Foundation) — executed (all tests pass, settings persist, test-button works)
-Phase: 40 (Generation Flow) — executed + repair wiring live-tested
-Phase: 41 (Compose Integration + Privacy Audit) — awaiting UAT
-Status: **Ready for human UAT** — all code paths, threading headers, attachments, Ollama preset implemented and unit-tested
-
-Last activity: 2026-10-18 — reply/send/LLM-reply wiring live-tested against mail.utfpr.edu.br (live_gate_reply exit=0), 530 lib tests green
+Phase: Not started (defining requirements)
+Plan: —
+Status: Defining requirements
+Last activity: 2026-10-20 — Milestone v1.9 started
 
 ## Repair Pass (2026-10-18) — why it was needed
 

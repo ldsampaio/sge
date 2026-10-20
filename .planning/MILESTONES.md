@@ -1,6 +1,8 @@
 # Milestones
 
-## v1.8 LLM-Assisted Replies (In progress — repaired 2026-10-18)
+## v1.8 LLM-Assisted Replies (Closed 2026-10-19 — UAT humano deferido)
+
+**Closed:** 2026-10-19 com o UAT humano da rota de reply/send registrado como **deferido** (preceito v1.5). Código + testes offline verdes; ver `milestones/v1.8-closeout/v1.8-CLOSEOUT-ADDENDUM.md` (supersede o relato de 2026-10-15).
 
 **Phases:** 39 LLM Settings Foundation, 40 Generation Flow, 41 Compose Integration + Hardening/UAT
 
