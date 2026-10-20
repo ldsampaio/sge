@@ -4,23 +4,23 @@ milestone: v1.9
 current_phase: 42
 current_phase_name: Threading Backend Lane
 status: executing
-stopped_at: Phase 42 context gathered
-last_updated: "2026-10-20T13:25:59.810Z"
+stopped_at: Completed 42-01-PLAN.md
+last_updated: "2026-10-20T13:54:35.999Z"
 last_activity: 2026-10-20
 last_activity_desc: Phase 42 execution started
-state_head: 1880b3ab9fbb008690001c689dcd722dca8aaf60
+state_head: 0c966b959e20e38ce9a3ce92fd40f96667f8adb1
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 7
-  completed_plans: 0
+  completed_plans: 1
 milestone_name: Email Threading & Interface Revamp
 ---
 
 # SGE — State (v1.9 Email Threading & Interface Revamp)
 
 **Milestone:** v1.9 (roadmap: phases 42–46, written 2026-10-20)
-**Status:** Executing Phase 42
+**Status:** Ready to execute
 **Prev milestone:** v1.8 LLM-Assisted Replies (closed 2026-10-19 with human UAT deferred; authoritative record `.planning/milestones/v1.8-closeout/v1.8-CLOSEOUT-ADDENDUM.md`). Repair context: the 2026-10-18 `dc7f8c7` pass made Reply/Reply-All real after Phase 38's over-claim ("stub compiles" precedent — Phase 46 gates exist to block this class).
 
 ## Project Reference
@@ -32,8 +32,8 @@ See: .planning/PROJECT.md (updated 2026-10-20)
 ## Current Position
 
 Phase: 42 (Threading Backend Lane) — EXECUTING
-Plan: 1 of 7
-Status: Executing Phase 42
+Plan: 2 of 7
+Status: Ready to execute
 Last activity: 2026-10-20 — Phase 42 execution started
 
 Progress: [░░░░░░░░░░] 0%
@@ -61,6 +61,11 @@ Same-commit invariants to enforce at plan time: peek_audit path-5 with the lane 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 42 | 0 | — | — |
+**Per-Plan Metrics:**
+
+| Plan | Duration | Tasks | Files |
+|------|----------|-------|-------|
+| Phase 42 P01 | 23 | 2 tasks | 12 files |
 
 ## Accumulated Context
 
@@ -72,6 +77,9 @@ Full log in PROJECT.md Key Decisions. Recent ones affecting v1.9:
 - 2026-10-20: v1.9 threading = backend References lane (user-approved); subject-only client grouping rejected as unreliable
 - 2026-10-20: keep clay identity + embed Baloo 2/Nunito woff2 locally (no CDN), normalize fallback stack
 - 2026-10-18: reply threading reads the local BODY.PEEK cache; LLM single-flight tracker is shared `AppState` state
+- [Phase 42]: M26 threading substrate: done-bit as mailboxes.refs_backfilled_at ALTER column (D-01); resumable accounting via WHERE references_json IS NULL (D-02)
+- [Phase 42]: Thread grouping key is (mailbox_id, thread_id) — bare thread_id never a grouping key; NULL thread_id = own-thread sentinel (D-04)
+- [Phase 42]: Upsert routes in_reply_to/references_json via plain excluded.field — NULL never coalesced to empty-string sentinel; existing 48 call sites pass None until 42-02 compute lane populates
 
 ### Pending Todos
 
@@ -93,6 +101,6 @@ Full log in PROJECT.md Key Decisions. Recent ones affecting v1.9:
 
 ## Session Continuity
 
-Last session: 2026-10-20T04:07:34.642Z
-Stopped at: Phase 42 context gathered
-Resume file: .planning/phases/42-threading-backend-lane/42-CONTEXT.md
+Last session: 2026-10-20T13:54:35.988Z
+Stopped at: Completed 42-01-PLAN.md
+Resume file: None
