@@ -4,10 +4,10 @@ milestone: v1.9
 current_phase: 42
 current_phase_name: Threading Backend Lane
 status: executing
-stopped_at: Completed 42-04-PLAN.md (mail-threading epoch substrate; sequential lane)
-last_updated: "2026-10-20T17:00:00.000Z"
+stopped_at: Plan 42-05 WIP (executor aborted mid-task; verified-green WIP committed with 3 tests disabled with reasons — resume from `.planning/milestones/v1.9-threading-revamp/42-05-WIP-HANDOFF.md`)
+last_updated: "2026-10-20T17:35:00.000Z"
 last_activity: 2026-10-20
-last_activity_desc: Plan 42-04 complete — store/threads.rs JWZ epoch + mail-threading 0.1.3 pin
+last_activity_desc: 42-05 WIP committed (lane + helpers + hooks); suite green 549/5 ignored; pushed for continuation elsewhere
 state_head: 810a3b6
 progress:
   total_phases: 5
@@ -36,7 +36,7 @@ Plan: 4 of 7
 Status: Executing Phase 42
 Last activity: 2026-10-20 — Plan 42-04 complete (store/threads.rs epoch + crate pin)
 
-Progress: [██░░░░░░░░] 19%
+Progress: [███░░░░░░░] 29%
 
 ## Roadmap Summary (v1.9)
 

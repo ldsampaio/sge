@@ -502,11 +502,16 @@ const UPSERT_MESSAGE_SQL: &str = concat!(
     "  date_utc        = excluded.date_utc, ",
     "  flags           = excluded.flags, ",
     "  has_attachments = excluded.has_attachments, ",
-    // NULL stays NULL: plain excluded.field routing, never coalesced to an
-    // empty-string chain sentinel (D-04 — unknown threading data is NULL).
+    // NULL preserves what is already cached: a sweep that cannot see a
+    // thread-identity header (envelope lane carries no References lane)
+    // must not wipe a References the backfill/refs lane JUST wrote —
+    // otherwise every periodic full sweep would re-NULL the chain and the
+    // done-bit skip would strand rows as own-thread (Plan 42-05 resume
+    // semantics). COALESCEs to the STORED value, never an empty-string
+    // chain sentinel (D-04 — unknown threading data is NULL).
     "  preview         = excluded.preview, ",
-    "  in_reply_to     = excluded.in_reply_to, ",
-    "  references_json = excluded.references_json",
+    "  in_reply_to     = COALESCE(excluded.in_reply_to, messages.in_reply_to), ",
+    "  references_json = COALESCE(excluded.references_json, messages.references_json)",
 );
 
 /// Upsert a single message header row.  Keyed on `(mailbox_id, uid)`

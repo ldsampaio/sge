@@ -160,6 +160,81 @@ fn load_folder_rows(
     Ok((by_id, msgs))
 }
 
+/// ── D-01/D-02 backfill helpers (Plan 42-05) ──────────────────────────
+///
+/// These are the ONLY SQL homes for the References backfill lane: the
+/// sync engine never embeds this SQL (raw-SQL-stays-in-store discipline).
+
+/// D-01 per-folder done-bit read: has the References backfill already
+/// drained this folder (once) since the M26 upgrade? `refs_backfilled_at`
+/// is NULL until the first completed pass — never in a sidecar.
+pub fn refs_backfill_done(conn: &Connection, mailbox_id: u64) -> StoreResult<bool> {
+    let stamp: Option<String> = conn
+        .query_row(
+            "SELECT refs_backfilled_at FROM mailboxes WHERE id = ?1",
+            params![mailbox_id],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::Sql)?;
+    Ok(stamp.is_some())
+}
+
+/// The resumable backfill set for one folder (D-01/D-02): UIDs of live
+/// rows that still lack a cached References chain. `pending_delete = 0`
+/// keeps tombstones out of the lane (PITFALLS #7 predicate — a tomb-stoned
+/// UID must never re-enter the backfill sweep), and a partially completed
+/// backfill resumes exactly from these rows.
+pub fn backfill_pending_set(conn: &Connection, mailbox_id: u64) -> StoreResult<Vec<u32>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT uid FROM messages \
+             WHERE mailbox_id = ?1 AND references_json IS NULL AND pending_delete = 0 \
+             ORDER BY uid",
+        )
+        .map_err(StoreError::Sql)?;
+    let rows = stmt
+        .query_map(params![mailbox_id], |row| row.get::<_, u32>(0))
+        .map_err(StoreError::Sql)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::Sql)?;
+    Ok(rows)
+}
+
+/// D-01 completion: stamp the folder's done-bit (DB column only — never a
+/// state.json sidecar). Idempotent; re-stamping only freshens the stamp.
+pub fn mark_folder_backfilled(conn: &Connection, mailbox_id: u64) -> StoreResult<()> {
+    conn.execute(
+        "UPDATE mailboxes SET refs_backfilled_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') \
+         WHERE id = ?1",
+        params![mailbox_id],
+    )
+    .map_err(StoreError::Sql)?;
+    Ok(())
+}
+
+/// Persist one fetched References-lane row (Plan 42-03 `attach_refs_row`
+/// contract: callers merge by uid into their cached rows). `references_json`
+/// arrives `Option<&str>` pre-normalized — a JSON id array, or `None` for
+/// the own-thread sentinel (NULL column, D-04; never an empty-string
+/// chain). Returns the number of rows written: 0 means the UID is not
+/// cached (torch rows enter the DB on a later sweep, never mid-lane).
+pub fn apply_refs_row(
+    conn: &Connection,
+    mailbox_id: u64,
+    uid: u32,
+    references_json: Option<&str>,
+) -> StoreResult<usize> {
+    let json = references_json.filter(|s| !s.trim().is_empty());
+    let written = conn
+        .execute(
+            "UPDATE messages SET references_json = ?1 \
+             WHERE mailbox_id = ?2 AND uid = ?3 AND pending_delete = 0",
+            params![json, mailbox_id, uid],
+        )
+        .map_err(StoreError::Sql)?;
+    Ok(written)
+}
+
 /// Recompute thread ids for one folder — the D-04 epoch.
 ///
 /// `newly_seen_uids` is the caller's dirty set (hook sites in Plan 42-05):

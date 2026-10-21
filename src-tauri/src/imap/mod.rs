@@ -314,6 +314,25 @@ pub trait SyncSession: Unpin + Send {
         range: &'a str,
     ) -> PinBox<'a, Result<Vec<headers::MessageHeader>, SyncError>>;
 
+    /// `UID FETCH <range> (UID BODY.PEEK[HEADER.FIELDS (REFERENCES)])` —
+    /// the References lane (Phase 42, THR-01): one partial header row per
+    /// RECEIVED item (only `uid` + `references` populated). PEEK-only, so
+    /// `\\Seen` is never set. DefaultStub: sessions that do not carry the
+    /// lane respond with a loud Protocol error — the sync pass surfaces it
+    /// rather than silently sweeping zero References rows
+    /// (RESEARCH pitfall #12: a silent empty stream is never success).
+    fn fetch_references<'a>(
+        &'a mut self,
+        range: &'a str,
+    ) -> PinBox<'a, Result<Vec<headers::MessageHeader>, SyncError>> {
+        let range_owned = range.to_string();
+        Box::pin(async move {
+            Err(SyncError::Protocol(format!(
+                "references lane unavailable on this session (range {range_owned})"
+            )))
+        })
+    }
+
     /// `UID FETCH <uid> BODY.PEEK[]` — fetch the full RFC822 message
     /// bytes for a single UID. Never sets `\\Seen`.
     fn fetch_body(&mut self, uid: u32) -> PinBox<'_, Result<Vec<u8>, SyncError>>;
@@ -631,6 +650,14 @@ impl SyncSession for BoxedSession {
             }
             Ok(out)
         })
+    }
+
+    fn fetch_references<'a>(
+        &'a mut self,
+        range: &'a str,
+    ) -> PinBox<'a, Result<Vec<headers::MessageHeader>, SyncError>> {
+        let range_owned = range.to_string();
+        Box::pin(async move { headers::fetch_refs_batch(self, &range_owned).await })
     }
 
     fn fetch_body(&mut self, uid: u32) -> PinBox<'_, Result<Vec<u8>, SyncError>> {
